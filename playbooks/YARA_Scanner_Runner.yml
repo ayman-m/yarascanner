@@ -1,0 +1,278 @@
+id: YARA_Scanner_Runner
+version: -1
+name: YARA Scanner Runner
+description: |-
+  Runs the YARA scanner (xdr_yara_scanner.py) on targeted Cortex agents via Action Center.
+  Flow: resolve the script UID from the library by name (core-get-scripts) -> resolve target
+  endpoints (core-get-endpoints) -> execute the scanner with its parameters (core-script-run).
+
+  Uses the built-in "Cortex Core - IR" integration, which is available on Cortex XDR (edr),
+  XSIAM, and cloud_runtime_security. Designed to be run manually or as a scheduled Job.
+
+  PREREQUISITE: the scanner must already exist in the Action Center script library (upload via
+  the console once) with entry point `main` and string inputs, in order:
+  yarafile, scan_folder, alert_severity, mode, options.
+starttaskid: "0"
+tasks:
+  "0":
+    id: "0"
+    taskid: 4b1c0a10-0000-0000-0000-000000000000
+    type: start
+    task:
+      id: 4b1c0a10-0000-0000-0000-000000000000
+      version: -1
+      name: ""
+      iscommand: false
+      brand: ""
+    nexttasks:
+      '#none#':
+      - "1"
+    separatecontext: false
+    continueonerrortype: ""
+    view: |-
+      {"position": {"x": 450, "y": 50}}
+  "1":
+    id: "1"
+    taskid: 4b1c0a10-0000-0000-0000-000000000001
+    type: regular
+    task:
+      id: 4b1c0a10-0000-0000-0000-000000000001
+      version: -1
+      name: Resolve script UID
+      description: Get the list of library scripts and match the one named by inputs.script_name.
+      script: Cortex Core - IR|||core-get-scripts
+      type: regular
+      iscommand: true
+      brand: Cortex Core - IR
+    scriptarguments:
+      script_name:
+        simple: ${inputs.script_name}
+    nexttasks:
+      '#none#':
+      - "2"
+    separatecontext: false
+    continueonerrortype: ""
+    view: |-
+      {"position": {"x": 450, "y": 195}}
+  "2":
+    id: "2"
+    taskid: 4b1c0a10-0000-0000-0000-000000000002
+    type: regular
+    task:
+      id: 4b1c0a10-0000-0000-0000-000000000002
+      version: -1
+      name: Store script UID
+      description: Save the resolved script_uid to context.
+      script: SetAndHandleEmpty
+      type: regular
+      iscommand: false
+      brand: ""
+    scriptarguments:
+      key:
+        simple: script_uuid
+      value:
+        simple: ${Core.Scripts.script_uid}
+      append:
+        simple: "false"
+    nexttasks:
+      '#none#':
+      - "3"
+    separatecontext: false
+    continueonerrortype: ""
+    view: |-
+      {"position": {"x": 450, "y": 340}}
+  "3":
+    id: "3"
+    taskid: 4b1c0a10-0000-0000-0000-000000000003
+    type: regular
+    task:
+      id: 4b1c0a10-0000-0000-0000-000000000003
+      version: -1
+      name: Get target endpoints
+      description: Resolve connected endpoints by hostname and/or group.
+      script: Cortex Core - IR|||core-get-endpoints
+      type: regular
+      iscommand: true
+      brand: Cortex Core - IR
+    scriptarguments:
+      hostname:
+        complex:
+          root: inputs.endpoint_hostnames
+          transformers:
+          - operator: join
+            args:
+              separator:
+                value:
+                  simple: ','
+      group_name:
+        complex:
+          root: inputs.endpoint_groups
+          transformers:
+          - operator: join
+            args:
+              separator:
+                value:
+                  simple: ','
+      status:
+        simple: connected
+    nexttasks:
+      '#none#':
+      - "4"
+    separatecontext: false
+    continueonerrortype: ""
+    view: |-
+      {"position": {"x": 450, "y": 485}}
+  "4":
+    id: "4"
+    taskid: 4b1c0a10-0000-0000-0000-000000000004
+    type: regular
+    task:
+      id: 4b1c0a10-0000-0000-0000-000000000004
+      version: -1
+      name: Collect endpoint IDs
+      description: Extract endpoint IDs from the resolved endpoints into context.
+      script: SetAndHandleEmpty
+      type: regular
+      iscommand: false
+      brand: ""
+    scriptarguments:
+      key:
+        simple: endpoint_id
+      value:
+        simple: ${Core.Endpoint.endpoint_id}
+      append:
+        simple: "false"
+    nexttasks:
+      '#none#':
+      - "5"
+    separatecontext: false
+    continueonerrortype: ""
+    view: |-
+      {"position": {"x": 450, "y": 630}}
+  "5":
+    id: "5"
+    taskid: 4b1c0a10-0000-0000-0000-000000000005
+    type: regular
+    task:
+      id: 4b1c0a10-0000-0000-0000-000000000005
+      version: -1
+      name: Run YARA scanner
+      description: Execute the scanner from the library on the resolved endpoints, passing its parameters.
+      script: Cortex Core - IR|||core-script-run
+      type: regular
+      iscommand: true
+      brand: Cortex Core - IR
+    scriptarguments:
+      script_uid:
+        simple: ${script_uuid}
+      endpoint_ids:
+        complex:
+          root: endpoint_id
+          transformers:
+          - operator: join
+            args:
+              separator:
+                value:
+                  simple: ','
+      parameters:
+        simple: '{"yarafile":"${inputs.yarafile}","scan_folder":"${inputs.scan_folder}","alert_severity":"${inputs.alert_severity}","mode":"${inputs.mode}","options":"${inputs.options}"}'
+      timeout:
+        simple: ${inputs.timeout}
+      polling_interval_in_seconds:
+        simple: "60"
+      polling_timeout_in_seconds:
+        simple: ${inputs.timeout}
+    nexttasks:
+      '#none#':
+      - "6"
+    separatecontext: false
+    continueonerrortype: ""
+    view: |-
+      {"position": {"x": 450, "y": 775}}
+  "6":
+    id: "6"
+    taskid: 4b1c0a10-0000-0000-0000-000000000006
+    type: title
+    task:
+      id: 4b1c0a10-0000-0000-0000-000000000006
+      version: -1
+      name: Done
+      type: title
+      iscommand: false
+      brand: ""
+    separatecontext: false
+    continueonerrortype: ""
+    view: |-
+      {"position": {"x": 450, "y": 920}}
+inputs:
+- key: script_name
+  value:
+    simple: xdr_yara_scanner_v4
+  required: true
+  description: |-
+    Exact name of the scanner script in the Action Center library. IMPORTANT: core-script-run
+    rejects any parameter set that does not exactly match the script's defined inputs, so this
+    script MUST be uploaded with exactly these 5 string inputs, in order:
+    yarafile, scan_folder, alert_severity, mode, options. The older 3-input build will be rejected.
+  playbookInputQuery: null
+- key: yarafile
+  value:
+    simple: ""
+  required: false
+  description: Base64-encoded YARA rules. Empty uses the scanner's built-in default rule (if any).
+  playbookInputQuery: null
+- key: scan_folder
+  value:
+    simple: default
+  required: false
+  description: Target folder to scan, or "default" for the platform default scope.
+  playbookInputQuery: null
+- key: alert_severity
+  value:
+    simple: low
+  required: false
+  description: low | medium | high.
+  playbookInputQuery: null
+- key: mode
+  value:
+    simple: scan
+  required: false
+  description: scan | cancel (deliver a cancel to a running scan on the targets).
+  playbookInputQuery: null
+- key: options
+  value:
+    simple: ""
+  required: false
+  description: 'Compact runtime options, e.g. create_alerts=false,throttle_mode=os,collect_files=true.'
+  playbookInputQuery: null
+- key: endpoint_hostnames
+  value:
+    simple: ""
+  required: false
+  description: Comma-separated hostnames to target (leave empty to target by group only).
+  playbookInputQuery: null
+- key: endpoint_groups
+  value:
+    simple: ""
+  required: false
+  description: Comma-separated endpoint group names to target.
+  playbookInputQuery: null
+- key: timeout
+  value:
+    simple: "3600"
+  required: false
+  description: Per-endpoint script execution + polling timeout in seconds.
+  playbookInputQuery: null
+outputs:
+- contextPath: Core.ScriptResult.action_id
+  description: ID of the Action Center action initiated.
+  type: Number
+- contextPath: Core.ScriptResult.results.standard_output
+  description: STDOUT/STDERR from the scanner (the SCAN_RESULT summary line).
+  type: String
+- contextPath: Core.ScriptResult.results.execution_status
+  description: Per-endpoint execution status.
+  type: String
+fromversion: 6.5.0
+tests:
+- No tests (auto-formatted)

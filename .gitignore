@@ -2,7 +2,7 @@
 __pycache__/
 *.py[codz]
 *$py.class
-
+.env
 # C extensions
 *.so
 
@@ -209,3 +209,6 @@ __marimo__/
 # Local test sandbox containing scanner copies with real XDR credentials.
 # Never commit anything inside this folder.
 local_test/
+
+# Internal engineering notes / design specs (brainstorming output) — kept local only.
+docs/superpowers/
