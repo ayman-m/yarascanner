@@ -1,0 +1,235 @@
+id: YARA_Scanner_Canceller
+version: -1
+name: YARA Scanner Canceller
+description: |-
+  Delivers a cooperative cancel to a running YARA scan on targeted Cortex agents.
+  Flow: resolve the script UID (core-get-scripts) -> resolve target endpoints
+  (core-get-endpoints) -> run the scanner with mode=cancel (core-script-run), which drops the
+  cancel flag on each endpoint; a running scan's watcher detects it within ~5s and shuts down
+  gracefully (terminal 'cancelled' lifecycle row).
+
+  Uses the built-in "Cortex Core - IR" integration (available on Cortex XDR / XSIAM).
+
+  PREREQUISITE: the scanner must exist in the Action Center library with exactly these 5 string
+  inputs, in order: yarafile, scan_folder, alert_severity, mode, options (core-script-run rejects
+  a parameter set that does not match the script's defined inputs).
+starttaskid: "0"
+tasks:
+  "0":
+    id: "0"
+    taskid: 5c2d0b20-0000-0000-0000-000000000000
+    type: start
+    task:
+      id: 5c2d0b20-0000-0000-0000-000000000000
+      version: -1
+      name: ""
+      iscommand: false
+      brand: ""
+    nexttasks:
+      '#none#':
+      - "1"
+    separatecontext: false
+    continueonerrortype: ""
+    view: |-
+      {"position": {"x": 450, "y": 50}}
+  "1":
+    id: "1"
+    taskid: 5c2d0b20-0000-0000-0000-000000000001
+    type: regular
+    task:
+      id: 5c2d0b20-0000-0000-0000-000000000001
+      version: -1
+      name: Resolve script UID
+      description: Get the list of library scripts and match the one named by inputs.script_name.
+      script: Cortex Core - IR|||core-get-scripts
+      type: regular
+      iscommand: true
+      brand: Cortex Core - IR
+    scriptarguments:
+      script_name:
+        simple: ${inputs.script_name}
+    nexttasks:
+      '#none#':
+      - "2"
+    separatecontext: false
+    continueonerrortype: ""
+    view: |-
+      {"position": {"x": 450, "y": 195}}
+  "2":
+    id: "2"
+    taskid: 5c2d0b20-0000-0000-0000-000000000002
+    type: regular
+    task:
+      id: 5c2d0b20-0000-0000-0000-000000000002
+      version: -1
+      name: Store script UID
+      description: Save the resolved script_uid to context.
+      script: SetAndHandleEmpty
+      type: regular
+      iscommand: false
+      brand: ""
+    scriptarguments:
+      key:
+        simple: script_uuid
+      value:
+        simple: ${Core.Scripts.script_uid}
+      append:
+        simple: "false"
+    nexttasks:
+      '#none#':
+      - "3"
+    separatecontext: false
+    continueonerrortype: ""
+    view: |-
+      {"position": {"x": 450, "y": 340}}
+  "3":
+    id: "3"
+    taskid: 5c2d0b20-0000-0000-0000-000000000003
+    type: regular
+    task:
+      id: 5c2d0b20-0000-0000-0000-000000000003
+      version: -1
+      name: Get target endpoints
+      description: Resolve connected endpoints by hostname and/or group.
+      script: Cortex Core - IR|||core-get-endpoints
+      type: regular
+      iscommand: true
+      brand: Cortex Core - IR
+    scriptarguments:
+      hostname:
+        complex:
+          root: inputs.endpoint_hostnames
+          transformers:
+          - operator: join
+            args:
+              separator:
+                value:
+                  simple: ','
+      group_name:
+        complex:
+          root: inputs.endpoint_groups
+          transformers:
+          - operator: join
+            args:
+              separator:
+                value:
+                  simple: ','
+      status:
+        simple: connected
+    nexttasks:
+      '#none#':
+      - "4"
+    separatecontext: false
+    continueonerrortype: ""
+    view: |-
+      {"position": {"x": 450, "y": 485}}
+  "4":
+    id: "4"
+    taskid: 5c2d0b20-0000-0000-0000-000000000004
+    type: regular
+    task:
+      id: 5c2d0b20-0000-0000-0000-000000000004
+      version: -1
+      name: Collect endpoint IDs
+      description: Extract endpoint IDs from the resolved endpoints into context.
+      script: SetAndHandleEmpty
+      type: regular
+      iscommand: false
+      brand: ""
+    scriptarguments:
+      key:
+        simple: endpoint_id
+      value:
+        simple: ${Core.Endpoint.endpoint_id}
+      append:
+        simple: "false"
+    nexttasks:
+      '#none#':
+      - "5"
+    separatecontext: false
+    continueonerrortype: ""
+    view: |-
+      {"position": {"x": 450, "y": 630}}
+  "5":
+    id: "5"
+    taskid: 5c2d0b20-0000-0000-0000-000000000005
+    type: regular
+    task:
+      id: 5c2d0b20-0000-0000-0000-000000000005
+      version: -1
+      name: Deliver cancel (mode=cancel)
+      description: Run the scanner with mode=cancel on the resolved endpoints to drop the cancel flag.
+      script: Cortex Core - IR|||core-script-run
+      type: regular
+      iscommand: true
+      brand: Cortex Core - IR
+    scriptarguments:
+      script_uid:
+        simple: ${script_uuid}
+      endpoint_ids:
+        complex:
+          root: endpoint_id
+          transformers:
+          - operator: join
+            args:
+              separator:
+                value:
+                  simple: ','
+      parameters:
+        simple: '{"yarafile":"","scan_folder":"default","alert_severity":"low","mode":"cancel","options":""}'
+      timeout:
+        simple: "300"
+      polling_interval_in_seconds:
+        simple: "30"
+      polling_timeout_in_seconds:
+        simple: "300"
+    nexttasks:
+      '#none#':
+      - "6"
+    separatecontext: false
+    continueonerrortype: ""
+    view: |-
+      {"position": {"x": 450, "y": 775}}
+  "6":
+    id: "6"
+    taskid: 5c2d0b20-0000-0000-0000-000000000006
+    type: title
+    task:
+      id: 5c2d0b20-0000-0000-0000-000000000006
+      version: -1
+      name: Done
+      type: title
+      iscommand: false
+      brand: ""
+    separatecontext: false
+    continueonerrortype: ""
+    view: |-
+      {"position": {"x": 450, "y": 920}}
+inputs:
+- key: script_name
+  value:
+    simple: xdr_yara_scanner_v4
+  required: true
+  description: |-
+    Exact name of the scanner script in the Action Center library. It must be the same
+    5-input build the runner targets (inputs: yarafile, scan_folder, alert_severity, mode, options).
+  playbookInputQuery: null
+- key: endpoint_hostnames
+  value:
+    simple: ""
+  required: false
+  description: Comma-separated hostnames whose running scan should be cancelled.
+  playbookInputQuery: null
+- key: endpoint_groups
+  value:
+    simple: ""
+  required: false
+  description: Comma-separated endpoint group names to target.
+  playbookInputQuery: null
+outputs:
+- contextPath: Core.ScriptResult.results.standard_output
+  description: Cancel delivery result per endpoint (reports whether a scan was running).
+  type: String
+fromversion: 6.5.0
+tests:
+- No tests (auto-formatted)

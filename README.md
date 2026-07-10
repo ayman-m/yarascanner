@@ -67,6 +67,74 @@ Optimized for Cortex XSIAM using a generic HTTP Event Collector or Webhook endpo
 
 ---
 
+---
+
+## 🔄 v2 Updates (XDR Edition — `xdr_yara_scanner.py`)
+
+This release reworks the XDR scanner around operator control, correct XDR API delivery, and dashboard-ready telemetry. **Defaults preserve prior behavior**, except matched-file copying now defaults **off**.
+
+### 🔐 Authentication — Advanced (HMAC) support
+The scanner now supports both Cortex XDR API auth models and **auto-detects** which the tenant expects:
+- **Advanced** — per-request `x-xdr-nonce` + `x-xdr-timestamp` + `Authorization = sha256(key + nonce + timestamp)`
+- **Standard** — plain `Authorization: <key>` + `x-xdr-auth-id`
+
+Set `XDR_AUTH_TYPE` (`auto` | `advanced` | `standard`, default `auto`) to override. All API calls (Insert Parsed Alerts, `add_dataset`, `add_data`, `get_datasets`) route through one `build_xdr_headers()` helper. *Advanced-key tenants previously received nothing — the Standard-only header returned HTTP 401 on every upload.*
+
+### 🎛️ Runtime options (`options` parameter)
+Passed as a compact `key=value,key=value` string (also available as env-var fallbacks for standalone runs). All are optional:
+
+| Option | Values | Default | Effect |
+|--------|--------|---------|--------|
+| `create_alerts` | true/false | `true` | Insert Parsed Alerts (feeds XDR alerts → incident creation) |
+| `write_dataset` | true/false | `true` | Write to the lookup datasets |
+| `collect_files` | true/false | **`false`** | Copy matched files into the evidence zip (metadata-only when off) |
+| `throttle_mode` | script/os/off | `script` | CPU pacing strategy (below) |
+| `cpu_high_threshold` | 1–100 | `80` | Pause-entry threshold (% system CPU) |
+| `cpu_critical_threshold` | 1–100 | `90` | Critical threshold (logged separately) |
+| `max_pause_secs` | ≥0 (`0`=unbounded) | `300` | Cap on one continuous CPU pause |
+| `tenant_id` | string | derived | Override the tenant slug (else parsed from the API URL) |
+
+Every run's summary and logs include a **posture** string, e.g. `alerts=on dataset=on files=off throttle=script mode=scan`.
+
+### 🧮 Resource management
+- **Configurable throttling** via the thresholds above (was hardcoded).
+- **Enhanced sleep logic** — a worker over the high threshold now *stays paused and re-checks CPU each interval*, resuming only once CPU drops below `high − 10` (hysteresis), bounded by `max_pause_secs` so a permanently busy host still finishes. Cumulative pause time is reported per scan.
+- **`throttle_mode=os`** hands pacing to the OS: script sleeps are disabled and the process drops to idle-tier priority (Windows `IDLE`/background mode; Linux `nice 19` + `ionice idle`; macOS `nice 19`). `throttle_mode=off` disables throttling entirely for maintenance windows.
+
+### 🛑 Scan cancellation via Action Center
+Run the same script with `mode=cancel` on the endpoint to drop a cooperative cancel flag; a running scan's watcher detects it within ~5 s and shuts down gracefully — draining uploaders, writing a terminal `cancelled` lifecycle row, and returning `Scan cancelled by operator: …` (exit 0). POSIX `SIGTERM`/`SIGINT` route into the same path.
+
+### 🗂️ Lookup datasets + tenant identity
+Two **fixed-name** datasets replace the old daily-rotating one (so dashboards can reference them literally):
+- **`yara_scanner_matches`** — one row per matched string; now includes `tenant_id` and `scan_date`.
+- **`yara_scanner_scans`** — scan lifecycle rows (`initiated` / `running` heartbeat / `completed` / `cancelled` / `failed`) with counts, throttle mode, paused time, and posture.
+
+Growth is bounded by the `scan_date` column (targeted `lookups/remove_data` pruning) instead of a rotating name.
+
+### 🌐 Scan scope
+Browser caches are **no longer bypassed** (removed from the skip list), and a `force_scan_fragments` allowlist re-opens browser caches on macOS where the broad `Library/Caches/` exclusion would otherwise swallow them.
+
+### 🩹 Platform fixes
+- macOS cleanup now uses a **launchd** LaunchDaemon (was incorrectly writing a systemd unit and failing every run).
+- The cleanup script is **generated from the real alert directory** (the old embedded scripts pointed at a non-existent `xdr-data` path, so cleanup silently did nothing).
+- CPU sampler is primed at start (the first `psutil.cpu_percent()` reads 0 and skipped the first throttle window).
+- Hosts without systemd log-and-skip cleanup instead of erroring.
+
+### 📊 Dashboard & 🧪 test skill
+- New **`dashboards/Yara XDR Scanner (Lookup).json`** + `widgets/xdr_lookup/*.xql` built on the two lookup datasets (every widget carries `tenant_id`).
+- A bundled Claude skill, **`.claude/skills/xdr-yara-scan-test/`**, drives the scanner on a live endpoint through the XDR API (via `run_snippet_code_script`, no library upload) and verifies the datasets. See its `SKILL.md`.
+
+### 🎛️ Automation playbooks
+- **`playbooks/YARA_Scanner_Runner.yml`** and **`playbooks/YARA_Scanner_Canceller.yml`** launch / cancel the scanner on targeted agents via the built-in **Cortex Core - IR** integration (`core-get-scripts` → `core-get-endpoints` → `core-script-run`), for manual runs or scheduled **Jobs**.
+- Works on Cortex XDR (the `edr` module) and XSIAM. **Prerequisite:** the scanner must be uploaded to the Action Center library with exactly the 5 string inputs (`yarafile, scan_folder, alert_severity, mode, options`) — `core-script-run` rejects a mismatched parameter set. See `playbooks/README.md` for import, run, Job scheduling, and verification.
+
+### 📘 Deployment guides
+Step-by-step deployment guides (Markdown + Word) live in **`docs/guides/`**:
+- **`XDR_YARA_Scanner_Guide`** — Advanced/Standard auth, library upload with the 5 inputs, run via UI/API/playbook, cancellation, lookup datasets + dashboard, XQL recipes.
+- **`XSIAM_YARA_Scanner_Guide`** — HTTP Log Collector + parsing rule, `yara_scans_raw` ingestion, dashboards, XQL recipes, tuning.
+
+---
+
 ## ✨ Key Features
 
 ### Core Capabilities
@@ -140,8 +208,10 @@ args = {
 | 1 | `yarafile` | Base64-encoded YARA rules | Built-in rules | `"cnVsZSB0ZXN0IHsgLi4uIH0="` |
 | 2 | `scan_folder` | Target directory path | Full system scan | `"/home/user"` or `"C:\\"` |
 | 3 | `alert_severity`| Desired severity level | `"low"` | `"high"` |
+| 4 | `mode` | `scan` or `cancel` (deliver a cancel to a running scan) | `"scan"` | `"cancel"` |
+| 5 | `options` | `key=value,key=value` runtime options (see v2 section) | none | `"create_alerts=false,throttle_mode=os"` |
 
-**Note:** Use an empty string `""` to skip a parameter and use its default value. API Credentials are no longer passed via command-line arguments and must be embedded directly in the script source.
+**Note:** Use an empty string `""` to skip a parameter and use its default value. API Credentials are no longer passed via command-line arguments and must be embedded directly in the script source. See the **v2 Updates** section below for the `mode` / `options` surface, authentication, datasets, cancellation, and the bundled test skill.
 
 ---
 

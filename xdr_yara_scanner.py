@@ -70,22 +70,32 @@ XDR_GET_DATASETS_PATH = "/public_api/v1/xql/get_datasets"
 XDR_ADD_DATASET_PATH = "/public_api/v1/xql/add_dataset"
 LOOKUP_DATASET_BATCH_SIZE = 100        # max rows per add_data POST (XDR rate-limits ~1000/10s)
 LOOKUP_DATASET_FLUSH_SECS = 5.0        # flush partial batch after this many seconds idle
+# Fixed lookup-dataset base name (stable so dashboards can reference literally):
+#   <prefix>_matches -> one row per matched YARA string
+#   <prefix>_scans   -> scan-lifecycle rows (initiated/running/completed/cancelled/failed)
+LOOKUP_DATASET_PREFIX = "yara_scanner"
+SCANS_HEARTBEAT_SECS = float(os.environ.get("YARA_HEARTBEAT_SECS", "600") or 600)  # running-row cadence
+CANCEL_POLL_SECS = float(os.environ.get("YARA_CANCEL_POLL_SECS", "5") or 5)        # cancel-flag watcher cadence
+CANCEL_DRAIN_DEADLINE_SECS = float(os.environ.get("YARA_CANCEL_DEADLINE_SECS", "30") or 30)  # graceful cancel budget
+CANCEL_STALE_TOLERANCE_SECS = 2.0  # mtime slack when judging a cancel flag stale (coarse-FS safety)
 XDR_API_KEY = DEFAULT_XDR_API_KEY
 XDR_API_ID = DEFAULT_XDR_API_ID
 XDR_API_URL = DEFAULT_XDR_API_URL
 
+# XDR public-API authentication mode.
+#   "auto"     -> probe the tenant once (Advanced first, then Standard) and cache the winner
+#   "advanced" -> per-request HMAC signature (x-xdr-nonce + x-xdr-timestamp + sha256(key+nonce+ts))
+#   "standard" -> plain header (Authorization: <key> + x-xdr-auth-id)
+# Advanced is the modern default for Cortex XDR/XSIAM API keys; Standard-only keys still work via auto.
+XDR_AUTH_TYPE = (os.environ.get("XDR_AUTH_TYPE") or "auto").strip().lower()
+_RESOLVED_AUTH_TYPE = None  # cache for "auto": resolved to "advanced" | "standard" on first use
+
 YARA_RULE = r""""""
 
 
-# ============================================================================
-# CLEANUP SCRIPTS
-# ============================================================================
-
-b64CleanupScriptWindows = (
-    "CkBlY2hvIG9mZgpjZCAvZCBjOlx4ZHItZGF0YVxhbGVydApyZW4gKi50eHQgKi5hbGVydAo="
-)
-b64CleanupScriptLinux = "IyEvYmluL2Jhc2gKY2QgL29wdC94ZHItZGF0YS9hbGVydApmb3IgZmlsZSBpbiAqLnR4dDsgZG8KICAgIG12ICIkZmlsZSIgIiR7ZmlsZSUudHh0fS5hbGVydCIKZG9uZQ=="
-
+# Note: the cleanup script is now generated at runtime from config.alert_dir
+# (CleanupManager._get_cleanup_script_content) instead of hardcoded base64 blobs,
+# which previously drifted to the wrong directory (P2 fix).
 
 
 # ============================================================================
@@ -332,6 +342,230 @@ def _build_xdr_add_dataset_url(api_url: str) -> str:
     return f"{base}{XDR_ADD_DATASET_PATH}"
 
 
+# ============================================================================
+# XDR API AUTHENTICATION (centralized)
+# ============================================================================
+
+def _advanced_auth_headers():
+    """Advanced (HMAC) auth headers. A fresh nonce+timestamp is generated per call,
+    so callers MUST build headers per HTTP attempt (never reuse across retries).
+
+    Uses os.urandom (not the `secrets` module): the Cortex agent's snippet/script
+    sandbox enforces an import allowlist that rejects `secrets`.
+    """
+    nonce = os.urandom(32).hex()
+    timestamp = str(int(time.time() * 1000))
+    signature = hashlib.sha256((XDR_API_KEY + nonce + timestamp).encode("utf-8")).hexdigest()
+    return {
+        "x-xdr-timestamp": timestamp,
+        "x-xdr-nonce": nonce,
+        "x-xdr-auth-id": str(XDR_API_ID),
+        "Authorization": signature,
+        "Content-Type": "application/json",
+    }
+
+
+def _standard_auth_headers():
+    """Standard auth headers (plain API key)."""
+    return {
+        "Authorization": XDR_API_KEY,
+        "x-xdr-auth-id": str(XDR_API_ID),
+        "Content-Type": "application/json",
+    }
+
+
+def _xdr_configured() -> bool:
+    """True when a real (non-placeholder) XDR API URL is configured."""
+    return bool(XDR_API_URL) and "replace_with" not in (XDR_API_URL or "")
+
+
+def _probe_auth_type(log_manager=None):
+    """Detect whether the tenant expects Advanced or Standard auth; cache the result.
+
+    Probes get_datasets (a cheap authenticated no-op) with Advanced then Standard.
+    Falls back to 'advanced' when the probe is inconclusive or the tenant is offline.
+    """
+    global _RESOLVED_AUTH_TYPE
+    if _RESOLVED_AUTH_TYPE:
+        return _RESOLVED_AUTH_TYPE
+
+    url = _build_xdr_get_datasets_url(XDR_API_URL)
+    if not url or not _xdr_configured():
+        _RESOLVED_AUTH_TYPE = "advanced"
+        return _RESOLVED_AUTH_TYPE
+
+    for auth in ("advanced", "standard"):
+        headers = _advanced_auth_headers() if auth == "advanced" else _standard_auth_headers()
+        try:
+            resp = requests.post(url, headers=headers, json={"request": {}}, timeout=DEFAULT_TIMEOUT_SECS)
+        except Exception as e:  # noqa: BLE001 - network errors leave detection for next call
+            if log_manager:
+                log_manager.log_upload(f"XDR auth probe ({auth}) network error: {e}")
+            return "advanced"  # transient; do not cache
+        if 200 <= resp.status_code < 300:
+            _RESOLVED_AUTH_TYPE = auth
+            if log_manager:
+                log_manager.log_upload(f"XDR auth type detected: {auth}")
+            return auth
+
+    _RESOLVED_AUTH_TYPE = "advanced"
+    if log_manager:
+        log_manager.log_upload("XDR auth probe inconclusive; defaulting to advanced")
+    return _RESOLVED_AUTH_TYPE
+
+
+def build_xdr_headers(log_manager=None):
+    """Return XDR API request headers using the configured/detected auth type.
+
+    Call this fresh for every HTTP attempt: Advanced auth embeds a per-request
+    nonce+timestamp that must not be replayed across retries.
+    """
+    if XDR_AUTH_TYPE in ("advanced", "standard"):
+        auth = XDR_AUTH_TYPE
+    else:
+        auth = _probe_auth_type(log_manager)
+    return _advanced_auth_headers() if auth == "advanced" else _standard_auth_headers()
+
+
+# ============================================================================
+# CONFIG HELPERS (runtime options + tenant identity)
+# ============================================================================
+
+def _clamp_pct(value, default):
+    """Coerce a percentage-like value into 1..100, falling back to default."""
+    try:
+        v = float(value) if value is not None else float(default)
+    except (TypeError, ValueError):
+        v = float(default)
+    return max(1.0, min(100.0, v))
+
+
+def _coerce_float(value, default):
+    """Coerce to float, falling back to default; negatives clamped to 0."""
+    try:
+        v = float(value) if value is not None else float(default)
+    except (TypeError, ValueError):
+        v = float(default)
+    return v if v >= 0 else 0.0
+
+
+def _derive_tenant_id(api_url, override=""):
+    """Best-effort tenant slug. Cortex hosts look like api-<tenant>.xdr.<region>...
+
+    An explicit override always wins; otherwise parse the FQDN. Never fails —
+    returns 'unknown' when nothing can be derived (labeling must not break a scan).
+    """
+    if override and str(override).strip():
+        return str(override).strip()
+    text = api_url or ""
+    m = re.search(r"api-([^./]+)\.xdr\.", text)
+    if m:
+        return m.group(1)
+    try:
+        host = text.split("//")[-1].split("/")[0]
+        first = host.split(".")[0]
+        return first or "unknown"
+    except Exception:
+        return "unknown"
+
+
+# Runtime options exposed through the compact `options` string parameter
+# (key=value,key=value). Kept small on purpose: each is also a plain kwarg on
+# main()/ScanConfig for standalone use.
+_VALID_OPTION_KEYS = {
+    "create_alerts", "write_dataset", "collect_files",
+    "throttle_mode", "cpu_high_threshold", "cpu_critical_threshold",
+    "max_pause_secs", "tenant_id",
+}
+
+
+def _parse_options_string(options):
+    """Parse `key=value,key=value` into a dict of recognized options.
+
+    Booleans/numbers are left as raw strings here; ScanConfig coerces them.
+    Unknown keys raise ValueError so operator typos fail loudly instead of
+    silently doing nothing.
+    """
+    parsed = {}
+    if not options:
+        return parsed
+    text = _ensure_text(options).strip()
+    if not text:
+        return parsed
+    for chunk in text.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "=" not in chunk:
+            raise ValueError(f"Invalid option '{chunk}'. Expected key=value.")
+        k, v = chunk.split("=", 1)
+        k = k.strip().lower()
+        v = v.strip()
+        if k not in _VALID_OPTION_KEYS:
+            raise ValueError(
+                f"Unknown option '{k}'. Valid keys: {', '.join(sorted(_VALID_OPTION_KEYS))}"
+            )
+        parsed[k] = v
+    return parsed
+
+
+def _default_scanner_dir():
+    """Platform default scanner working directory (matches ScanConfig)."""
+    override = os.environ.get("YARA_SCANNER_DIR")
+    if override and override.strip():
+        return override.strip()
+    if platform.system() == "Windows":
+        return "C:\\yara_scanner"
+    if platform.system() == "Darwin":
+        return "/usr/local/yara_scanner"
+    return "/opt/yara_scanner"
+
+
+def _handle_cancel_request(tenant_id_override=""):
+    """mode=cancel: drop a cooperative cancel flag for a running scan on this endpoint.
+
+    Deliberately lightweight — does NOT initialize the full logging/scan machinery.
+    Writes <scanner_dir>/control/cancel.flag and reports whether a scan appears to be
+    running via the running.json liveness marker that an active scan refreshes.
+    """
+    scanner_dir = _default_scanner_dir()
+    control_dir = os.path.join(scanner_dir, "control")
+    try:
+        os.makedirs(control_dir, exist_ok=True)
+    except Exception as e:
+        return f"Cancel failed: cannot create control dir {control_dir}: {e}"
+
+    flag_path = os.path.join(control_dir, "cancel.flag")
+    running_path = os.path.join(control_dir, "running.json")
+
+    running = False
+    running_info = {}
+    try:
+        if os.path.exists(running_path):
+            with open(running_path, "r", encoding="utf-8") as f:
+                running_info = json.load(f)
+            updated = float(running_info.get("updated_at", 0))
+            # Fresh marker => a scan is (probably) alive. Generous window vs heartbeat.
+            running = (time.time() - updated) < (SCANS_HEARTBEAT_SECS * 3 + 60)
+    except Exception:
+        running = False
+
+    try:
+        with open(flag_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "requested_at_ms": int(time.time() * 1000),
+                "source": "xdr_action",
+                "tenant_id_override": tenant_id_override or "",
+            }, f)
+    except Exception as e:
+        return f"Cancel failed: cannot write {flag_path}: {e}"
+
+    return (
+        f"Cancel signal delivered ({flag_path}) | scanner running: "
+        f"{'yes' if running else 'no'} | scan_id={running_info.get('scan_id', 'n/a')}"
+    )
+
+
 def _parse_bool_arg(value, arg_name="argument"):
     """Parse strict boolean CLI/runtime argument from text."""
     if isinstance(value, bool):
@@ -435,22 +669,44 @@ def _get_file_creation_time_iso(path, stat_result=None):
         return None
 
 
-def _apply_light_process_priority(log_manager=None):
-    """Best-effort priority tuning so user activity wins on busy machines."""
-    details = {}
+def _apply_light_process_priority(log_manager=None, throttle_mode="script"):
+    """Best-effort process priority tuning so user activity wins on busy machines.
+
+    throttle_mode:
+      script/off -> baseline low priority (below-normal / nice 10 + ionice BE-7)
+      os         -> idle-tier priority so the OS scheduler fully arbitrates and the
+                    scanner never competes with real work (customer request: hand
+                    resource control to the OS, bypassing script-side sleeps).
+    All calls are best-effort; a failure here must never fail the scan.
+    """
+    details = {"throttle_mode": throttle_mode}
+    os_mode = (throttle_mode == "os")
     try:
         process = psutil.Process()
 
         if platform.system() == "Windows":
             try:
-                process.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
-                details["cpu_priority"] = "below_normal"
+                if os_mode:
+                    process.nice(psutil.IDLE_PRIORITY_CLASS)
+                    details["cpu_priority"] = "idle"
+                    # Background mode also demotes I/O and memory priority (Win Vista+).
+                    try:
+                        process.nice(getattr(psutil, "PROCESS_MODE_BACKGROUND_BEGIN", 0x00100000))
+                        details["background_mode"] = "begin"
+                    except Exception as e:
+                        details["background_mode_error"] = str(e)
+                else:
+                    process.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+                    details["cpu_priority"] = "below_normal"
             except Exception as e:
                 details["cpu_priority_error"] = str(e)
         else:
             try:
-                current_nice = process.nice()
-                target_nice = max(int(current_nice), 10)
+                if os_mode:
+                    target_nice = 19
+                else:
+                    current_nice = process.nice()
+                    target_nice = max(int(current_nice), 10)
                 process.nice(target_nice)
                 details["cpu_priority"] = f"nice={target_nice}"
             except Exception as e:
@@ -458,16 +714,20 @@ def _apply_light_process_priority(log_manager=None):
 
             if platform.system() == "Linux" and hasattr(process, "ionice"):
                 try:
-                    process.ionice(psutil.IOPRIO_CLASS_BE, 7)
-                    details["io_priority"] = "best_effort:7"
+                    if os_mode:
+                        process.ionice(psutil.IOPRIO_CLASS_IDLE)
+                        details["io_priority"] = "idle"
+                    else:
+                        process.ionice(psutil.IOPRIO_CLASS_BE, 7)
+                        details["io_priority"] = "best_effort:7"
                 except Exception as e:
                     details["io_priority_error"] = str(e)
 
         if log_manager:
-            log_manager.log_system("Applied light profile process priority tuning", details)
+            log_manager.log_system("Applied process priority tuning", details)
     except Exception as e:
         if log_manager:
-            log_manager.log_system(f"Could not apply light profile process priority tuning: {e}")
+            log_manager.log_system(f"Could not apply process priority tuning: {e}")
 
     return None
 
@@ -2010,7 +2270,11 @@ class SystemResourceMonitor:
 class ScanConfig:
     """Configuration class for scan settings and environment setup."""
 
-    def __init__(self, yarafile, scan_folder=None, alert_severity="low"):
+    def __init__(self, yarafile, scan_folder=None, alert_severity="low",
+                 mode="scan", create_alerts=True, write_dataset=True,
+                 collect_files=False, throttle_mode="script",
+                 cpu_high_threshold=None, cpu_critical_threshold=None,
+                 max_pause_secs=None, tenant_id=""):
         self.hostname, self.ip_addresses, self.os_info = get_system_info()
         self.run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         # Roadmap Feature: Caching is disabled by default
@@ -2018,19 +2282,40 @@ class ScanConfig:
         self.light_profile = True
         parsed_alert_severity = _parse_alert_severity(alert_severity, "alert_severity")
         self.alert_severity = "low" if parsed_alert_severity is None else parsed_alert_severity
-        scanner_dir_override = os.environ.get("YARA_SCANNER_DIR")
-        if scanner_dir_override and scanner_dir_override.strip():
-            self.scanner_dir = scanner_dir_override.strip()
-        elif platform.system() == "Windows":
-            self.scanner_dir = "C:\\yara_scanner"
-        elif platform.system() == "Darwin":
-            self.scanner_dir = "/usr/local/yara_scanner"
-        else:
-            self.scanner_dir = "/opt/yara_scanner"
+
+        # --- v2 runtime options (all default to preserve prior behavior, except
+        #     collect_files which now defaults OFF per customer request) ---
+        self.mode = (str(mode) if mode is not None else "scan").strip().lower() or "scan"
+        if self.mode not in ("scan", "cancel"):
+            raise ValueError(f"Invalid mode '{mode}'. Use scan or cancel.")
+        _ca = _parse_bool_arg(create_alerts, "create_alerts")
+        self.create_alerts = True if _ca is None else _ca
+        _wd = _parse_bool_arg(write_dataset, "write_dataset")
+        self.write_dataset = True if _wd is None else _wd
+        _cf = _parse_bool_arg(collect_files, "collect_files")
+        self.collect_files = False if _cf is None else _cf
+        self.throttle_mode = (str(throttle_mode) if throttle_mode is not None else "script").strip().lower() or "script"
+        if self.throttle_mode not in ("script", "os", "off"):
+            raise ValueError(f"Invalid throttle_mode '{throttle_mode}'. Use script, os, or off.")
+        # CPU thresholds/max-pause are applied in the throttle-config block below.
+        self._opt_cpu_high = cpu_high_threshold
+        self._opt_cpu_critical = cpu_critical_threshold
+        self._opt_max_pause = max_pause_secs
+        self._tenant_id_override = (str(tenant_id).strip() if tenant_id else "")
+        # Posture summary string surfaced in logs and the final result line.
+        self.posture = (
+            f"alerts={'on' if self.create_alerts else 'off'} "
+            f"dataset={'on' if self.write_dataset else 'off'} "
+            f"files={'on' if self.collect_files else 'off'} "
+            f"throttle={self.throttle_mode} mode={self.mode}"
+        )
+        self.scanner_dir = _default_scanner_dir()
 
         self.logs_dir = os.path.join(self.scanner_dir, "logs")
+        self.control_dir = os.path.join(self.scanner_dir, "control")
         os.makedirs(self.scanner_dir, exist_ok=True)
         os.makedirs(self.logs_dir, exist_ok=True)
+        os.makedirs(self.control_dir, exist_ok=True)
 
         is_windows = platform.system() == "Windows"
         self.alert_dir = os.path.join(self.scanner_dir, "alert")
@@ -2056,9 +2341,14 @@ class ScanConfig:
         XDR_API_URL = DEFAULT_XDR_API_URL
         self.api_url_source = "default"
 
+        # Tenant identity: explicit override wins, else derived from the API URL.
+        self.tenant_id = _derive_tenant_id(XDR_API_URL, self._tenant_id_override)
+
         self.error_logger.error_logger.info("XDR API Key: Using default embedded credential")
         self.error_logger.error_logger.info("XDR API ID: Using default embedded credential")
         self.error_logger.error_logger.info(f"XDR API URL: {XDR_API_URL}")
+        self.error_logger.error_logger.info(f"Tenant ID: {self.tenant_id}")
+        self.error_logger.error_logger.info(f"Runtime posture: {self.posture}")
         self.error_logger.error_logger.info(f"Default XDR alert severity: {self.alert_severity}")
         self.error_logger.error_logger.info(
             "Light profile active: cache disabled, reduced workers, reduced monitoring, and lower-impact scan execution"
@@ -2115,14 +2405,23 @@ class ScanConfig:
             os.getenv("YARA_ENABLE_FD_MONITOR", "false")
         ).strip().lower() in ("1", "true", "yes", "on")
         self.track_real_paths = False
-        self.light_throttle_enabled = True
+        # Throttling is active unless the operator hands resource control to the OS
+        # (throttle_mode="os") or disables it outright (throttle_mode="off").
+        self.light_throttle_enabled = (self.throttle_mode == "script")
         self.throttle_check_interval_secs = float(os.getenv("YARA_LIGHT_THROTTLE_CHECK_SECS", "0.5") or 0.5)
-        self.high_cpu_threshold = float(os.getenv("YARA_LIGHT_HIGH_CPU", "80") or 80)
-        self.critical_cpu_threshold = float(os.getenv("YARA_LIGHT_CRITICAL_CPU", "90") or 90)
-        self.throttle_sleep_secs = float(os.getenv("YARA_LIGHT_SLEEP_SECS", "0.02") or 0.02)
-        self.critical_throttle_sleep_secs = float(
-            os.getenv("YARA_LIGHT_CRITICAL_SLEEP_SECS", "0.08") or 0.08
-        )
+        # CPU thresholds: script-parameter override wins over env default.
+        self.high_cpu_threshold = _clamp_pct(self._opt_cpu_high, os.getenv("YARA_LIGHT_HIGH_CPU", "80") or 80)
+        self.critical_cpu_threshold = _clamp_pct(self._opt_cpu_critical, os.getenv("YARA_LIGHT_CRITICAL_CPU", "90") or 90)
+        if self.critical_cpu_threshold <= self.high_cpu_threshold:
+            self.critical_cpu_threshold = min(100.0, self.high_cpu_threshold + 5.0)
+            self.error_logger.error_logger.warning(
+                "cpu_critical_threshold <= cpu_high_threshold; bumped critical to "
+                f"{self.critical_cpu_threshold:.0f}"
+            )
+        # Resume hysteresis: workers resume once CPU falls this far below the high mark.
+        self.resume_margin = float(os.getenv("YARA_LIGHT_RESUME_MARGIN", "10") or 10)
+        # Cap on one continuous CPU pause (0 = unbounded). Param override wins.
+        self.max_pause_secs = _coerce_float(self._opt_max_pause, os.getenv("YARA_MAX_PAUSE_SECS", "300") or 300)
         self.queue_backoff_secs = float(os.getenv("YARA_QUEUE_BACKOFF_SECS", "0.25") or 0.25)
         self.skip_extensions = {
             ".iso", ".img", ".dmg", ".vmdk", ".vhd", ".vhdx", ".qcow", ".qcow2", ".sparsebundle"
@@ -2144,10 +2443,19 @@ class ScanConfig:
             "/library/caches/",
             "/appdata/local/temp/",
             "/appdata/local/packages/",
-            "/appdata/local/google/chrome/user data/default/cache/",
-            "/appdata/local/microsoft/edge/user data/default/cache/",
-            "/mozilla/firefox/profiles/",
-            "/cache2/",
+        )
+        # Always-scan carve-outs (checked BEFORE skip logic): browser caches/profiles
+        # are common malware staging/persistence areas, so they are scanned even when a
+        # broader skip fragment/dir would otherwise exclude them. On Windows/Linux the
+        # browser-cache skip fragments were removed above; this list surgically re-opens
+        # browser caches on macOS where the broad "/library/caches/" (and the mac skip
+        # dirs) would still bypass them. Safari is best-effort under TCC/Full Disk Access.
+        self.force_scan_fragments = (
+            "/library/caches/google/chrome/",
+            "/library/caches/chromium/",
+            "/library/caches/microsoft edge/",
+            "/library/caches/firefox/",
+            "/library/caches/com.apple.safari/",
         )
 
         self.evidence_zip = os.path.join(
@@ -2375,8 +2683,11 @@ class ResultsUploader:
             'failed_uploads': 0
         }
         
-        if UPLOAD_RESULTS:
+        # create_alerts gates the Insert Parsed Alerts channel (XDR alerts -> incidents).
+        if UPLOAD_RESULTS and getattr(config, "create_alerts", True):
             self._start_upload_thread()
+        elif self.log_manager:
+            self.log_manager.log_upload("Parsed-alerts upload disabled (create_alerts=false)")
 
     def _start_upload_thread(self):
         """Start background upload thread."""
@@ -2450,6 +2761,7 @@ class ResultsUploader:
 
         alert_description = {
             "source": "yara_scanner",
+            "tenant_id": getattr(self.config, "tenant_id", "unknown"),
             "scan_id": standard_log.scan_id,
             "hostname": standard_log.hostname,
             "os_info": standard_log.os_info,
@@ -2476,11 +2788,6 @@ class ResultsUploader:
 
     def _upload_standard_result(self, standard_log: StandardLogEntry):
         """Upload YARA match with bounded retries."""
-        headers = {
-            "Authorization": XDR_API_KEY,
-            "x-xdr-auth-id": XDR_API_ID,
-            "Content-Type": "application/json"
-        }
         payload = self._build_xdr_parsed_alert(standard_log)
         endpoint = _build_xdr_insert_alerts_url(XDR_API_URL)
 
@@ -2490,7 +2797,7 @@ class ResultsUploader:
             try:
                 resp = requests.post(
                     url=endpoint,
-                    headers=headers,
+                    headers=build_xdr_headers(self.log_manager),
                     json=payload,
                     timeout=DEFAULT_TIMEOUT_SECS,
                 )
@@ -2623,8 +2930,10 @@ class ResultsUploader:
                 default_level = getattr(self.config, "alert_severity", "low")
                 severity = severity_map.get(str(default_level).lower(), "Low")
                 lookup_record = {
+                    "tenant_id": getattr(self.config, "tenant_id", "unknown"),
                     "scan_id": self.scan_id,
                     "run_id": getattr(self.config, "run_id", "") or "",
+                    "scan_date": (getattr(self.config, "run_id", "") or "").split("_", 1)[0],
                     "hostname": self.hostname,
                     "os_info": self.os_info,
                     "ip_address": self.ip_address,
@@ -2748,12 +3057,13 @@ class LookupDatasetUploader:
     def __init__(self, config, log_manager=None):
         self.config = config
         self.log_manager = log_manager
-        # Dataset name uses the calendar date only (YYYYMMDD) so every scan run on
-        # the same day appends to the same daily dataset. config.run_id has the
-        # shape YYYYMMDD_HHMMSS_uuuuuu, so the leading 8 chars are the date.
-        date_part = (config.run_id.split("_", 1)[0] if config.run_id else
-                     datetime.datetime.now().strftime("%Y%m%d"))
-        self.dataset_name = f"yara_matches_{date_part}"
+        self.tenant_id = getattr(config, "tenant_id", "unknown")
+        # scan_date (YYYYMMDD) bounds dataset growth via targeted remove_data pruning,
+        # replacing the old daily-rotating dataset NAME (which dashboards can't follow).
+        self.scan_date = (config.run_id.split("_", 1)[0] if getattr(config, "run_id", "") else
+                          datetime.datetime.now().strftime("%Y%m%d"))
+        self.matches_dataset = f"{LOOKUP_DATASET_PREFIX}_matches"
+        self.scans_dataset = f"{LOOKUP_DATASET_PREFIX}_scans"
         self.queue = Queue()
         self.upload_thread = None
         self.stop_flag = False
@@ -2766,13 +3076,16 @@ class LookupDatasetUploader:
             "records_updated": 0,
             "records_skipped": 0,
             "send_failures": 0,
+            "dropped": 0,
         }
 
-        # Schema for the lookup dataset — must match keys produced by ResultsUploader.add_match.
+        # Matches schema — must match keys produced by ResultsUploader.add_match.
         # XDR add_dataset supports: text, number, datetime, bool.
-        self.dataset_schema = {
+        self.matches_schema = {
+            "tenant_id": "text",
             "scan_id": "text",
             "run_id": "text",
+            "scan_date": "text",
             "hostname": "text",
             "os_info": "text",
             "ip_address": "text",
@@ -2787,34 +3100,57 @@ class LookupDatasetUploader:
             "event_timestamp_ms": "number",
             "date_of_scan": "text",
         }
+        # Scans lifecycle schema — one row per lifecycle transition/heartbeat.
+        self.scans_schema = {
+            "tenant_id": "text",
+            "scan_id": "text",
+            "run_id": "text",
+            "scan_date": "text",
+            "hostname": "text",
+            "os_info": "text",
+            "ip_address": "text",
+            "status": "text",
+            "files_scanned": "number",
+            "files_skipped": "number",
+            "detections": "number",
+            "valid_rules": "number",
+            "failed_rules": "number",
+            "scan_rate_fps": "number",
+            "elapsed_secs": "number",
+            "total_paused_secs": "number",
+            "throttle_mode": "text",
+            "posture": "text",
+            "event_timestamp_ms": "number",
+            "message": "text",
+        }
 
-        if UPLOAD_RESULTS and self._xdr_configured():
-            self._ensure_dataset_exists()
+        if UPLOAD_RESULTS and getattr(config, "write_dataset", True) and self._xdr_configured():
+            self._ensure_datasets()
             self._start_thread()
         elif self.log_manager:
             self.log_manager.log_upload(
-                "Lookup dataset uploads disabled (UPLOAD_RESULTS off or XDR URL not configured)"
+                "Lookup dataset uploads disabled (write_dataset=false, UPLOAD_RESULTS off, or XDR URL not configured)"
             )
 
     def _xdr_configured(self) -> bool:
         return bool(XDR_API_URL) and "replace_with" not in (XDR_API_URL or "")
 
-    def _ensure_dataset_exists(self):
+    def _ensure_datasets(self):
+        """Ensure both the matches and scans lookup datasets exist."""
+        self._ensure_one(self.matches_dataset, self.matches_schema)
+        self._ensure_one(self.scans_dataset, self.scans_schema)
+
+    def _ensure_one(self, dataset_name, dataset_schema):
         """Probe get_datasets; create the dataset via add_dataset if it does not exist yet.
 
         XDR's add_data endpoint returns HTTP 400 "Dataset not found" when the lookup
         dataset hasn't been created, so creation is a hard prerequisite — not implicit.
         """
-        headers = {
-            "Authorization": XDR_API_KEY,
-            "x-xdr-auth-id": XDR_API_ID,
-            "Content-Type": "application/json",
-        }
         found = False
         try:
             resp = requests.post(
                 _build_xdr_get_datasets_url(XDR_API_URL),
-                headers=headers,
+                headers=build_xdr_headers(self.log_manager),
                 json={"request": {}},
                 timeout=DEFAULT_TIMEOUT_SECS,
             )
@@ -2827,7 +3163,7 @@ class LookupDatasetUploader:
                     # Docs say dataset_name; XDR actually returns "Dataset Name". Accept both.
                     found = any(
                         isinstance(d, dict)
-                        and self.dataset_name in (d.get("dataset_name"), d.get("Dataset Name"))
+                        and dataset_name in (d.get("dataset_name"), d.get("Dataset Name"))
                         for d in (datasets or [])
                     )
                 except Exception as parse_err:
@@ -2851,7 +3187,7 @@ class LookupDatasetUploader:
         if found:
             if self.log_manager:
                 self.log_manager.log_upload(
-                    f"Lookup dataset '{self.dataset_name}' already exists - will append rows"
+                    f"Lookup dataset '{dataset_name}' already exists - will append rows"
                 )
             return
 
@@ -2859,12 +3195,12 @@ class LookupDatasetUploader:
         try:
             resp = requests.post(
                 _build_xdr_add_dataset_url(XDR_API_URL),
-                headers=headers,
+                headers=build_xdr_headers(self.log_manager),
                 json={
                     "request": {
-                        "dataset_name": self.dataset_name,
+                        "dataset_name": dataset_name,
                         "dataset_type": "lookup",
-                        "dataset_schema": self.dataset_schema,
+                        "dataset_schema": dataset_schema,
                     }
                 },
                 timeout=DEFAULT_TIMEOUT_SECS,
@@ -2872,8 +3208,8 @@ class LookupDatasetUploader:
             if 200 <= resp.status_code < 300:
                 if self.log_manager:
                     self.log_manager.log_upload(
-                        f"Lookup dataset '{self.dataset_name}' created "
-                        f"(schema fields: {len(self.dataset_schema)})"
+                        f"Lookup dataset '{dataset_name}' created "
+                        f"(schema fields: {len(dataset_schema)})"
                     )
                 return
             # XDR returns HTTP 500 with err_extra "Dataset X already exists" when the
@@ -2891,7 +3227,7 @@ class LookupDatasetUploader:
             if already_exists:
                 if self.log_manager:
                     self.log_manager.log_upload(
-                        f"Lookup dataset '{self.dataset_name}' already exists "
+                        f"Lookup dataset '{dataset_name}' already exists "
                         f"(reported via add_dataset 500) - will append rows"
                     )
                 return
@@ -2907,49 +3243,82 @@ class LookupDatasetUploader:
     def _start_thread(self):
         if self.log_manager:
             self.log_manager.log_upload(
-                f"Lookup dataset upload thread starting (dataset: {self.dataset_name}, "
-                f"batch_size: {self.batch_size})"
+                f"Lookup dataset upload thread starting (datasets: {self.matches_dataset}, "
+                f"{self.scans_dataset}; batch_size: {self.batch_size})"
             )
         self.upload_thread = threading.Thread(target=self._worker, daemon=True)
         self.upload_thread.start()
 
     def add(self, record: dict):
-        """Queue one record for the next batch upload. Non-blocking."""
+        """Queue one match record for the matches dataset. Non-blocking."""
+        self._enqueue(self.matches_dataset, record)
+
+    def add_scan_row(self, record: dict):
+        """Queue one scan-lifecycle record for the scans dataset. Non-blocking."""
+        self._enqueue(self.scans_dataset, record)
+
+    def _enqueue(self, target, record):
         if not self.upload_thread or not self.upload_thread.is_alive():
+            # Worker never started or died — count and log once so dropped rows
+            # (including the terminal lifecycle row) are diagnosable, not silent.
+            self.upload_stats["dropped"] = self.upload_stats.get("dropped", 0) + 1
+            if self.log_manager and not getattr(self, "_drop_logged", False):
+                self._drop_logged = True
+                self.log_manager.log_error(
+                    f"Lookup uploader thread not alive - dropping rows for {target} "
+                    f"(further drops suppressed)"
+                )
             return
         try:
-            self.queue.put(record, timeout=1.0)
+            self.queue.put((target, record), timeout=1.0)
             self.upload_stats["queued"] += 1
         except Exception:
+            self.upload_stats["dropped"] = self.upload_stats.get("dropped", 0) + 1
             if self.log_manager:
                 self.log_manager.log_error("Lookup dataset queue full - dropping record")
 
     def _worker(self):
         if self.log_manager:
             self.log_manager.log_upload("Lookup dataset worker started")
-        batch = []
-        last_flush = time.time()
+        batches = defaultdict(list)  # target dataset -> pending rows
+        last_flush = {}              # per-target: when the current batch started accumulating
+
+        def flush_target(target):
+            if batches[target]:
+                self._send_batch(target, batches[target])
+                batches[target] = []
+                last_flush.pop(target, None)
+
         while True:
             try:
-                rec = self.queue.get(timeout=1.0)
-                if rec is None:
+                item = self.queue.get(timeout=1.0)
+                if item is None:
                     break
-                batch.append(rec)
-                if len(batch) >= self.batch_size:
-                    self._send_batch(batch)
-                    batch = []
-                    last_flush = time.time()
+                target, rec = item
+                if not batches[target]:
+                    last_flush[target] = time.time()  # anchor this batch's flush timer
+                batches[target].append(rec)
+                if len(batches[target]) >= self.batch_size:
+                    flush_target(target)
             except Empty:
-                if batch and (time.time() - last_flush) >= self.flush_interval:
-                    self._send_batch(batch)
-                    batch = []
-                    last_flush = time.time()
-                if self.stop_flag and not batch:
+                # Each dataset flushes on ITS OWN timer, so a busy matches stream cannot
+                # starve the low-volume scans heartbeat (per-target last_flush).
+                now = time.time()
+                for target in list(batches.keys()):
+                    if batches[target] and (now - last_flush.get(target, now)) >= self.flush_interval:
+                        flush_target(target)
+                if self.stop_flag and not any(batches.values()):
                     break
                 continue
+            except Exception as e:
+                # Never let an unexpected error kill the uploader thread — that would
+                # silently drop every subsequent row (matches + terminal lifecycle row).
+                if self.log_manager:
+                    self.log_manager.log_error(f"Lookup worker loop error (continuing): {e}")
+                continue
 
-        if batch:
-            self._send_batch(batch)
+        for target in list(batches.keys()):
+            flush_target(target)
         if self.log_manager:
             self.log_manager.log_upload(
                 f"Lookup dataset worker stopped "
@@ -2960,17 +3329,12 @@ class LookupDatasetUploader:
                 f"failures={self.upload_stats['send_failures']})"
             )
 
-    def _send_batch(self, batch):
+    def _send_batch(self, target, batch):
         if not batch:
             return
-        headers = {
-            "Authorization": XDR_API_KEY,
-            "x-xdr-auth-id": XDR_API_ID,
-            "Content-Type": "application/json",
-        }
         payload = {
             "request": {
-                "dataset_name": self.dataset_name,
+                "dataset_name": target,
                 "data": batch,
             }
         }
@@ -2980,7 +3344,7 @@ class LookupDatasetUploader:
         while attempt < MAX_RETRIES_PER_ITEM:
             attempt += 1
             try:
-                resp = requests.post(url, headers=headers, json=payload, timeout=DEFAULT_TIMEOUT_SECS)
+                resp = requests.post(url, headers=build_xdr_headers(self.log_manager), json=payload, timeout=DEFAULT_TIMEOUT_SECS)
                 if 200 <= resp.status_code < 300:
                     try:
                         body = resp.json()
@@ -3120,15 +3484,9 @@ class ScanStatusUploader:
                 data=status_data
             )
             
-            headers = {
-                "Authorization": XDR_API_KEY,
-                "x-xdr-auth-id": XDR_API_ID,
-                "Content-Type": "application/json",
-            }
-            
             response = requests.post(
                 url=_build_xdr_insert_alerts_url(XDR_API_URL),
-                headers=headers,
+                headers=build_xdr_headers(),
                 json=standard_log.to_dict(),
                 timeout=10
             )
@@ -3195,15 +3553,25 @@ class EvidenceCollector:
                         mapping_file.write(f"{file_path} | {file_hash}\n")
 
     def _create_evidence_zip(self):
-        """Create ZIP file containing evidence."""
+        """Create ZIP file containing evidence.
+
+        With collect_files=false (default), the zip is metadata-only: the matched
+        files themselves are NOT copied, but file_mapping.txt (paths + SHA256) and
+        the per-rule alert texts still let a responder locate and fetch files by
+        path/hash manually.
+        """
+        copy_files = getattr(self.config, "collect_files", False)
         with zipfile.ZipFile(
             self.config.evidence_zip, "w", zipfile.ZIP_DEFLATED
         ) as zip_file:
-            for file_path, file_hash in self.file_hashes.items():
-                try:
-                    zip_file.write(file_path, f"matched_files/{file_hash}")
-                except Exception as e:
-                    logging.error(f"Error adding file to zip {file_path}: {e}")
+            if copy_files:
+                for file_path, file_hash in self.file_hashes.items():
+                    try:
+                        zip_file.write(file_path, f"matched_files/{file_hash}")
+                    except Exception as e:
+                        logging.error(f"Error adding file to zip {file_path}: {e}")
+            else:
+                logging.info("Evidence: collect_files=false - packaging metadata only (no matched file copies)")
 
             for alert_file in os.listdir(self.config.alert_dir):
                 if alert_file.endswith(".txt"):
@@ -3349,6 +3717,10 @@ class CleanupManager:
                 self._schedule_windows_cleanup()
                 if hasattr(self.config, 'log_manager'):
                     self.config.log_manager.log_system("Windows cleanup task scheduled successfully")
+            elif platform.system() == "Darwin":
+                self._schedule_macos_cleanup()
+                if hasattr(self.config, 'log_manager'):
+                    self.config.log_manager.log_system("macOS cleanup LaunchDaemon scheduled")
             else:
                 self._schedule_linux_cleanup()
                 if hasattr(self.config, 'log_manager'):
@@ -3374,10 +3746,29 @@ class CleanupManager:
             os.chmod(self.config.cleanup_script, 0o755)
 
     def _get_cleanup_script_content(self):
-        """Get platform-specific cleanup script."""
+        """Generate the cleanup script from the ACTUAL alert dir.
+
+        Fixes the historical path-drift bug (P2): the old embedded base64 scripts
+        targeted c:\\xdr-data\\alert / /opt/xdr-data/alert, which never matched the real
+        <scanner_dir>/alert, so scheduled cleanup renamed nothing. Generating from
+        config.alert_dir keeps the script and the data in lock-step.
+        """
+        alert_dir = self.config.alert_dir
         if platform.system() == "Windows":
-            return base64.b64decode(b64CleanupScriptWindows).decode("utf-8")
-        return base64.b64decode(b64CleanupScriptLinux).decode("utf-8")
+            return (
+                "@echo off\r\n"
+                f'cd /d "{alert_dir}"\r\n'
+                "if errorlevel 1 exit /b 0\r\n"
+                "ren *.txt *.alert\r\n"
+            )
+        return (
+            "#!/bin/bash\n"
+            f'cd "{alert_dir}" || exit 0\n'
+            "for file in *.txt; do\n"
+            '    [ -e "$file" ] || continue\n'
+            '    mv "$file" "${file%.txt}.alert"\n'
+            "done\n"
+        )
 
     def _schedule_windows_cleanup(self):
         """Schedule cleanup task in Windows."""
@@ -3426,14 +3817,52 @@ WantedBy=multi-user.target
                 raise Exception("Service file not owned by root")
 
             subprocess.run(["systemctl", "daemon-reload"], shell=False, check=True)
-            subprocess.run(["systemctl", "enable", "yara-cleanup.service"], shell=False, check=True) 
+            subprocess.run(["systemctl", "enable", "yara-cleanup.service"], shell=False, check=True)
             subprocess.run(["systemctl", "start", "yara-cleanup.service"], shell=False, check=True)
 
             logging.info("Linux cleanup service created and started")
 
+        except FileNotFoundError:
+            # Host without systemd (minimal container, non-systemd init). Cleanup is
+            # cosmetic (renames alert .txt -> .alert), so log-and-skip, never fail.
+            logging.warning("systemctl not found - skipping Linux cleanup scheduling (cosmetic only)")
+        except PermissionError:
+            logging.warning("Linux cleanup scheduling requires root - skipping (cosmetic only)")
         except subprocess.CalledProcessError as e:
             logging.error(f"Error scheduling Linux cleanup: {e}")
-            raise
+
+    def _schedule_macos_cleanup(self):
+        """Schedule a one-shot cleanup via launchd (macOS has no systemd) — fixes P1
+        where the old code wrote a systemd unit on Darwin and threw on every scan."""
+        label = "com.yarascanner.cleanup"
+        plist_path = f"/Library/LaunchDaemons/{label}.plist"
+        plist = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+            '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+            '<plist version="1.0">\n'
+            '<dict>\n'
+            f'    <key>Label</key><string>{label}</string>\n'
+            '    <key>ProgramArguments</key>\n'
+            '    <array>\n'
+            '        <string>/bin/bash</string>\n'
+            f'        <string>{self.config.cleanup_script}</string>\n'
+            '    </array>\n'
+            '    <key>RunAtLoad</key><true/>\n'
+            '</dict>\n'
+            '</plist>\n'
+        )
+        try:
+            with open(plist_path, "w") as f:
+                f.write(plist)
+            subprocess.run(["launchctl", "load", plist_path], shell=False, check=True)
+            logging.info("macOS cleanup LaunchDaemon loaded")
+        except PermissionError:
+            logging.warning("macOS cleanup scheduling requires root - skipping (cosmetic only)")
+        except FileNotFoundError:
+            logging.warning("launchctl not found - skipping macOS cleanup scheduling")
+        except subprocess.CalledProcessError as e:
+            logging.error(f"Error scheduling macOS cleanup: {e}")
 
 
 # ============================================================================
@@ -3496,9 +3925,33 @@ class YaraScanner:
         self.worker_processing_times = defaultdict(list)
         self.last_throttle_check = 0.0
         self.last_system_cpu = 0.0
-        self.last_throttle_sleep_secs = 0.0
+        self.total_paused_secs = 0.0     # wall-clock time >=1 worker was CPU-paused
+        self.critical_pauses = 0         # pauses that hit the critical CPU threshold
+        self._paused_workers = 0         # count of workers currently in the pause loop
+        self._pause_wall_start = 0.0     # wall-clock start of the current throttled window
         self.queue_full_events = 0
-        
+
+        # Cancellation state (set by the cancel watcher / signal handlers).
+        self.cancel_requested = False
+        self.cancel_source = ""
+        self.cancel_flag_path = os.path.join(getattr(config, "control_dir", config.scanner_dir), "cancel.flag")
+        self.running_marker_path = os.path.join(getattr(config, "control_dir", config.scanner_dir), "running.json")
+        self.cancel_watcher_thread = None
+        # Earliest baseline (construction time) used to distinguish a genuinely stale
+        # cancel flag from one delivered during the pre-scan compile phase. Never reset.
+        self._process_started_at = time.time()
+        self._scan_started_at = self._process_started_at  # reset to scan-phase start in scan_system
+        self._last_heartbeat = 0.0
+        self._scans_row_lock = threading.Lock()
+        self._cancel_lock = threading.Lock()
+
+        # Prime psutil's system-CPU sampler: the first cpu_percent(None) call always
+        # returns 0.0, which would let the first throttle window through blind (P3).
+        try:
+            psutil.cpu_percent(interval=None)
+        except Exception:
+            pass
+
         self.log_manager.log_system(
             f"YaraScanner initialized with {self.config.max_workers} workers",
             {
@@ -3516,7 +3969,153 @@ class YaraScanner:
             self.scan_failed = True
             self.failure_reasons.append(reason)
         self.scan_active = False
-    
+
+    # ------------------------------------------------------------------
+    # Cancellation + scan-lifecycle telemetry
+    # ------------------------------------------------------------------
+    def _request_cancel(self, source, log=True):
+        """Cooperatively request cancellation. Idempotent (first source wins) and safe
+        from any thread. NOT called from the signal handler — that sets the flags bare
+        to stay async-signal-safe (no lock, no I/O)."""
+        with self._cancel_lock:
+            if self.cancel_requested:
+                return
+            self.cancel_requested = True
+            self.cancel_source = source
+            self.scan_active = False
+        if log:
+            try:
+                self.log_manager.log_system(f"Cancellation requested (source={source})")
+            except Exception:
+                pass
+
+    def _start_cancellation_watcher(self):
+        """Remove a genuinely stale cancel flag, write the running marker, start polling.
+
+        "Stale" = written before this process even started (mtime < process start, minus
+        a small tolerance for coarse filesystem mtime). A cancel delivered DURING the
+        pre-scan rule-compilation phase has a newer mtime and is deliberately preserved,
+        so the watcher will honor it once it starts.
+        """
+        try:
+            if os.path.exists(self.cancel_flag_path):
+                mtime = os.path.getmtime(self.cancel_flag_path)
+                if mtime < (self._process_started_at - CANCEL_STALE_TOLERANCE_SECS):
+                    os.remove(self.cancel_flag_path)
+                    self.log_manager.log_system("Removed stale cancel flag from a previous run")
+        except Exception as e:
+            self.log_manager.log_system(f"Could not evaluate pre-existing cancel flag: {e}")
+
+        self._write_running_marker("running")
+        self.cancel_watcher_thread = threading.Thread(
+            target=self._cancellation_watcher, name="CancelWatcher", daemon=True
+        )
+        self.cancel_watcher_thread.start()
+
+    def _cancellation_watcher(self):
+        """Poll for an operator cancel flag (written by a `mode=cancel` invocation).
+
+        The flag was cleared at scan start, so any flag present now is a fresh cancel —
+        no mtime comparison needed.
+        """
+        while self.scan_active and not self.cancel_requested:
+            try:
+                if os.path.exists(self.cancel_flag_path):
+                    source = "action_center"
+                    try:
+                        with open(self.cancel_flag_path, "r", encoding="utf-8") as f:
+                            source = (json.load(f) or {}).get("source", source)
+                    except Exception:
+                        pass
+                    self._request_cancel(source)
+                    break
+            except Exception as e:
+                self.log_manager.log_error(f"Cancel watcher error: {e}")
+            time.sleep(CANCEL_POLL_SECS)
+
+    def _write_running_marker(self, status):
+        """Refresh the liveness marker that `mode=cancel` reports against.
+
+        Written atomically (temp + os.replace) so a cross-process cancel reader never
+        sees a half-written/empty file.
+        """
+        try:
+            tmp = self.running_marker_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({
+                    "scan_id": self.config.scan_id,
+                    "run_id": getattr(self.config, "run_id", ""),
+                    "pid": os.getpid(),
+                    "hostname": self.config.hostname,
+                    "started_at": self._scan_started_at,
+                    "updated_at": time.time(),
+                    "status": status,
+                    "files_scanned": self.files_scanned,
+                    "detections": self.total_detections,
+                }, f)
+            os.replace(tmp, self.running_marker_path)
+        except Exception:
+            pass
+
+    def _remove_running_marker(self):
+        try:
+            if os.path.exists(self.running_marker_path):
+                os.remove(self.running_marker_path)
+        except Exception:
+            pass
+
+    def _emit_scan_row(self, status, message=""):
+        """Append one scan-lifecycle row to the yara_scanner_scans lookup dataset."""
+        lu = getattr(self, "lookup_uploader", None)
+        if lu is None or not getattr(self.config, "write_dataset", True):
+            return
+        elapsed = max(0.0, time.time() - self._scan_started_at)
+        # Snapshot volatile counters under the locks that guard their writers so the row
+        # is a consistent instant (workers update files_scanned/total_detections under
+        # lock_counts; the pause loop updates total_paused_secs under lock_throttle).
+        with self.lock_counts:
+            files_scanned = int(self.files_scanned)
+            files_skipped = int(self.files_skipped)
+            detections = int(self.total_detections)
+        with self.lock_throttle:
+            paused = round(self.total_paused_secs, 2)
+        with self._scans_row_lock:
+            row = {
+                "tenant_id": getattr(self.config, "tenant_id", "unknown"),
+                "scan_id": self.config.scan_id,
+                "run_id": getattr(self.config, "run_id", ""),
+                "scan_date": (getattr(self.config, "run_id", "") or "").split("_", 1)[0],
+                "hostname": self.config.hostname,
+                "os_info": self.config.os_info,
+                "ip_address": self.config.ip_addresses[0] if self.config.ip_addresses else "",
+                "status": status,
+                "files_scanned": files_scanned,
+                "files_skipped": files_skipped,
+                "detections": detections,
+                "valid_rules": int(self.config.error_logger.valid_rules_count),
+                "failed_rules": int(self.config.error_logger.failed_rules_count),
+                "scan_rate_fps": round(files_scanned / elapsed, 2) if elapsed > 0 else 0.0,
+                "elapsed_secs": round(elapsed, 2),
+                "total_paused_secs": paused,
+                "throttle_mode": getattr(self.config, "throttle_mode", "script"),
+                "posture": getattr(self.config, "posture", ""),
+                "event_timestamp_ms": int(time.time() * 1000),
+                "message": message or "",
+            }
+        try:
+            lu.add_scan_row(row)
+        except Exception as e:
+            self.log_manager.log_error(f"Failed to emit scan-lifecycle row: {e}")
+
+    def _maybe_heartbeat(self):
+        """Emit a periodic 'running' lifecycle row + refresh the liveness marker."""
+        now = time.time()
+        if now - self._last_heartbeat >= SCANS_HEARTBEAT_SECS:
+            self._last_heartbeat = now
+            self._write_running_marker("running")
+            self._emit_scan_row("running", "heartbeat")
+
+
     def _clean_rule_content(self, rule_lines, rule_name):
         """Normalize extracted rule block without mutating braces."""
         if not rule_lines:
@@ -3957,33 +4556,73 @@ rule test {{
             return (cache_stats['hits'] / total_requests) * 100
         return 0
 
+    def _sample_system_cpu(self):
+        """Return a system-CPU% reading, cached at throttle_check_interval_secs cadence
+        so concurrent workers share one measurement instead of hammering psutil."""
+        now = time.time()
+        with self.lock_throttle:
+            if (now - self.last_throttle_check) >= self.config.throttle_check_interval_secs:
+                try:
+                    self.last_system_cpu = psutil.cpu_percent(interval=None)
+                except Exception:
+                    self.last_system_cpu = 0.0
+                self.last_throttle_check = now
+            return self.last_system_cpu
+
     def _maybe_throttle_scanning(self, force=False):
-        """Apply a small pause when the machine is already under CPU pressure."""
+        """Pause the calling worker while system CPU is above the high threshold.
+
+        Enhanced sleep logic (customer request): rather than a single fixed micro-sleep,
+        the worker stays paused and RE-CHECKS CPU each interval, resuming only once CPU
+        falls below the resume threshold (high - resume_margin, i.e. hysteresis to avoid
+        flapping). Bounded by max_pause_secs so a permanently busy host still makes
+        forward progress. No-op unless throttle_mode='script' (OS/off modes hand pacing
+        to the kernel). `force` is accepted for call-site compatibility; the CPU gate is
+        the same either way.
+        """
         if not getattr(self.config, "light_throttle_enabled", False):
             return
 
-        sleep_for = 0.0
-        now = time.time()
-        with self.lock_throttle:
-            if (not force and
-                (now - self.last_throttle_check) < self.config.throttle_check_interval_secs):
-                sleep_for = self.last_throttle_sleep_secs
-            else:
-                self.last_throttle_check = now
-                self.last_system_cpu = 0.0
-                self.last_throttle_sleep_secs = 0.0
-                try:
-                    self.last_system_cpu = psutil.cpu_percent(interval=None)
-                    if self.last_system_cpu >= self.config.critical_cpu_threshold:
-                        self.last_throttle_sleep_secs = self.config.critical_throttle_sleep_secs
-                    elif self.last_system_cpu >= self.config.high_cpu_threshold:
-                        self.last_throttle_sleep_secs = self.config.throttle_sleep_secs
-                except Exception:
-                    self.last_system_cpu = 0.0
-                sleep_for = self.last_throttle_sleep_secs
+        cpu = self._sample_system_cpu()
+        if cpu < self.config.high_cpu_threshold:
+            return  # fast path: machine is not under pressure
 
-        if sleep_for > 0:
-            time.sleep(sleep_for)
+        resume_threshold = max(1.0, self.config.high_cpu_threshold - self.config.resume_margin)
+        interval = max(0.05, self.config.throttle_check_interval_secs)
+        max_pause = self.config.max_pause_secs
+        pause_started = time.time()
+        entered_critical = cpu >= self.config.critical_cpu_threshold
+
+        # Track WALL-CLOCK throttled time (the span during which >=1 worker is paused),
+        # not the sum of per-worker pause seconds — otherwise N concurrent workers would
+        # inflate total_paused_secs by ~N. First worker in opens the window; last one out
+        # closes it and adds the elapsed wall time.
+        with self.lock_throttle:
+            if self._paused_workers == 0:
+                self._pause_wall_start = pause_started
+            self._paused_workers += 1
+        try:
+            while self.scan_active and not self.cancel_requested:
+                time.sleep(interval)
+                cpu = self._sample_system_cpu()
+                if cpu >= self.config.critical_cpu_threshold:
+                    entered_critical = True
+                if cpu < resume_threshold:
+                    break
+                if max_pause and (time.time() - pause_started) >= max_pause:
+                    self.log_manager.log_performance(
+                        f"Throttle pause hit max_pause_secs ({max_pause:.0f}s) at CPU {cpu:.0f}% - "
+                        f"resuming to guarantee forward progress"
+                    )
+                    break
+        finally:
+            with self.lock_throttle:
+                self._paused_workers -= 1
+                if self._paused_workers <= 0:
+                    self._paused_workers = 0
+                    self.total_paused_secs += time.time() - self._pause_wall_start
+                if entered_critical:
+                    self.critical_pauses += 1
 
     def _enqueue_scan_path(self, path):
         """Block gently when workers are saturated instead of dropping files."""
@@ -4178,6 +4817,11 @@ rule test {{
             return True
         if any(portable_path.endswith(ext) for ext in self.config.skip_extensions):
             return True
+        # Force-scan allowlist wins over all path-based skips (fragments + platform
+        # skip dirs): browser caches/profiles are scanned even if a broader rule excludes
+        # them. Filename/extension skips above still apply (no point scanning a .iso).
+        if any(fragment in portable_path for fragment in getattr(self.config, "force_scan_fragments", ())):
+            return False
         if any(fragment in portable_path for fragment in self.config.skip_path_fragments):
             return True
 
@@ -4567,7 +5211,20 @@ rule test {{
 
         self.scan_active = False
         cleanup_total_time = time.time() - cleanup_start
-        
+
+        # Emit the terminal lifecycle row now that workers have drained and counts are
+        # final, but BEFORE the uploaders are stopped so the row is actually sent.
+        if self.cancel_requested:
+            _term_status = "cancelled"
+            _term_msg = f"cancelled by operator (source={self.cancel_source})"
+        elif self.scan_failed:
+            _term_status = "failed"
+            _term_msg = "; ".join(self.failure_reasons[:3]) or "scan failed"
+        else:
+            _term_status = "completed"
+            _term_msg = "scan completed"
+        self._emit_scan_row(_term_status, _term_msg)
+
         try:
             if hasattr(self, "results_uploader") and self.results_uploader:
                 self.results_uploader.stop(wait=True)
@@ -4581,7 +5238,12 @@ rule test {{
     def scan_system(self):
         """Main system scan orchestration."""
         start_time = time.time()
-        
+        self._scan_started_at = start_time
+        self._last_heartbeat = start_time  # first heartbeat waits a full interval
+        # Start watching for an operator cancel flag and announce the scan started.
+        self._start_cancellation_watcher()
+        self._emit_scan_row("initiated", "scan initiated")
+
         self.resource_monitor = None
         if self.config.enable_resource_monitoring:
             self.resource_monitor = SystemResourceMonitor(self.config, self.log_manager)
@@ -4693,7 +5355,8 @@ rule test {{
                         if current_time - last_log >= self.config.log_interval:
                             self._log_progress()
                             last_log = current_time
-                            
+                        self._maybe_heartbeat()
+
                     target_scan_time = time.time() - target_start_time
                     files_per_target[target] = target_files_found
                     
@@ -4719,7 +5382,10 @@ rule test {{
         
         finally:
             scan_total_time = time.time() - start_time
+            # The terminal lifecycle row is emitted inside _perform_enhanced_cleanup,
+            # after workers drain (so counts are final) and before uploaders stop.
             self._perform_enhanced_cleanup(start_time, total_files_found, files_per_target)
+            self._remove_running_marker()
             self._log_final_results(scan_total_time)
 
 
@@ -4834,21 +5500,57 @@ def upload_final_comprehensive_report(scanner, total_scan_time):
         logging.error(f"Error uploading final comprehensive report: {e}")
 
 
-def main(yarafile=None, scan_folder=None, alert_severity="low"):
-    """Main entry point for YARA scanner."""
+def main(yarafile=None, scan_folder=None, alert_severity="low", mode="scan", options=None,
+         create_alerts=True, write_dataset=True, collect_files=False, throttle_mode="script",
+         cpu_high_threshold=None, cpu_critical_threshold=None, max_pause_secs=None, tenant_id=""):
+    """Main entry point for YARA scanner.
+
+    `options` is a compact "key=value,key=value" string (parsed into the same knobs as
+    the explicit kwargs; options win). `mode="cancel"` short-circuits to deliver a cancel
+    flag for a running scan instead of starting one.
+    """
+    # Resolve the compact options string over the explicit kwargs (options win).
+    opts = _parse_options_string(options)
+
+    def _pick(key, current):
+        return opts.get(key, current)
+
+    create_alerts = _pick("create_alerts", create_alerts)
+    write_dataset = _pick("write_dataset", write_dataset)
+    collect_files = _pick("collect_files", collect_files)
+    throttle_mode = _pick("throttle_mode", throttle_mode)
+    cpu_high_threshold = _pick("cpu_high_threshold", cpu_high_threshold)
+    cpu_critical_threshold = _pick("cpu_critical_threshold", cpu_critical_threshold)
+    max_pause_secs = _pick("max_pause_secs", max_pause_secs)
+    tenant_id = _pick("tenant_id", tenant_id)
+
+    mode = (str(mode) if mode is not None else "scan").strip().lower() or "scan"
+    if mode == "cancel":
+        return _handle_cancel_request(tenant_id_override=tenant_id)
+
     config = None
     log_manager = None
     stats_manager = None
     exception_logger = None
+    scanner = None
 
     try:
         config = ScanConfig(
             yarafile,
             scan_folder=scan_folder,
             alert_severity=alert_severity,
+            mode=mode,
+            create_alerts=create_alerts,
+            write_dataset=write_dataset,
+            collect_files=collect_files,
+            throttle_mode=throttle_mode,
+            cpu_high_threshold=cpu_high_threshold,
+            cpu_critical_threshold=cpu_critical_threshold,
+            max_pause_secs=max_pause_secs,
+            tenant_id=tenant_id,
         )
         log_manager = LogManager(config)
-        _apply_light_process_priority(log_manager)
+        _apply_light_process_priority(log_manager, throttle_mode=config.throttle_mode)
         exception_logger = config.exception_logger
         stats_manager = StatisticsManager(config, log_manager)
         cleanup_manager = CleanupManager(config)
@@ -4987,6 +5689,28 @@ def main(yarafile=None, scan_folder=None, alert_severity="low"):
         if scanner.file_cache:
             scanner.file_cache.log_manager = log_manager
 
+        # Route POSIX termination signals into the same graceful cancel path so a hard
+        # Action-Center abort (where a signal is delivered) still drains cleanly. The
+        # handler sets the flags BARE (no lock, no logging) to stay async-signal-safe;
+        # the watcher/main loop observe cancel_requested and drive the graceful shutdown.
+        try:
+            import signal as _signal
+
+            def _sig_cancel(signum, _frame):
+                scanner.cancel_source = f"signal:{signum}"
+                scanner.cancel_requested = True
+                scanner.scan_active = False
+
+            for _sig_name in ("SIGTERM", "SIGINT"):
+                _sig = getattr(_signal, _sig_name, None)
+                if _sig is not None:
+                    try:
+                        _signal.signal(_sig, _sig_cancel)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
         error_logger = config.error_logger
         stats_manager.start_monitoring()
         
@@ -5016,6 +5740,14 @@ def main(yarafile=None, scan_folder=None, alert_severity="low"):
             log_manager.log_error(f"Error during scanning: {e}", {'error_type': type(e).__name__})
             scanner.status_uploader.set_status("error")
             raise
+
+        # Operator-initiated cancellation is a success outcome (not a failure).
+        if scanner.cancel_requested:
+            log_manager.log_system(f"Scan cancelled by operator (source={scanner.cancel_source})")
+            return (
+                f"Scan cancelled by operator: {scanner.files_scanned} files scanned | "
+                f"{scanner.total_detections} matches found | {config.posture}"
+            )
 
         if scanner.scan_failed:
             failure_data = {
@@ -5094,7 +5826,8 @@ def main(yarafile=None, scan_folder=None, alert_severity="low"):
 
         summary = (f"Scan completed: {scanner.files_scanned} files scanned | "
                 f"{error_logger.failed_rules_count} rules failed compilation | "
-                f"{scanner.total_detections} matches found")
+                f"{scanner.total_detections} matches found | "
+                f"paused {scanner.total_paused_secs:.0f}s | {config.posture}")
         return summary
         
     except Exception as e:
@@ -5136,8 +5869,10 @@ def main(yarafile=None, scan_folder=None, alert_severity="low"):
             pass
 
         failed_rules = config.error_logger.failed_rules_count if config and hasattr(config, 'error_logger') else 0
-        files_scanned = scanner.files_scanned if 'scanner' in locals() else 0
-        matches = scanner.total_detections if 'scanner' in locals() else 0
+        # scanner is initialized to None at the top of main(), so `'scanner' in locals()`
+        # is always true — guard on the object itself (an early failure leaves it None).
+        files_scanned = scanner.files_scanned if scanner is not None else 0
+        matches = scanner.total_detections if scanner is not None else 0
         
         error_summary = (f"Scan failed: {files_scanned} files scanned | "
                         f"{failed_rules} rules failed compilation | "
@@ -5162,27 +5897,29 @@ def main(yarafile=None, scan_folder=None, alert_severity="low"):
 
 if __name__ == "__main__":
     try:
-        yarafile_arg = None
-        scan_folder_arg = None
-        alert_severity_arg = "low"
+        # Ordered params (matches the XDR script_input order):
+        #   1 yarafile  2 scan_folder  3 alert_severity  4 mode  5 options
+        # Empty strings select each param's default. `options` is "key=value,key=value".
+        def _argv(i):
+            return sys.argv[i] if len(sys.argv) > i and str(sys.argv[i]).strip() else None
 
-        if len(sys.argv) > 1:
-            yarafile_arg = sys.argv[1] if sys.argv[1].strip() else None
-
-        if len(sys.argv) > 2:
-            scan_folder_arg = sys.argv[2] if sys.argv[2].strip() else None
-
-        if len(sys.argv) > 3:
-            alert_severity_arg = _parse_alert_severity(sys.argv[3], "alert_severity")
+        yarafile_arg = _argv(1)
+        scan_folder_arg = _argv(2)
+        alert_severity_arg = _parse_alert_severity(_argv(3), "alert_severity") if _argv(3) else "low"
+        mode_arg = _argv(4) or "scan"
+        options_arg = _argv(5)
 
         result = main(
             yarafile_arg,
             scan_folder_arg,
             alert_severity_arg,
+            mode=mode_arg,
+            options=options_arg,
         )
 
         result_text = str(result or "")
-        is_success = bool(result_text) and not result_text.lower().startswith("scan failed")
+        low = result_text.lower()
+        is_success = bool(result_text) and not (low.startswith("scan failed") or low.startswith("cancel failed"))
         sys.exit(0 if is_success else 1)
 
     except Exception as e:

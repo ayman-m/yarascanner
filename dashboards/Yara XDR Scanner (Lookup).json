@@ -1,0 +1,661 @@
+{
+  "dashboards_data": [
+    {
+      "name": "Yara XDR Scanner (Lookup)",
+      "description": "YARA scanner detections and scan lifecycle from the yara_scanner_matches / yara_scanner_scans lookup datasets.",
+      "status": "ENABLED",
+      "layout": [
+        {
+          "id": "row-0",
+          "data": [
+            {
+              "key": "xql_0595aafcedecda6d",
+              "data": {
+                "type": "Custom XQL",
+                "width": 33.0,
+                "height": 360,
+                "phrase": "/**************************************************************************\n  Scans by Status\n\n  Latest lifecycle state per scan (initiated/running/completed/cancelled/failed).\n\n  Dataset(s): yara_scanner_scans. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n**************************************************************************/\ndataset = yara_scanner_scans\n| sort desc event_timestamp_ms\n| dedup scan_id\n| comp count() as scans by status\n\n| view graph type = pie subtype = full header = \"Scans by Status\" xaxis = status yaxis = scans\n",
+                "time_frame": {
+                  "relativeTime": 604800000
+                },
+                "viewOptions": {
+                  "type": "gauge",
+                  "commands": [
+                    {
+                      "command": {
+                        "op": "=",
+                        "name": "header",
+                        "value": "\"Scans by Status\""
+                      }
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "key": "xql_194c2734d7414c1c",
+              "data": {
+                "type": "Custom XQL",
+                "width": 33.0,
+                "height": 360,
+                "phrase": "/**************************************************************************\n  Active and Stale Scans\n\n  Scans whose latest state is running/initiated. A stale row (old event_timestamp_ms)\nwith no terminal update usually means the scan was hard-killed.\n\n  Dataset(s): yara_scanner_scans. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n**************************************************************************/\ndataset = yara_scanner_scans\n| sort desc event_timestamp_ms\n| dedup scan_id\n| filter status in (\"running\",\"initiated\")\n| fields hostname, scan_id, status, files_scanned, detections, throttle_mode, event_timestamp_ms\n\n| view graph type = table header = \"Active / Stale Scans\"\n",
+                "time_frame": {
+                  "relativeTime": 604800000
+                },
+                "viewOptions": {
+                  "type": "table",
+                  "commands": [
+                    {
+                      "command": {
+                        "op": "=",
+                        "name": "header",
+                        "value": "\"Active and Stale Scans\""
+                      }
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "key": "xql_7694f4c12cc42987",
+              "data": {
+                "type": "Custom XQL",
+                "width": 34.0,
+                "height": 360,
+                "phrase": "/**************************************************************************\n  Cancelled Scans Audit\n\n  Operator-cancelled scans with partial counts.\n\n  Dataset(s): yara_scanner_scans. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n**************************************************************************/\ndataset = yara_scanner_scans\n| filter status = \"cancelled\"\n| sort desc event_timestamp_ms\n| fields hostname, scan_id, files_scanned, detections, total_paused_secs, message\n| limit 50\n\n| view graph type = table header = \"Cancelled Scans Audit\"\n",
+                "time_frame": {
+                  "relativeTime": 604800000
+                },
+                "viewOptions": {
+                  "type": "table",
+                  "commands": [
+                    {
+                      "command": {
+                        "op": "=",
+                        "name": "header",
+                        "value": "\"Cancelled Scans Audit\""
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        {
+          "id": "row-1",
+          "data": [
+            {
+              "key": "xql_a962e3503b126307",
+              "data": {
+                "type": "Custom XQL",
+                "width": 33.0,
+                "height": 400,
+                "phrase": "/**************************************************************************\n  Top Rules by Hits\n\n  Noisiest YARA rules by total match count (yara_scanner_matches).\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n**************************************************************************/\ndataset = yara_scanner_matches\n| comp count() as hits by rule\n| sort desc hits\n| limit 15\n\n| view graph type = pie subtype = full header = \"Top YARA Rules by Hits\" xaxis = rule yaxis = hits\n",
+                "time_frame": {
+                  "relativeTime": 604800000
+                },
+                "viewOptions": {
+                  "type": "pie",
+                  "commands": [
+                    {
+                      "command": {
+                        "op": "=",
+                        "name": "header",
+                        "value": "\"Top Rules by Hits\""
+                      }
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "key": "xql_dafe91e6d88b4310",
+              "data": {
+                "type": "Custom XQL",
+                "width": 33.0,
+                "height": 400,
+                "phrase": "/**************************************************************************\n  Hot Hosts\n\n  Endpoints with the most matches.\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n**************************************************************************/\ndataset = yara_scanner_matches\n| comp count() as hits by hostname\n| sort desc hits\n| limit 15\n\n| view graph type = pie subtype = donut header = \"Hot Hosts (Most Matches)\" xaxis = hostname yaxis = hits\n",
+                "time_frame": {
+                  "relativeTime": 604800000
+                },
+                "viewOptions": {
+                  "type": "pie",
+                  "commands": [
+                    {
+                      "command": {
+                        "op": "=",
+                        "name": "header",
+                        "value": "\"Hot Hosts\""
+                      }
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "key": "xql_e40f60b928f86d21",
+              "data": {
+                "type": "Custom XQL",
+                "width": 34.0,
+                "height": 400,
+                "phrase": "/**************************************************************************\n  Severity Split\n\n  Distribution of match severity.\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n**************************************************************************/\ndataset = yara_scanner_matches\n| comp count() as hits by severity\n\n| view graph type = pie subtype = donut header = \"Matches by Severity\" xaxis = severity yaxis = hits\n",
+                "time_frame": {
+                  "relativeTime": 604800000
+                },
+                "viewOptions": {
+                  "type": "pie",
+                  "commands": [
+                    {
+                      "command": {
+                        "op": "=",
+                        "name": "header",
+                        "value": "\"Severity Split\""
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        {
+          "id": "row-2",
+          "data": [
+            {
+              "key": "xql_98e4a9be8634653f",
+              "data": {
+                "type": "Custom XQL",
+                "width": 50.0,
+                "height": 400,
+                "phrase": "/**************************************************************************\n  Endpoints Impacted per Rule\n\n  How many distinct endpoints each rule fired on.\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n**************************************************************************/\ndataset = yara_scanner_matches\n| comp count_distinct(hostname) as endpoints by rule\n| sort desc endpoints\n| limit 15\n\n| view graph type = bar header = \"Endpoints Impacted per Rule\" xaxis = rule yaxis = endpoints\n",
+                "time_frame": {
+                  "relativeTime": 604800000
+                },
+                "viewOptions": {
+                  "type": "bar",
+                  "commands": [
+                    {
+                      "command": {
+                        "op": "=",
+                        "name": "header",
+                        "value": "\"Endpoints Impacted per Rule\""
+                      }
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "key": "xql_f2c9f304be27b627",
+              "data": {
+                "type": "Custom XQL",
+                "width": 50.0,
+                "height": 400,
+                "phrase": "/**************************************************************************\n  Matches Over Time\n\n  Match volume in hourly buckets. Lookup rows have no _time, so we bucket on\nevent_timestamp_ms (epoch ms) -> hourly timestamp.\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n**************************************************************************/\ndataset = yara_scanner_matches\n| alter bucket_ms = multiply(to_integer(divide(event_timestamp_ms, 3600000)), 3600000)\n| alter ts = to_timestamp(bucket_ms, \"MILLIS\")\n| comp count() as hits by ts\n| sort asc ts\n\n| view graph type = line header = \"Matches Over Time (hourly)\" xaxis = ts yaxis = hits\n",
+                "time_frame": {
+                  "relativeTime": 604800000
+                },
+                "viewOptions": {
+                  "type": "line",
+                  "commands": [
+                    {
+                      "command": {
+                        "op": "=",
+                        "name": "header",
+                        "value": "\"Matches Over Time\""
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        {
+          "id": "row-3",
+          "data": [
+            {
+              "key": "xql_33e417fe019f8307",
+              "data": {
+                "type": "Custom XQL",
+                "width": 50.0,
+                "height": 420,
+                "phrase": "/**************************************************************************\n  Top Matched Files\n\n  Files triggering the most string matches (by path + sha256).\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n**************************************************************************/\ndataset = yara_scanner_matches\n| comp count() as hits by filename, file_sha256\n| sort desc hits\n| limit 20\n\n| view graph type = table header = \"Top Matched Files\"\n",
+                "time_frame": {
+                  "relativeTime": 604800000
+                },
+                "viewOptions": {
+                  "type": "table",
+                  "commands": [
+                    {
+                      "command": {
+                        "op": "=",
+                        "name": "header",
+                        "value": "\"Top Matched Files\""
+                      }
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "key": "xql_358baa1cbef1c7f8",
+              "data": {
+                "type": "Custom XQL",
+                "width": 50.0,
+                "height": 420,
+                "phrase": "/**************************************************************************\n  Scan Duration and Files per Host\n\n  Completed-scan throughput per host (latest completed row per scan).\n\n  Dataset(s): yara_scanner_scans. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n**************************************************************************/\ndataset = yara_scanner_scans\n| filter status = \"completed\"\n| sort desc event_timestamp_ms\n| dedup scan_id\n| comp avg(elapsed_secs) as avg_secs, sum(files_scanned) as files_scanned by hostname\n| sort desc files_scanned\n\n| view graph type = table header = \"Scan Duration & Files per Host\"\n",
+                "time_frame": {
+                  "relativeTime": 604800000
+                },
+                "viewOptions": {
+                  "type": "table",
+                  "commands": [
+                    {
+                      "command": {
+                        "op": "=",
+                        "name": "header",
+                        "value": "\"Scan Duration and Files per Host\""
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        {
+          "id": "row-4",
+          "data": [
+            {
+              "key": "xql_a2404bb1fd76e1e5",
+              "data": {
+                "type": "Custom XQL",
+                "width": 100.0,
+                "height": 380,
+                "phrase": "/**************************************************************************\n  Total Paused Time per Host\n\n  Cumulative CPU-throttle pause time per host (throttle visibility).\n\n  Dataset(s): yara_scanner_scans. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n**************************************************************************/\ndataset = yara_scanner_scans\n| filter status = \"completed\"\n| sort desc event_timestamp_ms\n| dedup scan_id\n| comp sum(total_paused_secs) as paused_secs by hostname\n| sort desc paused_secs\n\n| view graph type = bar header = \"Total Paused Time per Host\" xaxis = hostname yaxis = paused_secs\n",
+                "time_frame": {
+                  "relativeTime": 604800000
+                },
+                "viewOptions": {
+                  "type": "bar",
+                  "commands": [
+                    {
+                      "command": {
+                        "op": "=",
+                        "name": "header",
+                        "value": "\"Total Paused Time per Host\""
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "default_dashboard_id": 1,
+      "global_id": "16a0d35b2eabf0ceda16570e136360f5",
+      "metadata": {
+        "params": []
+      }
+    }
+  ],
+  "widgets_data": [
+    {
+      "widget_key": "xql_0595aafcedecda6d",
+      "title": "Yara XDR - Scans by Status",
+      "creation_time": 1783600000000,
+      "description": "",
+      "data": {
+        "phrase": "/**************************************************************************\n  Scans by Status\n\n  Latest lifecycle state per scan (initiated/running/completed/cancelled/failed).\n\n  Dataset(s): yara_scanner_scans. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n**************************************************************************/\ndataset = yara_scanner_scans\n| sort desc event_timestamp_ms\n| dedup scan_id\n| comp count() as scans by status\n\n| view graph type = pie subtype = full header = \"Scans by Status\" xaxis = status yaxis = scans\n",
+        "time_frame": {
+          "relativeTime": 604800000
+        },
+        "viewOptions": {
+          "type": "gauge",
+          "commands": [
+            {
+              "command": {
+                "op": "=",
+                "name": "header",
+                "value": "\"Scans by Status\""
+              }
+            }
+          ]
+        }
+      },
+      "support_time_range": true,
+      "additional_info": {
+        "query_tables": [
+          "yara_scanner_scans"
+        ],
+        "query_uses_library": false
+      },
+      "creator_mail": ""
+    },
+    {
+      "widget_key": "xql_194c2734d7414c1c",
+      "title": "Yara XDR - Active and Stale Scans",
+      "creation_time": 1783600000000,
+      "description": "",
+      "data": {
+        "phrase": "/**************************************************************************\n  Active and Stale Scans\n\n  Scans whose latest state is running/initiated. A stale row (old event_timestamp_ms)\nwith no terminal update usually means the scan was hard-killed.\n\n  Dataset(s): yara_scanner_scans. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n**************************************************************************/\ndataset = yara_scanner_scans\n| sort desc event_timestamp_ms\n| dedup scan_id\n| filter status in (\"running\",\"initiated\")\n| fields hostname, scan_id, status, files_scanned, detections, throttle_mode, event_timestamp_ms\n\n| view graph type = table header = \"Active / Stale Scans\"\n",
+        "time_frame": {
+          "relativeTime": 604800000
+        },
+        "viewOptions": {
+          "type": "table",
+          "commands": [
+            {
+              "command": {
+                "op": "=",
+                "name": "header",
+                "value": "\"Active and Stale Scans\""
+              }
+            }
+          ]
+        }
+      },
+      "support_time_range": true,
+      "additional_info": {
+        "query_tables": [
+          "yara_scanner_scans"
+        ],
+        "query_uses_library": false
+      },
+      "creator_mail": ""
+    },
+    {
+      "widget_key": "xql_7694f4c12cc42987",
+      "title": "Yara XDR - Cancelled Scans Audit",
+      "creation_time": 1783600000000,
+      "description": "",
+      "data": {
+        "phrase": "/**************************************************************************\n  Cancelled Scans Audit\n\n  Operator-cancelled scans with partial counts.\n\n  Dataset(s): yara_scanner_scans. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n**************************************************************************/\ndataset = yara_scanner_scans\n| filter status = \"cancelled\"\n| sort desc event_timestamp_ms\n| fields hostname, scan_id, files_scanned, detections, total_paused_secs, message\n| limit 50\n\n| view graph type = table header = \"Cancelled Scans Audit\"\n",
+        "time_frame": {
+          "relativeTime": 604800000
+        },
+        "viewOptions": {
+          "type": "table",
+          "commands": [
+            {
+              "command": {
+                "op": "=",
+                "name": "header",
+                "value": "\"Cancelled Scans Audit\""
+              }
+            }
+          ]
+        }
+      },
+      "support_time_range": true,
+      "additional_info": {
+        "query_tables": [
+          "yara_scanner_scans"
+        ],
+        "query_uses_library": false
+      },
+      "creator_mail": ""
+    },
+    {
+      "widget_key": "xql_a962e3503b126307",
+      "title": "Yara XDR - Top Rules by Hits",
+      "creation_time": 1783600000000,
+      "description": "",
+      "data": {
+        "phrase": "/**************************************************************************\n  Top Rules by Hits\n\n  Noisiest YARA rules by total match count (yara_scanner_matches).\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n**************************************************************************/\ndataset = yara_scanner_matches\n| comp count() as hits by rule\n| sort desc hits\n| limit 15\n\n| view graph type = pie subtype = full header = \"Top YARA Rules by Hits\" xaxis = rule yaxis = hits\n",
+        "time_frame": {
+          "relativeTime": 604800000
+        },
+        "viewOptions": {
+          "type": "pie",
+          "commands": [
+            {
+              "command": {
+                "op": "=",
+                "name": "header",
+                "value": "\"Top Rules by Hits\""
+              }
+            }
+          ]
+        }
+      },
+      "support_time_range": true,
+      "additional_info": {
+        "query_tables": [
+          "yara_scanner_matches"
+        ],
+        "query_uses_library": false
+      },
+      "creator_mail": ""
+    },
+    {
+      "widget_key": "xql_dafe91e6d88b4310",
+      "title": "Yara XDR - Hot Hosts",
+      "creation_time": 1783600000000,
+      "description": "",
+      "data": {
+        "phrase": "/**************************************************************************\n  Hot Hosts\n\n  Endpoints with the most matches.\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n**************************************************************************/\ndataset = yara_scanner_matches\n| comp count() as hits by hostname\n| sort desc hits\n| limit 15\n\n| view graph type = pie subtype = donut header = \"Hot Hosts (Most Matches)\" xaxis = hostname yaxis = hits\n",
+        "time_frame": {
+          "relativeTime": 604800000
+        },
+        "viewOptions": {
+          "type": "pie",
+          "commands": [
+            {
+              "command": {
+                "op": "=",
+                "name": "header",
+                "value": "\"Hot Hosts\""
+              }
+            }
+          ]
+        }
+      },
+      "support_time_range": true,
+      "additional_info": {
+        "query_tables": [
+          "yara_scanner_matches"
+        ],
+        "query_uses_library": false
+      },
+      "creator_mail": ""
+    },
+    {
+      "widget_key": "xql_e40f60b928f86d21",
+      "title": "Yara XDR - Severity Split",
+      "creation_time": 1783600000000,
+      "description": "",
+      "data": {
+        "phrase": "/**************************************************************************\n  Severity Split\n\n  Distribution of match severity.\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n**************************************************************************/\ndataset = yara_scanner_matches\n| comp count() as hits by severity\n\n| view graph type = pie subtype = donut header = \"Matches by Severity\" xaxis = severity yaxis = hits\n",
+        "time_frame": {
+          "relativeTime": 604800000
+        },
+        "viewOptions": {
+          "type": "pie",
+          "commands": [
+            {
+              "command": {
+                "op": "=",
+                "name": "header",
+                "value": "\"Severity Split\""
+              }
+            }
+          ]
+        }
+      },
+      "support_time_range": true,
+      "additional_info": {
+        "query_tables": [
+          "yara_scanner_matches"
+        ],
+        "query_uses_library": false
+      },
+      "creator_mail": ""
+    },
+    {
+      "widget_key": "xql_98e4a9be8634653f",
+      "title": "Yara XDR - Endpoints Impacted per Rule",
+      "creation_time": 1783600000000,
+      "description": "",
+      "data": {
+        "phrase": "/**************************************************************************\n  Endpoints Impacted per Rule\n\n  How many distinct endpoints each rule fired on.\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n**************************************************************************/\ndataset = yara_scanner_matches\n| comp count_distinct(hostname) as endpoints by rule\n| sort desc endpoints\n| limit 15\n\n| view graph type = bar header = \"Endpoints Impacted per Rule\" xaxis = rule yaxis = endpoints\n",
+        "time_frame": {
+          "relativeTime": 604800000
+        },
+        "viewOptions": {
+          "type": "bar",
+          "commands": [
+            {
+              "command": {
+                "op": "=",
+                "name": "header",
+                "value": "\"Endpoints Impacted per Rule\""
+              }
+            }
+          ]
+        }
+      },
+      "support_time_range": true,
+      "additional_info": {
+        "query_tables": [
+          "yara_scanner_matches"
+        ],
+        "query_uses_library": false
+      },
+      "creator_mail": ""
+    },
+    {
+      "widget_key": "xql_f2c9f304be27b627",
+      "title": "Yara XDR - Matches Over Time",
+      "creation_time": 1783600000000,
+      "description": "",
+      "data": {
+        "phrase": "/**************************************************************************\n  Matches Over Time\n\n  Match volume in hourly buckets. Lookup rows have no _time, so we bucket on\nevent_timestamp_ms (epoch ms) -> hourly timestamp.\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n**************************************************************************/\ndataset = yara_scanner_matches\n| alter bucket_ms = multiply(to_integer(divide(event_timestamp_ms, 3600000)), 3600000)\n| alter ts = to_timestamp(bucket_ms, \"MILLIS\")\n| comp count() as hits by ts\n| sort asc ts\n\n| view graph type = line header = \"Matches Over Time (hourly)\" xaxis = ts yaxis = hits\n",
+        "time_frame": {
+          "relativeTime": 604800000
+        },
+        "viewOptions": {
+          "type": "line",
+          "commands": [
+            {
+              "command": {
+                "op": "=",
+                "name": "header",
+                "value": "\"Matches Over Time\""
+              }
+            }
+          ]
+        }
+      },
+      "support_time_range": true,
+      "additional_info": {
+        "query_tables": [
+          "yara_scanner_matches"
+        ],
+        "query_uses_library": false
+      },
+      "creator_mail": ""
+    },
+    {
+      "widget_key": "xql_33e417fe019f8307",
+      "title": "Yara XDR - Top Matched Files",
+      "creation_time": 1783600000000,
+      "description": "",
+      "data": {
+        "phrase": "/**************************************************************************\n  Top Matched Files\n\n  Files triggering the most string matches (by path + sha256).\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n**************************************************************************/\ndataset = yara_scanner_matches\n| comp count() as hits by filename, file_sha256\n| sort desc hits\n| limit 20\n\n| view graph type = table header = \"Top Matched Files\"\n",
+        "time_frame": {
+          "relativeTime": 604800000
+        },
+        "viewOptions": {
+          "type": "table",
+          "commands": [
+            {
+              "command": {
+                "op": "=",
+                "name": "header",
+                "value": "\"Top Matched Files\""
+              }
+            }
+          ]
+        }
+      },
+      "support_time_range": true,
+      "additional_info": {
+        "query_tables": [
+          "yara_scanner_matches"
+        ],
+        "query_uses_library": false
+      },
+      "creator_mail": ""
+    },
+    {
+      "widget_key": "xql_358baa1cbef1c7f8",
+      "title": "Yara XDR - Scan Duration and Files per Host",
+      "creation_time": 1783600000000,
+      "description": "",
+      "data": {
+        "phrase": "/**************************************************************************\n  Scan Duration and Files per Host\n\n  Completed-scan throughput per host (latest completed row per scan).\n\n  Dataset(s): yara_scanner_scans. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n**************************************************************************/\ndataset = yara_scanner_scans\n| filter status = \"completed\"\n| sort desc event_timestamp_ms\n| dedup scan_id\n| comp avg(elapsed_secs) as avg_secs, sum(files_scanned) as files_scanned by hostname\n| sort desc files_scanned\n\n| view graph type = table header = \"Scan Duration & Files per Host\"\n",
+        "time_frame": {
+          "relativeTime": 604800000
+        },
+        "viewOptions": {
+          "type": "table",
+          "commands": [
+            {
+              "command": {
+                "op": "=",
+                "name": "header",
+                "value": "\"Scan Duration and Files per Host\""
+              }
+            }
+          ]
+        }
+      },
+      "support_time_range": true,
+      "additional_info": {
+        "query_tables": [
+          "yara_scanner_scans"
+        ],
+        "query_uses_library": false
+      },
+      "creator_mail": ""
+    },
+    {
+      "widget_key": "xql_a2404bb1fd76e1e5",
+      "title": "Yara XDR - Total Paused Time per Host",
+      "creation_time": 1783600000000,
+      "description": "",
+      "data": {
+        "phrase": "/**************************************************************************\n  Total Paused Time per Host\n\n  Cumulative CPU-throttle pause time per host (throttle visibility).\n\n  Dataset(s): yara_scanner_scans. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n**************************************************************************/\ndataset = yara_scanner_scans\n| filter status = \"completed\"\n| sort desc event_timestamp_ms\n| dedup scan_id\n| comp sum(total_paused_secs) as paused_secs by hostname\n| sort desc paused_secs\n\n| view graph type = bar header = \"Total Paused Time per Host\" xaxis = hostname yaxis = paused_secs\n",
+        "time_frame": {
+          "relativeTime": 604800000
+        },
+        "viewOptions": {
+          "type": "bar",
+          "commands": [
+            {
+              "command": {
+                "op": "=",
+                "name": "header",
+                "value": "\"Total Paused Time per Host\""
+              }
+            }
+          ]
+        }
+      },
+      "support_time_range": true,
+      "additional_info": {
+        "query_tables": [
+          "yara_scanner_scans"
+        ],
+        "query_uses_library": false
+      },
+      "creator_mail": ""
+    }
+  ],
+  "id": "2b56ffe98f3bdb36c7b6e094830fb849",
+  "name": "Yara XDR Scanner (Lookup)"
+}
