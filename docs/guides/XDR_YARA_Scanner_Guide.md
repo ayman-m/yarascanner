@@ -15,9 +15,9 @@ edition uses the **Cortex XDR public API** directly:
 
 | Channel | XDR API | Result |
 |---------|---------|--------|
-| Alerts | **Insert Parsed Alerts** (`/public_api/v1/alerts/insert_parsed_alerts`) | One alert per YARA match → feeds XDR incident creation |
-| Match records | **Lookup dataset** `yara_scanner_matches` (`/xql/lookups/add_data`) | One row per matched string, for XQL/dashboards |
-| Scan lifecycle | **Lookup dataset** `yara_scanner_scans` | initiated / running / completed / cancelled / failed rows |
+| Alerts | **Insert Parsed Alerts** (`/public_api/v1/alerts/insert_parsed_alerts`) | One alert per distinct finding (`rule + file@offset`) → feeds XDR incident creation |
+| Match records | **Lookup dataset** `yara_scanner_matches_v2_<host>` (`/xql/lookups/add_data`) | One row per matched string; per-endpoint shard, queried via `yara_scanner_matches*` |
+| Scan lifecycle | **Lookup dataset** `yara_scanner_scans_v2_<host>` | initiated / running / completed / cancelled / failed rows |
 
 Every row and alert is tagged with a **`tenant_id`** derived from your API URL, so the
 data is safe to consolidate across tenants.
@@ -48,7 +48,7 @@ A producer/consumer pipeline of single-responsibility classes:
 | `ScanConfig` | Rules, paths, thresholds, runtime options, tenant identity |
 | `YaraScanner` | Orchestrator — work queue, workers, scan loop, throttle + cancellation |
 | `ResultsUploader` | Insert Parsed Alerts channel (per matched string) |
-| `LookupDatasetUploader` | Batched writes to `yara_scanner_matches` and `yara_scanner_scans` |
+| `LookupDatasetUploader` | Batched writes to the per-endpoint `yara_scanner_matches_v2_*` / `yara_scanner_scans_v2_*` shards |
 | `EvidenceCollector` | Evidence ZIP (metadata always; matched-file copies optional) |
 | `CleanupManager` | Post-scan cleanup via Task Scheduler / systemd / launchd |
 
@@ -243,50 +243,80 @@ The scanner never wants to compete with real workload. Three modes, via `throttl
 
 # 11. Datasets & Schema
 
-## `yara_scanner_matches` — one row per matched string
+## Per-writer sharding (why the names have a suffix)
 
-`tenant_id`, `scan_id`, `run_id`, `scan_date`, `hostname`, `os_info`, `ip_address`,
-`rule`, `filename`, `file_sha256`, `file_creation_time`, `match`, `offset`, `string`,
-`severity`, `event_timestamp_ms`, `date_of_scan`.
+XDR's `lookups/add_data` is **not concurrency-safe**: two endpoints writing the *same*
+lookup dataset at once collide on a server-side clone-table race and lose rows (measured
+~2/8 landing at 8-way concurrency, and client-side retries/jitter do not fix it). The
+scanner therefore writes **one dataset per endpoint** — no two writers ever touch the same
+dataset — which lands **100%** at any fleet scale. Names are:
 
-## `yara_scanner_scans` — scan lifecycle
+```
+yara_scanner_matches_v2_<host>     yara_scanner_scans_v2_<host>
+```
 
-`tenant_id`, `scan_id`, `run_id`, `scan_date`, `hostname`, `os_info`, `ip_address`,
-`status` (initiated/running/completed/cancelled/failed), `files_scanned`,
-`files_skipped`, `detections`, `valid_rules`, `failed_rules`, `scan_rate_fps`,
-`elapsed_secs`, `total_paused_secs`, `throttle_mode`, `posture`, `event_timestamp_ms`,
-`message`.
+`_v2` is a **schema version** (bumped only when the row shape changes; `add_data` silently
+drops rows carrying fields an existing dataset doesn't know, so a new shape needs a new
+name). `<host>` is a slugged, hash-suffixed endpoint id. Sharding is configurable via the
+`lookup_shard` option / `YARA_LOOKUP_SHARD` env: `endpoint` (default), `none` (one legacy
+shared dataset — only safe at ~1 concurrency), or a literal wave/site label.
 
-Both datasets are **fixed-name** (so dashboards reference them literally). Growth is
-bounded by the `scan_date` column — prune with targeted `lookups/remove_data` by
+**Dashboards fan the shards back in with a wildcard** — `dataset = yara_scanner_matches*`
+spans every host and schema version at once (XQL supports `*` and `union`).
+
+## `yara_scanner_matches_v2_<host>` — one row per matched string
+
+`tenant_id`, `scan_id`, `run_id`, `scan_date`, `hostname`, `os_info`, `os_type`,
+`ip_address`, `rule`, `filename`, `file_size`, `file_sha256`, `file_creation_time`,
+`scan_folder`, `match`, `offset`, `matched_length`, `string`, `severity`,
+`event_timestamp_ms`, `date_of_scan`.
+
+## `yara_scanner_scans_v2_<host>` — scan lifecycle
+
+`tenant_id`, `scan_id`, `run_id`, `scan_date`, `hostname`, `os_info`, `os_type`,
+`ip_address`, `status` (initiated/running/completed/cancelled/failed), `scan_folder`,
+`files_scanned`, `files_skipped`, `detections`, `valid_rules`, `failed_rules`,
+`scan_rate_fps`, `elapsed_secs`, `total_paused_secs`, `throttle_mode`, `posture`,
+`event_timestamp_ms`, `message`.
+
+Growth is bounded by the `scan_date` column — prune with targeted `lookups/remove_data` by
 `scan_date` as an operational procedure.
+
+## Per-scan summary on the endpoint
+
+Every run also writes a machine-readable `scan_summary_<run_id>.json` under the scanner's
+`logs/` dir (outcome, duration, counts, throttle, **alert + dataset delivery stats**, top
+rules, and the resolved dataset names) — one file to parse instead of six text logs. Log
+retention keeps the last 10 scans (`YARA_LOG_KEEP`).
 
 ---
 
 # 12. Dashboard & XQL
 
 Import `dashboards/Yara XDR Scanner (Lookup).json` (**Dashboards → Import**). Its widgets
-build on the two lookup datasets; individual queries are in `widgets/xdr_lookup/*.xql`.
+build on the sharded lookup datasets via the `*` wildcard; individual queries are in
+`widgets/xdr_lookup/*.xql`.
 
-Lookup rows carry no `_time`, so time-filtering uses `event_timestamp_ms`.
+Lookup rows carry no `_time`, so time-filtering uses `event_timestamp_ms`. The `*` wildcard
+fans every per-endpoint shard (and schema version) into one fleet-wide result.
 
 **Top rules by hits:**
 
 ```sql
-dataset = yara_scanner_matches | comp count() as hits by rule | sort desc hits | limit 15
+dataset = yara_scanner_matches* | comp count() as hits by rule | sort desc hits | limit 15
 ```
 
 **Latest state per scan:**
 
 ```sql
-dataset = yara_scanner_scans | sort desc event_timestamp_ms | dedup scan_id
+dataset = yara_scanner_scans* | sort desc event_timestamp_ms | dedup scan_id
 | comp count() as scans by status
 ```
 
 **Recent matches for a host (tenant_id present):**
 
 ```sql
-dataset = yara_scanner_matches | filter hostname = "<host>"
+dataset = yara_scanner_matches* | filter hostname = "<host>"
 | sort desc event_timestamp_ms
 | fields tenant_id, rule, filename, string, severity, scan_id | limit 20
 ```
@@ -294,7 +324,7 @@ dataset = yara_scanner_matches | filter hostname = "<host>"
 **Cancelled scans audit:**
 
 ```sql
-dataset = yara_scanner_scans | filter status = "cancelled"
+dataset = yara_scanner_scans* | filter status = "cancelled"
 | sort desc event_timestamp_ms
 | fields hostname, scan_id, files_scanned, detections, message | limit 50
 ```

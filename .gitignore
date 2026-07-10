@@ -212,3 +212,6 @@ local_test/
 
 # Internal engineering notes / design specs (brainstorming output) — kept local only.
 docs/superpowers/
+
+# Test run outputs (environment-specific: hostnames, action IDs)
+tests/results/
