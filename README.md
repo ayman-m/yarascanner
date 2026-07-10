@@ -128,6 +128,11 @@ Browser caches are **no longer bypassed** (removed from the skip list), and a `f
 - **`playbooks/YARA_Scanner_Runner.yml`** and **`playbooks/YARA_Scanner_Canceller.yml`** launch / cancel the scanner on targeted agents via the built-in **Cortex Core - IR** integration (`core-get-scripts` → `core-get-endpoints` → `core-script-run`), for manual runs or scheduled **Jobs**.
 - Works on Cortex XDR (the `edr` module) and XSIAM. **Prerequisite:** the scanner must be uploaded to the Action Center library with exactly the 5 string inputs (`yarafile, scan_folder, alert_severity, mode, options`) — `core-script-run` rejects a mismatched parameter set. See `playbooks/README.md` for import, run, Job scheduling, and verification.
 
+### 📘 Deployment guides
+Step-by-step deployment guides (Markdown + Word) live in **`docs/guides/`**:
+- **`XDR_YARA_Scanner_Guide`** — Advanced/Standard auth, library upload with the 5 inputs, run via UI/API/playbook, cancellation, lookup datasets + dashboard, XQL recipes.
+- **`XSIAM_YARA_Scanner_Guide`** — HTTP Log Collector + parsing rule, `yara_scans_raw` ingestion, dashboards, XQL recipes, tuning.
+
 ---
 
 ## ✨ Key Features
