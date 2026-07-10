@@ -21,18 +21,28 @@ CLI examples
   python3 xdr_action_center.py cancel       --hostname H
   python3 xdr_action_center.py read-file    --hostname H --path /opt/yara_scanner/logs
   python3 xdr_action_center.py list-dir     --hostname H --path C:\\yara_scanner\\logs
-  python3 xdr_action_center.py xql          --query 'dataset = yara_scanner_scans | limit 5'
+  python3 xdr_action_center.py xql          --query 'dataset = yara_scanner_scans* | limit 5'
   python3 xdr_action_center.py verify       --hostname H
+  python3 xdr_action_center.py prune-datasets [--delete-legacy] [--older-than 30] [--yes]
 """
 import argparse
 import base64
+import datetime
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 
 import requests
+
+# YARA lookup-dataset naming (mirrors the scanner so the keep-set matches what it writes):
+#   current  -> yara_scanner_(matches|scans)_v<VER>[_<shard>]
+#   legacy   -> the shared yara_scanner_matches/_scans, old yara_matches_*, and any v1 shards
+YARA_SCHEMA_VERSION = (os.environ.get("YARA_LOOKUP_SCHEMA_VER", "2").strip() or "2")
+YARA_OWNED_RE = re.compile(r"^(yara_scanner_(matches|scans)(_.*)?|yara_(matches|scans)_.*)$")
+CURRENT_RE = re.compile(r"^yara_scanner_(matches|scans)_v%s(_.*)?$" % re.escape(YARA_SCHEMA_VERSION))
 
 # ---------------------------------------------------------------------------
 # Config / auth
@@ -323,6 +333,36 @@ class XDRActionCenter:
     def get_datasets(self):
         return self.reply("/public_api/v1/xql/get_datasets/", {}, wrap="request")
 
+    def delete_dataset(self, dataset_name, force=False):
+        """Delete an entire dataset (schema + all rows). NOTE the v2 path. force=True is only
+        needed to delete a dataset that has dependencies (correlation rules / scheduled queries)."""
+        return self.reply("/public_api/v2/xql/delete_dataset/",
+                          {"dataset_name": dataset_name, "force": bool(force)}, wrap="request")
+
+    def remove_lookup_data(self, dataset_name, filters):
+        """Remove rows matching filter blocks (OR across blocks, AND within a block; EXACT values
+        only). NOT concurrency-safe — the caller must serialize. Returns {'deleted': N}."""
+        return self.reply("/public_api/v1/xql/lookups/remove_data/",
+                          {"dataset_name": dataset_name, "filters": filters}, wrap="request", timeout=200)
+
+    def dataset_scan_dates(self, dataset_name):
+        if not YARA_OWNED_RE.match(dataset_name):  # guard the XQL interpolation
+            raise ValueError(f"refusing non-yara dataset in XQL: {dataset_name}")
+        rows = self.xql(f"dataset = {dataset_name} | fields scan_date | "
+                        f"comp count() as n by scan_date | sort asc scan_date", limit=1000)
+        return [(r.get("scan_date"), r.get("n")) for r in rows if r.get("scan_date")]
+
+    def classify_yara_datasets(self):
+        """Split the tenant's yara-owned LOOKUP datasets into (current_v<VER>, legacy)."""
+        current, legacy = [], []
+        for d in (self.get_datasets() or []):
+            name = d.get("Dataset Name") or d.get("dataset_name") or ""
+            dtype = (d.get("Type") or d.get("dataset_type") or "").upper()
+            if dtype != "LOOKUP" or not YARA_OWNED_RE.match(name):
+                continue
+            (current if CURRENT_RE.match(name) else legacy).append(name)
+        return sorted(current), sorted(legacy)
+
     # ---- YARA scanner helpers ----
     def build_scanner_snippet(self, scanner_path, rules_b64, scan_folder="default",
                               severity="low", mode="scan", options=None, prelude=""):
@@ -418,6 +458,16 @@ def main(argv=None):
 
     sub.add_parser("datasets", help="list datasets")
 
+    p = sub.add_parser("prune-datasets", help="report/clean up legacy or old YARA lookup datasets")
+    p.add_argument("--delete-legacy", action="store_true",
+                   help="delete every legacy (non-v%s) yara lookup dataset" % YARA_SCHEMA_VERSION)
+    p.add_argument("--older-than", type=int, help="prune rows older than N days from CURRENT datasets")
+    p.add_argument("--name", action="append", default=[], help="explicit dataset to delete (repeatable)")
+    p.add_argument("--force", action="store_true", help="delete_dataset force=true (datasets with dependencies)")
+    p.add_argument("--counts", action="store_true", help="include XQL row counts in the report")
+    p.add_argument("--sleep", type=float, default=11.0, help="seconds between remove_data calls")
+    p.add_argument("--yes", action="store_true", help="actually mutate (otherwise dry-run)")
+
     args = ap.parse_args(argv)
     c = XDRActionCenter(auth=args.auth, verbose=args.verbose)
 
@@ -488,13 +538,13 @@ def main(argv=None):
 
     if args.cmd == "verify":
         h = args.hostname.replace('"', '')
-        m = c.xql(f'dataset = yara_scanner_matches | filter hostname = "{h}" '
+        m = c.xql(f'dataset = yara_scanner_matches* | filter hostname = "{h}" '
                   f'| sort desc event_timestamp_ms '
                   f'| fields tenant_id, rule, filename, string, severity | limit {args.limit}')
         print(f"=== matches ({len(m)}) ===")
         for r in m:
             print(f"  [{r.get('tenant_id')}] {r.get('rule'):28} {r.get('filename')} ~ {r.get('string')}")
-        s = c.xql(f'dataset = yara_scanner_scans | filter hostname = "{h}" '
+        s = c.xql(f'dataset = yara_scanner_scans* | filter hostname = "{h}" '
                   f'| fields status, files_scanned, detections, elapsed_secs, total_paused_secs, '
                   f'throttle_mode, message, event_timestamp_ms | sort desc event_timestamp_ms | limit {args.limit}')
         print(f"=== scans ({len(s)}) ===")
@@ -507,6 +557,74 @@ def main(argv=None):
     if args.cmd == "datasets":
         _print(c.get_datasets())
         return 0
+
+    if args.cmd == "prune-datasets":
+        current, legacy = c.classify_yara_datasets()
+
+        def _rows(n):
+            if not args.counts:
+                return ""
+            try:
+                r = c.xql(f"dataset = {n} | comp count() as n", limit=1)
+                return f"  rows={r[0].get('n', 0) if r else 0}"
+            except Exception:
+                return "  rows=?"
+
+        print(f"CURRENT (keep, v{YARA_SCHEMA_VERSION}): {len(current)}")
+        for n in current:
+            print(f"  KEEP    {n}{_rows(n)}")
+        print(f"LEGACY (prune candidates): {len(legacy)}")
+        for n in legacy:
+            print(f"  LEGACY  {n}{_rows(n)}")
+
+        if not (args.delete_legacy or args.older_than or args.name):
+            return 0  # pure report
+
+        # keep-guard: never delete a CURRENT dataset unless it was explicitly named.
+        if args.name:
+            bad = [n for n in args.name if not YARA_OWNED_RE.match(n)]
+            if bad:
+                print(f"refusing non-yara dataset(s): {bad}", file=sys.stderr)
+                return 2
+            delete_targets = list(args.name)
+        elif args.delete_legacy:
+            delete_targets = list(legacy)
+        else:
+            delete_targets = []
+        delete_targets = [n for n in delete_targets if n not in current or n in args.name]
+
+        if not args.yes:
+            print(f"\nDRY RUN — would delete {len(delete_targets)} dataset(s): {delete_targets}")
+            if args.older_than:
+                print(f"DRY RUN — would prune rows older than {args.older_than}d from {len(current)} current dataset(s)")
+            print("Re-run with --yes to execute.")
+            return 0
+
+        deleted, failed, pruned_rows = [], [], 0
+        for n in delete_targets:
+            try:
+                c.delete_dataset(n, force=args.force)
+                deleted.append(n)
+                print(f"deleted {n}")
+            except Exception as e:
+                failed.append((n, str(e)[:200]))
+                print(f"FAILED  {n}: {e}", file=sys.stderr)
+
+        if args.older_than:
+            cutoff = (datetime.date.today() - datetime.timedelta(days=args.older_than)).strftime("%Y%m%d")
+            for n in current:
+                for sd, _cnt in c.dataset_scan_dates(n):
+                    if sd < cutoff:  # YYYYMMDD sorts lexicographically
+                        res = c.remove_lookup_data(n, [{"scan_date": sd}])  # one block per call (all-or-nothing gotcha)
+                        got = res.get("deleted", 0) if isinstance(res, dict) else 0
+                        pruned_rows += got
+                        print(f"pruned {n} scan_date={sd}: deleted={got}")
+                        time.sleep(args.sleep)  # endpoint is not concurrency-safe
+
+        print(f"\nSUMMARY: deleted={len(deleted)} failed={len(failed)} pruned_rows={pruned_rows}")
+        for n, e in failed:
+            print(f"  FAIL {n}: {e}")
+        return 1 if failed else 0
 
     return 1
 

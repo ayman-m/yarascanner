@@ -91,19 +91,25 @@ All actions completed with **zero execution errors**. Representative confirmatio
 
 # 4. Performance
 
-## 4.1 Compilation scales with rule count
+## 4.1 Compilation is cheap; wall time is dominated by delivery, not compile
 
-Wall time for a corpus scan is dominated by **rule compilation** as the rule count grows:
+An early read of the concurrency-4 matrix suggested compile time scaled steeply with rule count
+(500-rule scans ran ~110–122 s wall vs ~40 s for one rule). **Direct measurement corrected this:**
+with the scanner now reporting `compile_seconds` in the scan summary, a **500-rule pack compiles
+in ~0.17 s** (measured on Linux/yara 3.11); the pack's whole cold run is ~27 s wall. The earlier
+80-second spread was **add_data delivery latency and agent overhead under the old sequential
+drain**, not compilation. For the simple string/hex/regex rules in the test packs, compile is not
+the bottleneck at any size up to 500.
 
-| Rules | Windows wall | Linux wall |
-|-------|-------------|-----------|
-| 1 | ~40 s | ~37 s |
-| 100 | ~81 s | ~77 s |
-| 250 | ~77 s | ~77 s |
-| 500 | ~122 s | ~110 s |
+| Rules | Fresh compile (measured) | Cached load |
+|-------|--------------------------|-------------|
+| 500 (simple) | ~0.17 s | ~0.02 s |
 
-A 500-rule pack adds ~90 s of single-threaded compile time per scan (the LRU rule cache is a
-roadmap item).
+A **disk rule-cache** (`rules.save()`/`yara.load()`, content+version-keyed) was still added — it is
+near-free, falls back safely on any load failure, and pays off for genuinely expensive compiles
+(very large or regex-heavy packs). For the test corpus its benefit is marginal because compile was
+already sub-second. `compile_source` (`fresh`|`cache`) and `compile_seconds` are in every scan
+summary so the effect is measurable per run.
 
 ## 4.2 Throughput on a large folder
 
@@ -188,6 +194,37 @@ dataset with the new shape, while the dashboards' `*` wildcard still spans old a
 A rule using an unavailable module via a top-level `import` (e.g. `cuckoo`) is reported under
 "failed compilation" rather than "skipped". The rule correctly does not run either way; cosmetic.
 
+## 5.6 Second-pass adversarial review — 9 fixes + 3 enhancements
+
+A multi-agent adversarial review of the telemetry/concurrency/perf changes surfaced (and
+independently verified) nine real defects, all fixed and re-tested live:
+
+- **`verify` / CLI examples queried bare dataset names** — after sharding, `verify` and the docs
+  read `yara_scanner_matches` (which no longer receives rows) instead of the `*` wildcard, so they
+  reported 0 rows for scans that actually landed. Fixed to `yara_scanner_matches*` (verified: 4
+  matches + 4 scan rows now surface).
+- **A crashed scan was recorded as `outcome:"completed"`** in the summary JSON (the critical-error
+  path never set `scan_failed`). Fixed so a crash records `outcome:"failed"`.
+- **Alert identity collapsed same-basename files** — two different files sharing a basename merged
+  into one alert. Fixed by folding a stable full-path hash into the identity.
+- **`matched_length` used the rendered string length** (hex doubles, wide halves). Fixed to the
+  match byte length.
+- **Drain deadline < single-batch retry budget** — under a hung `add_data` endpoint the drain
+  thread could be killed mid-POST, losing a batch *silently*. Fixed with a wall-clock deadline so
+  loss is accounted and logged.
+- **Producer-side `queued`/`dropped` counters** were unlocked; **orphaned `.json.tmp`** summaries
+  were never pruned — both fixed.
+
+Three enhancements were designed, built, and verified:
+
+- **Cuckoo skip-vs-fail** — a rule using an unavailable module (e.g. `cuckoo`) is now counted as
+  *skipped*, not *failed* (verified `13_cuckoo_skip` → `failed=0`, was 1).
+- **Rule-compile disk cache** — content+version-keyed `save`/`load` with a counts sidecar; verified
+  cold→`fresh`, warm→`cache`, identical matches.
+- **`prune-datasets` CLI** — XDR *does* expose `delete_dataset` (v2) and `remove_data` (v1); the new
+  subcommand classifies current-vs-legacy datasets and cleans up legacy/old ones (dry-run by
+  default; `--yes` to execute).
+
 ---
 
 # 6. Telemetry & logging enhancements
@@ -215,7 +252,9 @@ A rule using an unavailable module via a top-level `import` (e.g. `cuckoo`) is r
    as the shipped widgets now do.
 3. **Detections remain alert-first.** `create_alerts=on` (default) feeds XDR incidents reliably and
    is concurrency-robust; the sharded datasets add fleet trend/hunting visibility.
-4. **Large rule packs cost compile time** (~90 s for 500+); split packs or prioritize rule caching.
+4. **Compile is cheap** (~0.17 s for 500 simple rules); the disk rule-cache is a near-free safeguard
+   that only matters for very large or regex-heavy packs. Per-scan wall is dominated by the ~10 s
+   `add_data` delivery, not compilation.
 5. **Expect ~10 s of `add_data` latency per dataset per scan.** For latency-sensitive fleets,
    `write_dataset=false` skips lookup writes entirely and relies on alerts; bump
    `YARA_LOOKUP_SCHEMA_VER` only when the row shape changes.

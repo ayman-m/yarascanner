@@ -100,6 +100,17 @@ LOOKUP_DATASET_SHARD = os.environ.get("YARA_LOOKUP_SHARD", "endpoint").strip() o
 # version = a fresh dataset with the new schema; old-version datasets remain queryable (the
 # dashboards' `yara_scanner_matches*` wildcard spans every version). Bump this on any schema edit.
 LOOKUP_SCHEMA_VERSION = os.environ.get("YARA_LOOKUP_SCHEMA_VER", "2").strip() or "2"
+# Rule-compilation DISK cache. Compiling a large pack (~500 rules) costs ~90s and is repeated on
+# every run because the scanner is a fresh process per action. yara-python's rules.save()/load()
+# lets us persist the compiled ruleset on the endpoint and skip the whole per-rule compile loop on
+# a subsequent run with identical rules. The cache is keyed on the exact rule text + yara/platform
+# version + externals + module availability + a format tag, so it can never load a stale or
+# cross-version bundle; any load failure falls back to a fresh compile.
+RULE_CACHE_ENABLED = (os.environ.get("YARA_RULE_CACHE", "1").strip().lower() not in ("0", "false", "no", ""))
+RULE_CACHE_FORMAT = os.environ.get("YARA_RULE_CACHE_FORMAT", "1").strip() or "1"  # bump when compile logic changes
+RULE_CACHE_MAX_FILES = int(os.environ.get("YARA_RULE_CACHE_MAX", "5") or 5)
+RULE_CACHE_MAX_BYTES = int(float(os.environ.get("YARA_RULE_CACHE_MAX_MB", "256") or 256) * 1024 * 1024)
+_RULE_CACHE_LOCK = threading.Lock()
 # Fixed lookup-dataset base name (stable so dashboards can reference literally):
 #   <prefix>_matches -> one row per matched YARA string
 #   <prefix>_scans   -> scan-lifecycle rows (initiated/running/completed/cancelled/failed)
@@ -349,6 +360,18 @@ def _os_type() -> str:
     """Coarse OS family for dashboard segmentation (windows/linux/macos/other)."""
     s = platform.system()
     return {"Windows": "windows", "Linux": "linux", "Darwin": "macos"}.get(s, (s or "other").lower())
+
+
+def _yara_version_tag() -> str:
+    """Identity of the yara engine + platform for rule-cache keying. libyara (YARA_VERSION)
+    drives the save/load serialization format; the binding version and platform tighten it so a
+    3.11-Linux bundle and a 4.1-Windows bundle can never collide on one cache key."""
+    return "%s/%s/%s/%s" % (
+        getattr(yara, "__version__", "?"),
+        getattr(yara, "YARA_VERSION", "?"),
+        platform.system(),
+        platform.machine(),
+    )
 
 
 def _dataset_shard_suffix(raw_label: str) -> str:
@@ -662,6 +685,22 @@ YARA_COMPILE_EXTERNALS = {
     "filepath": "",
     "filename": "",
 }
+
+# Module -> regex that detects a rule *using* that module (e.g. `cuckoo.network...`). Single
+# source of truth shared by _inject_missing_rule_imports (auto-import decision) and
+# _rule_uses_unavailable_modules (skip-vs-fail decision) so "does this rule need module X" is
+# answered identically in both places. A rule that references an UNAVAILABLE module can never
+# compile on this agent, so it must be SKIPPED (module missing), not counted as a FAILED rule.
+MODULE_USAGE_PATTERNS = OrderedDict([
+    ("math", r"\bmath\."),
+    ("elf", r"\belf\."),
+    ("pe", r"\bpe\."),
+    ("hash", r"\bhash\."),
+    ("time", r"\btime\."),
+    ("dotnet", r"\bdotnet\."),
+    ("magic", r"\bmagic\."),
+    ("cuckoo", r"\bcuckoo\."),
+])
 
 
 def _serialize_matches(yara_matches):
@@ -2033,13 +2072,19 @@ class LogManager:
             "posture": getattr(self.config, "posture", ""),
         }
         record.update(summary or {})
+        tmp = path + ".tmp"
         try:
-            tmp = path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(record, f, default=str, ensure_ascii=False, indent=2)
             os.replace(tmp, path)
             self.log_system(f"Scan summary written: {os.path.basename(path)}")
         except Exception as e:
+            # Don't leave a half-written temp behind (e.g. disk full mid-dump).
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
             self.log_error(f"Failed to write scan summary JSON: {e}")
         return path
 
@@ -2863,9 +2908,15 @@ class ResultsUploader:
         #   - a stable per-finding name makes alerts 1:1 with distinct matches within a scan, and
         #     idempotent across repeated scans of the same location (XDR updates the existing
         #     alert instead of piling on duplicates). event_timestamp still carries the scan time.
-        match_file = os.path.basename(str(data.get("filename", "") or data.get("file", "")))
+        _full_path = str(data.get("filename", "") or data.get("file", ""))
+        match_file = os.path.basename(_full_path)
         match_offset = data.get("offset", "")
-        alert_name = f"YARA Match: {rule_name} | {match_file}@{match_offset} | Host: {hostname}"
+        # Tag the identity with a stable hash of the FULL path so two distinct files that share a
+        # basename (e.g. per-user copies of one dropper at ...\alice\svchost.exe and ...\bob\svchost.exe)
+        # don't collapse into a single alert. basename alone loses the path; file_sha256 can't separate
+        # byte-identical copies at different locations. Same path -> same tag keeps re-scans idempotent.
+        _path_tag = hashlib.sha1(_full_path.encode("utf-8", "replace")).hexdigest()[:8] if _full_path else "nopath"
+        alert_name = f"YARA Match: {rule_name} | {match_file}@{match_offset} (#{_path_tag}) | Host: {hostname}"
 
         severity_map = {
             "critical": "High",
@@ -3007,6 +3058,11 @@ class ResultsUploader:
             _file_size = -1
         _scan_folder = str(getattr(self.config, "scan_folder", None) or "system")
         for string_id, offset, string_data in match_data:
+            # Capture the matched BYTE length BEFORE rendering. _render_match_data decodes wide
+            # matches to UTF-16 text (half the bytes) and binary matches to hex (double), so
+            # len() of the rendered string is not a consistent size. len() of the raw matched
+            # data is the byte length (capped by yara's max_match_data, ~512).
+            _matched_len = len(string_data) if string_data is not None else 0
             string_data = _render_match_data(string_data)
 
             result = {
@@ -3076,7 +3132,7 @@ class ResultsUploader:
                     "scan_folder": _scan_folder,
                     "match": string_id,
                     "offset": str(offset),
-                    "matched_length": len(string_data) if string_data is not None else 0,
+                    "matched_length": _matched_len,
                     "string": string_data,
                     "severity": severity,
                     "event_timestamp_ms": int(time.time() * 1000),
@@ -3422,10 +3478,13 @@ class LookupDatasetUploader:
         self._enqueue(self.scans_dataset, record)
 
     def _enqueue(self, target, record):
+        # _enqueue runs on the scan-worker threads (via add/add_scan_row), so guard the counters
+        # with the same _stats_lock the drain uses — bare += from N threads loses updates.
         if not self.upload_thread or not self.upload_thread.is_alive():
             # Worker never started or died — count and log once so dropped rows
             # (including the terminal lifecycle row) are diagnosable, not silent.
-            self.upload_stats["dropped"] = self.upload_stats.get("dropped", 0) + 1
+            with self._stats_lock:
+                self.upload_stats["dropped"] = self.upload_stats.get("dropped", 0) + 1
             if self.log_manager and not getattr(self, "_drop_logged", False):
                 self._drop_logged = True
                 self.log_manager.log_error(
@@ -3435,9 +3494,11 @@ class LookupDatasetUploader:
             return
         try:
             self.queue.put((target, record), timeout=1.0)
-            self.upload_stats["queued"] += 1
+            with self._stats_lock:
+                self.upload_stats["queued"] += 1
         except Exception:
-            self.upload_stats["dropped"] = self.upload_stats.get("dropped", 0) + 1
+            with self._stats_lock:
+                self.upload_stats["dropped"] = self.upload_stats.get("dropped", 0) + 1
             if self.log_manager:
                 self.log_manager.log_error("Lookup dataset queue full - dropping record")
 
@@ -3525,8 +3586,24 @@ class LookupDatasetUploader:
         if LOOKUP_WRITE_JITTER_SECS > 0:
             time.sleep(random.uniform(0, LOOKUP_WRITE_JITTER_SECS))
 
+        # Wall-clock deadline so this batch can't out-live the drain join budget. Without it, a
+        # hung add_data endpoint (every POST blocking to the read timeout) makes 6 retries take
+        # ~6*read_timeout, which exceeds LOOKUP_DRAIN_TIMEOUT; the daemon drain thread is then
+        # killed mid-POST at process exit and the batch is lost SILENTLY (counted neither sent nor
+        # failed). Refusing an attempt that can't finish in time lets the loop fall through to the
+        # accounted send_failures + "rows lost" path BEFORE the join fires — visible, not silent.
+        _read_to = LOOKUP_POST_TIMEOUT[1] if isinstance(LOOKUP_POST_TIMEOUT, (tuple, list)) else LOOKUP_POST_TIMEOUT
+        _deadline = time.monotonic() + max(1.0, LOOKUP_DRAIN_TIMEOUT - 20)
+
         attempt = 0
         while attempt < LOOKUP_ADD_DATA_MAX_RETRIES:
+            if time.monotonic() + _read_to > _deadline:
+                if self.log_manager:
+                    self.log_manager.log_upload(
+                        f"Lookup batch deadline reached ({len(batch)} rows) after {attempt} attempts; "
+                        f"stopping retries so the drain exits within budget."
+                    )
+                break
             attempt += 1
             try:
                 resp = requests.post(url, headers=build_xdr_headers(self.log_manager), json=payload, timeout=LOOKUP_POST_TIMEOUT)
@@ -3788,6 +3865,16 @@ class CleanupManager:
         logs_dir = self.config.logs_dir
         if not os.path.isdir(logs_dir):
             return
+
+        # Sweep orphaned atomic-write temps from summaries whose process died mid-write. Safe here
+        # because this runs at scan START (via initial_cleanup), before the current run writes its
+        # own summary tmp; the retention regex below anchors on .log/.json$ and never matches these.
+        for name in os.listdir(logs_dir):
+            if name.startswith("scan_summary_") and name.endswith(".tmp"):
+                try:
+                    os.remove(os.path.join(logs_dir, name))
+                except OSError:
+                    pass
 
         run_logs = defaultdict(list)
         for name in os.listdir(logs_dir):
@@ -4072,7 +4159,9 @@ class YaraScanner:
 
         self.log_manager = log_manager if log_manager else LogManager(config)
         self.stats_manager = stats_manager if stats_manager else StatisticsManager(config, self.log_manager)
-        self.rules = self._compile_yara_rules(config.yara_rule)
+        self._compile_source = "fresh"   # "cache" | "fresh" — surfaced in the scan summary
+        self._compile_seconds = 0.0
+        self.rules = self._load_or_compile_rules(config.yara_rule)
         
         self.files_scanned = 0
         self.files_skipped = 0
@@ -4373,17 +4462,34 @@ rule test {{
         return available
 
     def _rule_uses_unavailable_modules(self, rule_content, available_modules):
-        """Check if rule imports unavailable modules."""
+        """Return (True, module) if a rule REQUIRES a YARA module missing on this agent.
+
+        A rule can require a module two ways, and both mean it can never compile here, so it
+        must be SKIPPED (module unavailable), not counted as a FAILED compilation:
+          1. an explicit `import "<module>"` line inside the rule block, or
+          2. a reference to `<module>.<field>` whose declaring top-level import was dropped from
+             the preamble by _split_yara_rules (because the module is unavailable). The split
+             rule body then has no import line but still uses the module; previously it fell
+             through to yara.compile, raised `undefined identifier`, and was mis-counted as FAILED.
+        """
+        # (1) explicit inline import of an unavailable module
         import_pattern = r'^\s*import\s+"?(\w+)"?'
-        
         for line in rule_content.split('\n'):
             match = re.match(import_pattern, line.strip())
             if match:
                 module_name = match.group(1)
                 if module_name not in available_modules:
-                    logging.debug(f"Rule uses unavailable module: {module_name}")
+                    logging.debug(f"Rule imports unavailable module: {module_name}")
                     return True, module_name
-        
+
+        # (2) usage of a known module that isn't available on this agent
+        for module_name, usage_pattern in MODULE_USAGE_PATTERNS.items():
+            if module_name in available_modules:
+                continue
+            if re.search(usage_pattern, rule_content):
+                logging.debug(f"Rule uses unavailable module via reference: {module_name}")
+                return True, module_name
+
         return False, None
 
     def _extract_imported_modules(self, source_text):
@@ -4399,16 +4505,7 @@ rule test {{
         preamble_imports = preamble_imports or set()
         already_imported = self._extract_imported_modules(rule_content) | set(preamble_imports)
 
-        module_usage_patterns = OrderedDict([
-            ("math", r"\bmath\."),
-            ("elf", r"\belf\."),
-            ("pe", r"\bpe\."),
-            ("hash", r"\bhash\."),
-            ("time", r"\btime\."),
-            ("dotnet", r"\bdotnet\."),
-            ("magic", r"\bmagic\."),
-            ("cuckoo", r"\bcuckoo\."),
-        ])
+        module_usage_patterns = MODULE_USAGE_PATTERNS  # shared table (see _rule_uses_unavailable_modules)
 
         missing = []
         for module_name, usage_pattern in module_usage_patterns.items():
@@ -4421,6 +4518,136 @@ rule test {{
 
         import_block = "\n".join(f'import "{m}"' for m in missing)
         return f"{import_block}\n{rule_content}", missing
+
+    # ---- rule-compilation disk cache -------------------------------------------------------
+    def _rule_cache_dir(self):
+        d = os.path.join(self.config.scanner_dir, "rule_cache")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _rule_cache_key(self, yara_rule_string, available_modules):
+        """Key the cache on everything that determines the compiled bundle: the exact rule text,
+        the module set (drives skip/inject), the declared externals, the yara/platform version,
+        and a format tag (bump RULE_CACHE_FORMAT whenever the compile/split/inject logic changes).
+        Because compilation is a pure function of these inputs, the key can never drift from what
+        would actually be produced — no need to replay the per-rule transform to build it."""
+        h = hashlib.sha256()
+        h.update(("FMT:%s\n" % RULE_CACHE_FORMAT).encode())
+        h.update(("YARA:%s\n" % _yara_version_tag()).encode())
+        h.update(("EXT:%s\n" % json.dumps(YARA_COMPILE_EXTERNALS, sort_keys=True)).encode())
+        h.update(("MODS:%s\n" % ",".join(sorted(available_modules))).encode())
+        h.update(b"RULES:")
+        h.update((yara_rule_string or "").encode("utf-8", "replace"))
+        return h.hexdigest()
+
+    def _restore_cache_meta(self, cache_path):
+        """On a cache HIT the per-rule loop is skipped, so restore the valid/failed/skipped counts
+        from the sidecar written at save time — otherwise the scan summary would report 0 rules."""
+        meta_path = cache_path + ".meta.json"
+        el = self.config.error_logger
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            el.valid_rules_count = int(meta.get("valid_rules", 0))
+            el.failed_rules_count = int(meta.get("failed_rules", 0))
+            return int(meta.get("skipped", 0))
+        except Exception:
+            # No/broken sidecar: at least reflect that the loaded bundle has rules.
+            if not getattr(el, "valid_rules_count", 0):
+                el.valid_rules_count = 1
+            return 0
+
+    def _save_rule_cache(self, rules, cache_path, yara_rule_string):
+        """Persist the compiled ruleset + a counts sidecar, atomically. Best-effort (a read-only
+        or full disk just means no caching); never fatal to the scan."""
+        el = self.config.error_logger
+        with _RULE_CACHE_LOCK:
+            tmp = "%s.%d.%08x.tmp" % (cache_path, os.getpid(), random.getrandbits(32))
+            try:
+                rules.save(tmp)
+                os.replace(tmp, cache_path)
+                meta = {
+                    "valid_rules": int(getattr(el, "valid_rules_count", 0)),
+                    "failed_rules": int(getattr(el, "failed_rules_count", 0)),
+                    "yara": _yara_version_tag(),
+                    "format": RULE_CACHE_FORMAT,
+                }
+                with open(cache_path + ".meta.json", "w", encoding="utf-8") as f:
+                    json.dump(meta, f)
+                self._prune_rule_cache()
+            except Exception as e:
+                self.log_manager.log_system(f"Rule cache save failed (non-fatal): {e}")
+                for p in (tmp,):
+                    try:
+                        if os.path.exists(p):
+                            os.remove(p)
+                    except OSError:
+                        pass
+
+    def _prune_rule_cache(self):
+        """LRU-bound the cache dir by file count and total bytes (newest kept)."""
+        try:
+            d = self._rule_cache_dir()
+            files = [os.path.join(d, f) for f in os.listdir(d)
+                     if f.startswith("rules_") and f.endswith(".yarac")]
+            files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            kept, total = 0, 0
+            for p in files:
+                total += os.path.getsize(p)
+                kept += 1
+                if kept > RULE_CACHE_MAX_FILES or total > RULE_CACHE_MAX_BYTES:
+                    for q in (p, p + ".meta.json"):
+                        try:
+                            os.remove(q)
+                        except OSError:
+                            pass
+        except Exception:
+            pass
+
+    def _load_or_compile_rules(self, yara_rule_string):
+        """Return a compiled ruleset, using the disk cache when the exact rules were compiled
+        before on this endpoint+engine. Falls back to a fresh compile on any cache miss/failure."""
+        t0 = time.perf_counter()
+        self._compile_source, self._compile_seconds = "fresh", 0.0
+        cache_path = None
+        if RULE_CACHE_ENABLED:
+            try:
+                available_modules = self._get_available_yara_modules()
+                key = self._rule_cache_key(yara_rule_string, available_modules)
+                cache_path = os.path.join(self._rule_cache_dir(), "rules_%s.yarac" % key[:40])
+                if os.path.exists(cache_path):
+                    rules = yara.load(cache_path)  # raises on cross-version / corrupt bundle
+                    # Prove the bundle is usable AND still accepts the per-file externals the
+                    # scanner overrides at match time — fail HERE (and fall back) not mid-scan.
+                    rules.match(data=b"", externals={"filepath": "", "filename": ""})
+                    try:
+                        os.utime(cache_path, None)  # LRU touch
+                    except OSError:
+                        pass
+                    skipped = self._restore_cache_meta(cache_path)
+                    self._compile_source = "cache"
+                    self._compile_seconds = time.perf_counter() - t0
+                    self.log_manager.log_system(
+                        "Rule cache HIT %s load=%.2fs (valid=%s failed=%s skipped=%s)" % (
+                            os.path.basename(cache_path), self._compile_seconds,
+                            self.config.error_logger.valid_rules_count,
+                            self.config.error_logger.failed_rules_count, skipped))
+                    return rules
+            except Exception as e:
+                self.log_manager.log_system("Rule cache miss/unusable, compiling fresh: %s" % e)
+                if cache_path and os.path.exists(cache_path):
+                    for q in (cache_path, cache_path + ".meta.json"):
+                        try:
+                            os.remove(q)
+                        except OSError:
+                            pass
+
+        rules = self._compile_yara_rules(yara_rule_string)   # existing ~90s path, unchanged
+        self._compile_source, self._compile_seconds = "fresh", time.perf_counter() - t0
+        self.log_manager.log_system("Rule compile FRESH %.2fs" % self._compile_seconds)
+        if RULE_CACHE_ENABLED and cache_path:
+            self._save_rule_cache(rules, cache_path, yara_rule_string)
+        return rules
 
     def _compile_yara_rules(self, yara_rule_string):
         """Compile YARA rules with robust error handling."""
@@ -4475,8 +4702,10 @@ rule test {{
             if uses_unavailable:
                 skipped_count += 1
                 if skipped_count <= 10:
-                    logging.warning(f"Skipping rule '{display_name}': uses unavailable module '{missing_module}'")
-                    error_logger.error_logger.warning(f"Skipping rule '{display_name}': uses unavailable module '{missing_module}'")
+                    logging.warning(f"Skipping rule '{display_name}': requires unavailable module "
+                                    f"'{missing_module}' (not on this agent - not a compile failure)")
+                    error_logger.error_logger.warning(
+                        f"SKIP (module unavailable): rule '{display_name}' requires '{missing_module}'")
                 try:
                     skipped_rule_path = os.path.join(
                         self.config.failed_rules_dir, 
@@ -6074,7 +6303,12 @@ def main(yarafile=None, scan_folder=None, alert_severity="low", mode="scan", opt
         # is always true — guard on the object itself (an early failure leaves it None).
         files_scanned = scanner.files_scanned if scanner is not None else 0
         matches = scanner.total_detections if scanner is not None else 0
-        
+
+        # A crash reaching here IS a failed scan — record it so the finally-block's
+        # scan_summary derives outcome="failed" instead of the default "completed".
+        if scanner is not None:
+            scanner.scan_failed = True
+
         error_summary = (f"Scan failed: {files_scanned} files scanned | "
                         f"{failed_rules} rules failed compilation | "
                         f"{matches} matches found | Critical error occurred")
@@ -6118,6 +6352,8 @@ def main(yarafile=None, scan_folder=None, alert_severity="low", mode="scan", opt
                                           if _dur and _dur > 0 else 0),
                         "total_paused_secs": round(getattr(scanner, "total_paused_secs", 0) or 0, 2),
                         "throttle_mode": getattr(config, "throttle_mode", None),
+                        "compile_source": getattr(scanner, "_compile_source", None),
+                        "compile_seconds": round(getattr(scanner, "_compile_seconds", 0) or 0, 2),
                         "cancel_source": getattr(scanner, "cancel_source", None),
                         "alert_delivery": (scanner.results_uploader.get_upload_stats()
                                            if hasattr(scanner, "results_uploader") and scanner.results_uploader else {}),
