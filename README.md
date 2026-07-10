@@ -121,7 +121,7 @@ Browser caches are **no longer bypassed** (removed from the skip list), and a `f
 - Hosts without systemd log-and-skip cleanup instead of erroring.
 
 ### 📊 Dashboard & 🧪 test skill
-- New **`dashboards/Yara XDR Scanner (Lookup).json`** + `widgets/xdr_lookup/*.xql` built on the sharded lookup datasets via the `yara_scanner_matches*` / `yara_scanner_scans*` wildcards (every widget carries `tenant_id`).
+- Comprehensive **`dashboards/Yara XDR Scanner (Lookup).json`** (40 widgets) + `widgets/xdr_lookup/*.xql`, built on the sharded lookup datasets via the `yara_scanner_matches*` / `yara_scanner_scans*` wildcards plus the reliable `alerts` channel. Covers detections (by OS/folder/file-size/severity), fleet coverage, rule health, throughput/throttle, KPI tiles, and alert trends. Every query is validated live against the tenant.
 - A bundled Claude skill, **`.claude/skills/xdr-yara-scan-test/`**, drives the scanner on a live endpoint through the XDR API (via `run_snippet_code_script`, no library upload) and verifies the datasets. See its `SKILL.md`.
 
 ### 🎛️ Automation playbooks

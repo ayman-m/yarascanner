@@ -293,9 +293,12 @@ retention keeps the last 10 scans (`YARA_LOG_KEEP`).
 
 # 12. Dashboard & XQL
 
-Import `dashboards/Yara XDR Scanner (Lookup).json` (**Dashboards → Import**). Its widgets
-build on the sharded lookup datasets via the `*` wildcard; individual queries are in
-`widgets/xdr_lookup/*.xql`.
+Import `dashboards/Yara XDR Scanner (Lookup).json` (**Dashboards → Import**). It ships **40
+widgets** across detections (by OS / scan-folder / file-size / severity / matched-length), fleet
+coverage, rule health (valid/failed/skipped), throughput & throttle, single-value KPI tiles, and
+alert-channel trends. Widgets build on the sharded lookup datasets via the `*` wildcard (plus the
+reliable `alerts` dataset); individual queries are in `widgets/xdr_lookup/*.xql`, each validated
+live against the tenant.
 
 Lookup rows carry no `_time`, so time-filtering uses `event_timestamp_ms`. The `*` wildcard
 fans every per-endpoint shard (and schema version) into one fleet-wide result.
