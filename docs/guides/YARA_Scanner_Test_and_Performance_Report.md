@@ -225,6 +225,18 @@ Three enhancements were designed, built, and verified:
   subcommand classifies current-vs-legacy datasets and cleans up legacy/old ones (dry-run by
   default; `--yes` to execute).
 
+**A second adversarial pass** (re-reviewing the fixes themselves) caught a further 8 issues — most
+importantly a **silent detection regression the cuckoo fix had introduced**: a rule merely
+*mentioning* an unavailable module name as a literal hunt string (e.g. `"cuckoo.conf"`) was being
+skipped instead of compiled. Fixed by gating the module-usage check on the module actually being
+imported in the source (verified: the literal-hunt rule now matches; genuine dropped-import rules
+still skip). The pass also hardened the drain deadline (guarantee ≥1 attempt), the `prune-datasets`
+classifier (dict-reply unwrap + refuse to prune *newer*-version datasets on a version skew), and
+rule-cache edge cases (missing-sidecar count recovery, `.tmp` orphan sweep). Coverage tests
+confirmed **cancellation** (cancelled mid-scan at 12,024/14,962 files), **CPU throttling**
+(`paused=133 s` under load — previously untested), rule-cache **corruption fallback**, and the
+delete path (v2 datasets preserved by the keep-guard).
+
 ---
 
 # 6. Telemetry & logging enhancements

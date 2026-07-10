@@ -353,15 +353,32 @@ class XDRActionCenter:
         return [(r.get("scan_date"), r.get("n")) for r in rows if r.get("scan_date")]
 
     def classify_yara_datasets(self):
-        """Split the tenant's yara-owned LOOKUP datasets into (current_v<VER>, legacy)."""
-        current, legacy = [], []
-        for d in (self.get_datasets() or []):
+        """Split the tenant's yara-owned LOOKUP datasets into (current, legacy, newer) by schema
+        version. legacy = older/unversioned (safe to prune); newer = a HIGHER _vN than we assume,
+        which signals this host's YARA_LOOKUP_SCHEMA_VER is stale — so it must NOT be pruned."""
+        cur_ver = int(YARA_SCHEMA_VERSION) if YARA_SCHEMA_VERSION.isdigit() else None
+        ver_re = re.compile(r"_v(\d+)(?:_|$)")
+        current, legacy, newer = [], [], []
+        datasets = self.get_datasets()
+        if isinstance(datasets, dict):  # get_datasets can return {"data":[...]} / {"datasets":[...]}
+            datasets = datasets.get("data") or datasets.get("datasets") or []
+        for d in (datasets or []):
+            if not isinstance(d, dict):
+                continue
             name = d.get("Dataset Name") or d.get("dataset_name") or ""
             dtype = (d.get("Type") or d.get("dataset_type") or "").upper()
             if dtype != "LOOKUP" or not YARA_OWNED_RE.match(name):
                 continue
-            (current if CURRENT_RE.match(name) else legacy).append(name)
-        return sorted(current), sorted(legacy)
+            if CURRENT_RE.match(name):
+                current.append(name)
+                continue
+            m = ver_re.search(name)
+            v = int(m.group(1)) if m else None
+            if cur_ver is not None and v is not None and v > cur_ver:
+                newer.append(name)  # a version we don't recognize as old — refuse to prune
+            else:
+                legacy.append(name)
+        return sorted(current), sorted(legacy), sorted(newer)
 
     # ---- YARA scanner helpers ----
     def build_scanner_snippet(self, scanner_path, rules_b64, scan_folder="default",
@@ -559,7 +576,7 @@ def main(argv=None):
         return 0
 
     if args.cmd == "prune-datasets":
-        current, legacy = c.classify_yara_datasets()
+        current, legacy, newer = c.classify_yara_datasets()
 
         def _rows(n):
             if not args.counts:
@@ -573,6 +590,11 @@ def main(argv=None):
         print(f"CURRENT (keep, v{YARA_SCHEMA_VERSION}): {len(current)}")
         for n in current:
             print(f"  KEEP    {n}{_rows(n)}")
+        if newer:
+            print(f"NEWER (keep — higher schema version than v{YARA_SCHEMA_VERSION}; your "
+                  f"YARA_LOOKUP_SCHEMA_VER may be stale): {len(newer)}")
+            for n in newer:
+                print(f"  NEWER   {n}{_rows(n)}")
         print(f"LEGACY (prune candidates): {len(legacy)}")
         for n in legacy:
             print(f"  LEGACY  {n}{_rows(n)}")
@@ -580,7 +602,7 @@ def main(argv=None):
         if not (args.delete_legacy or args.older_than or args.name):
             return 0  # pure report
 
-        # keep-guard: never delete a CURRENT dataset unless it was explicitly named.
+        # keep-guard: never delete a CURRENT or NEWER dataset unless it was explicitly named.
         if args.name:
             bad = [n for n in args.name if not YARA_OWNED_RE.match(n)]
             if bad:
@@ -588,10 +610,18 @@ def main(argv=None):
                 return 2
             delete_targets = list(args.name)
         elif args.delete_legacy:
+            # Refuse blanket legacy deletion when NEWER-version datasets exist — that is a reliable
+            # signal this host's YARA_LOOKUP_SCHEMA_VER is out of date and "legacy" is untrustworthy.
+            if newer:
+                print(f"REFUSING --delete-legacy: found {len(newer)} dataset(s) at a NEWER schema "
+                      f"version than v{YARA_SCHEMA_VERSION}. Set YARA_LOOKUP_SCHEMA_VER to match the "
+                      f"scanner, or delete specific datasets with --name.", file=sys.stderr)
+                return 2
             delete_targets = list(legacy)
         else:
             delete_targets = []
-        delete_targets = [n for n in delete_targets if n not in current or n in args.name]
+        _protected = set(current) | set(newer)
+        delete_targets = [n for n in delete_targets if n not in _protected or n in args.name]
 
         if not args.yes:
             print(f"\nDRY RUN — would delete {len(delete_targets)} dataset(s): {delete_targets}")

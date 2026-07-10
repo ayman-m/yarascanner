@@ -1225,6 +1225,7 @@ class ErrorLogger:
         self.has_errors = False
         self.failed_rules_count = 0
         self.valid_rules_count = 0
+        self.skipped_rules_count = 0  # rules skipped for unavailable modules (persisted to rule cache)
     
     def _setup_error_logger(self):
         """Setup dedicated error logger."""
@@ -3597,7 +3598,10 @@ class LookupDatasetUploader:
 
         attempt = 0
         while attempt < LOOKUP_ADD_DATA_MAX_RETRIES:
-            if time.monotonic() + _read_to > _deadline:
+            # `attempt > 0` guarantees at least ONE POST regardless of how the drain/read knobs are
+            # tuned (a healthy endpoint then succeeds); the deadline only bounds the RETRIES so the
+            # drain still exits within its join budget.
+            if attempt > 0 and time.monotonic() + _read_to > _deadline:
                 if self.log_manager:
                     self.log_manager.log_upload(
                         f"Lookup batch deadline reached ({len(batch)} rows) after {attempt} attempts; "
@@ -3666,7 +3670,7 @@ class LookupDatasetUploader:
             self.upload_stats["send_failures"] += 1
         if self.log_manager:
             self.log_manager.log_error(
-                f"Lookup batch abandoned after {LOOKUP_ADD_DATA_MAX_RETRIES} retries ({len(batch)} rows lost)"
+                f"Lookup batch abandoned after {attempt} attempt(s) ({len(batch)} rows lost)"
             )
 
     def stop(self, wait=True):
@@ -4461,7 +4465,7 @@ rule test {{
         
         return available
 
-    def _rule_uses_unavailable_modules(self, rule_content, available_modules):
+    def _rule_uses_unavailable_modules(self, rule_content, available_modules, source_imported_modules=None):
         """Return (True, module) if a rule REQUIRES a YARA module missing on this agent.
 
         A rule can require a module two ways, and both mean it can never compile here, so it
@@ -4471,6 +4475,12 @@ rule test {{
              the preamble by _split_yara_rules (because the module is unavailable). The split
              rule body then has no import line but still uses the module; previously it fell
              through to yara.compile, raised `undefined identifier`, and was mis-counted as FAILED.
+
+        Case (2) is gated on the module actually being imported SOMEWHERE in the original source
+        (`source_imported_modules`). A bare `cuckoo.` in a rule that never imported cuckoo is just
+        literal text (a hunt string / comment / meta value) — it compiles and matches fine, so it
+        must NOT be skipped. Without this gate, a rule looking for the *string* "cuckoo.conf" was
+        silently dropped on a cuckoo-less agent.
         """
         # (1) explicit inline import of an unavailable module
         import_pattern = r'^\s*import\s+"?(\w+)"?'
@@ -4482,13 +4492,16 @@ rule test {{
                     logging.debug(f"Rule imports unavailable module: {module_name}")
                     return True, module_name
 
-        # (2) usage of a known module that isn't available on this agent
-        for module_name, usage_pattern in MODULE_USAGE_PATTERNS.items():
-            if module_name in available_modules:
-                continue
-            if re.search(usage_pattern, rule_content):
-                logging.debug(f"Rule uses unavailable module via reference: {module_name}")
-                return True, module_name
+        # (2) usage of a module that the source imported but this agent lacks
+        if source_imported_modules:
+            for module_name, usage_pattern in MODULE_USAGE_PATTERNS.items():
+                if module_name in available_modules:
+                    continue
+                if module_name not in source_imported_modules:
+                    continue  # bare "<mod>." here is a literal string/comment, not a module ref
+                if re.search(usage_pattern, rule_content):
+                    logging.debug(f"Rule uses unavailable imported module via reference: {module_name}")
+                    return True, module_name
 
         return False, None
 
@@ -4540,7 +4553,7 @@ rule test {{
         h.update((yara_rule_string or "").encode("utf-8", "replace"))
         return h.hexdigest()
 
-    def _restore_cache_meta(self, cache_path):
+    def _restore_cache_meta(self, cache_path, rules=None):
         """On a cache HIT the per-rule loop is skipped, so restore the valid/failed/skipped counts
         from the sidecar written at save time — otherwise the scan summary would report 0 rules."""
         meta_path = cache_path + ".meta.json"
@@ -4552,9 +4565,13 @@ rule test {{
             el.failed_rules_count = int(meta.get("failed_rules", 0))
             return int(meta.get("skipped", 0))
         except Exception:
-            # No/broken sidecar: at least reflect that the loaded bundle has rules.
+            # No/broken sidecar: recover the true valid count from the loaded bundle
+            # (yara.Rules is iterable and yields exactly the compiled rules).
             if not getattr(el, "valid_rules_count", 0):
-                el.valid_rules_count = 1
+                try:
+                    el.valid_rules_count = sum(1 for _ in rules) if rules is not None else 1
+                except Exception:
+                    el.valid_rules_count = 1
             return 0
 
     def _save_rule_cache(self, rules, cache_path, yara_rule_string):
@@ -4569,6 +4586,7 @@ rule test {{
                 meta = {
                     "valid_rules": int(getattr(el, "valid_rules_count", 0)),
                     "failed_rules": int(getattr(el, "failed_rules_count", 0)),
+                    "skipped": int(getattr(el, "skipped_rules_count", 0)),
                     "yara": _yara_version_tag(),
                     "format": RULE_CACHE_FORMAT,
                 }
@@ -4588,7 +4606,19 @@ rule test {{
         """LRU-bound the cache dir by file count and total bytes (newest kept)."""
         try:
             d = self._rule_cache_dir()
-            files = [os.path.join(d, f) for f in os.listdir(d)
+            names = os.listdir(d)
+            # Sweep stale save-temps orphaned by a crash between rules.save(tmp) and os.replace().
+            # Age-gate so a concurrent in-flight save from another per-action process is spared.
+            now = time.time()
+            for n in names:
+                if n.startswith("rules_") and n.endswith(".tmp"):
+                    p = os.path.join(d, n)
+                    try:
+                        if now - os.path.getmtime(p) > 3600:
+                            os.remove(p)
+                    except OSError:
+                        pass
+            files = [os.path.join(d, f) for f in names
                      if f.startswith("rules_") and f.endswith(".yarac")]
             files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
             kept, total = 0, 0
@@ -4624,7 +4654,7 @@ rule test {{
                         os.utime(cache_path, None)  # LRU touch
                     except OSError:
                         pass
-                    skipped = self._restore_cache_meta(cache_path)
+                    skipped = self._restore_cache_meta(cache_path, rules)
                     self._compile_source = "cache"
                     self._compile_seconds = time.perf_counter() - t0
                     self.log_manager.log_system(
@@ -4689,6 +4719,9 @@ rule test {{
         compilation_errors = []
         skipped_count = 0
         preamble_imports = self._extract_imported_modules(preamble)
+        # Modules imported ANYWHERE in the original source — used to tell a real (but dropped)
+        # module reference apart from a rule that merely contains "<mod>." as a literal string.
+        source_imported = self._extract_imported_modules(yara_rule_string)
         logging.info(f"Starting compilation of {len(individual_rules)} YARA rules...")
 
         for i, rule_content in enumerate(individual_rules, 1):
@@ -4696,7 +4729,7 @@ rule test {{
             display_name = name_match.group(1) if name_match else f"rule_{i}"
 
             uses_unavailable, missing_module = self._rule_uses_unavailable_modules(
-                rule_content, available_modules
+                rule_content, available_modules, source_imported
             )
             
             if uses_unavailable:
@@ -4763,8 +4796,9 @@ rule test {{
                 except Exception:
                     pass
 
+        error_logger.skipped_rules_count = skipped_count  # persist so a cache HIT can restore it
         error_logger.log_compilation_summary()
-        
+
         logging.info(f"Compilation complete: {error_logger.valid_rules_count} valid, {error_logger.failed_rules_count} failed, {skipped_count} skipped")
         
         if skipped_count > 0:
