@@ -146,38 +146,45 @@ Metadata:
 | Script Name | `xdr_yara_scanner_v4` (any name; referenced by the playbooks' `script_name`) |
 | Supported OS | Windows, Linux, macOS |
 | Timeout | `21600` (6 h) |
-| Entry Point | `main` |
+| Entry Point | `main` (run a scan) — or `cancel` (stop a running scan, no inputs) |
 | Run as | Administrator / root |
 
-**Input parameters — define exactly these 5 string inputs, in order:**
+**Input parameters — only these 3 string inputs (Entry Point = `main`):**
 
 | Order | Name | Description |
 |-------|------|-------------|
 | 1 | `yarafile` | Base64-encoded YARA rules |
 | 2 | `scan_folder` | Target path, or `default` |
 | 3 | `alert_severity` | `low` \| `medium` \| `high` |
-| 4 | `mode` | `scan` \| `cancel` |
-| 5 | `options` | Compact `key=value,key=value` runtime options (below) |
 
-> The parameter set must match exactly — `run_script` / `core-script-run` rejects a
-> parameter set that doesn't match the script's defined inputs.
+That is the whole per-run input list — operators fill in *which rules, which folder, what
+severity*, nothing else. Everything else (alerts on/off, dataset on/off, file collection, CPU
+throttling, sharding, tenant tag, …) is set **once** in the CUSTOMER CONFIG block at the top of
+the script (§7.1) and travels with the uploaded script. To **cancel** a running scan, run the
+same script with Entry Point = `cancel` (it takes no inputs).
 
-## 7.1 Runtime `options` reference
+## 7.1 CUSTOMER CONFIG — edit once, at the top of the script
 
-Pass as `key=value,key=value` (all optional):
+Open `xdr_yara_scanner.py` and edit the clearly-marked `CUSTOMER CONFIG` block near the top, then
+re-upload. These are the deployment-wide behaviour knobs (no per-run input needed):
 
-| Option | Values | Default | Effect |
-|--------|--------|---------|--------|
-| `create_alerts` | true/false | true | Insert Parsed Alerts (→ incidents) |
-| `write_dataset` | true/false | true | Write to the lookup datasets |
-| `collect_files` | true/false | **false** | Copy matched files into the evidence ZIP |
-| `throttle_mode` | script/os/off | script | CPU pacing strategy (§10) |
-| `cpu_high_threshold` | 1–100 | 80 | Pause-entry threshold (% system CPU) |
-| `cpu_critical_threshold` | 1–100 | 90 | Critical threshold |
-| `max_pause_secs` | ≥0 (`0`=unbounded) | 300 | Cap on one continuous CPU pause |
-| `tenant_id` | string | derived | Override the tenant slug |
+| Constant | Values | Default | Effect |
+|----------|--------|---------|--------|
+| `CONFIG_MODE` | `scan` / `cancel` | `scan` | Default action for the `main` entry point |
+| `CONFIG_CREATE_ALERTS` | `True`/`False` | `True` | Insert Parsed Alerts (→ incidents) |
+| `CONFIG_WRITE_DATASET` | `True`/`False` | `True` | Write the lookup datasets |
+| `CONFIG_COLLECT_FILES` | `True`/`False` | `False` | Copy matched files into the evidence ZIP |
+| `CONFIG_THROTTLE_MODE` | `script`/`os`/`off` | `script` | CPU pacing strategy (§10) |
+| `CONFIG_CPU_HIGH_THRESHOLD` | int or `None` | `None` | Pause-entry % CPU (`None` = profile default) |
+| `CONFIG_CPU_CRITICAL_THRESHOLD` | int or `None` | `None` | Critical % CPU (`None` = profile default) |
+| `CONFIG_MAX_PAUSE_SECS` | int or `None` | `None` | Cap on one continuous CPU pause |
+| `CONFIG_TENANT_ID` | string | `""` | Tenant tag (`""` = derive from API URL) |
+| `CONFIG_LOOKUP_SHARD` | `endpoint`/`none`/`<label>` | `endpoint` | Dataset sharding (§11) |
+| `CONFIG_OPTIONS` | `key=value,key=value` | `""` | Rarely-needed extra overrides applied every run |
 
-Example: `create_alerts=false,throttle_mode=os,collect_files=true`.
+> Advanced / automation only: the internal `run(...)` API and the CLI still accept a per-run
+> `options` string that overrides any constant above — but the Action Center `main` entry point
+> deliberately does **not** expose it, so operators aren't faced with a long input list.
 
 ---
 
@@ -340,7 +347,7 @@ dataset = yara_scanner_scans* | filter status = "cancelled"
 |---------|--------------|-----|
 | No alerts and no dataset rows | Standard-only auth against an **Advanced** key (HTTP 401) | Ensure v2; leave `XDR_AUTH_TYPE=auto` (or force `advanced`). Verify creds in Step 1. |
 | `Dataset not found` on `add_data` | Dataset not created yet | The scanner creates both datasets on start; check the upload log for the create call and API permissions. |
-| `parameters_values contain invalid/missing parameters` | Library script inputs don't match | The library script must define exactly the 5 inputs in order (§7). |
+| `parameters_values contain invalid/missing parameters` | Library script inputs don't match the entry point | With Entry Point `main`, pass only the 3 inputs in §7 (`yarafile, scan_folder, alert_severity`); with Entry Point `cancel`, pass none. |
 | Playbook can't find the script | `script_name` mismatch | Set the playbook's `script_name` input to the exact library script name. |
 | `Scan failed: N rules failed compilation` | Bad YARA syntax | Inspect `failed_rules/` on the endpoint; valid rules still ran. |
 | Scan won't stop | — | Run `mode=cancel` (or the Canceller playbook) on the same targets; watch for the terminal `cancelled` row. |

@@ -399,7 +399,7 @@ class XDRActionCenter:
             "import traceback as _tb\n"
             f"{prelude}\n"
             "try:\n"
-            f"    print('SCAN_RESULT: ' + str(main({rules}, {scan_folder!r}, {severity!r}, "
+            f"    print('SCAN_RESULT: ' + str(run({rules}, {scan_folder!r}, {severity!r}, "
             f"mode={mode!r}, options={opts})))\n"
             "except Exception:\n"
             "    print('SNIPPET_ERROR:\\n' + _tb.format_exc())\n")

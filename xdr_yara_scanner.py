@@ -64,6 +64,30 @@ THREAD_CLEANUP_TIMEOUT = 60          # Maximum time to wait for thread cleanup
 DEFAULT_XDR_API_KEY = "replace_with_xdr_standard_api_key"
 DEFAULT_XDR_API_ID = "replace_with_xdr_standard_api_id"
 DEFAULT_XDR_API_URL = "replace_with_xdr_standard_api_url"
+
+# ============================================================================
+# CUSTOMER CONFIG — set these ONCE for your deployment, then (re)upload/deliver
+# the script. These are the per-run behaviour knobs; putting them here means an
+# operator only supplies the essentials at run time — yarafile, scan_folder,
+# alert_severity — instead of a long options string on every scan.
+#
+# Precedence: an explicit Action Center `options` value (key=value,key=value)
+# still OVERRIDES the matching constant below, so per-run overrides remain
+# possible without editing the script. Leave a value as-is to use it fleet-wide.
+# ============================================================================
+CONFIG_MODE = "scan"                    # "scan" (run a scan) or "cancel" (stop a running scan)
+CONFIG_CREATE_ALERTS = True             # push one XDR alert per YARA match (feeds incidents)
+CONFIG_WRITE_DATASET = True             # write the yara_scanner_* lookup datasets (dashboards)
+CONFIG_COLLECT_FILES = False            # copy matched files into the evidence ZIP (off = metadata only)
+CONFIG_THROTTLE_MODE = "script"         # CPU throttling: "script" | "os" | "off"
+CONFIG_CPU_HIGH_THRESHOLD = None        # percent CPU to start pausing (e.g. 70); None = light-profile default
+CONFIG_CPU_CRITICAL_THRESHOLD = None    # percent CPU to pause hard (e.g. 90); None = light-profile default
+CONFIG_MAX_PAUSE_SECS = None            # cap cumulative throttle pause per scan (secs); None = default
+CONFIG_TENANT_ID = ""                   # tag rows/alerts with this tenant id; "" = derive from API URL
+CONFIG_LOOKUP_SHARD = "endpoint"        # dataset sharding: "endpoint" (per-host, recommended) | "none" | "<label>"
+CONFIG_OPTIONS = ""                     # extra "key=value,key=value" overrides applied every run (rarely needed)
+# ============================================================================
+
 XDR_INSERT_PARSED_ALERTS_PATH = "/public_api/v1/alerts/insert_parsed_alerts"
 XDR_LOOKUPS_ADD_DATA_PATH = "/public_api/v1/xql/lookups/add_data"
 XDR_GET_DATASETS_PATH = "/public_api/v1/xql/get_datasets"
@@ -5961,16 +5985,43 @@ def upload_final_comprehensive_report(scanner, total_scan_time):
         logging.error(f"Error uploading final comprehensive report: {e}")
 
 
-def main(yarafile=None, scan_folder=None, alert_severity="low", mode="scan", options=None,
-         create_alerts=True, write_dataset=True, collect_files=False, throttle_mode="script",
-         cpu_high_threshold=None, cpu_critical_threshold=None, max_pause_secs=None, tenant_id="",
-         lookup_shard=""):
-    """Main entry point for YARA scanner.
+def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, options=None,
+        create_alerts=None, write_dataset=None, collect_files=None, throttle_mode=None,
+        cpu_high_threshold=None, cpu_critical_threshold=None, max_pause_secs=None, tenant_id=None,
+        lookup_shard=None):
+    """Full scanner implementation (internal API).
 
-    `options` is a compact "key=value,key=value" string (parsed into the same knobs as
-    the explicit kwargs; options win). `mode="cancel"` short-circuits to deliver a cancel
-    flag for a running scan instead of starting one.
+    Operators do NOT call this directly through the Action Center — use the `main` entry point,
+    whose only inputs are yarafile / scan_folder / alert_severity. Every other behaviour knob
+    defaults to its CUSTOMER CONFIG constant at the top of this file (edit once per deployment).
+    Any knob left unset (None) falls back to its CONFIG_* constant; an explicit `options`
+    "key=value,key=value" entry still OVERRIDES the constant. `mode="cancel"` short-circuits to
+    deliver a cancel flag for a running scan instead of starting one.
     """
+    # Fall back to the CUSTOMER CONFIG constants for anything not explicitly supplied.
+    if mode is None:
+        mode = CONFIG_MODE
+    if options is None:
+        options = CONFIG_OPTIONS
+    if create_alerts is None:
+        create_alerts = CONFIG_CREATE_ALERTS
+    if write_dataset is None:
+        write_dataset = CONFIG_WRITE_DATASET
+    if collect_files is None:
+        collect_files = CONFIG_COLLECT_FILES
+    if throttle_mode is None:
+        throttle_mode = CONFIG_THROTTLE_MODE
+    if cpu_high_threshold is None:
+        cpu_high_threshold = CONFIG_CPU_HIGH_THRESHOLD
+    if cpu_critical_threshold is None:
+        cpu_critical_threshold = CONFIG_CPU_CRITICAL_THRESHOLD
+    if max_pause_secs is None:
+        max_pause_secs = CONFIG_MAX_PAUSE_SECS
+    if tenant_id is None:
+        tenant_id = CONFIG_TENANT_ID
+    if lookup_shard is None:
+        lookup_shard = CONFIG_LOOKUP_SHARD
+
     # Resolve the compact options string over the explicit kwargs (options win).
     opts = _parse_options_string(options)
 
@@ -6393,7 +6444,7 @@ def main(yarafile=None, scan_folder=None, alert_severity="low", mode="scan", opt
                                            if hasattr(scanner, "results_uploader") and scanner.results_uploader else {}),
                         "dataset_delivery": (dict(getattr(scanner.lookup_uploader, "upload_stats", {}))
                                              if hasattr(scanner, "lookup_uploader") and scanner.lookup_uploader else {}),
-                        "top_rules": sorted(_det.items(), key=lambda kv: kv[1], reverse=True)[:10],
+                        "top_rules": sorted(_det.items(), key=lambda rc: rc[1], reverse=True)[:10],
                     })
                 except Exception as _se:
                     log_manager.log_error(f"scan summary write failed: {_se}")
@@ -6404,21 +6455,43 @@ def main(yarafile=None, scan_folder=None, alert_severity="low", mode="scan", opt
             sys.stderr.flush()
 
 
+# ============================================================================
+# ACTION CENTER ENTRY POINTS
+# ---------------------------------------------------------------------------
+# Cortex XDR's "Run by entry point" turns each parameter of the selected function
+# into an input field the operator fills in. To keep that list short, `main` takes
+# ONLY the three things that change per run — yarafile, scan_folder, alert_severity.
+# Every other behaviour knob lives in the CUSTOMER CONFIG block at the top of this
+# file; edit it once and re-upload. Pick the `cancel` entry point to stop a scan.
+# ============================================================================
+def main(yarafile=None, scan_folder=None, alert_severity="low"):
+    """Action Center entry point — run a YARA scan. Only these 3 inputs are shown to the
+    operator; all other behaviour comes from the CUSTOMER CONFIG constants at the top."""
+    return run(yarafile, scan_folder, alert_severity)
+
+
+def cancel():
+    """Action Center entry point — cancel a running scan on this endpoint (no inputs)."""
+    return run(mode="cancel")
+
+
 if __name__ == "__main__":
     try:
         # Ordered params (matches the XDR script_input order):
         #   1 yarafile  2 scan_folder  3 alert_severity  4 mode  5 options
-        # Empty strings select each param's default. `options` is "key=value,key=value".
+        # Only 1-3 are typically needed now — mode/options fall back to CONFIG_MODE/CONFIG_OPTIONS
+        # (and every other behaviour knob to its CUSTOMER CONFIG constant) when left blank.
+        # An empty string for any input selects the CONFIG_* default.
         def _argv(i):
             return sys.argv[i] if len(sys.argv) > i and str(sys.argv[i]).strip() else None
 
         yarafile_arg = _argv(1)
         scan_folder_arg = _argv(2)
         alert_severity_arg = _parse_alert_severity(_argv(3), "alert_severity") if _argv(3) else "low"
-        mode_arg = _argv(4) or "scan"
-        options_arg = _argv(5)
+        mode_arg = _argv(4)      # blank -> CONFIG_MODE
+        options_arg = _argv(5)   # blank -> CONFIG_OPTIONS
 
-        result = main(
+        result = run(
             yarafile_arg,
             scan_folder_arg,
             alert_severity_arg,

@@ -59,7 +59,7 @@ def build(scanner_path, env, rules_b64, scan_folder, severity, mode, options, se
             "\n\n# ===== snippet footer: cancel =====\n"
             "import traceback as _tb\n"
             "try:\n"
-            f"    print('SCAN_RESULT: ' + str(main(None, None, 'low', mode='cancel', options={opts_literal})))\n"
+            f"    print('SCAN_RESULT: ' + str(run(None, None, 'low', mode='cancel', options={opts_literal})))\n"
             "except Exception:\n"
             "    print('SNIPPET_ERROR:\\n' + _tb.format_exc())\n"
         )
@@ -101,7 +101,7 @@ def build(scanner_path, env, rules_b64, scan_folder, severity, mode, options, se
             f"_RULES_B64 = '{rules_b64}'\n"
             f"{prelude}"
             "try:\n"
-            f"    print('SCAN_RESULT: ' + str(main(_RULES_B64, {target_expr}, {severity!r}, mode={mode!r}, options={opts_literal})))\n"
+            f"    print('SCAN_RESULT: ' + str(run(_RULES_B64, {target_expr}, {severity!r}, mode={mode!r}, options={opts_literal})))\n"
             "except Exception:\n"
             "    print('SNIPPET_ERROR:\\n' + _tb.format_exc())\n"
         )

@@ -80,21 +80,30 @@ The scanner now supports both Cortex XDR API auth models and **auto-detects** wh
 
 Set `XDR_AUTH_TYPE` (`auto` | `advanced` | `standard`, default `auto`) to override. All API calls (Insert Parsed Alerts, `add_dataset`, `add_data`, `get_datasets`) route through one `build_xdr_headers()` helper. *Advanced-key tenants previously received nothing — the Standard-only header returned HTTP 401 on every upload.*
 
-### 🎛️ Runtime options (`options` parameter)
-Passed as a compact `key=value,key=value` string (also available as env-var fallbacks for standalone runs). All are optional:
+### 🎛️ CUSTOMER CONFIG — edit the script, not the run inputs
+So operators aren't faced with a long input list on every scan, the behaviour knobs live in a
+**`CUSTOMER CONFIG` block at the top of `xdr_yara_scanner.py`**. Edit it once for your deployment
+and (re)upload the script. The Action Center **`main`** entry point then exposes only **3 inputs** —
+`yarafile`, `scan_folder`, `alert_severity` — and the **`cancel`** entry point takes none.
 
-| Option | Values | Default | Effect |
-|--------|--------|---------|--------|
-| `create_alerts` | true/false | `true` | Insert Parsed Alerts (feeds XDR alerts → incident creation) |
-| `write_dataset` | true/false | `true` | Write to the lookup datasets |
-| `collect_files` | true/false | **`false`** | Copy matched files into the evidence zip (metadata-only when off) |
-| `throttle_mode` | script/os/off | `script` | CPU pacing strategy (below) |
-| `cpu_high_threshold` | 1–100 | `80` | Pause-entry threshold (% system CPU) |
-| `cpu_critical_threshold` | 1–100 | `90` | Critical threshold (logged separately) |
-| `max_pause_secs` | ≥0 (`0`=unbounded) | `300` | Cap on one continuous CPU pause |
-| `tenant_id` | string | derived | Override the tenant slug (else parsed from the API URL) |
+| Constant | Values | Default | Effect |
+|----------|--------|---------|--------|
+| `CONFIG_MODE` | scan/cancel | `scan` | Default action for `main` |
+| `CONFIG_CREATE_ALERTS` | True/False | `True` | Insert Parsed Alerts (→ incident creation) |
+| `CONFIG_WRITE_DATASET` | True/False | `True` | Write the lookup datasets |
+| `CONFIG_COLLECT_FILES` | True/False | **`False`** | Copy matched files into the evidence zip |
+| `CONFIG_THROTTLE_MODE` | script/os/off | `script` | CPU pacing strategy (below) |
+| `CONFIG_CPU_HIGH_THRESHOLD` | int/None | `None` | Pause-entry % CPU (None = profile default) |
+| `CONFIG_CPU_CRITICAL_THRESHOLD` | int/None | `None` | Critical % CPU (None = profile default) |
+| `CONFIG_MAX_PAUSE_SECS` | int/None | `None` | Cap on one continuous CPU pause |
+| `CONFIG_TENANT_ID` | string | `""` | Tenant tag (`""` = derive from API URL) |
+| `CONFIG_LOOKUP_SHARD` | endpoint/none/label | `endpoint` | Per-writer dataset sharding |
+| `CONFIG_OPTIONS` | `key=value,...` | `""` | Rarely-needed extra overrides applied every run |
 
-Every run's summary and logs include a **posture** string, e.g. `alerts=on dataset=on files=off throttle=script mode=scan`.
+Advanced/automation callers (the CLI and the internal `run(...)` API) can still pass a per-run
+`options` string that overrides any constant, but the operator-facing `main` entry point does not
+expose it. Every run's summary and logs include a **posture** string, e.g.
+`alerts=on dataset=on files=off throttle=script mode=scan`.
 
 ### 🧮 Resource management
 - **Configurable throttling** via the thresholds above (was hardcoded).
@@ -126,11 +135,11 @@ Browser caches are **no longer bypassed** (removed from the skip list), and a `f
 
 ### 🎛️ Automation playbooks
 - **`playbooks/YARA_Scanner_Runner.yml`** and **`playbooks/YARA_Scanner_Canceller.yml`** launch / cancel the scanner on targeted agents via the built-in **Cortex Core - IR** integration (`core-get-scripts` → `core-get-endpoints` → `core-script-run`), for manual runs or scheduled **Jobs**.
-- Works on Cortex XDR (the `edr` module) and XSIAM. **Prerequisite:** the scanner must be uploaded to the Action Center library with exactly the 5 string inputs (`yarafile, scan_folder, alert_severity, mode, options`) — `core-script-run` rejects a mismatched parameter set. See `playbooks/README.md` for import, run, Job scheduling, and verification.
+- Works on Cortex XDR (the `edr` module) and XSIAM. **Prerequisite:** the scanner must be uploaded to the Action Center library with the `main` entry point's **3 string inputs** (`yarafile, scan_folder, alert_severity`) — `core-script-run` rejects a mismatched parameter set. All other behaviour is in the CUSTOMER CONFIG block. See `playbooks/README.md` for import, run, Job scheduling, and verification.
 
 ### 📘 Deployment guides
 Step-by-step deployment guides (Markdown + Word) live in **`docs/guides/`**:
-- **`XDR_YARA_Scanner_Guide`** — Advanced/Standard auth, library upload with the 5 inputs, run via UI/API/playbook, cancellation, lookup datasets + dashboard, XQL recipes.
+- **`XDR_YARA_Scanner_Guide`** — Advanced/Standard auth, library upload with the 3 inputs (+ CUSTOMER CONFIG), run via UI/API/playbook, cancellation, lookup datasets + dashboard, XQL recipes.
 - **`XSIAM_YARA_Scanner_Guide`** — HTTP Log Collector + parsing rule, `yara_scans_raw` ingestion, dashboards, XQL recipes, tuning.
 
 ---
