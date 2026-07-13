@@ -106,12 +106,18 @@ expose it. Every run's summary and logs include a **posture** string, e.g.
 `alerts=on dataset=on files=off throttle=script mode=scan`.
 
 **Throughput tuning for match-heavy scans (module constants near the top of the script).** Alerts
-are uploaded in **batches** (the Insert Parsed Alerts API takes a list — up to 60 per call), and
-lookup rows in batches of ~1000, so a scan that finds tens of thousands of matches can actually
-deliver them all before it ends. Tune via `ALERT_BATCH_SIZE` (≤60, clamped), `ALERT_FLUSH_SECS`,
-`ALERT_DRAIN_SECS`, and `LOOKUP_DATASET_BATCH_SIZE` — each also overridable by the matching
-`YARA_ALERT_*` / `YARA_LOOKUP_*` env var. Each scan's `alert_delivery` / `dataset_delivery` counts
-in the summary JSON show exactly how many landed.
+are uploaded in **batches** (the Insert Parsed Alerts API takes a list — **hard cap 60 per call**)
+and **paced** to respect the API's ~600-alerts/min rate limit (it returns HTTP 500 *"Exceeding the
+rate limit"* when tripped, and un-paced batches fail-storm). Lookup rows batch at ~1000/POST. Tune
+via `ALERT_BATCH_SIZE` (≤60, clamped), `ALERT_MIN_BATCH_INTERVAL` (rate-limit pacing),
+`ALERT_FLUSH_SECS`, `ALERT_DRAIN_SECS`, and `LOOKUP_DATASET_BATCH_SIZE` — each overridable by the
+matching `YARA_ALERT_*` / `YARA_LOOKUP_*` env var.
+
+> The alert channel is **rate-limited by XDR (~600/min)**, so a pathological scan that finds tens
+> of thousands of matches (e.g. an over-broad rule) cannot alert-deliver them all within the scan —
+> pacing makes those deliver *cleanly up to the limit* instead of failing, and the **lookup datasets
+> remain the complete record**. Well-tuned rules never approach this. Each scan's `alert_delivery` /
+> `dataset_delivery` counts in the summary JSON show exactly how many landed.
 
 ### 🧮 Resource management
 - **Configurable throttling** via the thresholds above (was hardcoded).
