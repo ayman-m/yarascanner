@@ -2883,7 +2883,11 @@ class ResultsUploader:
             'successful_uploads': 0,
             'failed_uploads': 0
         }
-        
+        # Rate-limit counters so a sustained upload failure (or a very match-heavy scan) can't
+        # bloat the logs with one line per matched string — a placeholder-cred run produced
+        # ~36k identical "Invalid URL" error lines (10 MB) before this.
+        self._rl_counters = {}
+
         # create_alerts gates the Insert Parsed Alerts channel (XDR alerts -> incidents).
         if UPLOAD_RESULTS and getattr(config, "create_alerts", True):
             self._start_upload_thread()
@@ -3003,6 +3007,23 @@ class ResultsUploader:
         }
         return {"request_data": {"alerts": [alert]}}
 
+    def _throttled_log(self, bucket, msg, level="error", full=20, every=1000):
+        """Log the first `full` messages in a bucket, then suppress and emit only a periodic
+        running count every `every`. Keeps per-match upload noise from ballooning the log files
+        on a sustained failure while still surfacing that something is wrong (and how much)."""
+        if not self.log_manager:
+            return
+        n = self._rl_counters.get(bucket, 0) + 1
+        self._rl_counters[bucket] = n
+        emit = self.log_manager.log_error if level == "error" else self.log_manager.log_upload
+        if n <= full:
+            emit(msg)
+        elif n == full + 1:
+            emit(f"[{bucket}] further similar messages suppressed; will summarize every {every}. "
+                 f"Example: {msg[:120]}")
+        elif n % every == 0:
+            emit(f"[{bucket}] {n} occurrences so far; latest: {msg[:120]}")
+
     def _upload_standard_result(self, standard_log: StandardLogEntry):
         """Upload YARA match with bounded retries."""
         payload = self._build_xdr_parsed_alert(standard_log)
@@ -3028,47 +3049,40 @@ class ResultsUploader:
                         pass
                     if not api_reply_ok:
                         self.upload_stats['failed_uploads'] += 1
-                        if self.log_manager:
-                            self.log_manager.log_error("XDR Insert Parsed Alerts returned false")
+                        self._throttled_log("alert_upload_err", "XDR Insert Parsed Alerts returned false")
                         return False
                     self.upload_stats['successful_uploads'] += 1
-                    if self.log_manager:
-                        self.log_manager.log_upload(f"YARA match upload successful (HTTP {resp.status_code})")
+                    self._throttled_log("alert_upload_ok",
+                                        f"YARA match upload successful (HTTP {resp.status_code})", level="upload")
                     return True
 
                 if resp.status_code in (408, 429, 500, 502, 503, 504):
                     delay = _exp_backoff_delay(attempt)
-                    if self.log_manager:
-                        self.log_manager.log_upload(
-                            f"Upload failed (HTTP {resp.status_code}). Body: {resp.text[:500]}. "
-                            f"Retrying in {delay:.1f}s (attempt {attempt}/{MAX_RETRIES_PER_ITEM})."
-                        )
+                    self._throttled_log("alert_upload_retry",
+                        f"Upload failed (HTTP {resp.status_code}). Body: {resp.text[:200]}. "
+                        f"Retrying in {delay:.1f}s (attempt {attempt}/{MAX_RETRIES_PER_ITEM}).", level="upload")
                     time.sleep(delay)
                     continue
 
                 self.upload_stats['failed_uploads'] += 1
-                if self.log_manager:
-                    self.log_manager.log_error(f"YARA match upload failed (HTTP {resp.status_code}): {resp.text}")
+                self._throttled_log("alert_upload_err",
+                                    f"YARA match upload failed (HTTP {resp.status_code}): {resp.text[:200]}")
                 return False
 
             except (requests.Timeout, requests.ConnectionError) as e:
                 delay = _exp_backoff_delay(attempt)
-                if self.log_manager:
-                    self.log_manager.log_upload(
-                        f"Network error uploading result: {e}. Retrying in {delay:.1f}s "
-                        f"(attempt {attempt}/{MAX_RETRIES_PER_ITEM})."
-                    )
+                self._throttled_log("alert_upload_retry",
+                    f"Network error uploading result: {str(e)[:160]}. Retrying in {delay:.1f}s "
+                    f"(attempt {attempt}/{MAX_RETRIES_PER_ITEM}).", level="upload")
                 time.sleep(delay)
 
             except Exception as e:
                 self.upload_stats['failed_uploads'] += 1
-                if self.log_manager:
-                    self.log_manager.log_error(f"YARA match upload unexpected error: {e}")
+                self._throttled_log("alert_upload_err", f"YARA match upload unexpected error: {e}")
                 return False
 
         self.upload_stats['failed_uploads'] += 1
-        if self.log_manager:
-            self.log_manager.log_error("Max retries reached for payload. Abandoning.")
+        self._throttled_log("alert_upload_err", "Max retries reached for payload. Abandoning.")
         return False
 
     def stop(self, wait=True):
@@ -3146,11 +3160,11 @@ class ResultsUploader:
                         }
                     )
                     self.upload_queue.put(standard_log, timeout=1.0)
-                    if self.log_manager:
-                        self.log_manager.log_upload(f"Queued match for upload: rule='{rule}', offset={offset}")
+                    self._throttled_log("queued_match",
+                                        f"Queued match for upload: rule='{rule}', offset={offset}", level="upload")
                 except Exception:
-                    if self.log_manager:
-                        self.log_manager.log_upload("Upload queue full - skipping real-time upload for match")
+                    self._throttled_log("queue_full", "Upload queue full - skipping real-time upload for match",
+                                        level="upload")
 
             lookup_uploader = getattr(self, "lookup_uploader", None)
             if lookup_uploader is not None:
@@ -3182,8 +3196,8 @@ class ResultsUploader:
                 }
                 lookup_uploader.add(lookup_record)
 
-        if self.log_manager:
-            self.log_manager.log_upload(f"Added {match_count} matches for rule '{rule}' in file: {filename}")
+        self._throttled_log("added_matches",
+                            f"Added {match_count} matches for rule '{rule}' in file: {filename}", level="upload")
 
     def save_results(self):
         """Save results to JSON file."""
