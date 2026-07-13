@@ -1,0 +1,100 @@
+rule Big_M_0000 { meta: threat_level = "high" strings: $s = "sekurlsa::logonpasswords" ascii nocase condition: $s }
+rule Big_M_0001 { meta: threat_level = "high" strings: $s = "YOUR FILES HAVE BEEN ENCRYPTED" ascii nocase condition: $s }
+rule Big_M_0002 { meta: threat_level = "high" strings: $s = "certutil -urlcache -split -f" ascii nocase condition: $s }
+rule Big_M_0003 { meta: threat_level = "high" strings: $s = "eval($_POST" ascii nocase condition: $s }
+rule Big_M_0004 { meta: threat_level = "high" strings: $s = "-EncodedCommand" ascii nocase condition: $s }
+rule Big_M_0005 { meta: threat_level = "high" strings: $s = "EICAR-STANDARD-ANTIVIRUS-TEST-FILE" ascii nocase condition: $s }
+rule Big_M_0006 { meta: threat_level = "high" strings: $s = "ReflectiveLoader" ascii nocase condition: $s }
+rule Big_M_0007 { meta: threat_level = "high" strings: $s = "kerberos::list" ascii nocase condition: $s }
+rule Big_M_0008 { meta: threat_level = "high" strings: $s = "gentilkiwi" ascii nocase condition: $s }
+rule Big_M_0009 { meta: threat_level = "high" strings: $s = "mimikatz" ascii nocase condition: $s }
+rule Big_N_0000 { meta: threat_level = "low" strings: $a = "noise_00000_alpha" $b = "noise_00000_beta" condition: all of them }
+rule Big_N_0001 { meta: threat_level = "low" strings: $a = "noise_00001_alpha" $b = "noise_00001_beta" condition: all of them }
+rule Big_N_0002 { meta: threat_level = "low" strings: $a = "noise_00002_alpha" $b = "noise_00002_beta" condition: all of them }
+rule Big_N_0003 { meta: threat_level = "low" strings: $a = "noise_00003_alpha" $b = "noise_00003_beta" condition: all of them }
+rule Big_N_0004 { meta: threat_level = "low" strings: $a = "noise_00004_alpha" $b = "noise_00004_beta" condition: all of them }
+rule Big_N_0005 { meta: threat_level = "low" strings: $a = "noise_00005_alpha" $b = "noise_00005_beta" condition: all of them }
+rule Big_N_0006 { meta: threat_level = "low" strings: $a = "noise_00006_alpha" $b = "noise_00006_beta" condition: all of them }
+rule Big_N_0007 { meta: threat_level = "low" strings: $a = "noise_00007_alpha" $b = "noise_00007_beta" condition: all of them }
+rule Big_N_0008 { meta: threat_level = "low" strings: $a = "noise_00008_alpha" $b = "noise_00008_beta" condition: all of them }
+rule Big_N_0009 { meta: threat_level = "low" strings: $a = "noise_00009_alpha" $b = "noise_00009_beta" condition: all of them }
+rule Big_N_0010 { meta: threat_level = "low" strings: $a = "noise_00010_alpha" $b = "noise_00010_beta" condition: all of them }
+rule Big_N_0011 { meta: threat_level = "low" strings: $a = "noise_00011_alpha" $b = "noise_00011_beta" condition: all of them }
+rule Big_N_0012 { meta: threat_level = "low" strings: $a = "noise_00012_alpha" $b = "noise_00012_beta" condition: all of them }
+rule Big_N_0013 { meta: threat_level = "low" strings: $a = "noise_00013_alpha" $b = "noise_00013_beta" condition: all of them }
+rule Big_N_0014 { meta: threat_level = "low" strings: $a = "noise_00014_alpha" $b = "noise_00014_beta" condition: all of them }
+rule Big_N_0015 { meta: threat_level = "low" strings: $a = "noise_00015_alpha" $b = "noise_00015_beta" condition: all of them }
+rule Big_N_0016 { meta: threat_level = "low" strings: $a = "noise_00016_alpha" $b = "noise_00016_beta" condition: all of them }
+rule Big_N_0017 { meta: threat_level = "low" strings: $a = "noise_00017_alpha" $b = "noise_00017_beta" condition: all of them }
+rule Big_N_0018 { meta: threat_level = "low" strings: $a = "noise_00018_alpha" $b = "noise_00018_beta" condition: all of them }
+rule Big_N_0019 { meta: threat_level = "low" strings: $a = "noise_00019_alpha" $b = "noise_00019_beta" condition: all of them }
+rule Big_N_0020 { meta: threat_level = "low" strings: $a = "noise_00020_alpha" $b = "noise_00020_beta" condition: all of them }
+rule Big_N_0021 { meta: threat_level = "low" strings: $a = "noise_00021_alpha" $b = "noise_00021_beta" condition: all of them }
+rule Big_N_0022 { meta: threat_level = "low" strings: $a = "noise_00022_alpha" $b = "noise_00022_beta" condition: all of them }
+rule Big_N_0023 { meta: threat_level = "low" strings: $a = "noise_00023_alpha" $b = "noise_00023_beta" condition: all of them }
+rule Big_N_0024 { meta: threat_level = "low" strings: $a = "noise_00024_alpha" $b = "noise_00024_beta" condition: all of them }
+rule Big_N_0025 { meta: threat_level = "low" strings: $a = "noise_00025_alpha" $b = "noise_00025_beta" condition: all of them }
+rule Big_N_0026 { meta: threat_level = "low" strings: $a = "noise_00026_alpha" $b = "noise_00026_beta" condition: all of them }
+rule Big_N_0027 { meta: threat_level = "low" strings: $a = "noise_00027_alpha" $b = "noise_00027_beta" condition: all of them }
+rule Big_N_0028 { meta: threat_level = "low" strings: $a = "noise_00028_alpha" $b = "noise_00028_beta" condition: all of them }
+rule Big_N_0029 { meta: threat_level = "low" strings: $a = "noise_00029_alpha" $b = "noise_00029_beta" condition: all of them }
+rule Big_N_0030 { meta: threat_level = "low" strings: $a = "noise_00030_alpha" $b = "noise_00030_beta" condition: all of them }
+rule Big_N_0031 { meta: threat_level = "low" strings: $a = "noise_00031_alpha" $b = "noise_00031_beta" condition: all of them }
+rule Big_N_0032 { meta: threat_level = "low" strings: $a = "noise_00032_alpha" $b = "noise_00032_beta" condition: all of them }
+rule Big_N_0033 { meta: threat_level = "low" strings: $a = "noise_00033_alpha" $b = "noise_00033_beta" condition: all of them }
+rule Big_N_0034 { meta: threat_level = "low" strings: $a = "noise_00034_alpha" $b = "noise_00034_beta" condition: all of them }
+rule Big_N_0035 { meta: threat_level = "low" strings: $a = "noise_00035_alpha" $b = "noise_00035_beta" condition: all of them }
+rule Big_N_0036 { meta: threat_level = "low" strings: $a = "noise_00036_alpha" $b = "noise_00036_beta" condition: all of them }
+rule Big_N_0037 { meta: threat_level = "low" strings: $a = "noise_00037_alpha" $b = "noise_00037_beta" condition: all of them }
+rule Big_N_0038 { meta: threat_level = "low" strings: $a = "noise_00038_alpha" $b = "noise_00038_beta" condition: all of them }
+rule Big_N_0039 { meta: threat_level = "low" strings: $a = "noise_00039_alpha" $b = "noise_00039_beta" condition: all of them }
+rule Big_N_0040 { meta: threat_level = "low" strings: $a = "noise_00040_alpha" $b = "noise_00040_beta" condition: all of them }
+rule Big_N_0041 { meta: threat_level = "low" strings: $a = "noise_00041_alpha" $b = "noise_00041_beta" condition: all of them }
+rule Big_N_0042 { meta: threat_level = "low" strings: $a = "noise_00042_alpha" $b = "noise_00042_beta" condition: all of them }
+rule Big_N_0043 { meta: threat_level = "low" strings: $a = "noise_00043_alpha" $b = "noise_00043_beta" condition: all of them }
+rule Big_N_0044 { meta: threat_level = "low" strings: $a = "noise_00044_alpha" $b = "noise_00044_beta" condition: all of them }
+rule Big_N_0045 { meta: threat_level = "low" strings: $a = "noise_00045_alpha" $b = "noise_00045_beta" condition: all of them }
+rule Big_N_0046 { meta: threat_level = "low" strings: $a = "noise_00046_alpha" $b = "noise_00046_beta" condition: all of them }
+rule Big_N_0047 { meta: threat_level = "low" strings: $a = "noise_00047_alpha" $b = "noise_00047_beta" condition: all of them }
+rule Big_N_0048 { meta: threat_level = "low" strings: $a = "noise_00048_alpha" $b = "noise_00048_beta" condition: all of them }
+rule Big_N_0049 { meta: threat_level = "low" strings: $a = "noise_00049_alpha" $b = "noise_00049_beta" condition: all of them }
+rule Big_N_0050 { meta: threat_level = "low" strings: $a = "noise_00050_alpha" $b = "noise_00050_beta" condition: all of them }
+rule Big_N_0051 { meta: threat_level = "low" strings: $a = "noise_00051_alpha" $b = "noise_00051_beta" condition: all of them }
+rule Big_N_0052 { meta: threat_level = "low" strings: $a = "noise_00052_alpha" $b = "noise_00052_beta" condition: all of them }
+rule Big_N_0053 { meta: threat_level = "low" strings: $a = "noise_00053_alpha" $b = "noise_00053_beta" condition: all of them }
+rule Big_N_0054 { meta: threat_level = "low" strings: $a = "noise_00054_alpha" $b = "noise_00054_beta" condition: all of them }
+rule Big_N_0055 { meta: threat_level = "low" strings: $a = "noise_00055_alpha" $b = "noise_00055_beta" condition: all of them }
+rule Big_N_0056 { meta: threat_level = "low" strings: $a = "noise_00056_alpha" $b = "noise_00056_beta" condition: all of them }
+rule Big_N_0057 { meta: threat_level = "low" strings: $a = "noise_00057_alpha" $b = "noise_00057_beta" condition: all of them }
+rule Big_N_0058 { meta: threat_level = "low" strings: $a = "noise_00058_alpha" $b = "noise_00058_beta" condition: all of them }
+rule Big_N_0059 { meta: threat_level = "low" strings: $a = "noise_00059_alpha" $b = "noise_00059_beta" condition: all of them }
+rule Big_N_0060 { meta: threat_level = "low" strings: $a = "noise_00060_alpha" $b = "noise_00060_beta" condition: all of them }
+rule Big_N_0061 { meta: threat_level = "low" strings: $a = "noise_00061_alpha" $b = "noise_00061_beta" condition: all of them }
+rule Big_N_0062 { meta: threat_level = "low" strings: $a = "noise_00062_alpha" $b = "noise_00062_beta" condition: all of them }
+rule Big_N_0063 { meta: threat_level = "low" strings: $a = "noise_00063_alpha" $b = "noise_00063_beta" condition: all of them }
+rule Big_N_0064 { meta: threat_level = "low" strings: $a = "noise_00064_alpha" $b = "noise_00064_beta" condition: all of them }
+rule Big_N_0065 { meta: threat_level = "low" strings: $a = "noise_00065_alpha" $b = "noise_00065_beta" condition: all of them }
+rule Big_N_0066 { meta: threat_level = "low" strings: $a = "noise_00066_alpha" $b = "noise_00066_beta" condition: all of them }
+rule Big_N_0067 { meta: threat_level = "low" strings: $a = "noise_00067_alpha" $b = "noise_00067_beta" condition: all of them }
+rule Big_N_0068 { meta: threat_level = "low" strings: $a = "noise_00068_alpha" $b = "noise_00068_beta" condition: all of them }
+rule Big_N_0069 { meta: threat_level = "low" strings: $a = "noise_00069_alpha" $b = "noise_00069_beta" condition: all of them }
+rule Big_N_0070 { meta: threat_level = "low" strings: $a = "noise_00070_alpha" $b = "noise_00070_beta" condition: all of them }
+rule Big_N_0071 { meta: threat_level = "low" strings: $a = "noise_00071_alpha" $b = "noise_00071_beta" condition: all of them }
+rule Big_N_0072 { meta: threat_level = "low" strings: $a = "noise_00072_alpha" $b = "noise_00072_beta" condition: all of them }
+rule Big_N_0073 { meta: threat_level = "low" strings: $a = "noise_00073_alpha" $b = "noise_00073_beta" condition: all of them }
+rule Big_N_0074 { meta: threat_level = "low" strings: $a = "noise_00074_alpha" $b = "noise_00074_beta" condition: all of them }
+rule Big_N_0075 { meta: threat_level = "low" strings: $a = "noise_00075_alpha" $b = "noise_00075_beta" condition: all of them }
+rule Big_N_0076 { meta: threat_level = "low" strings: $a = "noise_00076_alpha" $b = "noise_00076_beta" condition: all of them }
+rule Big_N_0077 { meta: threat_level = "low" strings: $a = "noise_00077_alpha" $b = "noise_00077_beta" condition: all of them }
+rule Big_N_0078 { meta: threat_level = "low" strings: $a = "noise_00078_alpha" $b = "noise_00078_beta" condition: all of them }
+rule Big_N_0079 { meta: threat_level = "low" strings: $a = "noise_00079_alpha" $b = "noise_00079_beta" condition: all of them }
+rule Big_N_0080 { meta: threat_level = "low" strings: $a = "noise_00080_alpha" $b = "noise_00080_beta" condition: all of them }
+rule Big_N_0081 { meta: threat_level = "low" strings: $a = "noise_00081_alpha" $b = "noise_00081_beta" condition: all of them }
+rule Big_N_0082 { meta: threat_level = "low" strings: $a = "noise_00082_alpha" $b = "noise_00082_beta" condition: all of them }
+rule Big_N_0083 { meta: threat_level = "low" strings: $a = "noise_00083_alpha" $b = "noise_00083_beta" condition: all of them }
+rule Big_N_0084 { meta: threat_level = "low" strings: $a = "noise_00084_alpha" $b = "noise_00084_beta" condition: all of them }
+rule Big_N_0085 { meta: threat_level = "low" strings: $a = "noise_00085_alpha" $b = "noise_00085_beta" condition: all of them }
+rule Big_N_0086 { meta: threat_level = "low" strings: $a = "noise_00086_alpha" $b = "noise_00086_beta" condition: all of them }
+rule Big_N_0087 { meta: threat_level = "low" strings: $a = "noise_00087_alpha" $b = "noise_00087_beta" condition: all of them }
+rule Big_N_0088 { meta: threat_level = "low" strings: $a = "noise_00088_alpha" $b = "noise_00088_beta" condition: all of them }
+rule Big_N_0089 { meta: threat_level = "low" strings: $a = "noise_00089_alpha" $b = "noise_00089_beta" condition: all of them }

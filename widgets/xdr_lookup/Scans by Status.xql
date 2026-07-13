@@ -6,7 +6,7 @@
   Dataset(s): yara_scanner_scans. Lookup rows carry no _time; time-filter on
   event_timestamp_ms. tenant_id is present on every row for multi-tenant views.
 **************************************************************************/
-dataset = yara_scanner_scans
+dataset = yara_scanner_scans*
 | sort desc event_timestamp_ms
 | dedup scan_id
 | comp count() as scans by status

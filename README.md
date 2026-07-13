@@ -105,11 +105,11 @@ Every run's summary and logs include a **posture** string, e.g. `alerts=on datas
 Run the same script with `mode=cancel` on the endpoint to drop a cooperative cancel flag; a running scan's watcher detects it within ~5 s and shuts down gracefully — draining uploaders, writing a terminal `cancelled` lifecycle row, and returning `Scan cancelled by operator: …` (exit 0). POSIX `SIGTERM`/`SIGINT` route into the same path.
 
 ### 🗂️ Lookup datasets + tenant identity
-Two **fixed-name** datasets replace the old daily-rotating one (so dashboards can reference them literally):
-- **`yara_scanner_matches`** — one row per matched string; now includes `tenant_id` and `scan_date`.
-- **`yara_scanner_scans`** — scan lifecycle rows (`initiated` / `running` heartbeat / `completed` / `cancelled` / `failed`) with counts, throttle mode, paused time, and posture.
+Two **per-endpoint sharded** datasets (`_v2_<host>`) — the fix for XDR's `add_data` concurrency limitation, where many endpoints writing one shared dataset collide on a server-side clone-table race and lose rows. One writer per dataset lands 100% at any fleet scale; dashboards fan the shards back in with a `yara_scanner_matches*` wildcard.
+- **`yara_scanner_matches_v2_<host>`** — one row per matched string; carries `tenant_id`, `scan_date`, `os_type`, `file_size`, `scan_folder`, `matched_length`.
+- **`yara_scanner_scans_v2_<host>`** — scan lifecycle rows (`initiated` / `running` heartbeat / `completed` / `cancelled` / `failed`) with counts, `os_type`, `scan_folder`, throttle mode, paused time, and posture.
 
-Growth is bounded by the `scan_date` column (targeted `lookups/remove_data` pruning) instead of a rotating name.
+Sharding is configurable (`lookup_shard` option / `YARA_LOOKUP_SHARD`: `endpoint` default, `none`, or a literal). The `_v2` tag is a schema version (bump on row-shape changes). Growth is bounded by the `scan_date` column (targeted `lookups/remove_data` pruning). Each run also drops a machine-readable `scan_summary_<run_id>.json` on the endpoint.
 
 ### 🌐 Scan scope
 Browser caches are **no longer bypassed** (removed from the skip list), and a `force_scan_fragments` allowlist re-opens browser caches on macOS where the broad `Library/Caches/` exclusion would otherwise swallow them.
@@ -121,7 +121,7 @@ Browser caches are **no longer bypassed** (removed from the skip list), and a `f
 - Hosts without systemd log-and-skip cleanup instead of erroring.
 
 ### 📊 Dashboard & 🧪 test skill
-- New **`dashboards/Yara XDR Scanner (Lookup).json`** + `widgets/xdr_lookup/*.xql` built on the two lookup datasets (every widget carries `tenant_id`).
+- Comprehensive **`dashboards/Yara XDR Scanner (Lookup).json`** (40 widgets) + `widgets/xdr_lookup/*.xql`, built on the sharded lookup datasets via the `yara_scanner_matches*` / `yara_scanner_scans*` wildcards plus the reliable `alerts` channel. Covers detections (by OS/folder/file-size/severity), fleet coverage, rule health, throughput/throttle, KPI tiles, and alert trends. Every query is validated live against the tenant.
 - A bundled Claude skill, **`.claude/skills/xdr-yara-scan-test/`**, drives the scanner on a live endpoint through the XDR API (via `run_snippet_code_script`, no library upload) and verifies the datasets. See its `SKILL.md`.
 
 ### 🎛️ Automation playbooks
