@@ -61,6 +61,10 @@ MAX_RETRIES_PER_ITEM = 4             # per-batch retry cap (Insert Parsed Alerts
 ALERT_BATCH_SIZE = min(60, int(os.environ.get("YARA_ALERT_BATCH", "60") or 60))  # alerts per POST (XDR HARD CAP = 60; clamped)
 ALERT_FLUSH_SECS = float(os.environ.get("YARA_ALERT_FLUSH_SECS", "10") or 10)     # flush a partial batch after this idle
 ALERT_DRAIN_SECS = float(os.environ.get("YARA_ALERT_DRAIN_SECS", "60") or 60)     # max wait to drain pending alerts at scan end
+# Insert Parsed Alerts is RATE-LIMITED (~600 alerts/min; the API returns HTTP 500 "Exceeding the
+# rate limit" when tripped). Pace batches to stay under it: 60 alerts every >=7s ~= 510/min. Without
+# pacing, over-fast batches fail and their retries burn the upload window, starving the rest.
+ALERT_MIN_BATCH_INTERVAL = float(os.environ.get("YARA_ALERT_MIN_INTERVAL", "7") or 7)  # min secs between alert POSTs
 BASE_BACKOFF_SECS = 1.0              # initial backoff
 MAX_BACKOFF_SECS = 30.0              # backoff ceiling
 CIRCUIT_FAILURE_THRESHOLD = 5        # open after N consecutive failures
@@ -2895,6 +2899,7 @@ class ResultsUploader:
         # bloat the logs with one line per matched string — a placeholder-cred run produced
         # ~36k identical "Invalid URL" error lines (10 MB) before this.
         self._rl_counters = {}
+        self._last_alert_post = 0.0  # monotonic time of the last alert POST (for rate-limit pacing)
 
         # create_alerts gates the Insert Parsed Alerts channel (XDR alerts -> incidents).
         if UPLOAD_RESULTS and getattr(config, "create_alerts", True):
@@ -3071,12 +3076,19 @@ class ResultsUploader:
         payload = {"request_data": {"alerts": alerts}}
         endpoint = _build_xdr_insert_alerts_url(XDR_API_URL)
 
+        # Pace to stay under the alert-API rate limit (~600 alerts/min). Sleep out the remainder of
+        # the min interval since the last POST before hitting the API again.
+        _gap = ALERT_MIN_BATCH_INTERVAL - (time.monotonic() - self._last_alert_post)
+        if _gap > 0:
+            time.sleep(_gap)
+
         attempt = 0
         while attempt < MAX_RETRIES_PER_ITEM:
             attempt += 1
             try:
                 resp = requests.post(url=endpoint, headers=build_xdr_headers(self.log_manager),
                                      json=payload, timeout=DEFAULT_TIMEOUT_SECS)
+                self._last_alert_post = time.monotonic()
                 if 200 <= resp.status_code < 300:
                     api_reply_ok = True
                     try:
@@ -3095,10 +3107,13 @@ class ResultsUploader:
                     return
 
                 if resp.status_code in (408, 429, 500, 502, 503, 504):
-                    delay = _exp_backoff_delay(attempt)
+                    # A rate-limit hit needs a real cooldown, not a 1-2s retry that trips it again.
+                    rate_limited = resp.status_code == 429 or "rate limit" in resp.text.lower()
+                    delay = max(_exp_backoff_delay(attempt), ALERT_MIN_BATCH_INTERVAL * 2) if rate_limited \
+                        else _exp_backoff_delay(attempt)
                     self._throttled_log("alert_upload_retry",
-                        f"Alert batch failed (HTTP {resp.status_code}). Body: {resp.text[:200]}. "
-                        f"Retry {attempt}/{MAX_RETRIES_PER_ITEM} in {delay:.1f}s.", level="upload")
+                        f"Alert batch failed (HTTP {resp.status_code}){' [rate-limited]' if rate_limited else ''}. "
+                        f"Body: {resp.text[:160]}. Retry {attempt}/{MAX_RETRIES_PER_ITEM} in {delay:.1f}s.", level="upload")
                     time.sleep(delay)
                     continue
 
