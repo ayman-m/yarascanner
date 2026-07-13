@@ -52,7 +52,15 @@ import yara
 UPLOAD_RESULTS = True  # Match uploads to XDR
 UPLOAD_NON_MATCH_DATA = False  # Keep non-match logs on disk only
 DEFAULT_TIMEOUT_SECS = 20            # increased request timeout everywhere
-MAX_RETRIES_PER_ITEM = 4             # per-item retry cap (Insert Parsed Alerts)
+MAX_RETRIES_PER_ITEM = 4             # per-batch retry cap (Insert Parsed Alerts)
+# Alert (Insert Parsed Alerts) upload BATCHING. The API accepts a LIST of alerts per POST, so
+# batching turns thousands of per-match POSTs into a handful — essential for match-heavy scans
+# (a broad rule can produce tens of thousands of string matches, which one-POST-per-match cannot
+# deliver before the scan ends). Edit these to tune the batch amount, flush interval, and how long
+# to keep draining pending alerts when the scan finishes.
+ALERT_BATCH_SIZE = min(60, int(os.environ.get("YARA_ALERT_BATCH", "60") or 60))  # alerts per POST (XDR HARD CAP = 60; clamped)
+ALERT_FLUSH_SECS = float(os.environ.get("YARA_ALERT_FLUSH_SECS", "10") or 10)     # flush a partial batch after this idle
+ALERT_DRAIN_SECS = float(os.environ.get("YARA_ALERT_DRAIN_SECS", "60") or 60)     # max wait to drain pending alerts at scan end
 BASE_BACKOFF_SECS = 1.0              # initial backoff
 MAX_BACKOFF_SECS = 30.0              # backoff ceiling
 CIRCUIT_FAILURE_THRESHOLD = 5        # open after N consecutive failures
@@ -102,7 +110,7 @@ XDR_ADD_DATASET_PATH = "/public_api/v1/xql/add_dataset"
 #   FEWER posts  -> big batches + deferred partial flush (each POST is one collision chance).
 #   DECORRELATE  -> small pre-write jitter spreads same-host writers.
 #   RECOVER      -> full-jitter retries mop up the remainder.
-LOOKUP_DATASET_BATCH_SIZE = int(os.environ.get("YARA_LOOKUP_BATCH", "500") or 500)  # rows per POST (<1000/10s limit)
+LOOKUP_DATASET_BATCH_SIZE = int(os.environ.get("YARA_LOOKUP_BATCH", "1000") or 1000)  # rows per POST (~1000/10s API limit; bigger batch = fewer slow POSTs so match-heavy scans drain in time)
 LOOKUP_DATASET_FLUSH_SECS = float(os.environ.get("YARA_LOOKUP_FLUSH_SECS", "30") or 30)  # defer partials -> fewer POSTs
 LOOKUP_WRITE_JITTER_SECS = float(os.environ.get("YARA_LOOKUP_WRITE_JITTER", "2") or 2)   # light same-host spread
 LOOKUP_ADD_DATA_MAX_RETRIES = int(os.environ.get("YARA_LOOKUP_RETRIES", "6") or 6)
@@ -2911,22 +2919,38 @@ class ResultsUploader:
             self.log_manager.log_upload("Real-time upload thread started successfully")
 
     def _upload_worker(self):
-        """Background worker for uploading results."""
+        """Background worker: accumulate matches and POST them to Insert Parsed Alerts in BATCHES
+        (the API takes a list of alerts per call), so a match-heavy scan can actually keep up."""
         if self.log_manager:
-            self.log_manager.log_upload("Upload worker thread started")
+            self.log_manager.log_upload(f"Upload worker thread started (batch={ALERT_BATCH_SIZE})")
+
+        batch = []
+        last_flush = time.time()
+
+        def flush():
+            if batch:
+                self._upload_alert_batch(batch)
+                batch.clear()
 
         while True:
             try:
                 standard_log = self.upload_queue.get(timeout=1.0)
-
                 if standard_log is None:
+                    flush()
                     break
-
-                self._upload_standard_result(standard_log)
+                batch.append(standard_log)
                 self.upload_queue.task_done()
-
+                if len(batch) >= ALERT_BATCH_SIZE:
+                    flush()
+                    last_flush = time.time()
             except Empty:
+                # No new matches for a moment — flush a partial batch so alerts don't sit idle,
+                # and exit once stop has been signalled and everything is drained.
+                if batch and (time.time() - last_flush) >= ALERT_FLUSH_SECS:
+                    flush()
+                    last_flush = time.time()
                 if self.stop_upload_thread:
+                    flush()
                     break
                 continue
             except Exception as e:
@@ -2936,11 +2960,13 @@ class ResultsUploader:
                     self.log_manager.log_error(f"Upload worker unexpected error: {err_text}")
                 continue
 
+        flush()
         if self.log_manager:
             self.log_manager.log_upload("Upload worker thread stopped")
 
-    def _build_xdr_parsed_alert(self, standard_log: StandardLogEntry):
-        """Map internal YARA match data to XDR Insert Parsed Alerts schema."""
+    def _alert_dict(self, standard_log: StandardLogEntry):
+        """Map one internal YARA match to a single XDR Insert Parsed Alerts alert dict.
+        Many of these are batched into one POST (request_data.alerts is a list)."""
         data = getattr(standard_log, "data", {}) or {}
 
         event_timestamp_ms = int(getattr(standard_log, "timestamp", time.time()) * 1000)
@@ -3005,7 +3031,11 @@ class ResultsUploader:
             "alert_description": json.dumps(alert_description, ensure_ascii=False, default=str),
             "action_status": "Reported",
         }
-        return {"request_data": {"alerts": [alert]}}
+        return alert
+
+    def _build_xdr_parsed_alert(self, standard_log: StandardLogEntry):
+        """Single-alert Insert Parsed Alerts payload (kept for compatibility)."""
+        return {"request_data": {"alerts": [self._alert_dict(standard_log)]}}
 
     def _throttled_log(self, bucket, msg, level="error", full=20, every=1000):
         """Log the first `full` messages in a bucket, then suppress and emit only a periodic
@@ -3024,21 +3054,29 @@ class ResultsUploader:
         elif n % every == 0:
             emit(f"[{bucket}] {n} occurrences so far; latest: {msg[:120]}")
 
-    def _upload_standard_result(self, standard_log: StandardLogEntry):
-        """Upload YARA match with bounded retries."""
-        payload = self._build_xdr_parsed_alert(standard_log)
+    def _upload_alert_batch(self, standard_logs):
+        """POST a batch of matches as one Insert Parsed Alerts call (request_data.alerts is a list),
+        with bounded retries. Upload stats are credited per-alert so counts stay match-accurate."""
+        if not standard_logs:
+            return
+        alerts = []
+        for sl in standard_logs:
+            try:
+                alerts.append(self._alert_dict(sl))
+            except Exception as e:
+                self._throttled_log("alert_build_err", f"alert build error (skipping one): {e}")
+        n = len(alerts)
+        if n == 0:
+            return
+        payload = {"request_data": {"alerts": alerts}}
         endpoint = _build_xdr_insert_alerts_url(XDR_API_URL)
 
         attempt = 0
         while attempt < MAX_RETRIES_PER_ITEM:
             attempt += 1
             try:
-                resp = requests.post(
-                    url=endpoint,
-                    headers=build_xdr_headers(self.log_manager),
-                    json=payload,
-                    timeout=DEFAULT_TIMEOUT_SECS,
-                )
+                resp = requests.post(url=endpoint, headers=build_xdr_headers(self.log_manager),
+                                     json=payload, timeout=DEFAULT_TIMEOUT_SECS)
                 if 200 <= resp.status_code < 300:
                     api_reply_ok = True
                     try:
@@ -3048,42 +3086,42 @@ class ResultsUploader:
                     except Exception:
                         pass
                     if not api_reply_ok:
-                        self.upload_stats['failed_uploads'] += 1
+                        self.upload_stats['failed_uploads'] += n
                         self._throttled_log("alert_upload_err", "XDR Insert Parsed Alerts returned false")
-                        return False
-                    self.upload_stats['successful_uploads'] += 1
+                        return
+                    self.upload_stats['successful_uploads'] += n
                     self._throttled_log("alert_upload_ok",
-                                        f"YARA match upload successful (HTTP {resp.status_code})", level="upload")
-                    return True
+                                        f"Alert batch ok ({n} alerts, HTTP {resp.status_code})", level="upload")
+                    return
 
                 if resp.status_code in (408, 429, 500, 502, 503, 504):
                     delay = _exp_backoff_delay(attempt)
                     self._throttled_log("alert_upload_retry",
-                        f"Upload failed (HTTP {resp.status_code}). Body: {resp.text[:200]}. "
-                        f"Retrying in {delay:.1f}s (attempt {attempt}/{MAX_RETRIES_PER_ITEM}).", level="upload")
+                        f"Alert batch failed (HTTP {resp.status_code}). Body: {resp.text[:200]}. "
+                        f"Retry {attempt}/{MAX_RETRIES_PER_ITEM} in {delay:.1f}s.", level="upload")
                     time.sleep(delay)
                     continue
 
-                self.upload_stats['failed_uploads'] += 1
+                self.upload_stats['failed_uploads'] += n
                 self._throttled_log("alert_upload_err",
-                                    f"YARA match upload failed (HTTP {resp.status_code}): {resp.text[:200]}")
-                return False
+                                    f"Alert batch failed (HTTP {resp.status_code}): {resp.text[:200]}")
+                return
 
             except (requests.Timeout, requests.ConnectionError) as e:
                 delay = _exp_backoff_delay(attempt)
                 self._throttled_log("alert_upload_retry",
-                    f"Network error uploading result: {str(e)[:160]}. Retrying in {delay:.1f}s "
-                    f"(attempt {attempt}/{MAX_RETRIES_PER_ITEM}).", level="upload")
+                    f"Alert batch network error: {str(e)[:160]}. Retry {attempt}/{MAX_RETRIES_PER_ITEM} "
+                    f"in {delay:.1f}s.", level="upload")
                 time.sleep(delay)
 
             except Exception as e:
-                self.upload_stats['failed_uploads'] += 1
-                self._throttled_log("alert_upload_err", f"YARA match upload unexpected error: {e}")
-                return False
+                self.upload_stats['failed_uploads'] += n
+                self._throttled_log("alert_upload_err", f"Alert batch unexpected error: {e}")
+                return
 
-        self.upload_stats['failed_uploads'] += 1
-        self._throttled_log("alert_upload_err", "Max retries reached for payload. Abandoning.")
-        return False
+        self.upload_stats['failed_uploads'] += n
+        self._throttled_log("alert_upload_err",
+                            f"Alert batch abandoned after {MAX_RETRIES_PER_ITEM} attempts ({n} alerts lost)")
 
     def stop(self, wait=True):
         """Stop uploader thread with timeout."""
@@ -3232,7 +3270,7 @@ class ResultsUploader:
             if self.log_manager:
                 self.log_manager.log_upload("Stopping real-time upload thread...")
             
-            max_wait_time = 15
+            max_wait_time = ALERT_DRAIN_SECS
             start_wait = time.time()
             initial_queue_size = self.upload_queue.qsize()
             

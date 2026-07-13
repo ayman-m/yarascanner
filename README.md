@@ -105,6 +105,14 @@ Advanced/automation callers (the CLI and the internal `run(...)` API) can still 
 expose it. Every run's summary and logs include a **posture** string, e.g.
 `alerts=on dataset=on files=off throttle=script mode=scan`.
 
+**Throughput tuning for match-heavy scans (module constants near the top of the script).** Alerts
+are uploaded in **batches** (the Insert Parsed Alerts API takes a list — up to 60 per call), and
+lookup rows in batches of ~1000, so a scan that finds tens of thousands of matches can actually
+deliver them all before it ends. Tune via `ALERT_BATCH_SIZE` (≤60, clamped), `ALERT_FLUSH_SECS`,
+`ALERT_DRAIN_SECS`, and `LOOKUP_DATASET_BATCH_SIZE` — each also overridable by the matching
+`YARA_ALERT_*` / `YARA_LOOKUP_*` env var. Each scan's `alert_delivery` / `dataset_delivery` counts
+in the summary JSON show exactly how many landed.
+
 ### 🧮 Resource management
 - **Configurable throttling** via the thresholds above (was hardcoded).
 - **Enhanced sleep logic** — a worker over the high threshold now *stays paused and re-checks CPU each interval*, resuming only once CPU drops below `high − 10` (hysteresis), bounded by `max_pause_secs` so a permanently busy host still finishes. Cumulative pause time is reported per scan.
