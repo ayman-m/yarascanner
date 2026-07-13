@@ -20,17 +20,24 @@ There is **no public API to upload a library script**, so the scanner is added v
 once. Critically, **`core-script-run` rejects any parameter set that does not exactly match the
 script's defined inputs** (verified: `parameters_values contain invalid/missing parameters`).
 
-So the scanner **must be uploaded to the Action Center script library with exactly these 5
-string inputs, in order** (matching `main(yarafile, scan_folder, alert_severity, mode, options)`):
+So the scanner **must be uploaded with the `main` entry point's exactly-3 string inputs, in
+order** (matching `main(yarafile, scan_folder, alert_severity)`):
 
 1. `yarafile` — base64-encoded YARA rules
 2. `scan_folder` — target path or `default`
 3. `alert_severity` — `low` | `medium` | `high`
-4. `mode` — `scan` | `cancel`
-5. `options` — `key=value,key=value` (see the scanner's v2 options)
+
+All other behaviour (alerts/dataset/collect_files/throttle/cpu/tenant/sharding) is now set in the
+**CUSTOMER CONFIG** block at the top of the script, not passed per run. To cancel a running scan,
+upload/run with Entry Point = **`cancel`** (no inputs).
 
 Entry point: `main`. Give it a name and set the `script_name` playbook input to match
-(default `xdr_yara_scanner_v4`). The older 3-input build will be rejected by the playbook.
+(default `xdr_yara_scanner_v4`).
+
+> **Playbooks deferred:** the bundled `YARA_Scanner_Runner.yml` / `YARA_Scanner_Canceller.yml`
+> still pass the old 5-input parameter set. Before using them, trim the Runner's `parameters` to
+> the 3 inputs above and point the Canceller at the `cancel` entry point — otherwise
+> `core-script-run` will reject the call.
 
 ## Import
 
