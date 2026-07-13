@@ -114,7 +114,7 @@ XDR_ADD_DATASET_PATH = "/public_api/v1/xql/add_dataset"
 #   FEWER posts  -> big batches + deferred partial flush (each POST is one collision chance).
 #   DECORRELATE  -> small pre-write jitter spreads same-host writers.
 #   RECOVER      -> full-jitter retries mop up the remainder.
-LOOKUP_DATASET_BATCH_SIZE = int(os.environ.get("YARA_LOOKUP_BATCH", "1000") or 1000)  # rows per POST (~1000/10s API limit; bigger batch = fewer slow POSTs so match-heavy scans drain in time)
+LOOKUP_DATASET_BATCH_SIZE = int(os.environ.get("YARA_LOOKUP_BATCH", "500") or 500)  # rows per POST. 500 is a sweet spot: bigger (e.g. 1000) makes the add_data payload slow enough that the API GATEWAY returns 502/read-timeouts under concurrent fleet load, losing whole batches.
 LOOKUP_DATASET_FLUSH_SECS = float(os.environ.get("YARA_LOOKUP_FLUSH_SECS", "30") or 30)  # defer partials -> fewer POSTs
 LOOKUP_WRITE_JITTER_SECS = float(os.environ.get("YARA_LOOKUP_WRITE_JITTER", "2") or 2)   # light same-host spread
 LOOKUP_ADD_DATA_MAX_RETRIES = int(os.environ.get("YARA_LOOKUP_RETRIES", "6") or 6)
