@@ -2525,8 +2525,25 @@ class ScanConfig:
         XDR_API_URL = DEFAULT_XDR_API_URL
         self.api_url_source = "default"
 
+        # Detect un-configured credentials: the shipped script has "replace_with_*" placeholders
+        # that the customer MUST replace with their real Advanced API key + tenant URL before
+        # uploading. If they don't, every alert/dataset upload fails ("No scheme supplied") and a
+        # perfect scan silently delivers nothing. Flag it here so run() can fail loud up front.
+        self.creds_placeholder = any(
+            "replace_with" in str(v).lower() or not str(v).strip()
+            for v in (XDR_API_URL, XDR_API_KEY, XDR_API_ID)
+        )
+
         # Tenant identity: explicit override wins, else derived from the API URL.
         self.tenant_id = _derive_tenant_id(XDR_API_URL, self._tenant_id_override)
+
+        if self.creds_placeholder:
+            self.error_logger.error_logger.error(
+                "XDR API CREDENTIALS NOT SET — DEFAULT_XDR_API_KEY / DEFAULT_XDR_API_ID / "
+                "DEFAULT_XDR_API_URL are still 'replace_with_*' placeholders. Alerts and lookup "
+                "datasets CANNOT be delivered. Edit the three credential lines at the top of the "
+                "script (real Advanced API key + https tenant URL) and re-upload."
+            )
 
         self.error_logger.error_logger.info("XDR API Key: Using default embedded credential")
         self.error_logger.error_logger.info("XDR API ID: Using default embedded credential")
@@ -6065,11 +6082,35 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
             lookup_shard=lookup_shard,
         )
         log_manager = LogManager(config)
+
+        # Fail loud on un-configured credentials BEFORE scanning: if the API creds are still the
+        # 'replace_with_*' placeholders and this run intends to deliver (alerts and/or datasets),
+        # a full scan would find matches but drop 100% of them. Abort now with a clear message in
+        # the SCAN_RESULT the operator sees, instead of wasting the scan and silently losing data.
+        # Use the PARSED booleans on config, not the raw run() args — an options string passes
+        # "false" (a truthy non-empty string), which config.__init__ has already coerced to bool.
+        if getattr(config, "creds_placeholder", False) and (config.create_alerts or config.write_dataset):
+            msg = (
+                "SCAN ABORTED — XDR API credentials are not set. DEFAULT_XDR_API_KEY / "
+                "DEFAULT_XDR_API_ID / DEFAULT_XDR_API_URL are still 'replace_with_*' placeholders, "
+                "so no alerts or lookup datasets can be delivered (every upload fails with 'No "
+                "scheme supplied'). Edit those three lines at the top of the script with your real "
+                "Advanced API key + https tenant URL and re-upload. "
+                "(To scan locally without delivery, set CONFIG_CREATE_ALERTS and CONFIG_WRITE_DATASET "
+                "to False.)"
+            )
+            log_manager.log_error(msg)
+            try:
+                log_manager.stop_logging()
+            except Exception:
+                pass
+            return msg
+
         _apply_light_process_priority(log_manager, throttle_mode=config.throttle_mode)
         exception_logger = config.exception_logger
         stats_manager = StatisticsManager(config, log_manager)
         cleanup_manager = CleanupManager(config)
-        
+
         cleanup_manager.initial_cleanup()
         log_manager.log_system("Initial cleanup completed")
 
@@ -6501,7 +6542,9 @@ if __name__ == "__main__":
 
         result_text = str(result or "")
         low = result_text.lower()
-        is_success = bool(result_text) and not (low.startswith("scan failed") or low.startswith("cancel failed"))
+        is_success = bool(result_text) and not (
+            low.startswith("scan failed") or low.startswith("cancel failed") or low.startswith("scan aborted")
+        )
         sys.exit(0 if is_success else 1)
 
     except Exception as e:
