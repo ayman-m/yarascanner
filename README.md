@@ -113,11 +113,18 @@ via `ALERT_BATCH_SIZE` (≤60, clamped), `ALERT_MIN_BATCH_INTERVAL` (rate-limit 
 `ALERT_FLUSH_SECS`, `ALERT_DRAIN_SECS`, and `LOOKUP_DATASET_BATCH_SIZE` — each overridable by the
 matching `YARA_ALERT_*` / `YARA_LOOKUP_*` env var.
 
-> The alert channel is **rate-limited by XDR (~600/min)**, so a pathological scan that finds tens
-> of thousands of matches (e.g. an over-broad rule) cannot alert-deliver them all within the scan —
-> pacing makes those deliver *cleanly up to the limit* instead of failing, and the **lookup datasets
-> remain the complete record**. Well-tuned rules never approach this. Each scan's `alert_delivery` /
-> `dataset_delivery` counts in the summary JSON show exactly how many landed.
+Rate-limited batches are **requeued and retried in a later window** rather than dropped
+(`ALERT_REQUEUE_ENABLED`), the server's `Retry-After` is honored, and the end-of-scan backlog gets
+a bounded requeue-enabled drain (`ALERT_DRAIN_SECS`) — all capped by a global budget
+(`ALERT_MAX_DELIVER_SECS`) so shutdown can't hang on a saturated key. In testing, a 900-match burst
+that would trip the limit delivered **900/900 with 0 failed** (180 requeued and recovered).
+
+> The alert channel is **rate-limited by XDR (~600/min, shared per API key)**, so a pathological
+> scan that finds tens of thousands of matches (e.g. an over-broad rule), or a very large concurrent
+> fleet, can saturate it. Pacing + requeue make alerts deliver *cleanly up to the ceiling* instead
+> of fail-storming; past the ceiling the **lookup datasets remain the complete record**. Well-tuned
+> rules never approach this. Each scan's `alert_delivery` (incl. `requeued`) / `dataset_delivery`
+> counts in the summary JSON show exactly what landed.
 
 ### 🧮 Resource management
 - **Configurable throttling** via the thresholds above (was hardcoded).

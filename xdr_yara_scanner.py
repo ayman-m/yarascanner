@@ -65,6 +65,13 @@ ALERT_DRAIN_SECS = float(os.environ.get("YARA_ALERT_DRAIN_SECS", "60") or 60)   
 # rate limit" when tripped). Pace batches to stay under it: 60 alerts every >=7s ~= 510/min. Without
 # pacing, over-fast batches fail and their retries burn the upload window, starving the rest.
 ALERT_MIN_BATCH_INTERVAL = float(os.environ.get("YARA_ALERT_MIN_INTERVAL", "7") or 7)  # min secs between alert POSTs
+# Requeue-on-rate-limit: when a batch exhausts its retries because it was RATE-LIMITED (not a real
+# error), put it back on the queue to try again once the per-minute window frees up — instead of
+# dropping it. Bounded by a global wall-clock budget so a permanently-saturated key (many concurrent
+# agents) can't loop forever; past the budget, or once the scan is stopping, batches drop as before.
+# This can't beat the shared server-side ceiling, only ride out transient saturation.
+ALERT_REQUEUE_ENABLED = (os.environ.get("YARA_ALERT_REQUEUE", "1").strip().lower() not in ("0", "false", "no", ""))
+ALERT_MAX_DELIVER_SECS = float(os.environ.get("YARA_ALERT_MAX_DELIVER_SECS", "900") or 900)  # global requeue budget
 BASE_BACKOFF_SECS = 1.0              # initial backoff
 MAX_BACKOFF_SECS = 30.0              # backoff ceiling
 CIRCUIT_FAILURE_THRESHOLD = 5        # open after N consecutive failures
@@ -2900,6 +2907,8 @@ class ResultsUploader:
         # ~36k identical "Invalid URL" error lines (10 MB) before this.
         self._rl_counters = {}
         self._last_alert_post = 0.0  # monotonic time of the last alert POST (for rate-limit pacing)
+        self._deliver_deadline = None  # global wall-clock budget for requeuing rate-limited batches
+        self._requeued_total = 0     # count of alerts put back for a later window (diagnostics)
 
         # create_alerts gates the Insert Parsed Alerts channel (XDR alerts -> incidents).
         if UPLOAD_RESULTS and getattr(config, "create_alerts", True):
@@ -2929,13 +2938,25 @@ class ResultsUploader:
         if self.log_manager:
             self.log_manager.log_upload(f"Upload worker thread started (batch={ALERT_BATCH_SIZE})")
 
+        self._deliver_deadline = time.monotonic() + ALERT_MAX_DELIVER_SECS
         batch = []
         last_flush = time.time()
 
         def flush():
-            if batch:
-                self._upload_alert_batch(batch)
-                batch.clear()
+            if not batch:
+                return
+            status = self._upload_alert_batch(batch)
+            if status == "requeue":
+                # Rate-limited, not a real error: put the matches back so they get another shot
+                # when the per-minute window frees up. Bounded by _deliver_deadline (checked in
+                # _upload_alert_batch) so this can't loop forever on a saturated key.
+                self._requeued_total += len(batch)
+                for sl in batch:
+                    try:
+                        self.upload_queue.put(sl, timeout=0.5)
+                    except Exception:
+                        self.upload_stats['failed_uploads'] += 1  # queue closing/full: give up on this one
+            batch.clear()
 
         while True:
             try:
@@ -3061,9 +3082,10 @@ class ResultsUploader:
 
     def _upload_alert_batch(self, standard_logs):
         """POST a batch of matches as one Insert Parsed Alerts call (request_data.alerts is a list),
-        with bounded retries. Upload stats are credited per-alert so counts stay match-accurate."""
+        with bounded retries. Returns "ok", "dropped", or "requeue" (rate-limited — try again in a
+        later window). Upload stats are credited per-alert so counts stay match-accurate."""
         if not standard_logs:
-            return
+            return "ok"
         alerts = []
         for sl in standard_logs:
             try:
@@ -3072,7 +3094,7 @@ class ResultsUploader:
                 self._throttled_log("alert_build_err", f"alert build error (skipping one): {e}")
         n = len(alerts)
         if n == 0:
-            return
+            return "dropped"
         payload = {"request_data": {"alerts": alerts}}
         endpoint = _build_xdr_insert_alerts_url(XDR_API_URL)
 
@@ -3082,6 +3104,7 @@ class ResultsUploader:
         if _gap > 0:
             time.sleep(_gap)
 
+        last_rate_limited = False
         attempt = 0
         while attempt < MAX_RETRIES_PER_ITEM:
             attempt += 1
@@ -3100,19 +3123,28 @@ class ResultsUploader:
                     if not api_reply_ok:
                         self.upload_stats['failed_uploads'] += n
                         self._throttled_log("alert_upload_err", "XDR Insert Parsed Alerts returned false")
-                        return
+                        return "dropped"
                     self.upload_stats['successful_uploads'] += n
                     self._throttled_log("alert_upload_ok",
                                         f"Alert batch ok ({n} alerts, HTTP {resp.status_code})", level="upload")
-                    return
+                    return "ok"
 
                 if resp.status_code in (408, 429, 500, 502, 503, 504):
                     # A rate-limit hit needs a real cooldown, not a 1-2s retry that trips it again.
-                    rate_limited = resp.status_code == 429 or "rate limit" in resp.text.lower()
-                    delay = max(_exp_backoff_delay(attempt), ALERT_MIN_BATCH_INTERVAL * 2) if rate_limited \
-                        else _exp_backoff_delay(attempt)
+                    last_rate_limited = resp.status_code == 429 or "rate limit" in resp.text.lower()
+                    # Prefer the server's Retry-After when present; else exp backoff (longer if rate-limited).
+                    delay = None
+                    ra = resp.headers.get("Retry-After")
+                    if ra:
+                        try:
+                            delay = float(ra)
+                        except (TypeError, ValueError):
+                            delay = None
+                    if delay is None:
+                        delay = max(_exp_backoff_delay(attempt), ALERT_MIN_BATCH_INTERVAL * 2) \
+                            if last_rate_limited else _exp_backoff_delay(attempt)
                     self._throttled_log("alert_upload_retry",
-                        f"Alert batch failed (HTTP {resp.status_code}){' [rate-limited]' if rate_limited else ''}. "
+                        f"Alert batch failed (HTTP {resp.status_code}){' [rate-limited]' if last_rate_limited else ''}. "
                         f"Body: {resp.text[:160]}. Retry {attempt}/{MAX_RETRIES_PER_ITEM} in {delay:.1f}s.", level="upload")
                     time.sleep(delay)
                     continue
@@ -3120,9 +3152,10 @@ class ResultsUploader:
                 self.upload_stats['failed_uploads'] += n
                 self._throttled_log("alert_upload_err",
                                     f"Alert batch failed (HTTP {resp.status_code}): {resp.text[:200]}")
-                return
+                return "dropped"
 
             except (requests.Timeout, requests.ConnectionError) as e:
+                last_rate_limited = False  # a transport error is not a rate-limit signal
                 delay = _exp_backoff_delay(attempt)
                 self._throttled_log("alert_upload_retry",
                     f"Alert batch network error: {str(e)[:160]}. Retry {attempt}/{MAX_RETRIES_PER_ITEM} "
@@ -3132,21 +3165,43 @@ class ResultsUploader:
             except Exception as e:
                 self.upload_stats['failed_uploads'] += n
                 self._throttled_log("alert_upload_err", f"Alert batch unexpected error: {e}")
-                return
+                return "dropped"
+
+        # Retries exhausted. If it was RATE-LIMITED (transient) and we're still within the delivery
+        # budget and not shutting down, hand it back to the worker to requeue for a later window.
+        if (last_rate_limited and ALERT_REQUEUE_ENABLED and not self.stop_upload_thread
+                and self._deliver_deadline is not None and time.monotonic() < self._deliver_deadline):
+            self._throttled_log("alert_requeue",
+                                f"Alert batch rate-limited after {MAX_RETRIES_PER_ITEM} attempts; requeuing "
+                                f"{n} alerts for a later window.", level="upload")
+            return "requeue"
 
         self.upload_stats['failed_uploads'] += n
         self._throttled_log("alert_upload_err",
                             f"Alert batch abandoned after {MAX_RETRIES_PER_ITEM} attempts ({n} alerts lost)")
+        return "dropped"
 
     def stop(self, wait=True):
         """Stop uploader thread with timeout."""
         try:
+            # Bounded, requeue-ENABLED drain first: give the end-of-scan backlog a real "later
+            # window" to deliver (stop_upload_thread stays False so rate-limited batches can still
+            # requeue) before we force the hard stop. Capped by ALERT_DRAIN_SECS so shutdown can't
+            # hang, and short-circuits the moment the queue empties.
+            if wait and self.upload_thread and self.upload_thread.is_alive():
+                pending = self.upload_queue.qsize()
+                if pending > 0 and self.log_manager:
+                    self.log_manager.log_upload(f"Draining {pending} pending alert(s) (up to {ALERT_DRAIN_SECS:.0f}s)...")
+                _drain_deadline = time.monotonic() + ALERT_DRAIN_SECS
+                while self.upload_queue.qsize() > 0 and time.monotonic() < _drain_deadline:
+                    time.sleep(0.5)
+
             self.stop_upload_thread = True
             try:
                 self.upload_queue.put(None, timeout=0.2)
             except Exception:
                 pass
-            
+
             if wait and self.upload_thread and self.upload_thread.is_alive():
                 self.upload_thread.join(timeout=THREAD_CLEANUP_TIMEOUT)
                 if self.upload_thread.is_alive() and self.log_manager:
@@ -3337,7 +3392,9 @@ class ResultsUploader:
 
     def get_upload_stats(self):
         """Get current upload statistics."""
-        return self.upload_stats.copy()
+        stats = self.upload_stats.copy()
+        stats['requeued'] = self._requeued_total
+        return stats
 
 
 class LookupDatasetUploader:
