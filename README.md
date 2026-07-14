@@ -1,858 +1,390 @@
-# YARA Scanner - Enterprise Threat Detection System
+# YARA Scanner for Cortex XDR & XSIAM
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](https://github.com/yourusername/yara-scanner)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-> **Production-ready YARA scanning engine with real-time threat reporting and comprehensive system monitoring**
+> Fleet-scale YARA scanning delivered through the Cortex agent — alerts sized for triage,
+> datasets sized for forensics, and delivery accounting that always balances.
 
-A high-performance, multi-threaded file scanning solution designed for enterprise security operations. While the scanner is **general-purpose and platform-agnostic**, this repository and its associated content (dashboards, reports, playbooks) are **specifically optimized for deployment via Palo Alto Networks Cortex XDR and XSIAM agents**.
+A multi-threaded, resource-aware YARA scanning engine designed to run on endpoints **through the
+Cortex agent** (Action Center / automation playbooks / scheduled jobs). Matches flow back into the
+Cortex platform as alerts, datasets, and dashboards — no extra infrastructure on the endpoint.
 
 ---
 
-## 🎯 Primary Use Case: Cortex XDR/XSIAM Integration
+## 1. Overview
 
-This scanner is designed to be deployed and executed through **Cortex XDR/XSIAM agents** on endpoints, enabling:
+### Two editions, one engine
 
-- **Centralized threat visibility** across your entire endpoint estate
-- **Real-time detection alerts** flowing directly into Cortex Data Lake
-- **Automated response workflows** via playbooks
-- **Executive dashboards** for performance and matching
-- **Evidence collection** with automatic upload to XDR/XSIAM console
+| | `xdr_yara_scanner.py` (Cortex XDR) | `xsiam_yara_scanner.py` (Cortex XSIAM) |
+|---|---|---|
+| **Delivery APIs** | Insert Parsed Alerts + XQL lookup datasets | HTTP Event Collector (webhook) |
+| **Auth** | XDR API key — Advanced (HMAC) and Standard, **auto-detected** | Single HTTP Collector key |
+| **Alerting model** | One XDR alert per **finding** (file × rule), storm-capped | Raw JSON events; alerting via XSIAM correlation rules |
+| **Forensic record** | Sharded + monthly-rotated lookup datasets (one row per matched string) | Collector dataset (one event per matched string) |
+| **Telemetry** | Match-focused (`UPLOAD_NON_MATCH_DATA=False`); agent covers general telemetry | Full telemetry: stats, performance, resources |
+| **Cancel a running scan** | `cancel` entry point (cooperative, ~5 s) | stop via agent |
+| **Dashboards** | `Yara XDR Scanner (Lookup).json` — 40 widgets | `Yara Matches.json`, `Yara Scan Performance.json` |
 
-### 🔄 Scanner Versions: XDR vs. XSIAM
-
-This repository provides two distinct scanner implementations tailored for different Cortex environments:
-
-#### 1. `xdr_yara_scanner.py` (Cortex XDR)
-Optimized specifically for the Cortex XDR environment. 
-- **API Integration:** Uses the **Insert Parsed Alerts API** (`/public_api/v1/alerts/insert_parsed_alerts`) and expects an XDR API Key and API ID.
-- **Data Payload:** Formats YARA matches into the strict XDR Parsed Alerts schema (`{"request_data": {"alerts": [...]}}`).
-- **Telemetry:** By default, only uploads positive YARA matches (`UPLOAD_NON_MATCH_DATA = False`), relying on the XDR agent itself for general endpoint telemetry.
-
-#### 2. `xsiam_yara_scanner.py` (Cortex XSIAM)
-Optimized for Cortex XSIAM using a generic HTTP Event Collector or Webhook endpoint.
-- **API Integration:** Connects to a generic webhook or HTTP Event Collector endpoint, using a single API Key.
-- **Data Payload:** Uploads standardized JSON objects directly, ideal for raw log ingestion in XSIAM.
-- **Telemetry:** Uploads full telemetry including non-match data, performance metrics, and statistics (`UPLOAD_NON_MATCH_DATA = True`) directly to the SIEM.
-- **Advanced Rule Support:** Features an advanced YARA rule parser, exposes custom external variables (`filename`, `filepath` to the rules), and provides detailed fallback summaries for condition-only rule matches.
-
-### 🏢 Enterprise Architecture
+### Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Cortex XSIAM/XDR                         │
-│    ┌──────────────┐  ┌──────────────┐  ┌──────────────┐     │
-│    │  Dashboards  │  │   Playbooks  │  │    Alerts    │     │
-│    └──────────────┘  └──────────────┘  └──────────────┘     │
-│         ▲                  ▲                  ▲             │
-│         └──────────────────┴──────────────────┘             │
-│                     WebHook Ingestion                       │
-└─────────────────────────────────────────────────────────────┘
-                            ▲
-                            │ HTTPS
-                            │
-         ┌──────────────────┴─────────────────┐
-         │                                    │
-    ┌────▼─────┐                         ┌────▼─────┐
-    │ Endpoint │                         │ Endpoint │
-    │ (Windows)│                         │  (Linux) │
-    │          │                         │          │
-    │ XDR Agent│                         │ XDR Agent│
-    │    │     │                         │    │     │
-    │    ▼     │                         │    ▼     │
-    │  Scanner │                         │  Scanner │
-    └──────────┘                         └──────────┘
+┌────────────────────────────────────────────────────────────────┐
+│                      Cortex XDR / XSIAM                        │
+│   ┌────────────┐   ┌───────────┐   ┌────────┐   ┌──────────┐   │
+│   │ Dashboards │   │ Playbooks │   │ Alerts │   │ Datasets │   │
+│   └────────────┘   └───────────┘   └────────┘   └──────────┘   │
+│          ▲               ▲              ▲            ▲         │
+│          └───────────────┴──────┬───────┴────────────┘         │
+│                                 │  public API / HTTP collector │
+└─────────────────────────────────┼──────────────────────────────┘
+                                  │ HTTPS (from the endpoint)
+                   ┌──────────────┴──────────────┐
+              ┌────▼─────┐                  ┌────▼─────┐
+              │ Endpoint │                  │ Endpoint │
+              │  Cortex  │  Action Center   │  Cortex  │
+              │  agent ──┼── runs script ───┼── agent  │
+              │  scanner │                  │  scanner │
+              └──────────┘                  └──────────┘
 ```
 
----
+### Engine capabilities (both editions)
+
+- **Multi-threaded scanning** with a bounded queue and light process priority (agent-friendly)
+- **CPU throttling** — `script` (pause/resume with hysteresis), `os` (idle-tier priority), or `off`
+- **Rule pack handling** — per-rule compile isolation, unavailable-module detection (skips only
+  rules that *import* a missing module), condition-only match summaries, `filename`/`filepath`
+  externals available to rules
+- **Rule-compile disk cache** (XDR edition) — re-runs with an identical pack skip compilation
+- **Junction/symlink cycle protection**, special-file skipping, per-file size limits
+- **Evidence collection** (optional) — matched files zipped on the endpoint
+- **Structured endpoint logs** per run + machine-readable `scan_summary_<run_id>.json`
+- **Log retention** — old run logs pruned automatically (last 10 runs kept)
 
 ---
 
-## 🔄 v2 Updates (XDR Edition — `xdr_yara_scanner.py`)
+## 2. Quick start (XDR edition)
 
-This release reworks the XDR scanner around operator control, correct XDR API delivery, and dashboard-ready telemetry. **Defaults preserve prior behavior**, except matched-file copying now defaults **off**.
+### Step 1 — set the CUSTOMER CONFIG
 
-### 🔐 Authentication — Advanced (HMAC) support
-The scanner now supports both Cortex XDR API auth models and **auto-detects** which the tenant expects:
-- **Advanced** — per-request `x-xdr-nonce` + `x-xdr-timestamp` + `Authorization = sha256(key + nonce + timestamp)`
-- **Standard** — plain `Authorization: <key>` + `x-xdr-auth-id`
-
-Set `XDR_AUTH_TYPE` (`auto` | `advanced` | `standard`, default `auto`) to override. All API calls (Insert Parsed Alerts, `add_dataset`, `add_data`, `get_datasets`) route through one `build_xdr_headers()` helper. *Advanced-key tenants previously received nothing — the Standard-only header returned HTTP 401 on every upload.*
-
-### 🎛️ CUSTOMER CONFIG — edit the script, not the run inputs
-So operators aren't faced with a long input list on every scan, the behaviour knobs live in a
-**`CUSTOMER CONFIG` block at the top of `xdr_yara_scanner.py`**. Edit it once for your deployment
-and (re)upload the script. The Action Center **`main`** entry point then exposes only **3 inputs** —
-`yarafile`, `scan_folder`, `alert_severity` — and the **`cancel`** entry point takes none.
+All deployment-wide behaviour lives in one block at the top of `xdr_yara_scanner.py`. Edit it once,
+then upload — operators never type these again:
 
 | Constant | Values | Default | Effect |
 |----------|--------|---------|--------|
 | `CONFIG_MODE` | scan/cancel | `scan` | Default action for `main` |
 | `CONFIG_CREATE_ALERTS` | True/False | `True` | Insert Parsed Alerts (→ incident creation) |
 | `CONFIG_WRITE_DATASET` | True/False | `True` | Write the lookup datasets |
-| `CONFIG_COLLECT_FILES` | True/False | **`False`** | Copy matched files into the evidence zip |
-| `CONFIG_THROTTLE_MODE` | script/os/off | `script` | CPU pacing strategy (below) |
+| `CONFIG_COLLECT_FILES` | True/False | `False` | Copy matched files into the evidence zip |
+| `CONFIG_THROTTLE_MODE` | script/os/off | `script` | CPU pacing strategy |
 | `CONFIG_CPU_HIGH_THRESHOLD` | int/None | `None` | Pause-entry % CPU (None = profile default) |
 | `CONFIG_CPU_CRITICAL_THRESHOLD` | int/None | `None` | Critical % CPU (None = profile default) |
 | `CONFIG_MAX_PAUSE_SECS` | int/None | `None` | Cap on one continuous CPU pause |
 | `CONFIG_TENANT_ID` | string | `""` | Tenant tag (`""` = derive from API URL) |
 | `CONFIG_LOOKUP_SHARD` | endpoint/none/label | `endpoint` | Per-writer dataset sharding |
-| `CONFIG_ALERT_MAX_PER_SCAN` | int | `500` | Storm cap: max per-finding alerts per scan; beyond → one rollup alert per rule (`≤0` = uncapped) |
-| `CONFIG_LOOKUP_ROTATION` | monthly/none | `monthly` | Monthly dataset rotation (`_YYYYMM`) — bounds dataset size & `add_data` merge time |
-| `CONFIG_OPTIONS` | `key=value,...` | `""` | Rarely-needed extra overrides applied every run |
+| `CONFIG_ALERT_MAX_PER_SCAN` | int | `500` | Storm cap: max per-finding alerts per scan (`≤0` = uncapped) |
+| `CONFIG_LOOKUP_ROTATION` | monthly/none | `monthly` | Monthly dataset rotation (`_YYYYMM`) |
+| `CONFIG_OPTIONS` | `key=value,...` | `""` | Extra overrides applied every run (rarely needed) |
 
-Advanced/automation callers (the CLI and the internal `run(...)` API) can still pass a per-run
-`options` string that overrides any constant, but the operator-facing `main` entry point does not
-expose it. Every run's summary and logs include a **posture** string, e.g.
-`alerts=on dataset=on files=off throttle=script mode=scan`.
+Also set the API credentials (`DEFAULT_XDR_API_URL` / `DEFAULT_XDR_API_ID` / `DEFAULT_XDR_API_KEY`).
+Both XDR auth models are supported and **auto-detected** (Advanced/HMAC and Standard); override with
+`XDR_AUTH_TYPE` if needed. **A scan aborts loudly if delivery is enabled and the credentials are
+still placeholders** — a misconfigured deployment can't silently scan into the void.
 
-**Alert grain — one alert per finding (file × rule).** A SOC triages *"this file matched this
-rule"*; the per-string-offset evidence belongs in the lookup dataset. Each alert carries the hit
-count and a sample of matched strings, and its identity is stable per (rule, file-path, host) — so
-alerts are **1:1 with findings within a scan and idempotent across re-scans** (a file edit that
-shifts offsets updates the existing alert instead of minting new ones). On a multi-string rule this
-is a 20×+ volume cut with *better* triage semantics.
+### Step 2 — upload to the script library
 
-**Storm cap.** Past `CONFIG_ALERT_MAX_PER_SCAN` findings (default 500 ≈ one minute of alert-channel
-budget), per-finding alerts stop and each rule reports the remainder as **one rollup alert** —
-`YARA Match Storm: <rule> | Host: <host>` with the suppressed count. An over-broad rule that hits
-30k files produces ≤500 alerts + a handful of rollups instead of a day-long fail-storm; nothing
-goes silent.
+Console → **Action Center → Script Library → Upload**, entry point **`main`**. The signature is the
+input list, so operators see exactly **3 inputs**:
 
-**Throughput + retry (module constants near the top of the script).** Alerts POST in **batches**
-(hard cap 60/call), **paced** under the API's **~600 alerts/min budget — shared per API key across
-all endpoints** (`ALERT_MIN_BATCH_INTERVAL`). Rate-limited batches honor `Retry-After`, are
-**requeued for a later window** rather than dropped (`ALERT_REQUEUE_ENABLED`, budget
-`ALERT_MAX_DELIVER_SECS`), and the end-of-scan drain window **scales with the backlog**
-(`ALERT_DRAIN_SECS` … `ALERT_DRAIN_MAX_SECS`).
+1. `yarafile` — base64-encoded YARA rules (`python3 encode_rules.py rules.yar`)
+2. `scan_folder` — target path, or `default` for platform defaults
+3. `alert_severity` — `low` | `medium` | `high`
 
-**Honest delivery books.** `alert_delivery` in the scan summary always balances:
-`findings = delivered + failed + undelivered (+ suppressed reported via rollups)` — anything the
-drain budget couldn't deliver is *counted*, never silently discarded, and the log states it plainly.
-Verified live: a 700-match scan delivered **501/501 queued alerts (500 findings + 1 rollup covering
-the 200 past the cap), 0 failed, 0 undelivered**, books exactly balanced.
+Upload the same file again with entry point **`cancel`** (no inputs) to get a stop button.
 
-> The ~600/min ceiling is a **platform limit shared by every endpoint on the API key** — no client
-> can beat it, only ride it out cleanly. Past sustained saturation the **lookup datasets remain the
-> complete record**, and `alert_delivery.undelivered` tells you exactly what didn't fit.
+### Step 3 — run
 
-### 🧮 Resource management
-- **Configurable throttling** via the thresholds above (was hardcoded).
-- **Enhanced sleep logic** — a worker over the high threshold now *stays paused and re-checks CPU each interval*, resuming only once CPU drops below `high − 10` (hysteresis), bounded by `max_pause_secs` so a permanently busy host still finishes. Cumulative pause time is reported per scan.
-- **`throttle_mode=os`** hands pacing to the OS: script sleeps are disabled and the process drops to idle-tier priority (Windows `IDLE`/background mode; Linux `nice 19` + `ionice idle`; macOS `nice 19`). `throttle_mode=off` disables throttling entirely for maintenance windows.
+Target endpoints in Action Center and run. Progress, per-run logs, and a `scan_summary_<run_id>.json`
+land on the endpoint under the scanner directory (`C:\yara_scanner\` / `/opt/yara_scanner/`);
+matches land in XDR as alerts + dataset rows as the scan runs.
 
-### 🛑 Scan cancellation via Action Center
-Run the same script with `mode=cancel` on the endpoint to drop a cooperative cancel flag; a running scan's watcher detects it within ~5 s and shuts down gracefully — draining uploaders, writing a terminal `cancelled` lifecycle row, and returning `Scan cancelled by operator: …` (exit 0). POSIX `SIGTERM`/`SIGINT` route into the same path.
-
-### 🗂️ Lookup datasets + tenant identity
-Two **per-endpoint sharded, monthly-rotated** datasets (`_v2_<host>_<YYYYMM>`) — the fix for two distinct XDR `add_data` platform limitations:
-- **Sharding (per host)** — concurrent writers to one shared dataset collide on a server-side clone-table race and lose rows; one writer per dataset lands 100% at any fleet scale.
-- **Rotation (per month)** — `add_data` **merge time scales with the dataset's total size, not the payload** (measured: ~13 s/POST at 15k rows → ~31 s at 77k). An ever-growing dataset eventually outlives any client timeout and goes **write-dead** (observed live: a grown shard landed 500 of 36,106 rows). A fresh dataset each month bounds size — and therefore merge time — forever.
-
-Dashboards are unaffected by both: they fan everything back in with a `yara_scanner_matches*` wildcard. Old months are pruned explicitly with `xdr_action_center.py prune-datasets` / `delete_dataset`.
-- **`yara_scanner_matches_v2_<host>_<YYYYMM>`** — one row per matched string (the forensic-grain record backing the finding-grain alerts); carries `tenant_id`, `scan_date`, `os_type`, `file_size`, `scan_folder`, `matched_length`.
-- **`yara_scanner_scans_v2_<host>_<YYYYMM>`** — scan lifecycle rows (`initiated` / `running` heartbeat / `completed` / `cancelled` / `failed`) with counts, `os_type`, `scan_folder`, throttle mode, paused time, and posture.
-
-Sharding and rotation are configurable (`CONFIG_LOOKUP_SHARD` / `CONFIG_LOOKUP_ROTATION`, env `YARA_LOOKUP_SHARD` / `YARA_LOOKUP_ROTATION`). The `_v2` tag is a schema version (bump on row-shape changes). Writes use a patient 120 s read timeout (a slow merge is a success, not a failure), and a batch whose **read times out is retried once, then counted `rows_unconfirmed`** — the server merge often commits after the client hangs up, so blind retries would duplicate rows. The final dataset drain **scales with the backlog** (up to `LOOKUP_DRAIN_MAX_SECS`), and anything past the budget is counted `undelivered` in `dataset_delivery` — the books always balance. Each run also drops a machine-readable `scan_summary_<run_id>.json` (including the resolved dataset names) on the endpoint.
-
-### 🌐 Scan scope
-Browser caches are **no longer bypassed** (removed from the skip list), and a `force_scan_fragments` allowlist re-opens browser caches on macOS where the broad `Library/Caches/` exclusion would otherwise swallow them.
-
-### 🩹 Platform fixes
-- macOS cleanup now uses a **launchd** LaunchDaemon (was incorrectly writing a systemd unit and failing every run).
-- The cleanup script is **generated from the real alert directory** (the old embedded scripts pointed at a non-existent `xdr-data` path, so cleanup silently did nothing).
-- CPU sampler is primed at start (the first `psutil.cpu_percent()` reads 0 and skipped the first throttle window).
-- Hosts without systemd log-and-skip cleanup instead of erroring.
-
-### 📊 Dashboard & 🧪 test skill
-- Comprehensive **`dashboards/Yara XDR Scanner (Lookup).json`** (40 widgets) + `widgets/xdr_lookup/*.xql`, built on the sharded lookup datasets via the `yara_scanner_matches*` / `yara_scanner_scans*` wildcards plus the reliable `alerts` channel. Covers detections (by OS/folder/file-size/severity), fleet coverage, rule health, throughput/throttle, KPI tiles, and alert trends. Every query is validated live against the tenant.
-- A bundled Claude skill, **`.claude/skills/xdr-yara-scan-test/`**, drives the scanner on a live endpoint through the XDR API (via `run_snippet_code_script`, no library upload) and verifies the datasets. See its `SKILL.md`.
-
-### 🎛️ Automation playbooks
-- **`playbooks/YARA_Scanner_Runner.yml`** and **`playbooks/YARA_Scanner_Canceller.yml`** launch / cancel the scanner on targeted agents via the built-in **Cortex Core - IR** integration (`core-get-scripts` → `core-get-endpoints` → `core-script-run`), for manual runs or scheduled **Jobs**.
-- Works on Cortex XDR (the `edr` module) and XSIAM. **Prerequisite:** the scanner must be uploaded to the Action Center library with the `main` entry point's **3 string inputs** (`yarafile, scan_folder, alert_severity`) — `core-script-run` rejects a mismatched parameter set. All other behaviour is in the CUSTOMER CONFIG block. See `playbooks/README.md` for import, run, Job scheduling, and verification.
-
-### 📘 Deployment guides
-Step-by-step deployment guides (Markdown + Word) live in **`docs/guides/`**:
-- **`XDR_YARA_Scanner_Guide`** — Advanced/Standard auth, library upload with the 3 inputs (+ CUSTOMER CONFIG), run via UI/API/playbook, cancellation, lookup datasets + dashboard, XQL recipes.
-- **`XSIAM_YARA_Scanner_Guide`** — HTTP Log Collector + parsing rule, `yara_scans_raw` ingestion, dashboards, XQL recipes, tuning.
+To stop a running scan: run the `cancel` entry point on the same endpoint — the scan winds down
+within ~5 s, drains its uploaders, and writes a terminal `cancelled` lifecycle row.
 
 ---
 
-## ✨ Key Features
+## 3. How results are delivered (XDR edition)
 
-### Core Capabilities
-- 🚀 **Multi-threaded Scanning** - Configurable worker threads for optimal performance
-- 🔄 **Circuit Breaker Pattern** - Resilient API uploads with exponential backoff
-- 🗂️ **Evidence Collection** - Automatic packaging with SHA256 hashing
-- 🧹 **Automated Cleanup** - Scheduled post-scan cleanup via Task Scheduler/systemd
-- 🌐 **Cross-Platform** - Full support for Windows, Linux, and macOS
+### 3.1 Alerts — sized for triage
 
-### Monitoring & Observability
-- 📊 **System Resource Monitoring** - CPU, memory, disk I/O, network metrics
-- 📈 **Performance Tracking** - Scan rates, worker efficiency, cache hit rates
-- 📝 **Categorized Logging** - Separate logs for alerts, errors, performance, uploads
-- ⚡ **Real-time Statistics** - Progress tracking with ETA calculations
+**One alert per finding (file × rule).** A SOC triages *"this file matched this rule"*; per-string
+evidence belongs in the dataset. Each alert carries the string-hit count and a sample, and its
+identity is stable per (rule, file path, host):
 
-### Enterprise Integration
-- 📡 **Real-Time Streaming Uploads** - Uses a producer/consumer queue model with a dedicated background thread to stream alerts to XDR/XSIAM instantly as matches are found, rather than waiting for the entire scan to finish.
-- 🔄 **Resilient API Delivery** - Built-in exponential backoff, timeout protection, and local `.json` file backups guarantee data preservation even if rate-limited or disconnected.
-- 🔐 **Embedded Authentication** - API credentials are hardcoded securely directly into the scripts for simplified endpoint deployment.
-- 🎯 **Standardized Log Format** - JSON-based structured logging mapped directly to Cortex XDR and XSIAM schemas.
+- **1:1 with findings** within a scan — a rule with 90 string hits in one file is *one* alert
+- **Idempotent across re-scans** — re-scanning updates the existing alert instead of duplicating it
+- Severity comes from the `alert_severity` run input
 
----
+**Storm cap.** Past `CONFIG_ALERT_MAX_PER_SCAN` findings (default 500), per-finding alerts stop and
+each affected rule reports the remainder as **one rollup alert** — `YARA Match Storm: <rule> |
+Host: <host>` with the suppressed count. Alert volume is bounded by design; nothing goes silent.
 
-## 🚀 Quick Start
+**Paced, batched, retried.** Alerts POST in batches (platform cap 60/call), paced under the
+platform's shared per-key alert budget, honor `Retry-After`, and requeue rate-limited batches for a
+later delivery window. The end-of-scan drain scales with the backlog.
 
-### Prerequisites
+### 3.2 Lookup datasets — sized for forensics
 
-```bash
-# Python 3.8 or higher
-python --version
+Two datasets per endpoint per month:
 
-# Required packages
-pip install -r requirements.txt
-```
+- **`yara_scanner_matches_v2_<host>_<YYYYMM>`** — one row per matched string: `rule`, `filename`,
+  `file_size`, `file_sha256`, `offset`, `matched_length`, `string`, `severity`, `os_type`,
+  `scan_folder`, `tenant_id`, `scan_id`/`run_id`, timestamps
+- **`yara_scanner_scans_v2_<host>_<YYYYMM>`** — scan lifecycle: `initiated` / `running` heartbeat /
+  `completed` / `cancelled` / `failed`, with counts, throttle posture, and paused time
 
-### Basic Usage
+Why this shape (both are XDR `add_data` platform characteristics):
 
-Choose the appropriate script (`xdr_yara_scanner.py` or `xsiam_yara_scanner.py`) based on your target platform.
+- **Sharding (`_<host>`)** — concurrent writers to one dataset collide server-side and lose rows;
+  one writer per dataset lands 100% at any fleet scale.
+- **Rotation (`_<YYYYMM>`)** — `add_data` merge time grows with the dataset's total size, so a
+  bounded dataset keeps bounded write time, permanently.
 
-#### 1. **Standalone Execution** (Testing/Development)
-```bash
-# Custom YARA rules (base64 encoded) using the XSIAM scanner
-python xsiam_yara_scanner.py "eW91cl9iYXNlNjRfcnVsZXM="
+Dashboards and queries are unaffected by either: they fan in with a wildcard
+(`dataset = yara_scanner_matches*`). Old months are pruned explicitly with
+`xdr_action_center.py prune-datasets` / the `delete_dataset` API. The `_v2` tag is the row-schema
+version — bump it on any row-shape change (datasets can't alter schemas in place).
 
-# Specific folder scan
-python xsiam_yara_scanner.py "eW91cl9iYXNlNjRfcnVsZXM=" "/path/to/scan"
+### 3.3 Delivery accounting — the books always balance
 
-# With specific alert severity
-python xsiam_yara_scanner.py "eW91cl9iYXNlNjRfcnVsZXM=" "/path/to/scan" "high"
-```
-
-#### 2. **Cortex XDR/XSIAM Deployment** (Production)
-
-Deploy via XDR/XSIAM Action Center:
-
-```python
-# XDR/XSIAM Script Arguments
-args = {
-    "yarafile": "base64_encoded_yara_rules",
-    "scan_folder": "default",  # or specific path
-    "alert_severity": "low"    # optional severity level
-}
-```
-
----
-
-## 📋 Command-Line Arguments
-
-| Position | Parameter | Description | Default | Example |
-|----------|-----------|-------------|---------|---------|
-| 1 | `yarafile` | Base64-encoded YARA rules | Built-in rules | `"cnVsZSB0ZXN0IHsgLi4uIH0="` |
-| 2 | `scan_folder` | Target directory path | Full system scan | `"/home/user"` or `"C:\\"` |
-| 3 | `alert_severity`| Desired severity level | `"low"` | `"high"` |
-| 4 | `mode` | `scan` or `cancel` (deliver a cancel to a running scan) | `"scan"` | `"cancel"` |
-| 5 | `options` | `key=value,key=value` runtime options (see v2 section) | none | `"create_alerts=false,throttle_mode=os"` |
-
-**Note:** Use an empty string `""` to skip a parameter and use its default value. API Credentials are no longer passed via command-line arguments and must be embedded directly in the script source. See the **v2 Updates** section below for the `mode` / `options` surface, authentication, datasets, cancellation, and the bundled test skill.
-
----
-
-## 🔧 Configuration
-
-### Environment Variables (Alternative to CLI args)
-
-```bash
-export YARA_THREADS=8              # Number of worker threads (default: CPU count)
-export YARA_MAX_MB=100             # Max file size to scan in MB (0 = no limit)
-```
-
-### Scan Behavior
-
-The scanner automatically adjusts behavior based on privileges:
-
-**Linux/macOS:**
-- **Root user**: Full system scan from `/`
-- **Non-root user**: Limited to accessible directories (home, tmp, opt, etc.)
-- **Recommendation**: Run with `sudo` for comprehensive coverage
-
-**Windows:**
-- Scans all available drives by default
-- Skips system-protected directories (e.g., `C:\ProgramData\Cyvera`)
-- Administrative privileges recommended
-
----
-
-## 📊 Output & Artifacts
-
-### Directory Structure
-
-```
-Windows:     C:\yara_scanner\
-Linux:       /opt/yara_scanner/
-macOS:       /usr/local/yara_scanner/
-
-├── logs/                          # Categorized log files
-│   ├── alerts_YYYYMMDD_HHMMSS.log
-│   ├── statistics_YYYYMMDD_HHMMSS.log
-│   ├── performance_YYYYMMDD_HHMMSS.log
-│   ├── uploads_YYYYMMDD_HHMMSS.log
-│   ├── scan_errors_YYYYMMDD_HHMMSS.log
-│   ├── yara_processing_YYYYMMDD_HHMMSS.log
-│   └── script_exceptions_YYYYMMDD_HHMMSS.log
-│
-├── alert/                         # Detection alert files (per rule)
-│   └── [RuleName].txt
-│
-├── evidence/                      # Matched files and metadata
-│   ├── evidence_hostname_timestamp.zip
-│   ├── file_mapping.txt
-│   └── yara_matches_hostname_timestamp.json
-│
-├── failed_rules/                  # Rules that failed compilation
-│   └── failed_rule_[name].yar
-```
-
-### Log Categories
-
-| Log Type | Description | XDR Integration |
-|----------|-------------|-----------------|
-| **Alerts** | YARA detection events | ✅ Auto-uploaded |
-| **Statistics** | Scan metrics & progress | ✅ Dashboard data |
-| **Performance** | System resource usage | ✅ Monitoring |
-| **Uploads** | Webhook transmission logs | 📊 Diagnostic |
-| **Errors** | Scan failures & issues | ⚠️ Alert triggers |
-| **Compilation Errors** | YARA rule validation | 🔍 Rule debugging |
-| **Script Exceptions** | Critical failures | 🚨 Incident response |
-
----
-
-## 📤 API Payloads & Telemetry
-
-### XDR Payload Schema
-When running `xdr_yara_scanner.py`, only **positive YARA matches** are uploaded to Cortex XDR via the **Insert Parsed Alerts API** (`/public_api/v1/alerts/insert_parsed_alerts`). The deep forensic details are embedded as a stringified JSON object inside the `alert_description` field.
-
-#### What data is collected and shipped?
-1. **Endpoint Identity**: Hostname, OS info, and Local IPv4 Address.
-2. **Detection Context**: YARA rule name, severity level, and timestamp.
-3. **Forensic Evidence**: The exact file path (`filename`), the matched byte sequence (`string`), its identifier (`match`), the byte offset (`offset`), and the file's SHA256 hash and creation time.
-
-#### Example XDR Payload
-```json
-{
-  "request_data": {
-    "alerts": [
-      {
-        "product": "YARA Scanner",
-        "vendor": "Custom",
-        "local_ip": "10.0.1.45",
-        "local_port": 65535,
-        "remote_ip": "127.0.0.1",
-        "remote_port": 65535,
-        "event_timestamp": 1715693452,
-        "severity": "High",
-        "alert_name": "YARA Match: Ransomware_WannaCry | Host: WIN-SRV-PROD1 | Time: 1715693452",
-        "action_status": "Reported",
-        "alert_description": "{\"source\": \"yara_scanner\", \"scan_id\": \"startup_20240514_104522_123456\", \"hostname\": \"WIN-SRV-PROD1\", \"os_info\": \"Windows-10-10.0.19045-SP0\", \"ip_address\": \"10.0.1.45\", \"message\": \"YARA match: rule 'Ransomware_WannaCry' in C:\\\\Users\\\\Admin\\\\Downloads\\\\invoice.exe\", \"network_fields_are_placeholders\": true, \"match_data\": {\"filename\": \"C:\\\\Users\\\\Admin\\\\Downloads\\\\invoice.exe\", \"rule\": \"Ransomware_WannaCry\", \"string\": \"WNcry@2ol7\", \"offset\": \"1024\", \"match\": \"$s1\", \"dateOfScan\": \"2024-05-14T10:45:22.123456\", \"file_sha256\": \"82b8a1c3bb545938023c7270e5b7c7b89736e6e2\", \"file_creation_time\": 1715600000.0}}"
-      }
-    ]
-  }
-}
-```
-
-### XSIAM Webhook Payload Schema
-Unlike the XDR edition which strictly sends alerts, the `xsiam_yara_scanner.py` acts as a comprehensive telemetry agent. It sends **raw JSON logs** directly to a generic Cortex XSIAM Webhook or HTTP Event Collector endpoint. 
-
-By default, the scanner uploads **4 distinct types of telemetry** to provide full operational visibility: `yara_match`, `scan_status`, `performance`, and `error`.
-
-#### Standardized Base Structure
-Every log sent to XSIAM shares a consistent base JSON envelope (`StandardLogEntry`).
+Every run's `scan_summary_<run_id>.json` reports exactly what landed:
 
 ```json
-{
-  "type": "<yara_match | scan_status | performance | error>",
-  "hostname": "WIN-SRV-PROD1",
-  "os_info": "Windows-10-10.0.19045-SP0",
-  "ipAddress": "10.0.1.45",
-  "timestamp": 1715693452.123456,
-  "timestamp_iso": "2024-05-14T10:45:22.123456",
-  "scan_id": "startup_20240514_104522",
-  "uploader_version": "enhanced_v2",
-  "source": "yara_scanner",
-  "message": "<Human readable summary>",
-  "level": "<INFO | WARNING | ERROR>",
-  "data": { }
-}
+"alert_delivery":   {"total_matches": 36243, "findings": 401, "alerts_queued": 401,
+                     "successful_uploads": 401, "failed_uploads": 0, "suppressed": 0,
+                     "rollups": 0, "undelivered": 0, "requeued": 0},
+"dataset_delivery": {"queued": 36246, "batches_sent": 59, "records_added": 27527,
+                     "records_skipped": 0, "send_failures": 1, "rows_unconfirmed": 0,
+                     "undelivered": 7719, "dropped": 0}
 ```
 
-#### Payload Types (`data` field)
+- `findings = successful + failed + undelivered` — anything a bounded drain window can't deliver is
+  **counted and logged**, never silently discarded
+- `suppressed` findings are reported via `rollups`
+- `rows_unconfirmed` marks dataset batches whose *read* timed out — the server merge often commits
+  after the client hangs up, so these are retried once and then counted (blind retries would
+  duplicate rows)
+- The uploads log closes with a one-line truth statement, e.g.
+  `Alert delivery final: findings=401 queued=401 ok=401 failed=0 undelivered=0 ...`
 
-**1. YARA Match Logs** (`type: "yara_match"`)
-```json
-"data": {
-  "filename": "C:\\Temp\\malicious.dll",
-  "rule": "APT_Lazarus_Backdoor",
-  "threat_level": "high",
-  "string": "cmd.exe /c start",
-  "offset": "2048",
-  "match": "$str1",
-  "match_scope": "string",
-  "string_match_count": 3,
-  "file_sha256": "82b8a1c3bb545938023c7270e5b7c7b89736e6e2",
-  "file_creation_time": 1715600000.0,
-  "dateOfScan": "2024-05-14T10:45:22.123456"
-}
-```
+---
 
-**2. Scan Status Logs** (`type: "scan_status"`)
-```json
-"data": {
-  "scan_status": "running",
-  "files_scanned": 15430,
-  "files_skipped": 120,
-  "detections_found": 5,
-  "current_file": "C:\\Windows\\System32\\ntdll.dll",
-  "scan_rate_files_per_second": 257.16,
-  "elapsed_time_seconds": 60,
-  "valid_rules_count": 1500,
-  "failed_rules_count": 2
-}
-```
+## 4. ⚠️ Limitations & best practices
 
-**3. Performance Metrics** (`type: "performance"`)
-```json
-"data": {
-  "cpu_percent": 14.5,
-  "memory_mb": 450.2,
-  "memory_percent": 2.8,
-  "disk_io_read_mb": 1024.5,
-  "queue_size": 50,
-  "active_workers": 8,
-  "files_scanned": 15430
-}
+The scanner rides two hard platform ceilings. Both are **shared-tenant characteristics of the
+Cortex APIs, not tunables** — the scanner is engineered to degrade *predictably and visibly*
+against them, and well-tuned rule packs never come near them.
+
+### 4.1 The two ceilings
+
+| Ceiling | What it is | What you see at the limit |
+|---|---|---|
+| **Alert budget** | The Insert Parsed Alerts API allows ~600 alerts/min **per API key, shared across every endpoint using that key** | Batches are paced/retried; a saturated key requeues and, past the delivery budget, counts `undelivered` |
+| **Dataset write time** | Each `add_data` POST triggers a server-side merge whose duration **grows with the dataset's total size** (measured: ~13 s/POST at 15k rows → ~31 s at 77k) | Rows queue behind slow merges; at scan end the drain runs up to its budget (10 min), then counts the remainder `undelivered` |
+
+### 4.2 When you would actually hit them
+
+One condition produces both: **a rule pack that matches far more than intended** on a large
+filesystem — e.g. a string common in benign files (a config keyword, a library banner, a copyright
+line) matching tens of thousands of files on a full-drive scan. A measured worst case: one
+over-broad rule on a 465k-file Windows system produced **36,243 string matches across 401 files**
+in a single scan. The finding-grain alert model absorbed it (401 alerts, all delivered), but the
+dataset channel — which records every string hit — queued 36k rows against write times of ~35 s per
+500-row batch, and 7,719 rows hit the drain budget: counted, logged, but absent from the dataset.
+
+A very large fleet scanning concurrently on one API key can also saturate the *alert* budget alone,
+even with tuned rules.
+
+### 4.3 How to avoid it
+
+1. **Tune out false-positive-prone rules before fleet rollout.** Test every new pack against a
+   small representative folder first (`scan_folder` = one directory, not a drive) and read
+   `top_rules` in the scan summary. A rule matching hundreds of files in a small sample will match
+   tens of thousands fleet-wide — fix the rule (anchor strings, add `filesize`/path conditions,
+   require multiple strings) or drop it. **Prefer fewer, specific rules over broad packs.**
+2. **Watch the books.** `alert_delivery.suppressed`, `.undelivered`, and
+   `dataset_delivery.undelivered` in the scan summary (and the dashboard's delivery widgets) are
+   your early-warning signals — non-zero values mean a rule needs tuning, not that data was lost
+   silently.
+3. **Stagger fleet scans** (scheduling waves in the Job/playbook) and/or use **separate API keys
+   per wave** if you must scan thousands of endpoints in one window — the alert budget is per key.
+4. **Let rotation work for you.** Keep `CONFIG_LOOKUP_ROTATION=monthly` (default) so dataset write
+   time stays bounded; prune old months periodically with `prune-datasets`.
+5. **Storm behaviour is a policy knob.** `CONFIG_ALERT_MAX_PER_SCAN` (default 500) decides how many
+   per-finding alerts a runaway scan may emit before rolling up. Raise it only with a tuned pack
+   and a dedicated API key.
+
+> **Design position:** past the ceilings, alerts stay complete at *finding* grain (cap + rollups),
+> the dataset holds everything the write budget allows, and every shortfall is **counted** in the
+> summary. If `undelivered` is consistently non-zero, the fix is in the rules or the schedule — not
+> the endpoint.
+
+---
+
+## 5. XSIAM edition (`xsiam_yara_scanner.py`)
+
+The XSIAM edition ships every event as standardized JSON to an **HTTP Event Collector** — matches,
+statistics, performance snapshots, and resource telemetry — and leaves alerting to XSIAM
+correlation rules over the ingested dataset.
+
+- **Setup:** set `DEFAULT_API_KEY` / `DEFAULT_API_ENDPOINT` to your collector, upload via the
+  console, entry point `main(yarafile, scan_folder, alert_severity)`. A scan **aborts loudly** if
+  uploads are enabled while the collector credentials are still placeholders.
+- **Delivery:** one JSON event per matched string with bounded per-item retries and backoff.
+  Repetitive per-item log lines are rate-limited on the endpoint (first 20, then periodic
+  summaries), so a sustained failure can't bloat endpoint logs.
+- **Accounting:** the uploads log closes with
+  `Match delivery final: matches=N ok=A failed=B undelivered=C` — items still queued when the
+  shutdown drain expires are counted, never silently dropped.
+- **Rule support:** the same engine features as XDR, plus detailed fallback summaries for
+  condition-only matches.
+- **Dashboards:** `dashboards/Yara Matches.json` and `dashboards/Yara Scan Performance.json` (with
+  their editable XQL under `widgets/`).
+
+---
+
+## 6. Dashboards
+
+| Dashboard | Edition | Contents |
+|---|---|---|
+| `dashboards/Yara XDR Scanner (Lookup).json` | XDR | **40 widgets** over the lookup datasets: detection KPIs, top rules/hosts/files, match timelines, scan throughput, cancellations/failures, alert-vs-dataset delivery health |
+| `dashboards/Yara Matches.json` | XSIAM | Threat-detection view over collector events |
+| `dashboards/Yara Scan Performance.json` | XSIAM | Scan operations: throughput, workers, cache, resources |
+
+Import via **Dashboards → Import**. Every widget's XQL is in `widgets/` (XSIAM) and
+`widgets/xdr_lookup/` (XDR) for customization. The XDR queries use wildcard dataset references, so
+they span all endpoint shards and months automatically.
+
+Example ad-hoc XQL against the XDR datasets:
+
+```sql
+dataset = yara_scanner_matches*
+| filter severity in ("High", "Medium")
+| comp count() as hits by rule, hostname
+| sort desc hits | limit 20
 ```
 
 ---
 
-## 📊 Pre-Built Dashboards & Widgets
+## 7. Automation & tooling
 
-This repository includes **production-ready dashboards and XQL queries** for comprehensive visibility into YARA scanning operations across your enterprise.
+### Playbooks (`playbooks/`)
 
-### 📁 Repository Structure
+`YARA_Scanner_Runner.yml` / `YARA_Scanner_Canceller.yml` — Action Center automation via the
+**Cortex Core - IR** integration (`core-get-scripts` → `core-get-endpoints` → `core-script-run`),
+plus scheduling guidance for recurring scan Jobs. See `playbooks/README.md` for the required
+3-input script upload.
 
-```
-yara-scanner/
-├── dashboards/                    # Dashboard definitions (JSON)
-│   ├── Yara_Matches.json         # Threat detection dashboard
-│   └── Yara_Scan_Performance.json # Operational metrics dashboard
-│
-├── widgets/                       # Individual XQL widget queries
-│   ├── matches/                   # Detection-focused widgets
-│   │   ├── top_rules_by_hits.xql
-│   │   ├── top_matched_files.xql
-│   │   ├── hot_hosts.xql
-│   │   ├── endpoints_per_rule.xql
-│   │   └── matches_over_time.xql
-│   │
-│   └── performance/               # Operational metrics widgets
-│       ├── worker_error_rate.xql
-│       ├── throughput_vs_latency.xql
-│       ├── cache_hit_rate.xql
-│       ├── scan_progress.xql
-│       ├── system_metrics.xql
-│       └── capacity_backpressure.xql
-│
-└── images/                        # Dashboard screenshots
-    ├── Matches_1.jpg
-    ├── Matches_2.jpg
-    ├── Performance_1.jpg
-    ├── Performance_2.jpg
-    └── Performance_3.jpg
-```
+### API toolkit (`xdr_action_center.py`)
 
----
-
-## 🎯 Dashboard 1: YARA Matches & Threat Detection
-
-**Purpose:** Real-time visibility into YARA rule detections across your endpoint fleet.
-
-**Location:** `dashboards/Yara_Matches.json`
-
-### Key Metrics & Visualizations
-
-![YARA Matches Dashboard - Part 1](images/Matches_1.jpg)
-
-#### 🔴 **Top YARA Rules by Hits**
-- **Type:** Pie chart with tabular breakdown
-- **Insight:** Identifies which detection rules are triggering most frequently
-- **Use Case:** Prioritize threat investigation and rule tuning
-- **Example Data:** ID_989714 (210,890 hits), ID_133073 (188,889 hits)
-
-#### 📦 **Top Matched Files (Stacked by String)**
-- **Type:** Bubble chart
-- **Insight:** Shows which files are triggering multiple YARA strings
-- **Use Case:** Identify commonly flagged binaries or potential false positives
-
----
-
-![YARA Matches Dashboard - Part 2](images/Matches_2.jpg)
-
-#### 🏥 **Completed Scans**
-- **Type:** Gauge (436 hosts)
-- **Insight:** Track scan completion rate across endpoints
-- **Use Case:** Monitor deployment success and coverage
-
-#### 📈 **YARA Matches Over Time**
-- **Type:** Time series (10-minute buckets)
-- **Insight:** Identify detection spikes and temporal patterns
-- **Use Case:** Correlate with incidents, campaigns, or user activity
-
-#### 🔥 **Hot Hosts (Most Matches)**
-- **Type:** Ring chart (199K total hits)
-- **Insight:** Pinpoint endpoints with highest detection rates
-- **Use Case:** Prioritize incident response and forensics
-- **Top Hosts:** 27,363 hits, 22,328 hits, 18,787 hits
-
-#### 🎯 **Top Matched Strings**
-- **Type:** Horizontal bar chart (hosts vs hits)
-- **Insight:** See which specific YARA strings are matching most
-- **Use Case:** Fine-tune detection logic and reduce noise
-
-#### 🌊 **Endpoints Impacted per Rule**
-- **Type:** Funnel chart
-- **Insight:** Visualize rule reach across the endpoint estate
-- **Use Case:** Assess rule effectiveness and coverage
-- **Example:** ID_124212 (519 endpoints), ID_989714 (455 endpoints)
-
-### Dashboard Import
+A single CLI/library for driving the whole lifecycle from anywhere with API access:
 
 ```bash
-# In Cortex XDR/XSIAM:
-# 1. Navigate to Dashboards → Import
-# 2. Upload: dashboards/Yara_Matches.json
-# 3. Verify data ingestion from webhook endpoint
+python3 xdr_action_center.py endpoints                    # list agents
+python3 xdr_action_center.py run-scanner --hostname H --rules rules.yar --scan-folder /tmp
+python3 xdr_action_center.py cancel --hostname H
+python3 xdr_action_center.py verify --hostname H          # matches/scans landed?
+python3 xdr_action_center.py xql "dataset = yara_scanner_scans* | limit 10"
+python3 xdr_action_center.py prune-datasets --dry-run     # retire legacy/old datasets
+```
+
+Credentials come from `.env` / environment (`XDR_API_URL`, `XDR_API_ID`, `XDR_API_KEY`); both auth
+models are auto-detected. Corporate-proxy TLS is supported via `XDR_CA_BUNDLE`.
+
+### Test harness (`tests/`)
+
+`gen_rules.py` (rule packs of every shape, 1→500 rules), `seed_corpus.py`, `run_matrix.py`
+(multi-host scan matrix), `analyze.py` (results → report tables). The
+`.claude/skills/xdr-yara-scan-test` skill packages the same flow for assistant-driven testing.
+
+### Guides (`docs/guides/`)
+
+- `XDR_YARA_Scanner_Guide.md` / `.docx` — deployment + operations, XDR edition
+- `XSIAM_YARA_Scanner_Guide.md` / `.docx` — deployment + operations, XSIAM edition
+- `YARA_Scanner_Test_and_Performance_Report.md` / `.docx` — measured performance & test coverage
+
+---
+
+## 8. Performance
+
+Measured on 2-worker light profile (agent-friendly defaults), e2-medium-class VMs:
+
+| Scenario | Result |
+|---|---|
+| Linux full-system scan (133k files, 10 rules) | ~2.6 min wall, ~850 files/s |
+| Windows full-drive scan (465k files, 10 rules) | ~25 min wall, ~470–540 files/s |
+| 500-rule pack compile | ~0.2 s (then cached on disk for re-runs) |
+| Small scan end-to-end (scan + alerts + datasets) | ~30–60 s including delivery drains |
+| Finding alerts | delivered 1:1 up to the cap, idempotent across re-scans |
+
+CPU stays under the configured thresholds via throttling; memory footprint is bounded by the scan
+queue and batch sizes. All figures come from live tenant runs recorded in the performance report.
+
+---
+
+## 9. Security considerations
+
+- **Credentials live in the script** (uploaded to the console script library) or in environment
+  variables for the CLI toolkit — never commit real keys to source control (`.env` is gitignored).
+- The XDR key needs only **Insert Parsed Alerts** + **XQL/lookups** permissions; scope it to a
+  dedicated role. The XSIAM collector key is write-only ingestion.
+- Runs against protected paths degrade gracefully (permission errors are counted + logged, not
+  fatal). Evidence collection (`CONFIG_COLLECT_FILES`) copies matched files — leave it off unless
+  your handling process requires it.
+- All uploads are HTTPS. On TLS-intercepting networks, point `XDR_CA_BUNDLE` /
+  `REQUESTS_CA_BUNDLE` at your CA chain for the CLI toolkit (endpoint agents are unaffected).
+
+---
+
+## 10. Troubleshooting
+
+| Symptom | Meaning / fix |
+|---|---|
+| Result says `SCAN ABORTED — … credentials are not set` | Delivery is enabled but the script still has placeholder creds — edit the `DEFAULT_*` values and re-upload |
+| `alert_delivery.undelivered > 0` | Alert budget saturated (fleet too concurrent, or a match storm) — see §4.3 |
+| `dataset_delivery.undelivered > 0` | Dataset write budget exhausted by a match storm — tune the offending rule (`top_rules` in the summary) |
+| `records_skipped > 0` in dataset delivery | Row shape doesn't match the dataset's schema — bump `LOOKUP_SCHEMA_VERSION` so a fresh dataset is created |
+| A rule never matches | Check `rules_failed` + the failed-rules log on the endpoint: unavailable module imports are skipped by design |
+| Scan is slow on a busy host | That's the throttler honoring CPU thresholds; use `CONFIG_THROTTLE_MODE=os` or raise thresholds for maintenance windows |
+| Alerts don't appear in XDR | Verify the key type/permissions; the scanner auto-detects Advanced (HMAC) vs Standard auth — check `uploads_<run_id>.log` for HTTP status lines |
+
+Per-run logs on the endpoint (`logs/` under the scanner directory): `scanner_`, `uploads_`,
+`scan_errors_`, `statistics_`, `performance_`, `system_`, `yara_processing_` + the
+`scan_summary_<run_id>.json`.
+
+---
+
+## 11. Repository layout
+
+```
+├── xdr_yara_scanner.py            # XDR edition (Action Center: main / cancel)
+├── xsiam_yara_scanner.py          # XSIAM edition (HTTP Collector)
+├── xdr_action_center.py           # API toolkit: run/cancel/verify/xql/prune
+├── encode_rules.py                # rules.yar -> base64 for the yarafile input
+├── test_rules.yar                 # sample rules (stock-binary matches for smoke tests)
+├── dashboards/                    # 3 importable dashboards (XDR lookup + 2 XSIAM)
+├── widgets/                       # per-widget XQL (XSIAM) + xdr_lookup/ (XDR)
+├── playbooks/                     # Runner / Canceller + README
+├── docs/guides/                   # deployment guides + performance report (md + docx)
+└── tests/                         # rule generator, corpus seeder, scan matrix, analyzer
 ```
 
 ---
 
-## ⚡ Dashboard 2: YARA Scan Performance & Operations
-
-**Purpose:** Monitor scanner health, efficiency, and resource utilization.
-
-**Location:** `dashboards/Yara_Scan_Performance.json`
-
-### Key Metrics & Visualizations
-
-![YARA Performance Dashboard - Part 1](images/Performance_1.jpg)
-
-#### ⚠️ **Workers Error Rate**
-- **Type:** Horizontal bar chart (per worker thread)
-- **Insight:** Identify problematic workers or systemic issues
-- **Use Case:** Troubleshoot scanning errors and optimize thread count
-- **Normal Range:** < 0.01 (1%) error rate
-
-#### 🚀 **Workers Throughput vs Latency**
-- **Type:** Scatter plot
-- **Insight:** Balance between file processing speed and response time
-- **Use Case:** Optimize worker thread configuration
-- **Example:** ScanWorker-1 (21.3M files, 139ms avg latency)
-
----
-
-![YARA Performance Dashboard - Part 2](images/Performance_2.jpg)
-
-#### 💾 **Cache Hit-Rate**
-- **Type:** Progress bar (38.94%)
-- **Insight:** Percentage of files served from cache vs rescanned
-- **Use Case:** Assess cache effectiveness and tune LRU size
-- **Expected:** 60-80% on subsequent scans
-
-#### 📦 **Files Scan Volume**
-- **Type:** Bubble chart by endpoint
-- **Insight:** Compare scan workloads across different hosts
-- **Use Case:** Identify outliers and capacity planning
-
-#### 📊 **Scan Progress**
-- **Type:** Time series (hourly buckets)
-- **Insight:** Visualize scan progression in real-time
-- **Use Case:** Monitor active scans and estimate completion
-
-#### ⏱️ **Scan Time Measures**
-- **Type:** Multi-metric display
-- **Metrics:** 
-  - AVG Scan Time: 1.149 minutes
-  - MAX Scan Time: 5.909 minutes
-  - MIN Scan Time: 8 seconds
-- **Use Case:** SLA compliance and performance benchmarking
-
-#### 📈 **Capacity vs Backpressure**
-- **Type:** Area chart (indexed to 100)
-- **Insight:** Queue depth vs processing capacity over time
-- **Use Case:** Detect bottlenecks and scale worker threads
-- **Healthy State:** Consistent capacity with minimal backpressure
-
----
-
-![YARA Performance Dashboard - Part 3](images/Performance_3.jpg)
-
-#### 🎬 **Scans Initiated**
-- **Type:** Gauge (585 hosts)
-- **Insight:** Total endpoints where scans started
-- **Use Case:** Track deployment reach
-
-#### ✅ **Scan Completed**
-- **Type:** Gauge (436 hosts)
-- **Insight:** Successfully finished scans
-- **Use Case:** Calculate completion rate (74.5% in example)
-
-#### ⚡ **Scan Rate**
-- **Type:** Gauge (137.087 files/second)
-- **Insight:** Real-time file processing throughput
-- **Use Case:** Performance monitoring and capacity planning
-
-#### 🖥️ **System Resource Metrics**
-- **Average System CPU Utilization:** 37% (healthy)
-- **Average Process CPU Utilization:** 159% (multi-threaded)
-- **Average System Memory Utilization:** 56% (moderate)
-- **Average Memory Allocation:** 662MB (per scanner instance)
-
-**Use Case:** Ensure scanner doesn't impact endpoint performance
-
-### Dashboard Import
-
-```bash
-# In Cortex XDR/XSIAM:
-# 1. Navigate to Dashboards → Import
-# 2. Upload: dashboards/Yara_Scan_Performance.json
-# 3. Configure refresh interval (recommended: 5 minutes)
-```
-
----
-
-## 🔧 Widget Customization
-
-All XQL queries are modular and can be used independently or combined into custom dashboards.
-
-### Example: Using Individual Widget Queries
-
-```xql
-// From: widgets/matches/top_rules_by_hits.xql
-dataset = xdr_data
-| filter log_type = "yara_match"
-| comp count() as hits by rule
-| sort desc hits
-| limit 10
-
-// From: widgets/performance/worker_error_rate.xql
-dataset = xdr_data
-| filter source = "yara_scanner" and log_type = "error"
-| comp count() as errors by worker_id
-| sort desc errors
-```
-
-### Combining Widgets
-
-```xql
-// Create a custom multi-metric widget
-dataset = xdr_data
-| filter source = "yara_scanner"
-| comp 
-    count_distinct(hostname) as endpoints_scanned,
-    count(case log_type = "yara_match" then 1) as total_detections,
-    avg(case log_type = "performance" then scan_rate) as avg_scan_rate,
-    avg(case log_type = "performance" then cache_hit_rate) as avg_cache_rate
-| alter 
-    detection_rate = total_detections / endpoints_scanned,
-    efficiency_score = (avg_scan_rate * avg_cache_rate) / 100
-```
-
----
-
-## 🎯 Cortex XDR/XSIAM Integration
-
-### XQL Query Examples
-
-```xql
-// Recent YARA detections across all endpoints
-dataset = xdr_data
-| filter log_type = "yara_match"
-| fields timestamp, hostname, rule, filename, offset
-| sort desc timestamp
-
-// Top 10 most triggered rules
-dataset = xdr_data
-| filter log_type = "yara_match"
-| comp count() as detection_count by rule
-| sort desc detection_count
-| limit 10
-
-// Endpoints with failed scans
-dataset = xdr_data
-| filter log_type = "error" and source = "yara_scanner"
-| comp count() as error_count by hostname
-| filter error_count > 0
-```
-
-### Automated Response Playbooks
-
-Sample XDR playbook triggers:
-- **High-severity detections** → Isolate endpoint + Create incident
-- **Multiple detections** → Initiate forensic collection
-- **Scan failures** → Alert SOC + Retry with elevated privileges
-
----
-
-## 🛡️ Security Considerations
-
-### API Key Management
-
-For simplified deployment via Cortex XDR or XSIAM Action Center, API credentials are now **hardcoded directly within the script source**. 
-
-Before deploying either script, you must open it and update the default credential variables near the top of the file:
-
-**XDR Edition:**
-```python
-DEFAULT_XDR_API_KEY = "your_actual_api_key"
-DEFAULT_XDR_API_ID = "your_actual_api_id"
-DEFAULT_XDR_API_URL = "your_actual_api_url"
-```
-
-**XSIAM Edition:**
-```python
-API_KEY = "your_actual_api_key"
-API_ENDPOINT = "your_actual_webhook_url"
-```
-*Note: Do not check these modified scripts into public version control after adding your credentials.*
-
-### Permissions
-
-- Scanner requires read access to target files
-- Evidence collection requires write access to output directory
-- Cleanup scheduling requires elevated privileges (admin/root)
-- XDR API uploads require network connectivity
-
-### Data Handling
-
-- **Matched files**: Automatically collected and zipped with SHA256 hashes
-- **Sensitive data**: Ensure YARA rules don't match PII/credentials
-- **Retention**: Evidence packages should be managed per compliance requirements
-
----
-
-## 🐛 Troubleshooting
-
-### Common Issues
-
-#### 1. **Permission Denied Errors**
-```
-Files skipped: 15,432 | Reason: Permission denied
-```
-**Solution:** Run with elevated privileges (`sudo` on Linux/macOS, Administrator on Windows)
-
-#### 2. **YARA Rule Compilation Failures**
-```
-Failed rules skipped: 5 | Check yara_processing_*.log
-```
-**Solution:** Review `failed_rules/` directory and validate YARA syntax. Scanner continues with valid rules.
-
-#### 3. **Webhook Upload Failures**
-```
-Upload errors: 127 | Check uploads_*.log
-```
-**Solution:** Verify API endpoint connectivity, check API key validity, review rate limits.
-
-#### 4. **High Memory Usage**
-```
-Memory: 4.2GB | Files: 1.2M scanned
-```
-**Solution:** Adjust cache size or run in batches. Cache auto-scales based on available RAM.
-
-### Debug Mode
-
-Enable verbose logging:
-```bash
-# Set environment variable before running
-export YARA_SCANNER_DEBUG=1
-python yara_scanner.py
-```
-
----
-
-## 📈 Performance Tuning
-
-### Recommended Settings by System Size
-
-| System Profile | Worker Threads | Max File Size |
-|----------------|----------------|---------------|
-| **Laptop/Workstation** | 4-8 | 50 MB |
-| **Server (16 GB RAM)** | 8-16 | 100 MB |
-| **Server (32+ GB RAM)** | 16-32 | 200 MB |
-
-### Optimization Tips
-
-1. **Skip patterns**: Customize the ignored directories in `ScanConfig` to avoid scanning low-risk or high-volume paths.
-2. **Network scans**: Consider local execution on the endpoint itself rather than scanning mounted network shares to avoid I/O bottlenecks.
-3. **Resource Limits**: Adjust `YARA_MAX_MB` environment variable if encountering large file timeouts.
-*Note: The LRU File Caching mechanism is currently disabled by default (Roadmap Feature).*
-
----
-
-## 🤝 Contributing
-
-This repository focuses on **Cortex XDR/XSIAM deployment scenarios**. Contributions welcome for:
-
-- Dashboard templates
-- Correlation rules
-- XQL query examples
-- Playbooks
-- Performance optimizations
-- Bug fixes and error handling
-
-**Note:** For general YARA scanning use cases outside XDR/XSIAM, consider forking the scanner core.
-
----
-
-## 📚 Additional Resources
-
-### Palo Alto Networks Documentation
-- [Cortex Documentation Hub](https://docs.paloaltonetworks.com/cortex)
-- [Extended Query Language (XQL)](https://docs-cortex.paloaltonetworks.com/r/Cortex-XDR/Cortex-XDR-4.x-Documentation/Get-started-with-XQL)
-
-### YARA Resources
-- [YARA Documentation](https://yara.readthedocs.io/)
-- [Writing YARA Rules](https://yara.readthedocs.io/en/stable/writingrules.html)
-- [YARA-Python API](https://yara.readthedocs.io/en/stable/yarapython.html)
-
----
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
----
-
-## 🙏 Acknowledgments
-
-- **YARA** by VirusTotal for the powerful pattern matching engine
-- **Palo Alto Networks** for the Cortex XDR/XSIAM platform
-- **Open Source Community** for Python security tooling ecosystem
-
----
-
-## 📞 Support
-
-- **Issues**: [GitHub Issues](https://github.com/yourusername/yara-scanner/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/yourusername/yara-scanner/discussions)
-- **XDR Support**: Contact Palo Alto Networks TAC for platform-specific issues
-
----
-
-<div align="center">
-
-**Built for enterprise security teams leveraging Cortex XDR/XSIAM**
-
-⭐ Star this repository if you find it useful! ⭐
-
-</div>
+## 12. License & support
+
+MIT — see [LICENSE](LICENSE). Issues and contributions via GitHub. For Cortex platform questions,
+see the [Cortex XDR](https://docs-cortex.paloaltonetworks.com/p/XDR) and
+[Cortex XSIAM](https://docs-cortex.paloaltonetworks.com/p/XSIAM) documentation; for YARA rule
+authoring, the [YARA documentation](https://yara.readthedocs.io/).
