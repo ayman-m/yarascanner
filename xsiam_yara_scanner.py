@@ -2650,11 +2650,33 @@ class ResultsUploader:
         self.upload_stats = {
             'total_matches': 0,
             'successful_uploads': 0,
-            'failed_uploads': 0
+            'failed_uploads': 0,
+            'undelivered': 0,        # items still queued when the drain window expired (never attempted)
         }
-        
+        # Rate-limit counters so a sustained upload failure (or a very match-heavy scan) can't
+        # bloat the endpoint logs with one line per matched string.
+        self._rl_counters = {}
+        self._stop_done = False
+
         if UPLOAD_RESULTS:
             self._start_upload_thread()
+
+    def _throttled_log(self, bucket, msg, level="error", full=20, every=1000):
+        """Log the first `full` messages in a bucket, then suppress and emit only a periodic
+        running count every `every`. Keeps per-match upload noise from ballooning the log files
+        on a sustained failure while still surfacing that something is wrong (and how much)."""
+        if not self.log_manager:
+            return
+        n = self._rl_counters.get(bucket, 0) + 1
+        self._rl_counters[bucket] = n
+        emit = self.log_manager.log_error if level == "error" else self.log_manager.log_upload
+        if n <= full:
+            emit(msg)
+        elif n == full + 1:
+            emit(f"[{bucket}] further similar messages suppressed; will summarize every {every}. "
+                 f"Example: {msg[:120]}")
+        elif n % every == 0:
+            emit(f"[{bucket}] {n} occurrences so far; latest: {msg[:120]}")
 
     def _start_upload_thread(self):
         """Start background upload thread."""
@@ -2727,47 +2749,46 @@ class ResultsUploader:
                 )
                 if 200 <= resp.status_code < 300:
                     self.upload_stats['successful_uploads'] += 1
-                    if self.log_manager:
-                        self.log_manager.log_upload(f"YARA match upload successful (HTTP {resp.status_code})")
+                    self._throttled_log("upload_ok",
+                                        f"YARA match upload successful (HTTP {resp.status_code})", level="upload")
                     return True
 
                 if resp.status_code in (408, 429, 500, 502, 503, 504):
                     delay = _exp_backoff_delay(attempt)
-                    if self.log_manager:
-                        self.log_manager.log_upload(
-                            f"Upload failed (HTTP {resp.status_code}). Retrying in {delay:.1f}s "
-                            f"(attempt {attempt}/{MAX_RETRIES_PER_ITEM})."
-                        )
+                    self._throttled_log("upload_retry",
+                                        f"Upload failed (HTTP {resp.status_code}). Retrying in {delay:.1f}s "
+                                        f"(attempt {attempt}/{MAX_RETRIES_PER_ITEM}).", level="upload")
                     time.sleep(delay)
                     continue
 
                 self.upload_stats['failed_uploads'] += 1
-                if self.log_manager:
-                    self.log_manager.log_error(f"YARA match upload failed (HTTP {resp.status_code}): {resp.text}")
+                self._throttled_log("upload_err",
+                                    f"YARA match upload failed (HTTP {resp.status_code}): {resp.text[:200]}")
                 return False
 
             except (requests.Timeout, requests.ConnectionError) as e:
                 delay = _exp_backoff_delay(attempt)
-                if self.log_manager:
-                    self.log_manager.log_upload(
-                        f"Network error uploading result: {e}. Retrying in {delay:.1f}s "
-                        f"(attempt {attempt}/{MAX_RETRIES_PER_ITEM})."
-                    )
+                self._throttled_log("upload_neterr",
+                                    f"Network error uploading result: {str(e)[:160]}. Retrying in {delay:.1f}s "
+                                    f"(attempt {attempt}/{MAX_RETRIES_PER_ITEM}).", level="upload")
                 time.sleep(delay)
 
             except Exception as e:
                 self.upload_stats['failed_uploads'] += 1
-                if self.log_manager:
-                    self.log_manager.log_error(f"YARA match upload unexpected error: {e}")
+                self._throttled_log("upload_err", f"YARA match upload unexpected error: {e}")
                 return False
 
         self.upload_stats['failed_uploads'] += 1
-        if self.log_manager:
-            self.log_manager.log_error("Max retries reached for payload. Abandoning.")
+        self._throttled_log("upload_err", "Max retries reached for payload. Abandoning.")
         return False
 
     def stop(self, wait=True):
-        """Stop uploader thread with timeout."""
+        """Stop uploader thread with timeout. Idempotent — a second call (main()'s finally
+        safety-net after cleanup already stopped us) returns immediately instead of re-paying
+        a full drain window."""
+        if self._stop_done:
+            return
+        self._stop_done = True
         try:
             if wait and self.upload_thread and self.upload_thread.is_alive():
                 max_wait_time = THREAD_CLEANUP_TIMEOUT
@@ -2785,13 +2806,39 @@ class ResultsUploader:
                 self.upload_queue.put(None, timeout=0.2)
             except Exception:
                 pass
-            
+
             if wait and self.upload_thread and self.upload_thread.is_alive():
                 self.upload_thread.join(timeout=THREAD_CLEANUP_TIMEOUT)
                 if self.upload_thread.is_alive() and self.log_manager:
                     self.log_manager.log_upload(f"Upload thread did not terminate within {THREAD_CLEANUP_TIMEOUT}s timeout")
                 elif self.log_manager:
                     self.log_manager.log_upload("Upload thread terminated successfully")
+
+            # Honest books: whatever is still queued was never attempted — count it so
+            # "0 failed" can't read as fully-delivered while items sit stranded.
+            leftover = self.upload_queue.qsize()
+            if self.upload_thread and not self.upload_thread.is_alive():
+                leftover = 0
+                try:
+                    while True:
+                        item = self.upload_queue.get_nowait()
+                        if item is not None:
+                            leftover += 1
+                except Empty:
+                    pass
+            else:
+                leftover = max(0, leftover - 1)  # approx: minus our sentinel
+            if leftover:
+                self.upload_stats['undelivered'] += leftover
+            s = self.upload_stats
+            if self.log_manager:
+                self.log_manager.log_upload(
+                    f"Match delivery final: matches={s['total_matches']} ok={s['successful_uploads']} "
+                    f"failed={s['failed_uploads']} undelivered={s['undelivered']}")
+                if s['undelivered']:
+                    self.log_manager.log_error(
+                        f"{s['undelivered']} match upload(s) undelivered within the drain window "
+                        f"(counted in upload stats, not silently dropped)")
         except Exception as e:
             if self.log_manager:
                 self.log_manager.log_error(f"Error stopping results uploader: {e}")
@@ -3260,7 +3307,10 @@ class WebhookUploader:
         }
 
     def stop_uploader(self):
-        """Stop webhook uploader with timeout."""
+        """Stop webhook uploader with timeout. Idempotent — repeated calls return at once."""
+        if getattr(self, "_stop_done", False):
+            return
+        self._stop_done = True
         try:
             if self.upload_thread and self.upload_thread.is_alive():
                 max_wait_time = THREAD_CLEANUP_TIMEOUT
@@ -3288,8 +3338,10 @@ class WebhookUploader:
                     self.log_manager.log_upload("Webhook thread terminated successfully")
 
             final_stats = self.get_upload_statistics()
+            stranded = final_stats.get('queue_size', 0)
             self.log_manager.log_upload(
-                f"WebhookUploader stopped. Success rate: {final_stats['summary']['success_rate_percent']:.1f}%",
+                f"WebhookUploader stopped. Success rate: {final_stats['summary']['success_rate_percent']:.1f}%"
+                + (f" ({stranded} telemetry item(s) undelivered at shutdown)" if stranded else ""),
                 final_stats
             )
 
@@ -5040,6 +5092,23 @@ def main(yarafile=None, scan_folder=None, alert_severity="low"):
         
         cleanup_manager.initial_cleanup()
         log_manager.log_system("Initial cleanup completed")
+
+        # Fail LOUD, fail EARLY on placeholder collector credentials. With the defaults still in
+        # place every webhook POST fails (one bounded-retry cycle per matched string), the scan
+        # "completes" with nothing ingested, and the failure is only visible in endpoint logs.
+        # An explicit abort surfaces the misconfiguration in the Action Center result instead.
+        _ep = str(API_ENDPOINT or "").strip()
+        _key = str(API_KEY or "").strip()
+        _ep_bad = (not _ep) or (_ep == DEFAULT_API_ENDPOINT) or (not _ep.lower().startswith("http"))
+        _key_bad = (not _key) or (_key == DEFAULT_API_KEY)
+        if UPLOAD_RESULTS and (_ep_bad or _key_bad):
+            abort_msg = (
+                "SCAN ABORTED - XSIAM HTTP Collector credentials are not set. Edit DEFAULT_API_KEY / "
+                "DEFAULT_API_ENDPOINT (or disable UPLOAD_RESULTS for a local-only scan) and re-upload "
+                "the script. Nothing was scanned."
+            )
+            log_manager.log_error(abort_msg)
+            return abort_msg
 
         if platform.system() != "Windows":
             import os
