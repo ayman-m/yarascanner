@@ -60,7 +60,8 @@ MAX_RETRIES_PER_ITEM = 4             # per-batch retry cap (Insert Parsed Alerts
 # to keep draining pending alerts when the scan finishes.
 ALERT_BATCH_SIZE = min(60, int(os.environ.get("YARA_ALERT_BATCH", "60") or 60))  # alerts per POST (XDR HARD CAP = 60; clamped)
 ALERT_FLUSH_SECS = float(os.environ.get("YARA_ALERT_FLUSH_SECS", "10") or 10)     # flush a partial batch after this idle
-ALERT_DRAIN_SECS = float(os.environ.get("YARA_ALERT_DRAIN_SECS", "60") or 60)     # max wait to drain pending alerts at scan end
+ALERT_DRAIN_SECS = float(os.environ.get("YARA_ALERT_DRAIN_SECS", "60") or 60)     # MINIMUM end-of-scan drain window
+ALERT_DRAIN_MAX_SECS = float(os.environ.get("YARA_ALERT_DRAIN_MAX_SECS", "300") or 300)  # backlog-scaled drain cap
 # Insert Parsed Alerts is RATE-LIMITED (~600 alerts/min; the API returns HTTP 500 "Exceeding the
 # rate limit" when tripped). Pace batches to stay under it: 60 alerts every >=7s ~= 510/min. Without
 # pacing, over-fast batches fail and their retries burn the upload window, starving the rest.
@@ -104,6 +105,17 @@ CONFIG_CPU_CRITICAL_THRESHOLD = None    # percent CPU to pause hard (e.g. 90); N
 CONFIG_MAX_PAUSE_SECS = None            # cap cumulative throttle pause per scan (secs); None = default
 CONFIG_TENANT_ID = ""                   # tag rows/alerts with this tenant id; "" = derive from API URL
 CONFIG_LOOKUP_SHARD = "endpoint"        # dataset sharding: "endpoint" (per-host, recommended) | "none" | "<label>"
+# Alert storm cap: alerts are ONE PER FINDING (file x rule). Past this many findings in one scan,
+# per-finding alerts stop and ONE rollup alert per rule reports the remainder ("rule X matched N
+# more files - see dataset"). Protects the shared ~600 alerts/min per-API-key ceiling while keeping
+# every suppressed finding visible (rollup + lookup dataset). <= 0 disables the cap.
+CONFIG_ALERT_MAX_PER_SCAN = 500         # max per-finding alerts per scan; beyond -> rollup per rule
+# Lookup dataset rotation: add_data merge time grows with DATASET SIZE (measured on-tenant: ~13s at
+# 15k rows, ~31s at 77k rows), so an ever-growing dataset eventually outlives any client timeout.
+# "monthly" starts a fresh _<YYYYMM> dataset each month -> bounded size -> bounded merge time,
+# forever. Dashboards need no change (they match yara_scanner_matches* wildcards); prune old months
+# with xdr_action_center.py prune-datasets. "none" = single unrotated dataset (legacy behaviour).
+CONFIG_LOOKUP_ROTATION = "monthly"      # "monthly" (recommended) | "none"
 CONFIG_OPTIONS = ""                     # extra "key=value,key=value" overrides applied every run (rarely needed)
 # ============================================================================
 
@@ -125,10 +137,26 @@ LOOKUP_DATASET_BATCH_SIZE = int(os.environ.get("YARA_LOOKUP_BATCH", "500") or 50
 LOOKUP_DATASET_FLUSH_SECS = float(os.environ.get("YARA_LOOKUP_FLUSH_SECS", "30") or 30)  # defer partials -> fewer POSTs
 LOOKUP_WRITE_JITTER_SECS = float(os.environ.get("YARA_LOOKUP_WRITE_JITTER", "2") or 2)   # light same-host spread
 LOOKUP_ADD_DATA_MAX_RETRIES = int(os.environ.get("YARA_LOOKUP_RETRIES", "6") or 6)
-LOOKUP_DRAIN_TIMEOUT = float(os.environ.get("YARA_LOOKUP_DRAIN_SECS", "150") or 150)  # final-flush budget (covers jitter+retries)
-# add_data merges are slow server-side (~10s/POST is normal), but a hung CONNECT shouldn't cost
-# the full budget. (connect, read) tuple: fail fast on connect, stay patient on the slow read.
-LOOKUP_POST_TIMEOUT = (5, float(os.environ.get("YARA_LOOKUP_READ_TIMEOUT", "30") or 30))
+LOOKUP_DRAIN_TIMEOUT = float(os.environ.get("YARA_LOOKUP_DRAIN_SECS", "150") or 150)  # MINIMUM final-flush budget (covers jitter+retries)
+# The final drain budget scales with the backlog (datasets are the record — give a storm scan's
+# 70-batch backlog the time the math requires, not a flat window) up to a hard cap so a dead API
+# can't hang shutdown. Roughly: per-batch worst case ~= jitter + merge + one retry.
+LOOKUP_DRAIN_MAX_SECS = float(os.environ.get("YARA_LOOKUP_DRAIN_MAX_SECS", "600") or 600)
+LOOKUP_DRAIN_PER_BATCH_SECS = float(os.environ.get("YARA_LOOKUP_DRAIN_PER_BATCH", "45") or 45)
+# add_data merges are slow server-side, and the merge time scales with the DATASET's total size,
+# not the payload (measured on-tenant with a 1-row POST: ~13s against a 15k-row dataset, ~31s
+# against a 77k-row one). A read timeout below the real merge time is catastrophic: every POST
+# "fails" client-side while the server may still commit it, retries re-run the full merge (and can
+# duplicate rows), and the batch ends up abandoned — a grown dataset goes into total write outage
+# (observed live: 500/36,106 rows landed). So: fail fast on CONNECT, stay patient on the read
+# (120s >> the largest merge a monthly-rotated dataset can grow into), and cap retries after a
+# READ timeout separately (see LOOKUP_TIMEOUT_MAX_ATTEMPTS) because the write may have succeeded.
+LOOKUP_POST_TIMEOUT = (5, float(os.environ.get("YARA_LOOKUP_READ_TIMEOUT", "120") or 120))
+# Max POST attempts for a batch whose failures are READ timeouts. Unlike a connect failure (server
+# never saw the request; retry freely), a read timeout means the server was mid-merge when we hung
+# up — the rows often land anyway, so each blind retry risks duplicating the whole batch. 2 =
+# one retry, then stop and count the batch 'unconfirmed' (fate unknown) instead of looping.
+LOOKUP_TIMEOUT_MAX_ATTEMPTS = int(os.environ.get("YARA_LOOKUP_TIMEOUT_ATTEMPTS", "2") or 2)
 # THE fix for the add_data concurrency limitation: shard the lookup datasets per-writer so the
 # server never sees two endpoints writing the SAME dataset at once (the only condition that
 # triggers the clone-table race). Each endpoint writes yara_scanner_matches_<shard> and
@@ -2898,9 +2926,14 @@ class ResultsUploader:
         self.upload_thread = None
         self.stop_upload_thread = False
         self.upload_stats = {
-            'total_matches': 0,
+            'total_matches': 0,       # offset-grain string matches (parity with the dataset rows)
+            'findings': 0,            # file x rule findings — the ALERT grain (one alert each)
+            'alerts_queued': 0,       # alerts actually put on the wire queue (findings + rollups)
             'successful_uploads': 0,
-            'failed_uploads': 0
+            'failed_uploads': 0,
+            'suppressed': 0,          # findings past CONFIG_ALERT_MAX_PER_SCAN (reported via rollups)
+            'rollups': 0,             # per-rule storm-rollup alerts queued at scan end
+            'undelivered': 0,         # alerts still queued when the drain budget expired
         }
         # Rate-limit counters so a sustained upload failure (or a very match-heavy scan) can't
         # bloat the logs with one line per matched string — a placeholder-cred run produced
@@ -2909,6 +2942,13 @@ class ResultsUploader:
         self._last_alert_post = 0.0  # monotonic time of the last alert POST (for rate-limit pacing)
         self._deliver_deadline = None  # global wall-clock budget for requeuing rate-limited batches
         self._requeued_total = 0     # count of alerts put back for a later window (diagnostics)
+        # Finding-grain alert state. Alerts are one per (file x rule) — the triage grain — while
+        # the dataset keeps every string offset (the forensic grain). The cap bounds a storm scan's
+        # alert volume; suppressed findings surface as one rollup alert per rule at scan end.
+        self._findings_lock = threading.Lock()
+        self._seen_findings = set()      # (rule, path) within-scan dedup, capped to bound memory
+        self._suppressed_by_rule = {}    # rule -> findings suppressed past the cap
+        self._stop_done = False
 
         # create_alerts gates the Insert Parsed Alerts channel (XDR alerts -> incidents).
         if UPLOAD_RESULTS and getattr(config, "create_alerts", True):
@@ -2998,23 +3038,29 @@ class ResultsUploader:
         event_timestamp_ms = int(getattr(standard_log, "timestamp", time.time()) * 1000)
         rule_name = data.get("rule", "unknown_rule")
         hostname = getattr(standard_log, "hostname", "UnknownHost")
-        # Alert identity = the FINDING (rule + file + offset), NOT the scan time. XDR aggregates
-        # alerts that share an alert_name, so:
+        # Alert identity = the FINDING (rule + file), NOT the scan time and NOT the string offset.
+        # XDR aggregates alerts that share an alert_name, so:
         #   - putting the timestamp in the name made every re-scan mint NEW alerts (alert flood)
         #     AND collapsed distinct matches that shared a millisecond into one — the opposite of
         #     what we want.
-        #   - a stable per-finding name makes alerts 1:1 with distinct matches within a scan, and
-        #     idempotent across repeated scans of the same location (XDR updates the existing
+        #   - putting the OFFSET in the name made every string hit its own alert (a 22x flood on a
+        #     multi-string rule) and broke idempotency whenever a file edit shifted offsets. The
+        #     per-offset evidence belongs in the lookup dataset; the alert carries match_count and
+        #     a sample, and stays 1:1 with the finding across re-scans (XDR updates the existing
         #     alert instead of piling on duplicates). event_timestamp still carries the scan time.
         _full_path = str(data.get("filename", "") or data.get("file", ""))
         match_file = os.path.basename(_full_path)
-        match_offset = data.get("offset", "")
         # Tag the identity with a stable hash of the FULL path so two distinct files that share a
         # basename (e.g. per-user copies of one dropper at ...\alice\svchost.exe and ...\bob\svchost.exe)
         # don't collapse into a single alert. basename alone loses the path; file_sha256 can't separate
         # byte-identical copies at different locations. Same path -> same tag keeps re-scans idempotent.
         _path_tag = hashlib.sha1(_full_path.encode("utf-8", "replace")).hexdigest()[:8] if _full_path else "nopath"
-        alert_name = f"YARA Match: {rule_name} | {match_file}@{match_offset} (#{_path_tag}) | Host: {hostname}"
+        if data.get("rollup"):
+            # Storm rollup: one alert per rule summarizing findings suppressed past the per-scan
+            # cap. Stable name per (rule, host) so repeated storms update one alert, not pile up.
+            alert_name = f"YARA Match Storm: {rule_name} | Host: {hostname}"
+        else:
+            alert_name = f"YARA Match: {rule_name} | {match_file} (#{_path_tag}) | Host: {hostname}"
 
         severity_map = {
             "critical": "High",
@@ -3181,20 +3227,80 @@ class ResultsUploader:
                             f"Alert batch abandoned after {MAX_RETRIES_PER_ITEM} attempts ({n} alerts lost)")
         return "dropped"
 
+    def _queue_rollup_alerts(self):
+        """One rollup alert per rule for findings suppressed past CONFIG_ALERT_MAX_PER_SCAN,
+        queued ahead of the final drain so a storm scan ends with a bounded, complete alert
+        story: <cap> per-finding alerts + one "and N more files" rollup per rule. The lookup
+        dataset holds every suppressed finding in full detail."""
+        with self._findings_lock:
+            suppressed = dict(self._suppressed_by_rule)
+        if not suppressed:
+            return
+        for rule, n in sorted(suppressed.items(), key=lambda kv: -kv[1]):
+            try:
+                standard_log = create_standard_log(
+                    log_type='yara_match',
+                    hostname=self.hostname,
+                    os_info=self.os_info,
+                    ip_address=self.ip_address,
+                    scan_id=self.scan_id,
+                    message=(f"YARA storm rollup: rule '{rule}' matched {n} more file(s) beyond "
+                             f"the per-scan alert cap ({CONFIG_ALERT_MAX_PER_SCAN}). Full detail "
+                             f"is in the yara_scanner_matches dataset."),
+                    level="INFO",
+                    data={
+                        'rule': rule,
+                        'rollup': True,
+                        'suppressed_count': n,
+                        'filename': '(multiple files)',
+                        'match_count': n,
+                        'dateOfScan': self.date_of_scan,
+                    }
+                )
+                self.upload_queue.put(standard_log, timeout=1.0)
+                with self._findings_lock:
+                    self.upload_stats['rollups'] += 1
+                    self.upload_stats['alerts_queued'] += 1
+            except Exception as e:
+                self._throttled_log("rollup_err", f"Failed to queue rollup alert for rule '{rule}': {e}")
+        if self.log_manager:
+            self.log_manager.log_upload(
+                f"Queued {len(suppressed)} storm-rollup alert(s) covering "
+                f"{sum(suppressed.values())} suppressed finding(s)")
+
     def stop(self, wait=True):
-        """Stop uploader thread with timeout."""
+        """Stop uploader thread with timeout. Idempotent — a second call (run()'s finally
+        safety-net after cleanup already stopped us) returns immediately instead of re-paying
+        a full drain window."""
+        if self._stop_done:
+            return
+        self._stop_done = True
         try:
+            # Storm rollups ride the final drain along with everything else.
+            try:
+                self._queue_rollup_alerts()
+            except Exception as e:
+                if self.log_manager:
+                    self.log_manager.log_error(f"Error queueing rollup alerts: {e}")
+
             # Bounded, requeue-ENABLED drain first: give the end-of-scan backlog a real "later
             # window" to deliver (stop_upload_thread stays False so rate-limited batches can still
-            # requeue) before we force the hard stop. Capped by ALERT_DRAIN_SECS so shutdown can't
-            # hang, and short-circuits the moment the queue empties.
+            # requeue) before we force the hard stop. The window scales with the backlog (a capped
+            # scan is at most cap/60 batches at ALERT_MIN_BATCH_INTERVAL pacing) and is hard-capped
+            # so shutdown can't hang; it short-circuits the moment the queue empties.
             if wait and self.upload_thread and self.upload_thread.is_alive():
                 pending = self.upload_queue.qsize()
-                if pending > 0 and self.log_manager:
-                    self.log_manager.log_upload(f"Draining {pending} pending alert(s) (up to {ALERT_DRAIN_SECS:.0f}s)...")
-                _drain_deadline = time.monotonic() + ALERT_DRAIN_SECS
-                while self.upload_queue.qsize() > 0 and time.monotonic() < _drain_deadline:
-                    time.sleep(0.5)
+                if pending > 0:
+                    batches = max(1, (pending + ALERT_BATCH_SIZE - 1) // ALERT_BATCH_SIZE)
+                    drain_secs = min(ALERT_DRAIN_MAX_SECS,
+                                     max(ALERT_DRAIN_SECS, batches * (ALERT_MIN_BATCH_INTERVAL + 8)))
+                    if self.log_manager:
+                        self.log_manager.log_upload(
+                            f"Draining {pending} pending alert(s) (~{batches} batches, "
+                            f"up to {drain_secs:.0f}s)...")
+                    _drain_deadline = time.monotonic() + drain_secs
+                    while self.upload_queue.qsize() > 0 and time.monotonic() < _drain_deadline:
+                        time.sleep(0.5)
 
             self.stop_upload_thread = True
             try:
@@ -3208,13 +3314,51 @@ class ResultsUploader:
                     self.log_manager.log_upload(f"Upload thread did not terminate within {THREAD_CLEANUP_TIMEOUT}s timeout")
                 elif self.log_manager:
                     self.log_manager.log_upload("Upload thread terminated successfully")
+
+            # Honest books: whatever is still queued was never attempted — count it, don't let
+            # "0 failed" read as 100% delivered while thousands sit stranded.
+            leftover = self.upload_queue.qsize()
+            if self.upload_thread and not self.upload_thread.is_alive():
+                leftover = 0
+                try:
+                    while True:
+                        item = self.upload_queue.get_nowait()
+                        if item is not None:
+                            leftover += 1
+                except Empty:
+                    pass
+            else:
+                leftover = max(0, leftover - 1)  # approx: minus our sentinel
+            if leftover:
+                self.upload_stats['undelivered'] += leftover
+            s = self.upload_stats
+            if self.log_manager:
+                self.log_manager.log_upload(
+                    f"Alert delivery final: findings={s['findings']} queued={s['alerts_queued']} "
+                    f"ok={s['successful_uploads']} failed={s['failed_uploads']} "
+                    f"undelivered={s['undelivered']} suppressed={s['suppressed']} "
+                    f"rollups={s['rollups']} requeued={self._requeued_total}")
+                if s['undelivered']:
+                    self.log_manager.log_error(
+                        f"{s['undelivered']} alert(s) undelivered within the drain budget (shared "
+                        f"rate-limit ceiling) — the yara_scanner_matches dataset holds the "
+                        f"complete record")
         except Exception as e:
             if self.log_manager:
                 self.log_manager.log_error(f"Error stopping results uploader: {e}")
 
     def add_match(self, filename, rule, match_data, file_sha256=None, file_creation_time=None):
-        """Add YARA match and queue for upload."""
+        """Add YARA match and queue for upload.
+
+        Grain split: the LOOKUP DATASET gets one row per matched string offset (forensic grain),
+        while the ALERT channel gets ONE alert per (file x rule) finding (triage grain) — yara
+        hands us all of a rule's string hits for a file in this single call, so the aggregation
+        needs no cross-call state. A SOC triages "this file matched this rule"; the per-offset
+        evidence lives in the dataset the alert points at."""
         match_count = 0
+        _first_offset = None
+        _hit_samples = []      # first few "string_id@offset" pairs for the alert description
+        _string_sample = ""    # first rendered matched string for the alert description
         # Resolve per-file context once (not per matched string).
         try:
             _file_size = int(os.path.getsize(filename))
@@ -3245,34 +3389,11 @@ class ResultsUploader:
             self.results.append(result)
             self.upload_stats['total_matches'] += 1
             match_count += 1
-            
-            if UPLOAD_RESULTS and self.upload_thread and self.upload_thread.is_alive():
-                try:
-                    standard_log = create_standard_log(
-                        log_type='yara_match',
-                        hostname=self.hostname,
-                        os_info=self.os_info,
-                        ip_address=self.ip_address,
-                        scan_id=self.scan_id,
-                        message=f"YARA match: rule '{rule}' in {filename}",
-                        level="INFO",
-                        data={
-                            'filename': filename,
-                            'rule': rule,
-                            'string': string_data,
-                            'offset': str(offset),
-                            'match': string_id,
-                            'dateOfScan': self.date_of_scan,
-                            'file_sha256': file_sha256,
-                            'file_creation_time': file_creation_time
-                        }
-                    )
-                    self.upload_queue.put(standard_log, timeout=1.0)
-                    self._throttled_log("queued_match",
-                                        f"Queued match for upload: rule='{rule}', offset={offset}", level="upload")
-                except Exception:
-                    self._throttled_log("queue_full", "Upload queue full - skipping real-time upload for match",
-                                        level="upload")
+            if _first_offset is None:
+                _first_offset = offset
+                _string_sample = string_data
+            if len(_hit_samples) < 3:
+                _hit_samples.append(f"{string_id}@{offset}")
 
             lookup_uploader = getattr(self, "lookup_uploader", None)
             if lookup_uploader is not None:
@@ -3303,6 +3424,56 @@ class ResultsUploader:
                     "date_of_scan": self.date_of_scan,
                 }
                 lookup_uploader.add(lookup_record)
+
+        # ---- Alert channel: ONE alert per finding (file x rule), storm-capped ----
+        # The Insert Parsed Alerts budget is ~600/min SHARED across every endpoint on the API key,
+        # so alert volume must be bounded by design, not by luck. Findings past the cap are counted
+        # per rule and surface as one rollup alert each at scan end — nothing goes silent.
+        if UPLOAD_RESULTS and match_count > 0 and self.upload_thread and self.upload_thread.is_alive():
+            queue_it = False
+            with self._findings_lock:
+                fkey = (rule, filename)
+                if fkey not in self._seen_findings:
+                    if len(self._seen_findings) < 150000:  # bound memory on pathological scans
+                        self._seen_findings.add(fkey)
+                    cap = CONFIG_ALERT_MAX_PER_SCAN
+                    if cap and cap > 0 and self.upload_stats['findings'] >= cap:
+                        self._suppressed_by_rule[rule] = self._suppressed_by_rule.get(rule, 0) + 1
+                        self.upload_stats['suppressed'] += 1
+                    else:
+                        self.upload_stats['findings'] += 1
+                        queue_it = True
+            if queue_it:
+                try:
+                    standard_log = create_standard_log(
+                        log_type='yara_match',
+                        hostname=self.hostname,
+                        os_info=self.os_info,
+                        ip_address=self.ip_address,
+                        scan_id=self.scan_id,
+                        message=f"YARA match: rule '{rule}' in {filename} ({match_count} string hit(s))",
+                        level="INFO",
+                        data={
+                            'filename': filename,
+                            'rule': rule,
+                            'match_count': match_count,
+                            'offset': str(_first_offset if _first_offset is not None else ""),
+                            'matches_sample': _hit_samples,
+                            'string': _string_sample,
+                            'dateOfScan': self.date_of_scan,
+                            'file_sha256': file_sha256,
+                            'file_creation_time': file_creation_time
+                        }
+                    )
+                    self.upload_queue.put(standard_log, timeout=1.0)
+                    with self._findings_lock:
+                        self.upload_stats['alerts_queued'] += 1
+                    self._throttled_log("queued_match",
+                                        f"Queued finding alert: rule='{rule}', file={filename}, "
+                                        f"hits={match_count}", level="upload")
+                except Exception:
+                    self._throttled_log("queue_full", "Upload queue full - skipping alert for finding",
+                                        level="upload")
 
         self._throttled_log("added_matches",
                             f"Added {match_count} matches for rule '{rule}' in file: {filename}", level="upload")
@@ -3433,8 +3604,14 @@ class LookupDatasetUploader:
             self.dataset_shard = _dataset_shard_suffix(shard_cfg)
         _suffix = f"_{self.dataset_shard}" if self.dataset_shard else ""
         _ver = f"_v{LOOKUP_SCHEMA_VERSION}"  # schema-version tag; bump when the row shape changes
-        self.matches_dataset = f"{LOOKUP_DATASET_PREFIX}_matches{_ver}{_suffix}"
-        self.scans_dataset = f"{LOOKUP_DATASET_PREFIX}_scans{_ver}{_suffix}"
+        # Monthly rotation bounds every dataset's SIZE, and therefore its add_data merge time,
+        # forever (merge time scales with dataset size; an unrotated shard eventually outgrows any
+        # client timeout and goes write-dead). Dashboards fan in via wildcard, so a new month's
+        # dataset joins them automatically; prune old months with the prune-datasets tooling.
+        _rot_cfg = str(os.environ.get("YARA_LOOKUP_ROTATION", "") or CONFIG_LOOKUP_ROTATION).strip().lower()
+        _rot = f"_{self.scan_date[:6]}" if _rot_cfg == "monthly" and len(self.scan_date) >= 6 else ""
+        self.matches_dataset = f"{LOOKUP_DATASET_PREFIX}_matches{_ver}{_suffix}{_rot}"
+        self.scans_dataset = f"{LOOKUP_DATASET_PREFIX}_scans{_ver}{_suffix}{_rot}"
         # Surface the resolved (sharded) dataset names so the scan-summary JSON and logs can
         # tell the operator exactly where this scan's rows landed.
         try:
@@ -3457,7 +3634,11 @@ class LookupDatasetUploader:
             "records_skipped": 0,
             "send_failures": 0,
             "dropped": 0,
+            "rows_unconfirmed": 0,   # read-timeout batches: server merge may have committed (fate unknown)
+            "undelivered": 0,        # rows still queued when the drain budget expired (never attempted)
         }
+        self._stop_done = False
+        self._drain_budget = None    # scaled at stop(): backlog-aware, capped by LOOKUP_DRAIN_MAX_SECS
 
         # Matches schema — must match keys produced by ResultsUploader.add_match.
         # XDR add_dataset supports: text, number, datetime, bool.
@@ -3723,7 +3904,7 @@ class LookupDatasetUploader:
                 th.start()
                 drain_threads.append(th)
             for th in drain_threads:
-                th.join(timeout=LOOKUP_DRAIN_TIMEOUT)
+                th.join(timeout=getattr(self, "_drain_budget", None) or LOOKUP_DRAIN_TIMEOUT)
         if self.log_manager:
             self.log_manager.log_upload(
                 f"Lookup dataset worker stopped "
@@ -3759,8 +3940,10 @@ class LookupDatasetUploader:
         # failed). Refusing an attempt that can't finish in time lets the loop fall through to the
         # accounted send_failures + "rows lost" path BEFORE the join fires — visible, not silent.
         _read_to = LOOKUP_POST_TIMEOUT[1] if isinstance(LOOKUP_POST_TIMEOUT, (tuple, list)) else LOOKUP_POST_TIMEOUT
-        _deadline = time.monotonic() + max(1.0, LOOKUP_DRAIN_TIMEOUT - 20)
+        _budget = getattr(self, "_drain_budget", None) or LOOKUP_DRAIN_TIMEOUT
+        _deadline = time.monotonic() + max(1.0, _budget - 20)
 
+        read_timeouts = 0
         attempt = 0
         while attempt < LOOKUP_ADD_DATA_MAX_RETRIES:
             # `attempt > 0` guarantees at least ONE POST regardless of how the drain/read knobs are
@@ -3818,6 +4001,25 @@ class LookupDatasetUploader:
                 return
 
             except (requests.Timeout, requests.ConnectionError) as e:
+                # A READ timeout is not a clean failure: the server was mid-merge when we hung up,
+                # and the rows often commit anyway — every blind retry risks duplicating the whole
+                # batch (and re-running a merge whose duration CAUSED the timeout). Allow at most
+                # LOOKUP_TIMEOUT_MAX_ATTEMPTS attempts on read timeouts, then stop and count the
+                # batch 'rows_unconfirmed' (fate unknown — NOT added, NOT lost). Connect-phase
+                # errors never reached the server, so they keep the full retry budget.
+                if isinstance(e, requests.exceptions.ReadTimeout):
+                    read_timeouts += 1
+                    if read_timeouts >= LOOKUP_TIMEOUT_MAX_ATTEMPTS:
+                        with self._stats_lock:
+                            self.upload_stats["rows_unconfirmed"] = (
+                                self.upload_stats.get("rows_unconfirmed", 0) + len(batch))
+                        if self.log_manager:
+                            self.log_manager.log_upload(
+                                f"Lookup batch read-timed-out {read_timeouts}x ({len(batch)} rows); the server "
+                                f"merge may have committed anyway - stopping retries to avoid duplicate rows "
+                                f"(counted as rows_unconfirmed)."
+                            )
+                        return
                 delay = _lookup_backoff_delay(attempt)
                 if self.log_manager:
                     self.log_manager.log_upload(
@@ -3839,8 +4041,24 @@ class LookupDatasetUploader:
             )
 
     def stop(self, wait=True):
-        """Signal the worker to drain remaining batches and exit."""
+        """Signal the worker to drain remaining batches and exit. Idempotent — the second
+        call (run()'s finally safety-net after cleanup already stopped us) returns at once
+        instead of re-paying a full drain window."""
+        if self._stop_done:
+            return
+        self._stop_done = True
         try:
+            # Datasets are THE record, so scale the drain budget to the actual backlog instead
+            # of a flat window: a storm scan's 36k-row backlog needs ~70 POSTs, a normal scan's
+            # 1-2 POSTs shouldn't wait around. Capped so a dead API can't hang shutdown forever.
+            pending_rows = self.queue.qsize()
+            pending_batches = max(1, (pending_rows + self.batch_size - 1) // self.batch_size)
+            self._drain_budget = min(LOOKUP_DRAIN_MAX_SECS,
+                                     max(LOOKUP_DRAIN_TIMEOUT, pending_batches * LOOKUP_DRAIN_PER_BATCH_SECS))
+            if pending_rows > 0 and self.log_manager:
+                self.log_manager.log_upload(
+                    f"Lookup drain: {pending_rows} rows pending (~{pending_batches} batches), "
+                    f"budget {self._drain_budget:.0f}s")
             self.stop_flag = True
             try:
                 self.queue.put(None, timeout=0.5)
@@ -3849,11 +4067,34 @@ class LookupDatasetUploader:
             if wait and self.upload_thread and self.upload_thread.is_alive():
                 # Longer than the generic thread timeout: the final batch(es) may need the
                 # full retry budget to thread through the add_data clone race under concurrency.
-                self.upload_thread.join(timeout=LOOKUP_DRAIN_TIMEOUT)
+                self.upload_thread.join(timeout=self._drain_budget)
                 if self.upload_thread.is_alive() and self.log_manager:
                     self.log_manager.log_upload(
-                        f"Lookup uploader thread did not stop within {LOOKUP_DRAIN_TIMEOUT}s"
+                        f"Lookup uploader thread did not stop within {self._drain_budget:.0f}s"
                     )
+            # Honest books: whatever is still queued was never even attempted. Count it so
+            # queued == added+updated+skipped+unconfirmed+undelivered(+failures*batch) balances
+            # instead of silently reading as delivered.
+            leftover = self.queue.qsize()
+            if self.upload_thread and not self.upload_thread.is_alive():
+                # Thread is dead — drain precisely (sentinels excluded).
+                leftover = 0
+                try:
+                    while True:
+                        item = self.queue.get_nowait()
+                        if item is not None:
+                            leftover += 1
+                except Empty:
+                    pass
+            else:
+                leftover = max(0, leftover - 1)  # approx: minus our sentinel
+            if leftover:
+                with self._stats_lock:
+                    self.upload_stats["undelivered"] += leftover
+                if self.log_manager:
+                    self.log_manager.log_error(
+                        f"Lookup drain budget expired with {leftover} rows undelivered "
+                        f"(counted in dataset_delivery.undelivered)")
         except Exception as e:
             if self.log_manager:
                 self.log_manager.log_error(f"Error stopping lookup uploader: {e}")

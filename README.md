@@ -98,6 +98,8 @@ and (re)upload the script. The Action Center **`main`** entry point then exposes
 | `CONFIG_MAX_PAUSE_SECS` | int/None | `None` | Cap on one continuous CPU pause |
 | `CONFIG_TENANT_ID` | string | `""` | Tenant tag (`""` = derive from API URL) |
 | `CONFIG_LOOKUP_SHARD` | endpoint/none/label | `endpoint` | Per-writer dataset sharding |
+| `CONFIG_ALERT_MAX_PER_SCAN` | int | `500` | Storm cap: max per-finding alerts per scan; beyond → one rollup alert per rule (`≤0` = uncapped) |
+| `CONFIG_LOOKUP_ROTATION` | monthly/none | `monthly` | Monthly dataset rotation (`_YYYYMM`) — bounds dataset size & `add_data` merge time |
 | `CONFIG_OPTIONS` | `key=value,...` | `""` | Rarely-needed extra overrides applied every run |
 
 Advanced/automation callers (the CLI and the internal `run(...)` API) can still pass a per-run
@@ -105,26 +107,35 @@ Advanced/automation callers (the CLI and the internal `run(...)` API) can still 
 expose it. Every run's summary and logs include a **posture** string, e.g.
 `alerts=on dataset=on files=off throttle=script mode=scan`.
 
-**Throughput tuning for match-heavy scans (module constants near the top of the script).** Alerts
-are uploaded in **batches** (the Insert Parsed Alerts API takes a list — **hard cap 60 per call**)
-and **paced** to respect the API's ~600-alerts/min rate limit (it returns HTTP 500 *"Exceeding the
-rate limit"* when tripped, and un-paced batches fail-storm). Lookup rows batch at ~1000/POST. Tune
-via `ALERT_BATCH_SIZE` (≤60, clamped), `ALERT_MIN_BATCH_INTERVAL` (rate-limit pacing),
-`ALERT_FLUSH_SECS`, `ALERT_DRAIN_SECS`, and `LOOKUP_DATASET_BATCH_SIZE` — each overridable by the
-matching `YARA_ALERT_*` / `YARA_LOOKUP_*` env var.
+**Alert grain — one alert per finding (file × rule).** A SOC triages *"this file matched this
+rule"*; the per-string-offset evidence belongs in the lookup dataset. Each alert carries the hit
+count and a sample of matched strings, and its identity is stable per (rule, file-path, host) — so
+alerts are **1:1 with findings within a scan and idempotent across re-scans** (a file edit that
+shifts offsets updates the existing alert instead of minting new ones). On a multi-string rule this
+is a 20×+ volume cut with *better* triage semantics.
 
-Rate-limited batches are **requeued and retried in a later window** rather than dropped
-(`ALERT_REQUEUE_ENABLED`), the server's `Retry-After` is honored, and the end-of-scan backlog gets
-a bounded requeue-enabled drain (`ALERT_DRAIN_SECS`) — all capped by a global budget
-(`ALERT_MAX_DELIVER_SECS`) so shutdown can't hang on a saturated key. In testing, a 900-match burst
-that would trip the limit delivered **900/900 with 0 failed** (180 requeued and recovered).
+**Storm cap.** Past `CONFIG_ALERT_MAX_PER_SCAN` findings (default 500 ≈ one minute of alert-channel
+budget), per-finding alerts stop and each rule reports the remainder as **one rollup alert** —
+`YARA Match Storm: <rule> | Host: <host>` with the suppressed count. An over-broad rule that hits
+30k files produces ≤500 alerts + a handful of rollups instead of a day-long fail-storm; nothing
+goes silent.
 
-> The alert channel is **rate-limited by XDR (~600/min, shared per API key)**, so a pathological
-> scan that finds tens of thousands of matches (e.g. an over-broad rule), or a very large concurrent
-> fleet, can saturate it. Pacing + requeue make alerts deliver *cleanly up to the ceiling* instead
-> of fail-storming; past the ceiling the **lookup datasets remain the complete record**. Well-tuned
-> rules never approach this. Each scan's `alert_delivery` (incl. `requeued`) / `dataset_delivery`
-> counts in the summary JSON show exactly what landed.
+**Throughput + retry (module constants near the top of the script).** Alerts POST in **batches**
+(hard cap 60/call), **paced** under the API's **~600 alerts/min budget — shared per API key across
+all endpoints** (`ALERT_MIN_BATCH_INTERVAL`). Rate-limited batches honor `Retry-After`, are
+**requeued for a later window** rather than dropped (`ALERT_REQUEUE_ENABLED`, budget
+`ALERT_MAX_DELIVER_SECS`), and the end-of-scan drain window **scales with the backlog**
+(`ALERT_DRAIN_SECS` … `ALERT_DRAIN_MAX_SECS`).
+
+**Honest delivery books.** `alert_delivery` in the scan summary always balances:
+`findings = delivered + failed + undelivered (+ suppressed reported via rollups)` — anything the
+drain budget couldn't deliver is *counted*, never silently discarded, and the log states it plainly.
+Verified live: a 700-match scan delivered **501/501 queued alerts (500 findings + 1 rollup covering
+the 200 past the cap), 0 failed, 0 undelivered**, books exactly balanced.
+
+> The ~600/min ceiling is a **platform limit shared by every endpoint on the API key** — no client
+> can beat it, only ride it out cleanly. Past sustained saturation the **lookup datasets remain the
+> complete record**, and `alert_delivery.undelivered` tells you exactly what didn't fit.
 
 ### 🧮 Resource management
 - **Configurable throttling** via the thresholds above (was hardcoded).
@@ -135,11 +146,15 @@ that would trip the limit delivered **900/900 with 0 failed** (180 requeued and 
 Run the same script with `mode=cancel` on the endpoint to drop a cooperative cancel flag; a running scan's watcher detects it within ~5 s and shuts down gracefully — draining uploaders, writing a terminal `cancelled` lifecycle row, and returning `Scan cancelled by operator: …` (exit 0). POSIX `SIGTERM`/`SIGINT` route into the same path.
 
 ### 🗂️ Lookup datasets + tenant identity
-Two **per-endpoint sharded** datasets (`_v2_<host>`) — the fix for XDR's `add_data` concurrency limitation, where many endpoints writing one shared dataset collide on a server-side clone-table race and lose rows. One writer per dataset lands 100% at any fleet scale; dashboards fan the shards back in with a `yara_scanner_matches*` wildcard.
-- **`yara_scanner_matches_v2_<host>`** — one row per matched string; carries `tenant_id`, `scan_date`, `os_type`, `file_size`, `scan_folder`, `matched_length`.
-- **`yara_scanner_scans_v2_<host>`** — scan lifecycle rows (`initiated` / `running` heartbeat / `completed` / `cancelled` / `failed`) with counts, `os_type`, `scan_folder`, throttle mode, paused time, and posture.
+Two **per-endpoint sharded, monthly-rotated** datasets (`_v2_<host>_<YYYYMM>`) — the fix for two distinct XDR `add_data` platform limitations:
+- **Sharding (per host)** — concurrent writers to one shared dataset collide on a server-side clone-table race and lose rows; one writer per dataset lands 100% at any fleet scale.
+- **Rotation (per month)** — `add_data` **merge time scales with the dataset's total size, not the payload** (measured: ~13 s/POST at 15k rows → ~31 s at 77k). An ever-growing dataset eventually outlives any client timeout and goes **write-dead** (observed live: a grown shard landed 500 of 36,106 rows). A fresh dataset each month bounds size — and therefore merge time — forever.
 
-Sharding is configurable (`lookup_shard` option / `YARA_LOOKUP_SHARD`: `endpoint` default, `none`, or a literal). The `_v2` tag is a schema version (bump on row-shape changes). Growth is bounded by the `scan_date` column (targeted `lookups/remove_data` pruning). Each run also drops a machine-readable `scan_summary_<run_id>.json` on the endpoint.
+Dashboards are unaffected by both: they fan everything back in with a `yara_scanner_matches*` wildcard. Old months are pruned explicitly with `xdr_action_center.py prune-datasets` / `delete_dataset`.
+- **`yara_scanner_matches_v2_<host>_<YYYYMM>`** — one row per matched string (the forensic-grain record backing the finding-grain alerts); carries `tenant_id`, `scan_date`, `os_type`, `file_size`, `scan_folder`, `matched_length`.
+- **`yara_scanner_scans_v2_<host>_<YYYYMM>`** — scan lifecycle rows (`initiated` / `running` heartbeat / `completed` / `cancelled` / `failed`) with counts, `os_type`, `scan_folder`, throttle mode, paused time, and posture.
+
+Sharding and rotation are configurable (`CONFIG_LOOKUP_SHARD` / `CONFIG_LOOKUP_ROTATION`, env `YARA_LOOKUP_SHARD` / `YARA_LOOKUP_ROTATION`). The `_v2` tag is a schema version (bump on row-shape changes). Writes use a patient 120 s read timeout (a slow merge is a success, not a failure), and a batch whose **read times out is retried once, then counted `rows_unconfirmed`** — the server merge often commits after the client hangs up, so blind retries would duplicate rows. The final dataset drain **scales with the backlog** (up to `LOOKUP_DRAIN_MAX_SECS`), and anything past the budget is counted `undelivered` in `dataset_delivery` — the books always balance. Each run also drops a machine-readable `scan_summary_<run_id>.json` (including the resolved dataset names) on the endpoint.
 
 ### 🌐 Scan scope
 Browser caches are **no longer bypassed** (removed from the skip list), and a `force_scan_fragments` allowlist re-opens browser caches on macOS where the broad `Library/Caches/` exclusion would otherwise swallow them.

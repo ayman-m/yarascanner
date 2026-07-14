@@ -15,9 +15,9 @@ edition uses the **Cortex XDR public API** directly:
 
 | Channel | XDR API | Result |
 |---------|---------|--------|
-| Alerts | **Insert Parsed Alerts** (`/public_api/v1/alerts/insert_parsed_alerts`) | One alert per distinct finding (`rule + file@offset`) → feeds XDR incident creation |
-| Match records | **Lookup dataset** `yara_scanner_matches_v2_<host>` (`/xql/lookups/add_data`) | One row per matched string; per-endpoint shard, queried via `yara_scanner_matches*` |
-| Scan lifecycle | **Lookup dataset** `yara_scanner_scans_v2_<host>` | initiated / running / completed / cancelled / failed rows |
+| Alerts | **Insert Parsed Alerts** (`/public_api/v1/alerts/insert_parsed_alerts`) | One alert per **finding** (`rule + file`, offset-free identity; hit count + sample inside) → feeds XDR incident creation. Storm-capped at `CONFIG_ALERT_MAX_PER_SCAN` (default 500) with one rollup alert per rule beyond it |
+| Match records | **Lookup dataset** `yara_scanner_matches_v2_<host>_<YYYYMM>` (`/xql/lookups/add_data`) | One row per matched string; per-endpoint shard, **monthly-rotated** (bounds `add_data` merge time, which grows with dataset size), queried via `yara_scanner_matches*` |
+| Scan lifecycle | **Lookup dataset** `yara_scanner_scans_v2_<host>_<YYYYMM>` | initiated / running / completed / cancelled / failed rows |
 
 Every row and alert is tagged with a **`tenant_id`** derived from your API URL, so the
 data is safe to consolidate across tenants.
@@ -47,7 +47,7 @@ A producer/consumer pipeline of single-responsibility classes:
 |-----------|----------------|
 | `ScanConfig` | Rules, paths, thresholds, runtime options, tenant identity |
 | `YaraScanner` | Orchestrator — work queue, workers, scan loop, throttle + cancellation |
-| `ResultsUploader` | Insert Parsed Alerts channel (per matched string) |
+| `ResultsUploader` | Insert Parsed Alerts channel (one alert per file×rule finding; storm cap + per-rule rollups; honest undelivered accounting) |
 | `LookupDatasetUploader` | Batched writes to the per-endpoint `yara_scanner_matches_v2_*` / `yara_scanner_scans_v2_*` shards |
 | `EvidenceCollector` | Evidence ZIP (metadata always; matched-file copies optional) |
 | `CleanupManager` | Post-scan cleanup via Task Scheduler / systemd / launchd |
@@ -259,7 +259,7 @@ scanner therefore writes **one dataset per endpoint** — no two writers ever to
 dataset — which lands **100%** at any fleet scale. Names are:
 
 ```
-yara_scanner_matches_v2_<host>     yara_scanner_scans_v2_<host>
+yara_scanner_matches_v2_<host>_<YYYYMM>     yara_scanner_scans_v2_<host>_<YYYYMM>
 ```
 
 `_v2` is a **schema version** (bumped only when the row shape changes; `add_data` silently
@@ -271,14 +271,14 @@ shared dataset — only safe at ~1 concurrency), or a literal wave/site label.
 **Dashboards fan the shards back in with a wildcard** — `dataset = yara_scanner_matches*`
 spans every host and schema version at once (XQL supports `*` and `union`).
 
-## `yara_scanner_matches_v2_<host>` — one row per matched string
+## `yara_scanner_matches_v2_<host>_<YYYYMM>` — one row per matched string
 
 `tenant_id`, `scan_id`, `run_id`, `scan_date`, `hostname`, `os_info`, `os_type`,
 `ip_address`, `rule`, `filename`, `file_size`, `file_sha256`, `file_creation_time`,
 `scan_folder`, `match`, `offset`, `matched_length`, `string`, `severity`,
 `event_timestamp_ms`, `date_of_scan`.
 
-## `yara_scanner_scans_v2_<host>` — scan lifecycle
+## `yara_scanner_scans_v2_<host>_<YYYYMM>` — scan lifecycle
 
 `tenant_id`, `scan_id`, `run_id`, `scan_date`, `hostname`, `os_info`, `os_type`,
 `ip_address`, `status` (initiated/running/completed/cancelled/failed), `scan_folder`,
