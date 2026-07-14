@@ -302,6 +302,14 @@ python3 xdr_action_center.py prune-datasets --dry-run     # retire legacy/old da
 Credentials come from `.env` / environment (`XDR_API_URL`, `XDR_API_ID`, `XDR_API_KEY`); both auth
 models are auto-detected. Corporate-proxy TLS is supported via `XDR_CA_BUNDLE`.
 
+### Automation skill (`.claude/skills/xdr-action-center-api/`)
+
+A self-contained bundle documenting **which supported public APIs automate each YARA-scan
+operation** (run / cancel / track / results / verify), with a runnable end-to-end example
+(`scripts/yara_scan_automation.py`) usable by humans or LLM agents. Includes a full
+endpoint map (`references/public-api-map.md`) — including why console-internal
+`/api/webapp/*` endpoints must not be scripted, and the supported equivalent for each.
+
 ### Test harness (`tests/`)
 
 `gen_rules.py` (rule packs of every shape, 1→500 rules), `seed_corpus.py`, `run_matrix.py`
