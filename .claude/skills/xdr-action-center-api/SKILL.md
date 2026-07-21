@@ -22,7 +22,14 @@ Both key types work — **Advanced (HMAC) and Standard are auto-detected** by th
 (`build_xdr_headers` / `XDRActionCenter._detect_auth`). For the exact least-privilege
 role recipes (two separate keys: scanner delivery vs automation, with per-operation
 permission components for XDR and the collector-token model for XSIAM), see
-**references/api-permissions.md**.
+**references/api-permissions.md**. To create the role + key from the API,
+`scripts/manage_role_key.py create --name yara-scanner-delivery --days 90` wraps the
+verified flow (`list-perms` to browse components, `delete` to clean up).
+
+> Verified on a live tenant: `insert_parsed_alerts` needs the **External Issues Mapping**
+> component (`external_alerts_action`), *not* "Cases and Issues"; datasets need **Data
+> Management** (`data_management_action`). A two-permission delivery role passed an
+> end-to-end smoke test (6/6 alerts + datasets, 0 forbidden).
 
 ## Quick reference — task → command → public API
 

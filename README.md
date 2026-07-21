@@ -346,9 +346,11 @@ queue and batch sizes. All figures come from live tenant runs recorded in the pe
 - **Credentials live in the script** (uploaded to the console script library) or in environment
   variables for the CLI toolkit — never commit real keys to source control (`.env` is gitignored).
 - **Least-privilege key roles**: use two separate XDR keys — a *scanner delivery* key
-  (Alerts/Issues Edit + Data Management only) and an optional *automation* key (script
-  execution + Action Center + query, endpoint-scoped). The XSIAM collector key is a
-  write-only ingestion token with no RBAC role. Exact per-operation permission recipes:
+  (**External Issues Mapping** for alerts + **Data Management** for datasets — verified
+  by live smoke test) and an optional *automation* key (script execution + Action Center +
+  query, endpoint-scoped). The XSIAM collector key is a write-only ingestion token with no
+  RBAC role. Exact per-operation recipes, the create-role/key API flow, and the
+  `manage_role_key.py` helper:
   [.claude/skills/xdr-action-center-api/references/api-permissions.md](.claude/skills/xdr-action-center-api/references/api-permissions.md).
 - Runs against protected paths degrade gracefully (permission errors are counted + logged, not
   fatal). Evidence collection (`CONFIG_COLLECT_FILES`) copies matched files — leave it off unless
