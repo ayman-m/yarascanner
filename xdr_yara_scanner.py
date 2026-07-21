@@ -2778,10 +2778,33 @@ class ScanConfig:
         self.statistics_upload_interval = 60
 
         if self.scan_folder and self.scan_folder.lower() != "default":
-            if not os.path.isdir(self.scan_folder):
-                raise ValueError(f"Specified scan folder is not a valid directory: {self.scan_folder}")
-            self.scan_targets = [os.path.abspath(self.scan_folder)]
-            self.error_logger.error_logger.info(f"Scan limited to folder: {self.scan_targets[0]}")
+            # scan_folder accepts a COMMA-SEPARATED list of locations so one run can cover
+            # multiple scopes/partitions (e.g. "C:\Users,D:\Shares" or "/opt/data, /srv/www").
+            # A single path (no comma) behaves exactly as before. Each entry is validated
+            # independently: a typo in one folder of a scheduled multi-target scan must not
+            # kill the whole run, but it must be LOUD in the logs — and if nothing is valid,
+            # fail the scan outright. (A path that itself contains a comma is rare; scan its
+            # parent folder instead.)
+            requested = [p.strip().strip('"').strip("'") for p in self.scan_folder.split(",")]
+            requested = [p for p in requested if p]
+            valid, invalid = [], []
+            for p in requested:
+                if os.path.isdir(p):
+                    ap = os.path.abspath(p)
+                    if ap not in valid:
+                        valid.append(ap)
+                else:
+                    invalid.append(p)
+            if not valid:
+                raise ValueError(
+                    f"No valid scan directory among the specified scan folder(s): {requested}")
+            if invalid:
+                self.error_logger.error_logger.warning(
+                    f"Ignoring {len(invalid)} specified scan folder(s) that are not valid "
+                    f"directories on this endpoint: {invalid}")
+            self.scan_targets = valid
+            self.error_logger.error_logger.info(
+                f"Scan limited to {len(valid)} folder(s): {valid}")
         else:
             if hasattr(self, "_discover_all_targets"):
                 self.scan_targets = self._discover_all_targets()
@@ -6506,7 +6529,9 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
                 else:
                     system_paths = ['/etc', '/boot', '/var/log', '/root']
                 
-                if scan_folder and any(scan_folder.startswith(path) for path in system_paths):
+                _requested_folders = [p.strip().strip('"').strip("'")
+                                      for p in str(scan_folder or "").split(",") if p.strip()]
+                if any(f.startswith(path) for f in _requested_folders for path in system_paths):
                     log_manager.log_system("ERROR: System path scan requires elevated privileges")
                     if platform.system() == "Darwin":
                         log_manager.log_system("Either run as root (sudo) or grant Full Disk Access")

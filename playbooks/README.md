@@ -53,7 +53,7 @@ integration is enabled.
 |-------|---------|
 | `script_name` | `xdr_yara_scanner_v4` |
 | `yarafile` | *(base64 of your `.yar`; e.g. `python3 encode_rules.py test_rules.yar`)* |
-| `scan_folder` | `C:\Users` or `default` |
+| `scan_folder` | `C:\Users`, `C:\Users,D:\Shares` (comma-separated multi-target), or `default` |
 | `alert_severity` | `low` |
 | `mode` | `scan` |
 | `options` | `create_alerts=true,write_dataset=true` |
