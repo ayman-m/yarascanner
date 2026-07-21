@@ -19,9 +19,10 @@ export XDR_API_KEY="<key secret>"
 ```
 
 Both key types work — **Advanced (HMAC) and Standard are auto-detected** by the toolkit
-(`build_xdr_headers` / `XDRActionCenter._detect_auth`). The key's role needs: Run Script,
-Script Library read, Action Status, XQL, and (for the scanner's own delivery) Insert
-Parsed Alerts + lookups.
+(`build_xdr_headers` / `XDRActionCenter._detect_auth`). For the exact least-privilege
+role recipes (two separate keys: scanner delivery vs automation, with per-operation
+permission components for XDR and the collector-token model for XSIAM), see
+**references/api-permissions.md**.
 
 ## Quick reference — task → command → public API
 
