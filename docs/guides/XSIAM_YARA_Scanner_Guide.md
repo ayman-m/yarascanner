@@ -216,7 +216,7 @@ DEFAULT_API_ENDPOINT = "https://api-<tenant>.xdr.<region>.paloaltonetworks.com/l
 | Order | Name | Type | Required | Description |
 |-------|------|------|----------|-------------|
 | 1 | `yarafile` | String | Yes | Base64-encoded YARA rule(s) — see Step 5 |
-| 2 | `scan_folder` | String | No | Path to scan, or `default` for full-system scan |
+| 2 | `scan_folder` | String | No | Path to scan, a comma-separated list of paths (multi-location scan; invalid entries skipped with a warning), or `default` for full-system scan |
 | 3 | `alert_severity` | String | No | `low` \| `medium` \| `high` (default `low`) |
 
 5. **Output**: `String`. (Optional) declare Python packages `yara-python`, `psutil`,

@@ -98,7 +98,7 @@ Console → **Action Center → Script Library → Upload**, entry point **`main
 input list, so operators see exactly **3 inputs**:
 
 1. `yarafile` — base64-encoded YARA rules (`python3 encode_rules.py rules.yar`)
-2. `scan_folder` — target path, or `default` for platform defaults
+2. `scan_folder` — a target path, a **comma-separated list of paths** (one scan covering multiple locations/partitions, e.g. `C:\Users,D:\Shares`), or `default` for platform defaults. Invalid entries in a list are skipped with a logged warning; the scan fails only if none are valid
 3. `alert_severity` — `low` | `medium` | `high`
 
 Upload the same file again with entry point **`cancel`** (no inputs) to get a stop button.

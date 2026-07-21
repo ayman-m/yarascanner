@@ -154,7 +154,7 @@ Metadata:
 | Order | Name | Description |
 |-------|------|-------------|
 | 1 | `yarafile` | Base64-encoded YARA rules |
-| 2 | `scan_folder` | Target path, or `default` |
+| 2 | `scan_folder` | Target path, a comma-separated list of paths (multi-location/partition scan; invalid entries skipped with a warning), or `default` |
 | 3 | `alert_severity` | `low` \| `medium` \| `high` |
 
 That is the whole per-run input list — operators fill in *which rules, which folder, what
