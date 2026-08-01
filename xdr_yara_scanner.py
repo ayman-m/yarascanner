@@ -845,7 +845,7 @@ def _get_file_creation_time_iso(path, stat_result=None):
         return None
 
 
-def _apply_light_process_priority(log_manager=None, throttle_mode="script"):
+def _apply_light_process_priority(log_manager=None, throttle_mode="script", config=None):
     """Best-effort process priority tuning so user activity wins on busy machines.
 
     throttle_mode:
@@ -899,8 +899,40 @@ def _apply_light_process_priority(log_manager=None, throttle_mode="script"):
                 except Exception as e:
                     details["io_priority_error"] = str(e)
 
+        # CPU affinity materially changes what the throttle can observe. The Cortex
+        # agent pins Windows payload processes to a SUBSET of cores (measured: 2 of 8),
+        # so the scanner may be unable to move system-wide CPU anywhere near
+        # cpu_high_threshold on its own. Record it: without this, throttle behaviour
+        # on Windows is inexplicable from the logs.
+        try:
+            affinity = process.cpu_affinity()
+            details["cpu_affinity"] = affinity
+            details["cpu_affinity_count"] = len(affinity)
+            details["host_cores"] = os.cpu_count()
+        except Exception as e:
+            details["cpu_affinity_error"] = str(e)
+
         if log_manager:
             log_manager.log_system("Applied process priority tuning", details)
+            # Self-describing header for the performance log, so a run's throttle
+            # behaviour can be interpreted without cross-referencing other files.
+            try:
+                log_manager.log_performance("THROTTLE_CONFIG " + json.dumps({
+                    "throttle_mode": throttle_mode,
+                    "high": getattr(config, "high_cpu_threshold", None),
+                    "critical": getattr(config, "critical_cpu_threshold", None),
+                    "resume_margin": getattr(config, "resume_margin", None),
+                    "max_pause_secs": getattr(config, "max_pause_secs", None),
+                    "check_interval": getattr(config, "throttle_check_interval_secs", None),
+                    "pause_loop_enabled": getattr(config, "light_throttle_enabled", None),
+                    "platform": platform.system(),
+                    "host_cores": details.get("host_cores"),
+                    "cpu_affinity_count": details.get("cpu_affinity_count"),
+                    "cpu_priority": details.get("cpu_priority"),
+                    "io_priority": details.get("io_priority"),
+                }))
+            except Exception:
+                pass
     except Exception as e:
         if log_manager:
             log_manager.log_system(f"Could not apply process priority tuning: {e}")
@@ -1030,11 +1062,16 @@ def create_standard_log(log_type, hostname, os_info, ip_address, scan_id, messag
 class PerformanceSnapshot:
     """Snapshot of system performance metrics at a point in time."""
     
-    def __init__(self, timestamp, cpu_percent, memory_mb, memory_percent, 
+    def __init__(self, timestamp, cpu_percent, memory_mb, memory_percent,
                  disk_io_read_mb, disk_io_write_mb, network_sent_mb, network_recv_mb,
-                 files_scanned, detections_found, queue_size, active_workers):
+                 files_scanned, detections_found, queue_size, active_workers,
+                 system_cpu_percent=0.0):
         self.timestamp = timestamp
         self.cpu_percent = cpu_percent
+        # System-wide CPU. This is the signal the CPU throttle actually decides on
+        # (see _maybe_throttle_scanning); process cpu_percent above is the scanner's
+        # own share and does NOT explain throttle behaviour on its own.
+        self.system_cpu_percent = system_cpu_percent
         self.memory_mb = memory_mb
         self.memory_percent = memory_percent
         self.disk_io_read_mb = disk_io_read_mb
@@ -1051,6 +1088,7 @@ class PerformanceSnapshot:
         return {
             'timestamp': self.timestamp,
             'cpu_percent': self.cpu_percent,
+            'system_cpu_percent': self.system_cpu_percent,
             'memory_mb': self.memory_mb,
             'memory_percent': self.memory_percent,
             'disk_io_read_mb': self.disk_io_read_mb,
@@ -1704,6 +1742,11 @@ class StatisticsManager:
             net_sent_mb = (net_counters.bytes_sent - self.initial_net_counters.bytes_sent) / 1024 / 1024
             net_recv_mb = (net_counters.bytes_recv - self.initial_net_counters.bytes_recv) / 1024 / 1024
             
+            try:
+                system_cpu = psutil.cpu_percent(interval=None)
+            except Exception:
+                system_cpu = 0.0
+
             return PerformanceSnapshot(
                 timestamp=time.time(),
                 cpu_percent=cpu_percent,
@@ -1716,7 +1759,8 @@ class StatisticsManager:
                 files_scanned=0,
                 detections_found=0,
                 queue_size=0,
-                active_workers=0
+                active_workers=0,
+                system_cpu_percent=system_cpu
             )
             
         except Exception as e:
@@ -1752,7 +1796,7 @@ class StatisticsManager:
         """Log detailed performance snapshot."""
         self.performance_logger.info(
             f"Performance Snapshot | "
-            f"CPU: {snapshot.cpu_percent:.1f}% | "
+            f"CPU: {snapshot.cpu_percent:.1f}% (system {snapshot.system_cpu_percent:.1f}%) | "
             f"Memory: {snapshot.memory_mb:.1f}MB ({snapshot.memory_percent:.1f}%) | "
             f"Disk I/O: R:{snapshot.disk_io_read_mb:.1f}MB W:{snapshot.disk_io_write_mb:.1f}MB | "
             f"Network: S:{snapshot.network_sent_mb:.1f}MB R:{snapshot.network_recv_mb:.1f}MB | "
@@ -5478,6 +5522,22 @@ rule test {{
         pause_started = time.time()
         entered_critical = cpu >= self.config.critical_cpu_threshold
 
+        # Structured throttle telemetry. Event-driven (not tied to the 30s performance
+        # snapshot cadence), so volume only grows when the host is genuinely under
+        # pressure. Machine-readable so a harness can correlate pauses against an
+        # independent CPU trace.
+        self.log_manager.log_performance(
+            "THROTTLE_EVENT " + json.dumps({
+                "event": "pause_start",
+                "t": round(pause_started, 3),
+                "cpu": round(cpu, 1),
+                "high": round(self.config.high_cpu_threshold, 1),
+                "critical": round(self.config.critical_cpu_threshold, 1),
+                "at_critical": bool(entered_critical),
+                "mode": self.config.throttle_mode,
+            })
+        )
+
         # Track WALL-CLOCK throttled time (the span during which >=1 worker is paused),
         # not the sum of per-worker pause seconds — otherwise N concurrent workers would
         # inflate total_paused_secs by ~N. First worker in opens the window; last one out
@@ -5508,6 +5568,19 @@ rule test {{
                     self.total_paused_secs += time.time() - self._pause_wall_start
                 if entered_critical:
                     self.critical_pauses += 1
+
+            # Emitted outside the lock: logging must never extend lock hold time.
+            _pause_end = time.time()
+            self.log_manager.log_performance(
+                "THROTTLE_EVENT " + json.dumps({
+                    "event": "pause_end",
+                    "t": round(_pause_end, 3),
+                    "cpu": round(self.last_system_cpu, 1),
+                    "duration": round(_pause_end - pause_started, 3),
+                    "at_critical": bool(entered_critical),
+                    "mode": self.config.throttle_mode,
+                })
+            )
 
     def _enqueue_scan_path(self, path):
         """Block gently when workers are saturated instead of dropping files."""
@@ -6494,7 +6567,8 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
                 pass
             return msg
 
-        _apply_light_process_priority(log_manager, throttle_mode=config.throttle_mode)
+        _apply_light_process_priority(log_manager, throttle_mode=config.throttle_mode,
+                                      config=config)
         exception_logger = config.exception_logger
         stats_manager = StatisticsManager(config, log_manager)
         cleanup_manager = CleanupManager(config)
