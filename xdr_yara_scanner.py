@@ -2846,6 +2846,29 @@ class ScanConfig:
                 self.error_logger.error_logger.warning(
                     f"Ignoring {len(invalid)} specified scan folder(s) that are not valid "
                     f"directories on this endpoint: {invalid}")
+            # A target can be a real directory and still yield nothing, because the
+            # platform skip-list filters it out during the walk. That produced a
+            # silent no-op: "Scan completed: 0 files scanned" with no reason given
+            # (e.g. /private/tmp on macOS, /proc on Linux). Say so explicitly.
+            skips = getattr(self, "skip_paths", None) or ()
+            excluded = []
+            for ap in valid:
+                probe = ap if ap.endswith(os.sep) else ap + os.sep
+                for s in skips:
+                    if probe.startswith(s) or probe == s:
+                        excluded.append((ap, s))
+                        break
+            if excluded:
+                detail = ", ".join(f"{p} (excluded by '{s}')" for p, s in excluded)
+                self.error_logger.error_logger.warning(
+                    f"{len(excluded)} of {len(valid)} scan folder(s) sit under a "
+                    f"platform skip-path and will yield no files: {detail}")
+                if len(excluded) == len(valid):
+                    self.error_logger.error_logger.warning(
+                        "EVERY requested scan folder is excluded by the platform "
+                        "skip-list - this scan will scan 0 files. Choose a target "
+                        "outside the skip-list.")
+
             self.scan_targets = valid
             self.error_logger.error_logger.info(
                 f"Scan limited to {len(valid)} folder(s): {valid}")
@@ -7005,6 +7028,14 @@ if __name__ == "__main__":
         )
 
         result_text = str(result or "")
+        # Print the outcome. Without this the CLI path is silent: it exits 0 having
+        # reported nothing, because the only place the result was ever printed is the
+        # footer that build_scanner_snippet appends (which also neutralizes this
+        # guard). Anyone running the script directly - a customer validating it, a
+        # scheduled task, CI - got no output at all. Same "SCAN_RESULT: " prefix as
+        # the snippet path so downstream parsing is identical either way.
+        print("SCAN_RESULT: " + result_text)
+        sys.stdout.flush()
         low = result_text.lower()
         is_success = bool(result_text) and not (
             low.startswith("scan failed") or low.startswith("cancel failed") or low.startswith("scan aborted")
