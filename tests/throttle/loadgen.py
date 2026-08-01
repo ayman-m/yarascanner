@@ -18,9 +18,20 @@ import hashlib
 import json
 import os
 import platform
+import signal
 import sys
 import threading
 import time
+
+# Set by SIGTERM/SIGINT so the driver can stop the load as soon as the scan it was
+# pacing against finishes, instead of every condition paying for the full profile
+# duration. The handler only flips a flag; run_profile returns normally and main()
+# still writes its JSON, so an early stop yields usable data rather than nothing.
+_STOP = {"flag": False}
+
+
+def _handle_term(_signum, _frame):
+    _STOP["flag"] = True
 
 try:
     import psutil
@@ -192,9 +203,11 @@ def run_profile(profile, hard_deadline=HARD_DEADLINE_SECS):
     samples = []
     try:
         for stage_idx, (secs, duty) in enumerate(profile):
+            if _STOP["flag"]:
+                break
             state["duty"] = duty
             stage_end = time.time() + secs
-            while time.time() < stage_end and time.time() < deadline:
+            while time.time() < stage_end and time.time() < deadline and not _STOP["flag"]:
                 time.sleep(1.0)
                 samples.append({
                     "t": round(time.time(), 3),
@@ -203,7 +216,7 @@ def run_profile(profile, hard_deadline=HARD_DEADLINE_SECS):
                     "stage": stage_idx,
                     "duty": duty,
                 })
-            if time.time() >= deadline:
+            if time.time() >= deadline or _STOP["flag"]:
                 break
     finally:
         _stop(state, workers)
@@ -284,6 +297,12 @@ def main():
                     help="sweep duty and report achieved system CPU per step")
     ap.add_argument("--out", help="write JSON here (also printed to stdout)")
     args = ap.parse_args()
+
+    for _sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(_sig, _handle_term)
+        except Exception:
+            pass
 
     if psutil is None:
         print("WARNING: psutil missing - CPU samples will be -1", file=sys.stderr)
