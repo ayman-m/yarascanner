@@ -189,9 +189,12 @@ def _stop(state, workers):
         w.join(timeout=5)
 
 
-def run_profile(profile, hard_deadline=HARD_DEADLINE_SECS):
+def run_profile(profile, hard_deadline=HARD_DEADLINE_SECS, threads=None):
     cores = os.cpu_count() or 2
-    workers_n = max(1, cores - 1)          # headroom so the box stays responsive
+    # `threads` lets a caller emulate a smaller host: on a taskset-confined N-core run the
+    # generator should offer N-1 threads, not (host_cores - 1), or it over-subscribes.
+    workers_n = int(threads) if threads else max(1, cores - 1)
+    workers_n = max(1, workers_n)
     before, after = widen_affinity()
     state = {"duty": 0.0, "stop": False}
 
@@ -295,6 +298,9 @@ def main():
                     help='stages as "secs:duty,secs:duty"')
     ap.add_argument("--calibrate", action="store_true",
                     help="sweep duty and report achieved system CPU per step")
+    ap.add_argument("--threads", type=int,
+                    help="worker threads (default cores-1); set explicitly when emulating "
+                         "a smaller host under taskset")
     ap.add_argument("--out", help="write JSON here (also printed to stdout)")
     args = ap.parse_args()
 
@@ -307,7 +313,8 @@ def main():
     if psutil is None:
         print("WARNING: psutil missing - CPU samples will be -1", file=sys.stderr)
 
-    result = run_calibration() if args.calibrate else run_profile(parse_profile(args.profile))
+    result = (run_calibration() if args.calibrate
+              else run_profile(parse_profile(args.profile), threads=args.threads))
     blob = json.dumps(result, indent=2)
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:
