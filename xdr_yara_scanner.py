@@ -193,6 +193,22 @@ LOG_KEEP_SCANS = int(os.environ.get("YARA_LOG_KEEP", "10") or 10)
 CANCEL_POLL_SECS = float(os.environ.get("YARA_CANCEL_POLL_SECS", "5") or 5)        # cancel-flag watcher cadence
 CANCEL_DRAIN_DEADLINE_SECS = float(os.environ.get("YARA_CANCEL_DEADLINE_SECS", "30") or 30)  # graceful cancel budget
 CANCEL_STALE_TOLERANCE_SECS = 2.0  # mtime slack when judging a cancel flag stale (coarse-FS safety)
+
+# --- script-mode throttle pacing -------------------------------------------------
+# The old behaviour PARKED a worker until system CPU fell below (high - resume_margin).
+# That condition is unreachable when the pressure is EXTERNAL and sustained: measured on
+# an 8-core Linux endpoint, an unrelated workload holding ~74% CPU made the scanner park
+# 285s out of a 347s scan (82% of its life) - a 7.2x slowdown that bought only ~11% more
+# protection for the competing workload than 'os' mode did. The scanner was punishing
+# itself for load it did not cause, and only max_pause_secs eventually forced progress.
+#
+# New behaviour: a proportional DUTY CYCLE. Above the high threshold the worker sleeps in
+# proportion to the work it just did, so throughput degrades smoothly and predictably but
+# the scan ALWAYS advances. Ratio 1.0 => roughly half speed; 4.0 => roughly one-fifth.
+THROTTLE_SLEEP_RATIO_HIGH = float(os.environ.get("YARA_THROTTLE_RATIO_HIGH", "1.0") or 1.0)
+THROTTLE_SLEEP_RATIO_CRITICAL = float(os.environ.get("YARA_THROTTLE_RATIO_CRITICAL", "4.0") or 4.0)
+THROTTLE_SLEEP_CAP_SECS = float(os.environ.get("YARA_THROTTLE_SLEEP_CAP", "1.0") or 1.0)
+THROTTLE_SLEEP_MIN_SECS = float(os.environ.get("YARA_THROTTLE_SLEEP_MIN", "0.01") or 0.01)
 XDR_API_KEY = DEFAULT_XDR_API_KEY
 XDR_API_ID = DEFAULT_XDR_API_ID
 XDR_API_URL = DEFAULT_XDR_API_URL
@@ -4705,6 +4721,9 @@ class YaraScanner:
         self.worker_processing_times = defaultdict(list)
         self.last_throttle_check = 0.0
         self.last_system_cpu = 0.0
+        # Per-worker throttle state (episode start, accumulated sleep, last return time).
+        # Thread-local because each worker duty-cycles independently.
+        self._throttle_tls = threading.local()
         self.total_paused_secs = 0.0     # wall-clock time >=1 worker was CPU-paused
         self.critical_pauses = 0         # pauses that hit the critical CPU threshold
         self._paused_workers = 0         # count of workers currently in the pause loop
@@ -5522,88 +5541,104 @@ rule test {{
             return self.last_system_cpu
 
     def _maybe_throttle_scanning(self, force=False):
-        """Pause the calling worker while system CPU is above the high threshold.
+        """Duty-cycle the calling worker while system CPU is above the high threshold.
 
-        Enhanced sleep logic (customer request): rather than a single fixed micro-sleep,
-        the worker stays paused and RE-CHECKS CPU each interval, resuming only once CPU
-        falls below the resume threshold (high - resume_margin, i.e. hysteresis to avoid
-        flapping). Bounded by max_pause_secs so a permanently busy host still makes
-        forward progress. No-op unless throttle_mode='script' (OS/off modes hand pacing
-        to the kernel). `force` is accepted for call-site compatibility; the CPU gate is
-        the same either way.
+        Sleeps in PROPORTION to the work just done, rather than parking until CPU drops.
+        The old park-until-drop design waited for system CPU to fall below
+        (high - resume_margin); when the pressure is external and sustained that never
+        happens, and the scan stalls until max_pause_secs bails it out (measured: 285s
+        parked in a 347s scan, 7.2x slower, for ~11% more workload protection than 'os').
+
+        Proportional sleeping degrades throughput smoothly and predictably instead:
+        ratio 1.0 is roughly half speed, 4.0 (above critical) roughly one fifth, and the
+        scan always advances. A throttle EPISODE is a contiguous run of throttled checks
+        by one worker; events are emitted per episode, not per sleep, so the log stays
+        readable. No-op unless throttle_mode='script' ('os'/'off' hand pacing to the
+        kernel). `force` is accepted for call-site compatibility.
         """
         if not getattr(self.config, "light_throttle_enabled", False):
             return
 
+        tl = self._throttle_tls
+        now = time.time()
         cpu = self._sample_system_cpu()
+        episode_start = getattr(tl, "episode_start", None)
+
         if cpu < self.config.high_cpu_threshold:
-            return  # fast path: machine is not under pressure
+            # Not under pressure. Close an open episode if this worker had one.
+            if episode_start is not None:
+                slept = getattr(tl, "episode_slept", 0.0)
+                tl.episode_start = None
+                tl.episode_slept = 0.0
+                self.log_manager.log_performance(
+                    "THROTTLE_EVENT " + json.dumps({
+                        "event": "pause_end",
+                        "t": round(now, 3),
+                        "cpu": round(cpu, 1),
+                        "duration": round(now - episode_start, 3),
+                        "slept": round(slept, 3),
+                        "at_critical": bool(getattr(tl, "episode_critical", False)),
+                        "mode": self.config.throttle_mode,
+                    })
+                )
+            tl.last_return = now
+            return
 
-        resume_threshold = max(1.0, self.config.high_cpu_threshold - self.config.resume_margin)
-        interval = max(0.05, self.config.throttle_check_interval_secs)
+        at_critical = cpu >= self.config.critical_cpu_threshold
+        if episode_start is None:
+            tl.episode_start = now
+            tl.episode_slept = 0.0
+            tl.episode_critical = at_critical
+            self.log_manager.log_performance(
+                "THROTTLE_EVENT " + json.dumps({
+                    "event": "pause_start",
+                    "t": round(now, 3),
+                    "cpu": round(cpu, 1),
+                    "high": round(self.config.high_cpu_threshold, 1),
+                    "critical": round(self.config.critical_cpu_threshold, 1),
+                    "at_critical": bool(at_critical),
+                    "mode": self.config.throttle_mode,
+                })
+            )
+        elif at_critical:
+            tl.episode_critical = True
+
+        # Sleep proportional to the work done since this worker last returned, so the
+        # slowdown factor is stable regardless of file size or scan speed.
+        work_elapsed = max(0.0, now - getattr(tl, "last_return", now))
+        ratio = THROTTLE_SLEEP_RATIO_CRITICAL if at_critical else THROTTLE_SLEEP_RATIO_HIGH
+        sleep_secs = min(THROTTLE_SLEEP_CAP_SECS,
+                         max(THROTTLE_SLEEP_MIN_SECS, work_elapsed * ratio))
+
         max_pause = self.config.max_pause_secs
-        pause_started = time.time()
-        entered_critical = cpu >= self.config.critical_cpu_threshold
+        if max_pause and getattr(tl, "episode_slept", 0.0) >= max_pause:
+            # Cumulative safety valve: stop sleeping entirely for this episode.
+            if not getattr(tl, "episode_capped", False):
+                tl.episode_capped = True
+                self.log_manager.log_performance(
+                    f"Throttle episode hit max_pause_secs ({max_pause:.0f}s) at CPU "
+                    f"{cpu:.0f}% - running at full speed to guarantee progress")
+            tl.last_return = time.time()
+            return
 
-        # Structured throttle telemetry. Event-driven (not tied to the 30s performance
-        # snapshot cadence), so volume only grows when the host is genuinely under
-        # pressure. Machine-readable so a harness can correlate pauses against an
-        # independent CPU trace.
-        self.log_manager.log_performance(
-            "THROTTLE_EVENT " + json.dumps({
-                "event": "pause_start",
-                "t": round(pause_started, 3),
-                "cpu": round(cpu, 1),
-                "high": round(self.config.high_cpu_threshold, 1),
-                "critical": round(self.config.critical_cpu_threshold, 1),
-                "at_critical": bool(entered_critical),
-                "mode": self.config.throttle_mode,
-            })
-        )
-
-        # Track WALL-CLOCK throttled time (the span during which >=1 worker is paused),
-        # not the sum of per-worker pause seconds — otherwise N concurrent workers would
-        # inflate total_paused_secs by ~N. First worker in opens the window; last one out
-        # closes it and adds the elapsed wall time.
+        # Wall-clock throttled time: the span during which >=1 worker is sleeping, not
+        # the sum of per-worker sleeps (N workers would inflate it by ~N).
         with self.lock_throttle:
             if self._paused_workers == 0:
-                self._pause_wall_start = pause_started
+                self._pause_wall_start = now
             self._paused_workers += 1
         try:
-            while self.scan_active and not self.cancel_requested:
-                time.sleep(interval)
-                cpu = self._sample_system_cpu()
-                if cpu >= self.config.critical_cpu_threshold:
-                    entered_critical = True
-                if cpu < resume_threshold:
-                    break
-                if max_pause and (time.time() - pause_started) >= max_pause:
-                    self.log_manager.log_performance(
-                        f"Throttle pause hit max_pause_secs ({max_pause:.0f}s) at CPU {cpu:.0f}% - "
-                        f"resuming to guarantee forward progress"
-                    )
-                    break
+            time.sleep(sleep_secs)
         finally:
             with self.lock_throttle:
                 self._paused_workers -= 1
                 if self._paused_workers <= 0:
                     self._paused_workers = 0
                     self.total_paused_secs += time.time() - self._pause_wall_start
-                if entered_critical:
+                if at_critical:
                     self.critical_pauses += 1
-
-            # Emitted outside the lock: logging must never extend lock hold time.
-            _pause_end = time.time()
-            self.log_manager.log_performance(
-                "THROTTLE_EVENT " + json.dumps({
-                    "event": "pause_end",
-                    "t": round(_pause_end, 3),
-                    "cpu": round(self.last_system_cpu, 1),
-                    "duration": round(_pause_end - pause_started, 3),
-                    "at_critical": bool(entered_critical),
-                    "mode": self.config.throttle_mode,
-                })
-            )
+            tl.episode_slept = getattr(tl, "episode_slept", 0.0) + sleep_secs
+            tl.last_return = time.time()
 
     def _enqueue_scan_path(self, path):
         """Block gently when workers are saturated instead of dropping files."""
