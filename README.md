@@ -52,7 +52,9 @@ Cortex platform as alerts, datasets, and dashboards — no extra infrastructure 
 ### Engine capabilities (both editions)
 
 - **Multi-threaded scanning** with a bounded queue and light process priority (agent-friendly)
-- **CPU throttling** — `script` (pause/resume with hysteresis), `os` (idle-tier priority), or `off`
+- **CPU governor** — bounds the scanner's OWN share of the host: `headroom` (leave N% free,
+  adaptive), `budget` (never exceed N%), or `none`. Never stalls: under heavy external load it
+  shrinks to a floor rather than waiting for room
 - **Rule pack handling** — per-rule compile isolation, unavailable-module detection (skips only
   rules that *import* a missing module), condition-only match summaries, `filename`/`filepath`
   externals available to rules
@@ -77,10 +79,11 @@ then upload — operators never type these again:
 | `CONFIG_CREATE_ALERTS` | True/False | `True` | Insert Parsed Alerts (→ incident creation) |
 | `CONFIG_WRITE_DATASET` | True/False | `True` | Write the lookup datasets |
 | `CONFIG_COLLECT_FILES` | True/False | `False` | Copy matched files into the evidence zip |
-| `CONFIG_THROTTLE_MODE` | script/os/off | `script` | CPU pacing strategy |
-| `CONFIG_CPU_HIGH_THRESHOLD` | int/None | `None` | Pause-entry % CPU (None = profile default) |
-| `CONFIG_CPU_CRITICAL_THRESHOLD` | int/None | `None` | Critical % CPU (None = profile default) |
-| `CONFIG_MAX_PAUSE_SECS` | int/None | `None` | Cap on one continuous CPU pause |
+| `CONFIG_CPU_GUARANTEE` | headroom/budget/none | `headroom` | CPU impact policy |
+| `CONFIG_CPU_HEADROOM_PCT` | int | `30` | *headroom:* % of the host always left free |
+| `CONFIG_CPU_BUDGET_PCT` | int | `25` | *budget:* max % of the host we may use |
+| `CONFIG_CPU_FLOOR_PCT` | int | `5` | Never target below this — guarantees progress |
+| `CONFIG_WORKERS` | int | `2` | Worker threads. More measured SLOWER (disk-bound); leave at 2 |
 | `CONFIG_TENANT_ID` | string | `""` | Tenant tag (`""` = derive from API URL) |
 | `CONFIG_LOOKUP_SHARD` | endpoint/none/label | `endpoint` | Per-writer dataset sharding |
 | `CONFIG_ALERT_MAX_PER_SCAN` | int | `500` | Storm cap: max per-finding alerts per scan (`≤0` = uncapped) |
@@ -336,7 +339,7 @@ Measured on 2-worker light profile (agent-friendly defaults), e2-medium-class VM
 | Small scan end-to-end (scan + alerts + datasets) | ~30–60 s including delivery drains |
 | Finding alerts | delivered 1:1 up to the cap, idempotent across re-scans |
 
-CPU stays under the configured thresholds via throttling; memory footprint is bounded by the scan
+CPU stays under the configured share via the governor; memory footprint is bounded by the scan
 queue and batch sizes. All figures come from live tenant runs recorded in the performance report.
 
 ---
@@ -369,7 +372,7 @@ queue and batch sizes. All figures come from live tenant runs recorded in the pe
 | `dataset_delivery.undelivered > 0` | Dataset write budget exhausted by a match storm — tune the offending rule (`top_rules` in the summary) |
 | `records_skipped > 0` in dataset delivery | Row shape doesn't match the dataset's schema — bump `LOOKUP_SCHEMA_VERSION` so a fresh dataset is created |
 | A rule never matches | Check `rules_failed` + the failed-rules log on the endpoint: unavailable module imports are skipped by design |
-| Scan is slow on a busy host | That's the throttler honoring CPU thresholds; use `CONFIG_THROTTLE_MODE=os` or raise thresholds for maintenance windows |
+| Scan is slow on a busy host | The governor is holding the scanner to its share. Raise `CONFIG_CPU_HEADROOM_PCT`'s complement (i.e. allow more), switch to `CONFIG_CPU_GUARANTEE=budget` with a higher `CONFIG_CPU_BUDGET_PCT`, or `none` for a maintenance window. Check `cpu_governor` in the scan summary to see what it actually used |
 | Alerts don't appear in XDR | Verify the key type/permissions; the scanner auto-detects Advanced (HMAC) vs Standard auth — check `uploads_<run_id>.log` for HTTP status lines |
 
 Per-run logs on the endpoint (`logs/` under the scanner directory): `scanner_`, `uploads_`,

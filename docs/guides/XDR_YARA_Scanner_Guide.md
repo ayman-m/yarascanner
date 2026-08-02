@@ -174,13 +174,22 @@ re-upload. These are the deployment-wide behaviour knobs (no per-run input neede
 | `CONFIG_CREATE_ALERTS` | `True`/`False` | `True` | Insert Parsed Alerts (→ incidents) |
 | `CONFIG_WRITE_DATASET` | `True`/`False` | `True` | Write the lookup datasets |
 | `CONFIG_COLLECT_FILES` | `True`/`False` | `False` | Copy matched files into the evidence ZIP |
-| `CONFIG_THROTTLE_MODE` | `script`/`os`/`off` | `script` | CPU pacing strategy (§10) |
-| `CONFIG_CPU_HIGH_THRESHOLD` | int or `None` | `None` | Pause-entry % CPU (`None` = profile default) |
-| `CONFIG_CPU_CRITICAL_THRESHOLD` | int or `None` | `None` | Critical % CPU (`None` = profile default) |
-| `CONFIG_MAX_PAUSE_SECS` | int or `None` | `None` | Cap on one continuous CPU pause |
+| `CONFIG_CPU_GUARANTEE` | `headroom`/`budget`/`none` | `headroom` | CPU impact policy (§10) |
+| `CONFIG_CPU_HEADROOM_PCT` | int | `30` | *headroom:* % of the host always left free |
+| `CONFIG_CPU_BUDGET_PCT` | int | `25` | *budget:* max % of the host we may use |
+| `CONFIG_CPU_FLOOR_PCT` | int | `5` | Never target below this — guarantees progress (§10) |
+| `CONFIG_WORKERS` | int | `2` | Scan worker threads. `0` = auto (`cores // 2`). **Leave at 2** (§10) |
 | `CONFIG_TENANT_ID` | string | `""` | Tenant tag (`""` = derive from API URL) |
 | `CONFIG_LOOKUP_SHARD` | `endpoint`/`none`/`<label>` | `endpoint` | Dataset sharding (§11) |
+| `CONFIG_ALERT_MAX_PER_SCAN` | int | `500` | Max per-finding alerts per scan; beyond → one rollup per rule |
+| `CONFIG_LOOKUP_ROTATION` | `monthly`/`none` | `monthly` | Monthly dataset rotation (§11) |
 | `CONFIG_OPTIONS` | `key=value,key=value` | `""` | Rarely-needed extra overrides applied every run |
+
+**Retired constants.** `CONFIG_THROTTLE_MODE`, `CONFIG_CPU_HIGH_THRESHOLD`,
+`CONFIG_CPU_CRITICAL_THRESHOLD` and `CONFIG_MAX_PAUSE_SECS` no longer exist — see §10 for
+why. The equivalent *runtime options* are still accepted and translated, so existing
+scripts and scheduled jobs keep running: `throttle_mode=off` → `cpu_guarantee=none`;
+`throttle_mode=script` or `os` → `cpu_guarantee=headroom`. Unknown keys still fail loudly.
 
 > Advanced / automation only: the internal `run(...)` API and the CLI still accept a per-run
 > `options` string that overrides any constant above — but the Action Center `main` entry point
@@ -228,23 +237,137 @@ validating rules/credentials before a production rollout.
 
 # 9. Step 5 — Scan Cancellation
 
-To stop a running scan, run the same script with `mode=cancel` on the same endpoints
-(or use `YARA_Scanner_Canceller.yml`). This drops a cancel flag that the running scan's
-watcher detects within ~5 s; the scan drains gracefully, writes a terminal `cancelled`
-row to `yara_scanner_scans`, and returns `Scan cancelled by operator: …`. POSIX
-`SIGTERM`/`SIGINT` route into the same path.
+To stop a running scan, run the **`cancel` entry point** as a second Action Center action
+against the same endpoints (or use `YARA_Scanner_Canceller.yml`). This writes a flag file
+that the running scan polls; the scan **stops scanning within ~5 s**, drains what it has,
+writes a terminal `cancelled` row to `yara_scanner_scans`, and returns
+`Scan cancelled by operator: …`.
+
+Verified live: a scan stopped after 7,592 files with both workers halting **4.45 s** after
+the flag was detected.
+
+> ### Why the console's own Cancel does not stop a running scan
+>
+> This is platform behaviour, not a scanner limitation. Per Cortex XDR documentation:
+> *"It is possible to cancel an upgrade if the Status is Pending. Once the Status is In
+> Progress, the action is already received by the agent locally and **cannot be canceled
+> from the management console**."* The same wording covers file retrieval and endpoint
+> isolation — the console menu item is literally **"Cancel for pending endpoint"**.
+>
+> On a 1,000-endpoint scan, the console Cancel removes the queued endpoints and every
+> already-running scan continues. The `cancel` entry point is the workaround.
+>
+> **There is also no public API to cancel an action.** The cancel/abort endpoints live under
+> `/api/webapp/` — the console's private backend, which needs an interactive MFA session and
+> is not supported for automation. So the `cancel` entry point is the *only*
+> API-drivable way to stop a running scan, which makes it usable from SOAR playbooks.
+>
+> **Signals do not work either.** The agent runs scripts on a worker thread, so
+> `signal.signal()` raises *"signal only works in main thread of the main interpreter"* on
+> both Windows and Linux. A polled flag file is the only mechanism the platform permits.
+
+**Known latency.** The scan stops *scanning* within ~5 s, but the process can take up to
+about a minute to *exit*, because the directory walk observes the flag only between
+`os.walk` yields — an interval that is unbounded on large trees. No files are scanned in
+that window and results are unaffected. The same cause makes `control/running.json` go stale
+during long walks, so a `cancel` may report `scanner running: no` while a scan is in fact
+running.
 
 ---
 
-# 10. Resource Management
+# 10. Resource Management — the CPU governor
 
-The scanner never wants to compete with real workload. Three modes, via `throttle_mode`:
+The scanner bounds **its own share of the machine**. It does *not* react to load other
+processes create. Answering "will this scan slow my host?" is this section.
 
-| Mode | Behavior |
-|------|----------|
-| `script` (default) | Worker **pauses while system CPU is above `cpu_high_threshold`**, re-checks each interval, and resumes only once CPU drops below `high − 10` (hysteresis). Bounded by `max_pause_secs`; wall-clock pause time is reported per scan. |
-| `os` | Script sleeps disabled; the process drops to **idle-tier priority** (Windows IDLE/background; Linux `nice 19` + `ionice idle`; macOS `nice 19`) and the OS scheduler arbitrates. |
-| `off` | No throttling — for dedicated maintenance windows. |
+## 10.1 Policies
+
+| `CONFIG_CPU_GUARANTEE` | Behaviour |
+|---|---|
+| `headroom` (default) | **Adaptive.** Target = `100 − CONFIG_CPU_HEADROOM_PCT − (what everyone else is using)`. A quiet machine gets a fast scan; a busy one gets a quiet scanner. |
+| `budget` | **Fixed.** Never exceed `CONFIG_CPU_BUDGET_PCT` of the host, whatever else is happening. Predictable, and easy to state in a change request. |
+| `none` | No CPU governing. Low process priority still applies. |
+
+**How it acts.** The governor measures the scanner's own CPU as a share of the whole host
+(`process_cpu ÷ cpu_count`), compares it to the target, and sleeps each worker *in
+proportion to the work it just did*. Proportional sleeping keeps the slowdown factor stable
+regardless of file size or machine speed.
+
+**The floor is the anti-stall guarantee.** Under heavy external load the target drops to
+`CONFIG_CPU_FLOOR_PCT` and the scan continues slowly — it never stops. No throttle can
+create headroom that another process is consuming, so the scanner shrinks to its floor
+rather than waiting for room that will not appear.
+
+## 10.2 Why the old `script`/`os`/`off` modes were replaced
+
+The previous design watched **system-wide** CPU and paused while it exceeded a threshold.
+Measured on an 8-core Linux endpoint:
+
+- With unrelated load holding ~74% CPU, the scanner **parked 285 s of a 347 s scan** waiting
+  for a resume condition (CPU below 70%) that sustained external load never allowed. With a
+  longer load it parked **593 s of a 594 s scan** — a 65.9× slowdown.
+- It was reacting to load it did not cause.
+- Across 2, 4 and 8 cores under saturating load, throttling protected the competing workload
+  by **−3% to +1% versus not throttling at all**.
+- `os` mode was not a safe substitute: idle priority **starved** on a saturated 8-core host,
+  taking 252 s versus 77 s unthrottled.
+
+The governor fixes the stall (65.9× → 2.07×) and can state a number. Be aware what it does
+*not* claim: on a host where the scanner only ever uses a small share, throttling of any
+kind changes host impact very little. Its real value is that a scan **never stalls** on a
+busy machine, and that the promise is measurable after the fact.
+
+## 10.3 Worker count
+
+`CONFIG_WORKERS` defaults to **2. Leave it there unless you have measured otherwise.**
+More workers measured *slower* (8-core Linux, 93k files, warm cache):
+
+| Workers | Wall clock |
+|---|---|
+| **2** | **71 s** |
+| 4 | 93 s (+31%) |
+| 8 | 101 s (+42%) |
+
+Scanning is disk-bound as well as CPU-bound, so extra concurrent readers cause seek
+contention rather than useful overlap. The setting exists so operators with fast NVMe can
+raise it *after measuring* — not as a default to tune upward.
+
+## 10.4 Measured behaviour
+
+Linux, 8 cores, `/usr` (93,116 files), 3 rounds:
+
+| Condition | Wall clock | Slept |
+|---|---|---|
+| idle, `none` | 64 s | 0 s |
+| idle, `headroom` | 68 s | 0 s |
+| **saturating external load, `headroom`** | **153 s** | 40 s |
+| saturating external load, `budget=20%` | 131 s | 0 s |
+
+Governing an idle host costs about **6%**. Under load the scan still completes.
+
+## 10.5 Telemetry
+
+`performance_<run_id>.log` carries one header per run and a `CPU_GOVERNOR` line on
+meaningful change or every 30 s:
+
+```
+THROTTLE_CONFIG {"cpu_guarantee":"headroom","cpu_headroom_pct":30.0,...,
+                 "host_cores":8,"cpu_affinity_count":2,"cpu_priority":"below_normal"}
+CPU_GOVERNOR    {"policy":"headroom","target":70.0,"own":8.1,"others":0.0,
+                 "ratio":0.0,"slept_secs":0.0,"floor_hits":0,"t":...}
+```
+
+`own` is a share of the **whole host** — it should never exceed 100. The scan summary
+carries the same figures under `cpu_governor`, which is your after-the-fact evidence that
+the promise held.
+
+## 10.6 Windows note
+
+The Cortex agent pins payload processes to **2 CPU cores** regardless of host size
+(visible in every scan as `host_cores: 8, cpu_affinity_count: 2`). The scanner therefore
+cannot exceed roughly **25% of an 8-core Windows host whatever you configure** — the agent
+has already applied coarse containment. The governor stays effectively idle there until
+other processes push the target below that ceiling.
 
 ---
 
