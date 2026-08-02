@@ -210,6 +210,9 @@ LOG_KEEP_SCANS = int(os.environ.get("YARA_LOG_KEEP", "10") or 10)
 CANCEL_POLL_SECS = float(os.environ.get("YARA_CANCEL_POLL_SECS", "5") or 5)        # cancel-flag watcher cadence
 CANCEL_DRAIN_DEADLINE_SECS = float(os.environ.get("YARA_CANCEL_DEADLINE_SECS", "30") or 30)  # graceful cancel budget
 CANCEL_STALE_TOLERANCE_SECS = 2.0  # mtime slack when judging a cancel flag stale (coarse-FS safety)
+# Governor telemetry heartbeat: emit at least this often even when nothing changes, so a
+# healthy scan still leaves a time series proving the CPU promise held.
+GOVERNOR_HEARTBEAT_SECS = float(os.environ.get("YARA_GOVERNOR_HEARTBEAT_SECS", "30") or 30)
 
 XDR_API_KEY = DEFAULT_XDR_API_KEY
 XDR_API_ID = DEFAULT_XDR_API_ID
@@ -5705,10 +5708,18 @@ rule test {{
             return
         self.cpu_governor.update(own_raw, system)
 
-        # Emit on meaningful change only; a line per sample would flood the log.
+        # Emit on meaningful change, OR on a heartbeat. Change-only emission produced a
+        # single line across a 15,516-file scan (the ratio never moved because the host
+        # was idle) - and a steady, un-throttled scan is exactly the case a customer
+        # wants evidence for. The heartbeat guarantees a usable time series without
+        # emitting per sample.
         s = self.cpu_governor.stats()
-        if self._last_governor_emit is None or abs(s["ratio"] - self._last_governor_emit) >= 0.25:
+        changed = (self._last_governor_emit is None
+                   or abs(s["ratio"] - self._last_governor_emit) >= 0.25)
+        heartbeat = (now - getattr(self, "_last_governor_emit_at", 0.0)) >= GOVERNOR_HEARTBEAT_SECS
+        if changed or heartbeat:
             self._last_governor_emit = s["ratio"]
+            self._last_governor_emit_at = now
             self.log_manager.log_performance(
                 "CPU_GOVERNOR " + json.dumps(dict(s, t=round(now, 3))))
 
