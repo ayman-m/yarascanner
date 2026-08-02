@@ -246,25 +246,39 @@ writes a terminal `cancelled` row to `yara_scanner_scans`, and returns
 Verified live: a scan stopped after 7,592 files with both workers halting **4.45 s** after
 the flag was detected.
 
-> ### Why the console's own Cancel does not stop a running scan
+> ### Console Cancel vs the `cancel` entry point — they are not equivalent
 >
-> This is platform behaviour, not a scanner limitation. Per Cortex XDR documentation:
-> *"It is possible to cancel an upgrade if the Status is Pending. Once the Status is In
-> Progress, the action is already received by the agent locally and **cannot be canceled
-> from the management console**."* The same wording covers file retrieval and endpoint
-> isolation — the console menu item is literally **"Cancel for pending endpoint"**.
+> **Measured on agent 9.2.0.90 (Windows), 2026-08-02.** Cancelling a running *script*
+> action from the console **does stop it — by killing the payload process**. Two endpoints
+> mid-scan went to status `ABORTED`, both payload PIDs died, and neither wrote a terminal
+> `cancelled` row or a scan summary. Their logs stop mid-walk with no cleanup.
 >
-> On a 1,000-endpoint scan, the console Cancel removes the queued endpoints and every
-> already-running scan continues. The `cancel` entry point is the workaround.
+> Note this contradicts the wording in the Cortex documentation for *agent upgrades*
+> (*"once the Status is In Progress… cannot be canceled from the management console"*).
+> That statement describes upgrades, **not script executions**, and should not be assumed to
+> generalise.
 >
-> **There is also no public API to cancel an action.** The cancel/abort endpoints live under
+> | | Console Cancel | `cancel` entry point |
+> |---|---|---|
+> | Stops the scan | yes, immediately | yes, within ~5 s |
+> | Method | **hard kill** of the payload | cooperative flag |
+> | Terminal `cancelled` row | **no** | yes |
+> | Scan summary written | **no** | yes |
+> | Queued alerts / dataset rows | **discarded** | drained first |
+> | Drivable from API / SOAR | **no** | yes |
+>
+> **Use the `cancel` entry point when you want to stop a scan and keep what it found.**
+> Use the console Cancel when you just need it dead immediately and do not care about the
+> findings discovered so far.
+>
+> **There is no public API to cancel an action.** The cancel/abort endpoints live under
 > `/api/webapp/` — the console's private backend, which needs an interactive MFA session and
-> is not supported for automation. So the `cancel` entry point is the *only*
-> API-drivable way to stop a running scan, which makes it usable from SOAR playbooks.
+> is not supported for automation. The `cancel` entry point is therefore the *only*
+> API-drivable way to stop a running scan, which is what makes it usable from SOAR.
 >
 > **Signals do not work either.** The agent runs scripts on a worker thread, so
 > `signal.signal()` raises *"signal only works in main thread of the main interpreter"* on
-> both Windows and Linux. A polled flag file is the only mechanism the platform permits.
+> both Windows and Linux. A polled flag file is the only cooperative mechanism available.
 
 **Known latency.** The scan stops *scanning* within ~5 s, but the process can take up to
 about a minute to *exit*, because the directory walk observes the flag only between
