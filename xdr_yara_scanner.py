@@ -956,6 +956,71 @@ def _apply_light_process_priority(log_manager=None, throttle_mode="script", conf
     return None
 
 
+class CpuGovernor:
+    """Bounds the scanner's OWN CPU share so the host keeps a guaranteed remainder.
+
+    Replaces the previous system-CPU pause loop, which measured a quantity the scanner
+    cannot control. Measured consequence of that design (8-core Linux, 2026-08-01): with
+    unrelated load holding ~74% CPU, the scanner parked 285s of a 347s scan waiting for a
+    resume condition that could never arrive - while protecting the competing workload by
+    -3% to +1% versus not throttling at all. It punished itself for load it did not cause.
+
+    This governor instead asks "how much of the machine am I using?" and holds that under
+    a target. It reacts to external load only by SHRINKING its own share, never by
+    stopping, so it structurally cannot stall: the target is floored at floor_pct.
+
+    Policies:
+      "headroom" - adaptive; always leave headroom_pct of the host free for other work
+      "budget"   - fixed; never exceed budget_pct of the host
+      "none"     - disabled
+    """
+
+    GAIN = 0.05          # sleep-ratio change per point of CPU error
+    RATIO_MAX = 20.0     # ~5% duty floor; bounds a runaway error term
+    PACE_CAP_SECS = 1.0  # no single pace() sleep longer than this
+
+    def __init__(self, policy="headroom", headroom_pct=30.0, budget_pct=25.0,
+                 floor_pct=5.0, cpu_count=None, log_manager=None):
+        self.policy = str(policy or "none").strip().lower()
+        self.headroom_pct = float(headroom_pct)
+        self.budget_pct = float(budget_pct)
+        self.floor_pct = float(floor_pct)
+        self.cpu_count = int(cpu_count if cpu_count is not None else (os.cpu_count() or 1))
+        self.log_manager = log_manager
+        self.enabled = self.policy in ("headroom", "budget")
+        self.sleep_ratio = 0.0
+        self.slept_total = 0.0
+        self.floor_hits = 0
+        self.last_own = 0.0
+        self.last_others = 0.0
+        self.last_target = None
+        self._lock = threading.Lock()
+
+    def normalise_own(self, raw_pct):
+        """psutil reports PROCESS cpu as a percentage of ONE core - a 4-thread scanner
+        reads 400%. Convert to a share of the whole machine.
+
+        Omitting this holds the scanner to 1/N of the configured budget, and does so
+        invisibly: the scan still runs, still throttles, still reports success. It is
+        simply N times slower than promised, and the bigger the host the worse it gets.
+        """
+        if self.cpu_count <= 0:
+            return float(raw_pct)
+        return float(raw_pct) / self.cpu_count
+
+    def compute_target(self, others_pct):
+        """Target share of the machine for this scanner, per the configured policy."""
+        if not self.enabled:
+            return None
+        if self.policy == "budget":
+            return self.budget_pct
+        target = 100.0 - self.headroom_pct - max(0.0, float(others_pct))
+        if target < self.floor_pct:
+            self.floor_hits += 1
+            return self.floor_pct
+        return target
+
+
 def _render_match_data(data) -> str:
     """Render YARA-matched bytes as a printable string for human-readable output.
 
