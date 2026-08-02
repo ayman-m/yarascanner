@@ -70,3 +70,50 @@ def months_between(older_yyyymm, newer_yyyymm):
     o = datetime.date(int(older_yyyymm[:4]), int(older_yyyymm[4:6]), 1)
     n = datetime.date(int(newer_yyyymm[:4]), int(newer_yyyymm[4:6]), 1)
     return (n.year - o.year) * 12 + (n.month - o.month)
+
+
+def select_rotated_for_deletion(current_names, older_than_months, now_yyyymm):
+    """Pick rotated datasets older than the window. Returns (candidates, skip_reasons).
+
+    Every safety rail that governs WHAT gets deleted lives here:
+      * the CURRENT month is never a candidate - a scan may be writing to it, and
+        delete_dataset mid-scan does not error the scan, it just makes every subsequent
+        add_data batch fail with HTTP 400 against a name that no longer exists
+      * a FUTURE month is never a candidate - clock skew must not destroy data
+      * an UNROTATED dataset is never a candidate - deleting it destroys ALL history for
+        that host, not one month: same API call, categorically different blast radius
+      * anything outside the naming contract is never a candidate
+    """
+    candidates, skipped = [], []
+    for name in current_names or []:
+        info = parse_dataset_name(name)
+        if info is None:
+            skipped.append("%s: not a YARA dataset name" % name)
+            continue
+        if not info["month"]:
+            skipped.append(
+                '%s: not rotated (no YYYYMM) - set CONFIG_LOOKUP_ROTATION="monthly" in '
+                "the scanner so this dataset stops growing" % name)
+            continue
+        if info["month"] == now_yyyymm:
+            skipped.append("%s: current month - a scan may be writing to it" % name)
+            continue
+        age = months_between(info["month"], now_yyyymm)
+        if age < 0:
+            skipped.append("%s: dated in the future (clock skew?)" % name)
+            continue
+        if age <= older_than_months:
+            skipped.append("%s: %d month(s) old, inside the %d-month window"
+                           % (name, age, older_than_months))
+            continue
+        candidates.append(name)
+    return candidates, skipped
+
+
+def select_legacy_for_deletion(legacy_names):
+    """Legacy = older/unversioned schema, already classified by the toolkit.
+
+    The toolkit's 'newer' bucket is deliberately NOT accepted by this function: a host
+    running a stale YARA_LOOKUP_SCHEMA_VER must never delete a future schema's data.
+    """
+    return list(legacy_names or [])

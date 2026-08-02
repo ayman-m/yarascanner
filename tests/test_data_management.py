@@ -66,3 +66,74 @@ def test_months_between_across_year_boundary():
 
 def test_months_between_negative_when_future():
     assert months_between("202608", "202607") == -1
+
+
+# ------------------------------------------------------- candidate selection + rails
+from xdr_data_management import (  # noqa: E402
+    select_legacy_for_deletion, select_rotated_for_deletion)
+
+
+def test_selects_old_rotated_months():
+    names = ["yara_scanner_matches_v2_h_202601", "yara_scanner_scans_v2_h_202601"]
+    cands, _ = select_rotated_for_deletion(names, older_than_months=3, now_yyyymm="202607")
+    assert sorted(cands) == sorted(names)
+
+
+def test_never_deletes_the_current_month():
+    """Rail 1. delete_dataset on a dataset a scan is WRITING to does not error the scan -
+    it keeps POSTing rows to a name that no longer exists and gets HTTP 400 per batch.
+    Silent, partial data loss across a fleet, found days later as a dashboard gap."""
+    names = ["yara_scanner_matches_v2_h_202607"]
+    cands, skipped = select_rotated_for_deletion(names, older_than_months=0,
+                                                 now_yyyymm="202607")
+    assert cands == []
+    assert any("current month" in s for s in skipped)
+
+
+def test_keeps_months_inside_the_window():
+    names = ["yara_scanner_matches_v2_h_202605"]      # 2 months old
+    cands, _ = select_rotated_for_deletion(names, older_than_months=6, now_yyyymm="202607")
+    assert cands == []
+
+
+def test_boundary_is_strictly_older_than():
+    """Exactly N months old is KEPT; older than N is deleted."""
+    at_boundary = ["yara_scanner_matches_v2_h_202601"]   # exactly 6 months
+    beyond = ["yara_scanner_matches_v2_h_202512"]        # 7 months
+    assert select_rotated_for_deletion(at_boundary, 6, "202607")[0] == []
+    assert select_rotated_for_deletion(beyond, 6, "202607")[0] == beyond
+
+
+def test_unrotated_datasets_are_never_candidates():
+    """No month means rotation is off. Deleting such a dataset destroys ALL history for
+    that host, not one month - same API call, categorically different blast radius."""
+    names = ["yara_scanner_matches_v2_h"]
+    cands, skipped = select_rotated_for_deletion(names, older_than_months=1,
+                                                 now_yyyymm="202607")
+    assert cands == []
+    assert any("not rotated" in s for s in skipped)
+
+
+def test_foreign_names_are_never_candidates():
+    names = ["some_other_dataset_202601"]
+    cands, _ = select_rotated_for_deletion(names, older_than_months=1, now_yyyymm="202607")
+    assert cands == []
+
+
+def test_future_month_is_never_deleted():
+    """Clock skew on one endpoint must not make a dataset look ancient."""
+    names = ["yara_scanner_matches_v2_h_202612"]
+    cands, skipped = select_rotated_for_deletion(names, older_than_months=0,
+                                                 now_yyyymm="202607")
+    assert cands == []
+    assert any("future" in s for s in skipped)
+
+
+def test_legacy_selection_passes_names_through():
+    names = ["yara_scanner_matches_v1_h", "yara_scanner_scans_h"]
+    assert sorted(select_legacy_for_deletion(names)) == sorted(names)
+
+
+def test_legacy_selection_handles_empty():
+    assert select_legacy_for_deletion([]) == []
+    assert select_legacy_for_deletion(None) == []
