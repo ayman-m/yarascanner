@@ -118,3 +118,34 @@ def test_stats_shape():
     s = g.stats()
     for k in ("policy", "target", "own", "others", "ratio", "slept_secs", "floor_hits"):
         assert k in s
+
+
+# ------------------------------------------------------------------ migration shim
+from xdr_yara_scanner import migrate_throttle_option  # noqa: E402
+
+
+def test_migrate_off_becomes_none():
+    assert migrate_throttle_option({"throttle_mode": "off"})["cpu_guarantee"] == "none"
+
+
+def test_migrate_script_and_os_become_headroom():
+    assert migrate_throttle_option({"throttle_mode": "script"})["cpu_guarantee"] == "headroom"
+    assert migrate_throttle_option({"throttle_mode": "os"})["cpu_guarantee"] == "headroom"
+
+
+def test_migrate_drops_dead_threshold_keys():
+    out = migrate_throttle_option({"throttle_mode": "script", "cpu_high_threshold": "70",
+                                   "cpu_critical_threshold": "90", "max_pause_secs": "300"})
+    for dead in ("throttle_mode", "cpu_high_threshold", "cpu_critical_threshold",
+                 "max_pause_secs"):
+        assert dead not in out
+
+
+def test_migrate_leaves_explicit_new_key_alone():
+    out = migrate_throttle_option({"throttle_mode": "off", "cpu_guarantee": "budget"})
+    assert out["cpu_guarantee"] == "budget"   # explicit new setting wins
+
+
+def test_migrate_passes_through_unrelated_keys():
+    out = migrate_throttle_option({"create_alerts": "false"})
+    assert out["create_alerts"] == "false"

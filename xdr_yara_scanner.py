@@ -99,10 +99,21 @@ CONFIG_MODE = "scan"                    # "scan" (run a scan) or "cancel" (stop 
 CONFIG_CREATE_ALERTS = True             # push one XDR alert per YARA match (feeds incidents)
 CONFIG_WRITE_DATASET = True             # write the yara_scanner_* lookup datasets (dashboards)
 CONFIG_COLLECT_FILES = False            # copy matched files into the evidence ZIP (off = metadata only)
-CONFIG_THROTTLE_MODE = "script"         # CPU throttling: "script" | "os" | "off"
-CONFIG_CPU_HIGH_THRESHOLD = None        # percent CPU to start pausing (e.g. 70); None = light-profile default
-CONFIG_CPU_CRITICAL_THRESHOLD = None    # percent CPU to pause hard (e.g. 90); None = light-profile default
-CONFIG_MAX_PAUSE_SECS = None            # cap cumulative throttle pause per scan (secs); None = default
+# CPU impact control. The scanner bounds its OWN share of the machine; it does NOT react
+# to load other processes create. Measured rationale (8-core Linux, 2026-08-01): the
+# previous design watched system-wide CPU and parked the scan for load it did not cause
+# (285s of a 347s scan, up to 65.9x slowdown) while protecting the host by -3% to +1%
+# versus no throttling at all. Impact is now bounded independently of worker count, so
+# scans can use the machine when it is idle and shrink when it is not.
+#   "headroom" - adaptive: always leave CONFIG_CPU_HEADROOM_PCT of the host free.
+#                A quiet machine gets a fast scan; a busy one gets a quiet scanner.
+#   "budget"   - fixed: never exceed CONFIG_CPU_BUDGET_PCT of the host. Predictable.
+#   "none"     - no CPU governing (low process priority still applies).
+CONFIG_CPU_GUARANTEE    = "headroom"    # "headroom" | "budget" | "none"
+CONFIG_CPU_HEADROOM_PCT = 30            # headroom policy: % of the host always left free
+CONFIG_CPU_BUDGET_PCT   = 25            # budget policy: max % of the host we may use
+CONFIG_CPU_FLOOR_PCT    = 5             # never target below this - guarantees progress
+CONFIG_WORKERS          = 0             # 0 = auto: max(2, cores // 2)
 CONFIG_TENANT_ID = ""                   # tag rows/alerts with this tenant id; "" = derive from API URL
 CONFIG_LOOKUP_SHARD = "endpoint"        # dataset sharding: "endpoint" (per-host, recommended) | "none" | "<label>"
 # Alert storm cap: alerts are ONE PER FINDING (file x rule). Past this many findings in one scan,
@@ -194,21 +205,6 @@ CANCEL_POLL_SECS = float(os.environ.get("YARA_CANCEL_POLL_SECS", "5") or 5)     
 CANCEL_DRAIN_DEADLINE_SECS = float(os.environ.get("YARA_CANCEL_DEADLINE_SECS", "30") or 30)  # graceful cancel budget
 CANCEL_STALE_TOLERANCE_SECS = 2.0  # mtime slack when judging a cancel flag stale (coarse-FS safety)
 
-# --- script-mode throttle pacing -------------------------------------------------
-# The old behaviour PARKED a worker until system CPU fell below (high - resume_margin).
-# That condition is unreachable when the pressure is EXTERNAL and sustained: measured on
-# an 8-core Linux endpoint, an unrelated workload holding ~74% CPU made the scanner park
-# 285s out of a 347s scan (82% of its life) - a 7.2x slowdown that bought only ~11% more
-# protection for the competing workload than 'os' mode did. The scanner was punishing
-# itself for load it did not cause, and only max_pause_secs eventually forced progress.
-#
-# New behaviour: a proportional DUTY CYCLE. Above the high threshold the worker sleeps in
-# proportion to the work it just did, so throughput degrades smoothly and predictably but
-# the scan ALWAYS advances. Ratio 1.0 => roughly half speed; 4.0 => roughly one-fifth.
-THROTTLE_SLEEP_RATIO_HIGH = float(os.environ.get("YARA_THROTTLE_RATIO_HIGH", "1.0") or 1.0)
-THROTTLE_SLEEP_RATIO_CRITICAL = float(os.environ.get("YARA_THROTTLE_RATIO_CRITICAL", "4.0") or 4.0)
-THROTTLE_SLEEP_CAP_SECS = float(os.environ.get("YARA_THROTTLE_SLEEP_CAP", "1.0") or 1.0)
-THROTTLE_SLEEP_MIN_SECS = float(os.environ.get("YARA_THROTTLE_SLEEP_MIN", "0.01") or 0.01)
 XDR_API_KEY = DEFAULT_XDR_API_KEY
 XDR_API_ID = DEFAULT_XDR_API_ID
 XDR_API_URL = DEFAULT_XDR_API_URL
@@ -646,9 +642,31 @@ def _derive_tenant_id(api_url, override=""):
 # main()/ScanConfig for standalone use.
 _VALID_OPTION_KEYS = {
     "create_alerts", "write_dataset", "collect_files",
-    "throttle_mode", "cpu_high_threshold", "cpu_critical_threshold",
-    "max_pause_secs", "tenant_id", "lookup_shard",
+    "cpu_guarantee", "cpu_headroom_pct", "cpu_budget_pct", "cpu_floor_pct",
+    "workers", "tenant_id", "lookup_shard",
 }
+
+# Options retired by the CPU-governor redesign. Accepted and translated rather than
+# rejected, so existing scripts and scheduled jobs keep running. The old BEHAVIOUR is
+# deliberately not preserved: it was measured to cost up to 65.9x scan time while
+# protecting the host by -3% to +1% versus not throttling at all.
+_RETIRED_OPTION_KEYS = {
+    "throttle_mode", "cpu_high_threshold", "cpu_critical_threshold", "max_pause_secs",
+}
+_THROTTLE_MODE_MAP = {"off": "none", "script": "headroom", "os": "headroom"}
+
+
+def migrate_throttle_option(options):
+    """Translate retired throttle options into their CPU-governor equivalents."""
+    if not options:
+        return options
+    out = dict(options)
+    mode = str(out.pop("throttle_mode", "") or "").strip().lower()
+    if mode and "cpu_guarantee" not in out:
+        out["cpu_guarantee"] = _THROTTLE_MODE_MAP.get(mode, "headroom")
+    for dead in _RETIRED_OPTION_KEYS:
+        out.pop(dead, None)
+    return out
 
 
 def _parse_options_string(options):
@@ -673,7 +691,10 @@ def _parse_options_string(options):
         k, v = chunk.split("=", 1)
         k = k.strip().lower()
         v = v.strip()
-        if k not in _VALID_OPTION_KEYS:
+        # Retired keys are ACCEPTED here and translated later by
+        # migrate_throttle_option(). Rejecting them at the parser would break every
+        # existing script and scheduled job that still sets throttle_mode.
+        if k not in _VALID_OPTION_KEYS and k not in _RETIRED_OPTION_KEYS:
             raise ValueError(
                 f"Unknown option '{k}'. Valid keys: {', '.join(sorted(_VALID_OPTION_KEYS))}"
             )
@@ -934,13 +955,12 @@ def _apply_light_process_priority(log_manager=None, throttle_mode="script", conf
             # behaviour can be interpreted without cross-referencing other files.
             try:
                 log_manager.log_performance("THROTTLE_CONFIG " + json.dumps({
-                    "throttle_mode": throttle_mode,
-                    "high": getattr(config, "high_cpu_threshold", None),
-                    "critical": getattr(config, "critical_cpu_threshold", None),
-                    "resume_margin": getattr(config, "resume_margin", None),
-                    "max_pause_secs": getattr(config, "max_pause_secs", None),
-                    "check_interval": getattr(config, "throttle_check_interval_secs", None),
-                    "pause_loop_enabled": getattr(config, "light_throttle_enabled", None),
+                    "priority_tier": throttle_mode,
+                                                                                "check_interval": getattr(config, "throttle_check_interval_secs", None),
+                    "cpu_guarantee": getattr(config, "cpu_guarantee", None),
+                    "cpu_headroom_pct": getattr(config, "cpu_headroom_pct", None),
+                    "cpu_budget_pct": getattr(config, "cpu_budget_pct", None),
+                    "cpu_floor_pct": getattr(config, "cpu_floor_pct", None),
                     "platform": platform.system(),
                     "host_cores": details.get("host_cores"),
                     "cpu_affinity_count": details.get("cpu_affinity_count"),
@@ -1204,7 +1224,7 @@ class PerformanceSnapshot:
         self.timestamp = timestamp
         self.cpu_percent = cpu_percent
         # System-wide CPU. This is the signal the CPU throttle actually decides on
-        # (see _maybe_throttle_scanning); process cpu_percent above is the scanner's
+        # (see CpuGovernor); process cpu_percent above is the scanner's
         # own share and does NOT explain throttle behaviour on its own.
         self.system_cpu_percent = system_cpu_percent
         self.memory_mb = memory_mb
@@ -2679,9 +2699,9 @@ class ScanConfig:
 
     def __init__(self, yarafile, scan_folder=None, alert_severity="low",
                  mode="scan", create_alerts=True, write_dataset=True,
-                 collect_files=False, throttle_mode="script",
-                 cpu_high_threshold=None, cpu_critical_threshold=None,
-                 max_pause_secs=None, tenant_id="", lookup_shard=""):
+                 collect_files=False, cpu_guarantee=None,
+                 cpu_headroom_pct=None, cpu_budget_pct=None, cpu_floor_pct=None,
+                 workers=None, tenant_id="", lookup_shard=""):
         self.hostname, self.ip_addresses, self.os_info = get_system_info()
         # Lookup-dataset shard selector (see LOOKUP_DATASET_SHARD). Empty => module default
         # ("endpoint" = per-host datasets, which sidesteps the add_data concurrency race).
@@ -2704,20 +2724,28 @@ class ScanConfig:
         self.write_dataset = True if _wd is None else _wd
         _cf = _parse_bool_arg(collect_files, "collect_files")
         self.collect_files = False if _cf is None else _cf
-        self.throttle_mode = (str(throttle_mode) if throttle_mode is not None else "script").strip().lower() or "script"
-        if self.throttle_mode not in ("script", "os", "off"):
-            raise ValueError(f"Invalid throttle_mode '{throttle_mode}'. Use script, os, or off.")
-        # CPU thresholds/max-pause are applied in the throttle-config block below.
-        self._opt_cpu_high = cpu_high_threshold
-        self._opt_cpu_critical = cpu_critical_threshold
-        self._opt_max_pause = max_pause_secs
+        # CPU impact control. The scanner bounds its OWN share; it does not react to load
+        # other processes create (see CpuGovernor for the measured rationale).
+        _guarantee = cpu_guarantee if cpu_guarantee is not None else CONFIG_CPU_GUARANTEE
+        self.cpu_guarantee = str(
+            os.getenv("YARA_CPU_GUARANTEE", _guarantee) or _guarantee).strip().lower()
+        if self.cpu_guarantee not in ("headroom", "budget", "none"):
+            raise ValueError(
+                f"Invalid cpu_guarantee '{self.cpu_guarantee}'. Use headroom, budget, or none.")
+        self.cpu_headroom_pct = float(
+            cpu_headroom_pct if cpu_headroom_pct is not None else CONFIG_CPU_HEADROOM_PCT)
+        self.cpu_budget_pct = float(
+            cpu_budget_pct if cpu_budget_pct is not None else CONFIG_CPU_BUDGET_PCT)
+        self.cpu_floor_pct = float(
+            cpu_floor_pct if cpu_floor_pct is not None else CONFIG_CPU_FLOOR_PCT)
+        self._opt_workers = workers
         self._tenant_id_override = (str(tenant_id).strip() if tenant_id else "")
         # Posture summary string surfaced in logs and the final result line.
         self.posture = (
             f"alerts={'on' if self.create_alerts else 'off'} "
             f"dataset={'on' if self.write_dataset else 'off'} "
             f"files={'on' if self.collect_files else 'off'} "
-            f"throttle={self.throttle_mode} mode={self.mode}"
+            f"cpu={self.cpu_guarantee} mode={self.mode}"
         )
         self.scanner_dir = _default_scanner_dir()
 
@@ -2815,9 +2843,14 @@ class ScanConfig:
         self.max_file_bytes = self.max_file_mb * 1024 * 1024 if self.max_file_mb else 0
 
         cpu_count = os.cpu_count() or 2
-        default_workers = 1 if cpu_count <= 2 else 2
-        configured_workers = int(os.getenv("YARA_THREADS", str(default_workers)) or default_workers)
-        self.max_workers = max(1, min(2, configured_workers))
+        # Impact is bounded by CpuGovernor, NOT by starving the worker pool. The previous
+        # min(2, ...) cap welded throughput to impact: a 32-core server scanned no faster
+        # than a laptop, permanently, whether or not anyone else was using the machine.
+        # More workers also helps at the SAME cpu budget, because scanning is disk-bound
+        # as well as CPU-bound - more outstanding reads per CPU-second.
+        _cfg_workers = self._opt_workers if self._opt_workers is not None else CONFIG_WORKERS
+        configured_workers = int(os.getenv("YARA_THREADS", str(_cfg_workers)) or _cfg_workers)
+        self.max_workers = configured_workers if configured_workers > 0 else max(2, cpu_count // 2)
         self.scan_queue_size = max(
             2, int(os.getenv("YARA_QUEUE_SIZE", str(self.max_workers * 2)) or (self.max_workers * 2))
         )
@@ -2834,21 +2867,11 @@ class ScanConfig:
         self.track_real_paths = False
         # Throttling is active unless the operator hands resource control to the OS
         # (throttle_mode="os") or disables it outright (throttle_mode="off").
-        self.light_throttle_enabled = (self.throttle_mode == "script")
-        self.throttle_check_interval_secs = float(os.getenv("YARA_LIGHT_THROTTLE_CHECK_SECS", "0.5") or 0.5)
-        # CPU thresholds: script-parameter override wins over env default.
-        self.high_cpu_threshold = _clamp_pct(self._opt_cpu_high, os.getenv("YARA_LIGHT_HIGH_CPU", "80") or 80)
-        self.critical_cpu_threshold = _clamp_pct(self._opt_cpu_critical, os.getenv("YARA_LIGHT_CRITICAL_CPU", "90") or 90)
-        if self.critical_cpu_threshold <= self.high_cpu_threshold:
-            self.critical_cpu_threshold = min(100.0, self.high_cpu_threshold + 5.0)
-            self.error_logger.error_logger.warning(
-                "cpu_critical_threshold <= cpu_high_threshold; bumped critical to "
-                f"{self.critical_cpu_threshold:.0f}"
-            )
-        # Resume hysteresis: workers resume once CPU falls this far below the high mark.
-        self.resume_margin = float(os.getenv("YARA_LIGHT_RESUME_MARGIN", "10") or 10)
-        # Cap on one continuous CPU pause (0 = unbounded). Param override wins.
-        self.max_pause_secs = _coerce_float(self._opt_max_pause, os.getenv("YARA_MAX_PAUSE_SECS", "300") or 300)
+        # How often the governor refreshes its CPU reading. 1s is plenty: the actuator is
+        # a per-file proportional sleep, not a hard gate, so sub-second sampling bought
+        # nothing but psutil overhead.
+        self.throttle_check_interval_secs = float(
+            os.getenv("YARA_GOVERNOR_INTERVAL_SECS", "1.0") or 1.0)
         self.queue_backoff_secs = float(os.getenv("YARA_QUEUE_BACKOFF_SECS", "0.25") or 0.25)
         self.skip_extensions = {
             ".iso", ".img", ".dmg", ".vmdk", ".vhd", ".vhdx", ".qcow", ".qcow2", ".sparsebundle"
@@ -4838,15 +4861,23 @@ class YaraScanner:
             self.file_cache.log_manager = self.log_manager
 
         self.worker_processing_times = defaultdict(list)
-        self.last_throttle_check = 0.0
-        self.last_system_cpu = 0.0
-        # Per-worker throttle state (episode start, accumulated sleep, last return time).
-        # Thread-local because each worker duty-cycles independently.
-        self._throttle_tls = threading.local()
-        self.total_paused_secs = 0.0     # wall-clock time >=1 worker was CPU-paused
-        self.critical_pauses = 0         # pauses that hit the critical CPU threshold
-        self._paused_workers = 0         # count of workers currently in the pause loop
-        self._pause_wall_start = 0.0     # wall-clock start of the current throttled window
+        self.cpu_governor = CpuGovernor(
+            policy=getattr(config, "cpu_guarantee", "none"),
+            headroom_pct=getattr(config, "cpu_headroom_pct", 30.0),
+            budget_pct=getattr(config, "cpu_budget_pct", 25.0),
+            floor_pct=getattr(config, "cpu_floor_pct", 5.0),
+            log_manager=self.log_manager,
+        )
+        # psutil's first cpu_percent() call always returns 0.0 - prime both readings so
+        # the governor's first real sample is meaningful.
+        try:
+            self._governor_proc = psutil.Process()
+            self._governor_proc.cpu_percent(interval=None)
+            psutil.cpu_percent(interval=None)
+        except Exception:
+            self._governor_proc = None
+        self.last_governor_sample = 0.0
+        self._last_governor_emit = None
         self.queue_full_events = 0
 
         # Cancellation state (set by the cancel watcher / signal handlers).
@@ -4996,7 +5027,7 @@ class YaraScanner:
             files_skipped = int(self.files_skipped)
             detections = int(self.total_detections)
         with self.lock_throttle:
-            paused = round(self.total_paused_secs, 2)
+            paused = round(self.cpu_governor.slept_total, 2)
         with self._scans_row_lock:
             row = {
                 "tenant_id": getattr(self.config, "tenant_id", "unknown"),
@@ -5017,7 +5048,7 @@ class YaraScanner:
                 "scan_rate_fps": round(files_scanned / elapsed, 2) if elapsed > 0 else 0.0,
                 "elapsed_secs": round(elapsed, 2),
                 "total_paused_secs": paused,
-                "throttle_mode": getattr(self.config, "throttle_mode", "script"),
+                "throttle_mode": getattr(self.config, "cpu_guarantee", "none"),
                 "posture": getattr(self.config, "posture", ""),
                 "event_timestamp_ms": int(time.time() * 1000),
                 "message": message or "",
@@ -5646,118 +5677,34 @@ rule test {{
             return (cache_stats['hits'] / total_requests) * 100
         return 0
 
-    def _sample_system_cpu(self):
-        """Return a system-CPU% reading, cached at throttle_check_interval_secs cadence
-        so concurrent workers share one measurement instead of hammering psutil."""
-        now = time.time()
-        with self.lock_throttle:
-            if (now - self.last_throttle_check) >= self.config.throttle_check_interval_secs:
-                try:
-                    self.last_system_cpu = psutil.cpu_percent(interval=None)
-                except Exception:
-                    self.last_system_cpu = 0.0
-                self.last_throttle_check = now
-            return self.last_system_cpu
+    def _sample_governor(self):
+        """Feed the CPU governor a fresh reading. Cheap, rate-limited, fail-open.
 
-    def _maybe_throttle_scanning(self, force=False):
-        """Duty-cycle the calling worker while system CPU is above the high threshold.
-
-        Sleeps in PROPORTION to the work just done, rather than parking until CPU drops.
-        The old park-until-drop design waited for system CPU to fall below
-        (high - resume_margin); when the pressure is external and sustained that never
-        happens, and the scan stalls until max_pause_secs bails it out (measured: 285s
-        parked in a 347s scan, 7.2x slower, for ~11% more workload protection than 'os').
-
-        Proportional sleeping degrades throughput smoothly and predictably instead:
-        ratio 1.0 is roughly half speed, 4.0 (above critical) roughly one fifth, and the
-        scan always advances. A throttle EPISODE is a contiguous run of throttled checks
-        by one worker; events are emitted per episode, not per sleep, so the log stays
-        readable. No-op unless throttle_mode='script' ('os'/'off' hand pacing to the
-        kernel). `force` is accepted for call-site compatibility.
+        Fail-open is deliberate: if CPU cannot be read we run unthrottled rather than
+        guessing. A scan that silently never finishes is worse than one that runs fast.
         """
-        if not getattr(self.config, "light_throttle_enabled", False):
+        if not self.cpu_governor.enabled or self._governor_proc is None:
             return
-
-        tl = self._throttle_tls
         now = time.time()
-        cpu = self._sample_system_cpu()
-        episode_start = getattr(tl, "episode_start", None)
-
-        if cpu < self.config.high_cpu_threshold:
-            # Not under pressure. Close an open episode if this worker had one.
-            if episode_start is not None:
-                slept = getattr(tl, "episode_slept", 0.0)
-                tl.episode_start = None
-                tl.episode_slept = 0.0
-                self.log_manager.log_performance(
-                    "THROTTLE_EVENT " + json.dumps({
-                        "event": "pause_end",
-                        "t": round(now, 3),
-                        "cpu": round(cpu, 1),
-                        "duration": round(now - episode_start, 3),
-                        "slept": round(slept, 3),
-                        "at_critical": bool(getattr(tl, "episode_critical", False)),
-                        "mode": self.config.throttle_mode,
-                    })
-                )
-            tl.last_return = now
+        if (now - self.last_governor_sample) < self.config.throttle_check_interval_secs:
             return
-
-        at_critical = cpu >= self.config.critical_cpu_threshold
-        if episode_start is None:
-            tl.episode_start = now
-            tl.episode_slept = 0.0
-            tl.episode_critical = at_critical
-            self.log_manager.log_performance(
-                "THROTTLE_EVENT " + json.dumps({
-                    "event": "pause_start",
-                    "t": round(now, 3),
-                    "cpu": round(cpu, 1),
-                    "high": round(self.config.high_cpu_threshold, 1),
-                    "critical": round(self.config.critical_cpu_threshold, 1),
-                    "at_critical": bool(at_critical),
-                    "mode": self.config.throttle_mode,
-                })
-            )
-        elif at_critical:
-            tl.episode_critical = True
-
-        # Sleep proportional to the work done since this worker last returned, so the
-        # slowdown factor is stable regardless of file size or scan speed.
-        work_elapsed = max(0.0, now - getattr(tl, "last_return", now))
-        ratio = THROTTLE_SLEEP_RATIO_CRITICAL if at_critical else THROTTLE_SLEEP_RATIO_HIGH
-        sleep_secs = min(THROTTLE_SLEEP_CAP_SECS,
-                         max(THROTTLE_SLEEP_MIN_SECS, work_elapsed * ratio))
-
-        max_pause = self.config.max_pause_secs
-        if max_pause and getattr(tl, "episode_slept", 0.0) >= max_pause:
-            # Cumulative safety valve: stop sleeping entirely for this episode.
-            if not getattr(tl, "episode_capped", False):
-                tl.episode_capped = True
-                self.log_manager.log_performance(
-                    f"Throttle episode hit max_pause_secs ({max_pause:.0f}s) at CPU "
-                    f"{cpu:.0f}% - running at full speed to guarantee progress")
-            tl.last_return = time.time()
-            return
-
-        # Wall-clock throttled time: the span during which >=1 worker is sleeping, not
-        # the sum of per-worker sleeps (N workers would inflate it by ~N).
-        with self.lock_throttle:
-            if self._paused_workers == 0:
-                self._pause_wall_start = now
-            self._paused_workers += 1
+        self.last_governor_sample = now
         try:
-            time.sleep(sleep_secs)
-        finally:
-            with self.lock_throttle:
-                self._paused_workers -= 1
-                if self._paused_workers <= 0:
-                    self._paused_workers = 0
-                    self.total_paused_secs += time.time() - self._pause_wall_start
-                if at_critical:
-                    self.critical_pauses += 1
-            tl.episode_slept = getattr(tl, "episode_slept", 0.0) + sleep_secs
-            tl.last_return = time.time()
+            own_raw = self._governor_proc.cpu_percent(interval=None)
+            system = psutil.cpu_percent(interval=None)
+        except Exception as e:
+            self.cpu_governor.enabled = False
+            self.log_manager.log_performance(
+                f"CPU governor disabled - could not read CPU ({e}). Scan continues unthrottled.")
+            return
+        self.cpu_governor.update(own_raw, system)
+
+        # Emit on meaningful change only; a line per sample would flood the log.
+        s = self.cpu_governor.stats()
+        if self._last_governor_emit is None or abs(s["ratio"] - self._last_governor_emit) >= 0.25:
+            self._last_governor_emit = s["ratio"]
+            self.log_manager.log_performance(
+                "CPU_GOVERNOR " + json.dumps(dict(s, t=round(now, 3))))
 
     def _enqueue_scan_path(self, path):
         """Block gently when workers are saturated instead of dropping files."""
@@ -5771,7 +5718,9 @@ rule test {{
                     self.log_manager.log_performance(
                         f"Scan queue saturated ({self.scan_queue.qsize()} items) - backing off producer"
                     )
-                self._maybe_throttle_scanning(force=True)
+                # Producer side: refresh the reading but never sleep here - the producer
+                # holds no unit of work for the sleep to be proportional to.
+                self._sample_governor()
                 time.sleep(self.config.queue_backoff_secs)
             except Exception as e:
                 self.log_manager.log_error(f"Failed to enqueue file for scanning: {e}", {'file_path': path})
@@ -5848,13 +5797,18 @@ rule test {{
                 with self.lock_real_paths:
                     self.scanned_real_paths.add(real_path)
 
-            self._maybe_throttle_scanning()
+            self._sample_governor()
             # Populate the filename/filepath externals per file so rules that key off them work.
+            _work_started = time.time()
             matches = self.rules.match(
                 filepath=file_path,
                 externals={"filepath": file_path, "filename": os.path.basename(file_path)},
                 callback=self._yara_callback,
             )
+            # Pace AFTER the work, proportional to how long it took. The old code gated
+            # BEFORE the match on a system-CPU threshold, which is why it could park
+            # indefinitely without ever doing any work.
+            self.cpu_governor.pace(time.time() - _work_started)
 
             if matches:
                 file_creation_time = _get_file_creation_time_iso(file_path, st)
@@ -6397,7 +6351,7 @@ rule test {{
                 'resource_monitoring': self.config.enable_resource_monitoring,
                 'match_upload_enabled': UPLOAD_RESULTS,
                 'worker_threads': self.config.max_workers,
-                'light_throttling': self.config.light_throttle_enabled,
+                'cpu_guarantee': self.config.cpu_guarantee,
                 'cache_enabled': self.config.use_cache
             }
         )
@@ -6641,9 +6595,9 @@ def upload_final_comprehensive_report(scanner, total_scan_time):
 
 
 def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, options=None,
-        create_alerts=None, write_dataset=None, collect_files=None, throttle_mode=None,
-        cpu_high_threshold=None, cpu_critical_threshold=None, max_pause_secs=None, tenant_id=None,
-        lookup_shard=None):
+        create_alerts=None, write_dataset=None, collect_files=None, cpu_guarantee=None,
+        cpu_headroom_pct=None, cpu_budget_pct=None, cpu_floor_pct=None, workers=None,
+        tenant_id=None, lookup_shard=None):
     """Full scanner implementation (internal API).
 
     Operators do NOT call this directly through the Action Center — use the `main` entry point,
@@ -6664,21 +6618,25 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
         write_dataset = CONFIG_WRITE_DATASET
     if collect_files is None:
         collect_files = CONFIG_COLLECT_FILES
-    if throttle_mode is None:
-        throttle_mode = CONFIG_THROTTLE_MODE
-    if cpu_high_threshold is None:
-        cpu_high_threshold = CONFIG_CPU_HIGH_THRESHOLD
-    if cpu_critical_threshold is None:
-        cpu_critical_threshold = CONFIG_CPU_CRITICAL_THRESHOLD
-    if max_pause_secs is None:
-        max_pause_secs = CONFIG_MAX_PAUSE_SECS
+    if cpu_guarantee is None:
+        cpu_guarantee = CONFIG_CPU_GUARANTEE
+    if cpu_headroom_pct is None:
+        cpu_headroom_pct = CONFIG_CPU_HEADROOM_PCT
+    if cpu_budget_pct is None:
+        cpu_budget_pct = CONFIG_CPU_BUDGET_PCT
+    if cpu_floor_pct is None:
+        cpu_floor_pct = CONFIG_CPU_FLOOR_PCT
+    if workers is None:
+        workers = CONFIG_WORKERS
     if tenant_id is None:
         tenant_id = CONFIG_TENANT_ID
     if lookup_shard is None:
         lookup_shard = CONFIG_LOOKUP_SHARD
 
     # Resolve the compact options string over the explicit kwargs (options win).
-    opts = _parse_options_string(options)
+    # Retired throttle_* options are translated first, so existing scripts and scheduled
+    # jobs keep running rather than erroring on an unrecognised key.
+    opts = migrate_throttle_option(_parse_options_string(options))
 
     def _pick(key, current):
         return opts.get(key, current)
@@ -6686,10 +6644,11 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
     create_alerts = _pick("create_alerts", create_alerts)
     write_dataset = _pick("write_dataset", write_dataset)
     collect_files = _pick("collect_files", collect_files)
-    throttle_mode = _pick("throttle_mode", throttle_mode)
-    cpu_high_threshold = _pick("cpu_high_threshold", cpu_high_threshold)
-    cpu_critical_threshold = _pick("cpu_critical_threshold", cpu_critical_threshold)
-    max_pause_secs = _pick("max_pause_secs", max_pause_secs)
+    cpu_guarantee = _pick("cpu_guarantee", cpu_guarantee)
+    cpu_headroom_pct = _pick("cpu_headroom_pct", cpu_headroom_pct)
+    cpu_budget_pct = _pick("cpu_budget_pct", cpu_budget_pct)
+    cpu_floor_pct = _pick("cpu_floor_pct", cpu_floor_pct)
+    workers = _pick("workers", workers)
     tenant_id = _pick("tenant_id", tenant_id)
     lookup_shard = _pick("lookup_shard", lookup_shard)
 
@@ -6712,10 +6671,11 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
             create_alerts=create_alerts,
             write_dataset=write_dataset,
             collect_files=collect_files,
-            throttle_mode=throttle_mode,
-            cpu_high_threshold=cpu_high_threshold,
-            cpu_critical_threshold=cpu_critical_threshold,
-            max_pause_secs=max_pause_secs,
+            cpu_guarantee=cpu_guarantee,
+            cpu_headroom_pct=cpu_headroom_pct,
+            cpu_budget_pct=cpu_budget_pct,
+            cpu_floor_pct=cpu_floor_pct,
+            workers=workers,
             tenant_id=tenant_id,
             lookup_shard=lookup_shard,
         )
@@ -6744,8 +6704,9 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
                 pass
             return msg
 
-        _apply_light_process_priority(log_manager, throttle_mode=config.throttle_mode,
-                                      config=config)
+        # Always the below-normal tier. The old 'os' idle tier was measured to STARVE
+        # on a saturated host (252s vs 77s on 8 cores); the governor bounds impact now.
+        _apply_light_process_priority(log_manager, throttle_mode="standard", config=config)
         exception_logger = config.exception_logger
         stats_manager = StatisticsManager(config, log_manager)
         cleanup_manager = CleanupManager(config)
@@ -7024,7 +6985,7 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
         summary = (f"Scan completed: {scanner.files_scanned} files scanned | "
                 f"{error_logger.failed_rules_count} rules failed compilation | "
                 f"{scanner.total_detections} matches found | "
-                f"paused {scanner.total_paused_secs:.0f}s | {config.posture}")
+                f"cpu-slept {scanner.cpu_governor.slept_total:.0f}s | {config.posture}")
         return summary
         
     except Exception as e:
@@ -7117,8 +7078,11 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
                         "valid_rules": getattr(_el, "valid_rules_count", None),
                         "scan_rate_fps": (round(getattr(scanner, "files_scanned", 0) / _dur, 2)
                                           if _dur and _dur > 0 else 0),
-                        "total_paused_secs": round(getattr(scanner, "total_paused_secs", 0) or 0, 2),
-                        "throttle_mode": getattr(config, "throttle_mode", None),
+                        "total_paused_secs": round(
+                            getattr(getattr(scanner, "cpu_governor", None), "slept_total", 0) or 0, 2),
+                        "throttle_mode": getattr(config, "cpu_guarantee", None),
+                        "cpu_governor": scanner.cpu_governor.stats()
+                        if getattr(scanner, "cpu_governor", None) else None,
                         "compile_source": getattr(scanner, "_compile_source", None),
                         "compile_seconds": round(getattr(scanner, "_compile_seconds", 0) or 0, 2),
                         "cancel_source": getattr(scanner, "cancel_source", None),
