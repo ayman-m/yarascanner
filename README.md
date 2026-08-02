@@ -117,6 +117,18 @@ within ~5 s, drains its uploaders, and writes a terminal `cancelled` lifecycle r
 
 ---
 
+
+### Dataset maintenance — `xdr_data_management.py`
+
+Rotation bounds each dataset's size but never deletes anything, so old months accumulate. This small companion script removes them:
+
+```bash
+python3 xdr_data_management.py --report                      # inventory (default)
+python3 xdr_data_management.py --older-than-months 6 --yes   # drop months older than 6
+```
+
+Dry run unless `--yes`. Never deletes the current month, a future-dated month, an unsuffixed dataset, a newer schema version, or anything outside the `yara_scanner_*` naming contract. **No scan depends on it having run** — if it never runs, datasets grow but every scan still succeeds.
+
 ## 3. How results are delivered (XDR edition)
 
 ### 3.1 Alerts — sized for triage

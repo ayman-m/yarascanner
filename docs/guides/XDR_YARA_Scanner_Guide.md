@@ -419,6 +419,52 @@ Every run also writes a machine-readable `scan_summary_<run_id>.json` under the 
 rules, and the resolved dataset names) — one file to parse instead of six text logs. Log
 retention keeps the last 10 scans (`YARA_LOG_KEEP`).
 
+## Keeping datasets bounded — `xdr_data_management.py`
+
+Rotation bounds each dataset's **size**, which is what keeps `add_data` fast. It does not
+delete anything: old months accumulate on the tenant indefinitely. `xdr_data_management.py`
+is a small standalone script that removes them.
+
+**It is deliberately not a prerequisite for anything.** The scanner creates its own datasets
+and writes to them self-sufficiently. If this script never runs, datasets get large and
+eventually slow, but **every scan still succeeds**. Cleanup is optional work; creation is
+not, and coupling them would mean a scan could fail because a different script had not run.
+
+Run it from a workstation with the same credentials as the toolkit:
+
+```bash
+python3 xdr_data_management.py --report                      # inventory (default action)
+python3 xdr_data_management.py --older-than-months 6 --yes   # drop months older than 6
+python3 xdr_data_management.py --delete-legacy --yes         # drop pre-v2 schema datasets
+```
+
+`--report` lists every YARA dataset with kind, host and age in months, and flags two
+conditions worth knowing about:
+
+- **`frozen`** — an unsuffixed dataset that has rotated siblings. It predates rotation, is
+  no longer written to, and is not deleted by this tool: an unsuffixed dataset holds *all*
+  pre-rotation history for that host, so removing one is a bigger decision than dropping a
+  month.
+- **not rotated** — an unsuffixed dataset with *no* rotated siblings, i.e. the deployment is
+  running `CONFIG_LOOKUP_ROTATION="none"` and that dataset really will grow without bound.
+  The report names the exact config change.
+
+### Safety rails
+
+Nothing is deleted if it is the **current month** (a scan may be writing to it), a
+**future-dated month** (clock skew), **unsuffixed**, on a **newer schema version** than this
+host understands, or **outside the `yara_scanner_*` naming contract**. On top of that it is
+a **dry run unless `--yes`**, and `--older-than-months` has no default — so a bare `--yes`
+deletes nothing.
+
+> Deleting a dataset a scan is actively writing to does not error the scan: the scanner
+> keeps POSTing rows to a name that no longer exists and gets HTTP 400 per batch. Across a
+> fleet mid-scan that is silent, partial data loss discovered days later as a dashboard gap.
+> Hence the current-month guard.
+
+A failed delete is reported and the run continues to the next dataset, so one dataset with
+dependencies cannot strand the whole cleanup. Exit code is non-zero if any deletion failed.
+
 ---
 
 # 12. Dashboard & XQL
