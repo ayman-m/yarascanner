@@ -1020,6 +1020,60 @@ class CpuGovernor:
             return self.floor_pct
         return target
 
+    def update(self, own_raw_pct, system_pct):
+        """Recompute the sleep ratio from a fresh pair of CPU readings.
+
+        own_raw_pct is psutil's PROCESS reading (percent of one core); system_pct is the
+        machine-wide reading. `others` is what everyone else is using - deriving it as
+        (system - own) is what makes this immune to the original bug: the scanner reacts
+        to external load only by shrinking its own share, never by halting.
+
+        Returns the target share, or None when disabled.
+        """
+        if not self.enabled:
+            return None
+        own = self.normalise_own(own_raw_pct)
+        others = max(0.0, float(system_pct) - own)
+        target = self.compute_target(others)
+        error = own - target
+        with self._lock:
+            ratio = self.sleep_ratio + (self.GAIN * error)
+            self.sleep_ratio = max(0.0, min(self.RATIO_MAX, ratio))
+            self.last_own = own
+            self.last_others = others
+            self.last_target = target
+        return target
+
+    def pace(self, work_secs):
+        """Sleep in proportion to the work just done. Returns seconds slept.
+
+        Proportional rather than fixed sleeping keeps the slowdown factor stable
+        regardless of file size or machine speed, so the promised share holds on a
+        laptop and a 32-core server alike.
+        """
+        if not self.enabled:
+            return 0.0
+        ratio = self.sleep_ratio
+        if ratio <= 0.0:
+            return 0.0
+        secs = min(self.PACE_CAP_SECS, max(0.0, float(work_secs) * ratio))
+        if secs > 0.0:
+            time.sleep(secs)
+            with self._lock:
+                self.slept_total += secs
+        return secs
+
+    def stats(self):
+        return {
+            "policy": self.policy,
+            "target": round(self.last_target, 1) if self.last_target is not None else None,
+            "own": round(self.last_own, 1),
+            "others": round(self.last_others, 1),
+            "ratio": round(self.sleep_ratio, 3),
+            "slept_secs": round(self.slept_total, 2),
+            "floor_hits": self.floor_hits,
+        }
+
 
 def _render_match_data(data) -> str:
     """Render YARA-matched bytes as a printable string for human-readable output.
