@@ -38,3 +38,21 @@ XDR Action Center and correlated with the lookup datasets.
 
 > The seeded corpus and rule files contain benign detection *signatures* (e.g. `mimikatz`,
 > EICAR) as plain text so scans produce deterministic hits — there is no live malware.
+
+## Verified — xdr_data_management.py (2026-08-02)
+
+Live dry-run verification against the EU tenant:
+
+- `--report` listed **12** YARA lookup datasets: 6 rotated (`_202607`, 1 month old) and
+  6 unsuffixed pre-rotation leftovers, correctly labelled `frozen` because rotated
+  siblings exist for the same host+kind.
+- `--older-than-months 0` selected only the 6 rotated datasets and printed
+  `DRY RUN - nothing deleted`. No unsuffixed dataset was ever a candidate.
+- A bare `--yes` printed the report and deleted nothing (no window given ⇒ nothing
+  selected), confirming `--older-than-months` having no default is a real safety rail.
+- Live deletion is deliberately NOT automated. This is a shared tenant and
+  `delete_dataset` is irreversible.
+
+Found by this run: unsuffixed datasets sitting beside rotated ones are *abandoned*, not
+evidence of `rotation=none`. The original message told operators to enable a setting that
+was already enabled. Fixed via `has_rotated_sibling`.
