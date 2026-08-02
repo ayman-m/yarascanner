@@ -117,3 +117,111 @@ def select_legacy_for_deletion(legacy_names):
     running a stale YARA_LOOKUP_SCHEMA_VER must never delete a future schema's data.
     """
     return list(legacy_names or [])
+
+
+def render_report(current, legacy, newer, now_yyyymm):
+    """Human-readable inventory. Ages are whole months."""
+    schema = os.environ.get("YARA_LOOKUP_SCHEMA_VER", "2")
+    lines = ["YARA lookup datasets (schema v%s current, now %s)" % (schema, now_yyyymm), ""]
+    lines.append("%-52s %-8s %-14s %6s" % ("dataset", "kind", "host", "age"))
+    lines.append("-" * 84)
+    unrotated = []
+    for name in current:
+        info = parse_dataset_name(name)
+        if info is None:
+            lines.append("%-52s %s" % (name[:52], "(unrecognised - never a candidate)"))
+            continue
+        if info["month"]:
+            age = "%dmo" % months_between(info["month"], now_yyyymm)
+        else:
+            age = "n/a"
+            unrotated.append(name)
+        lines.append("%-52s %-8s %-14s %6s"
+                     % (name[:52], info["kind"], (info["host"] or "-")[:14], age))
+    if not current:
+        lines.append("(none)")
+    if legacy:
+        lines += ["", "legacy schema (deletable with --delete-legacy):"]
+        lines += ["  " + n for n in legacy]
+    if newer:
+        lines += ["", "NEWER schema - never deleted by this tool. Your "
+                      "YARA_LOOKUP_SCHEMA_VER may be stale:"]
+        lines += ["  " + n for n in newer]
+    if unrotated:
+        lines += [
+            "",
+            "WARNING: %d dataset(s) are NOT rotated and will grow without bound."
+            % len(unrotated),
+            "         add_data merge time scales with dataset SIZE, so these eventually",
+            "         exceed any client timeout and go write-dead. Set",
+            '         CONFIG_LOOKUP_ROTATION="monthly" in the scanner.',
+            "         This tool deletes whole datasets only and will not touch them.",
+        ]
+    return "\n".join(lines)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Bound YARA lookup dataset growth by deleting whole old datasets.")
+    ap.add_argument("--report", action="store_true",
+                    help="inventory of YARA datasets (default action)")
+    ap.add_argument("--older-than-months", type=int,
+                    help="delete rotated datasets older than N months (no default)")
+    ap.add_argument("--delete-legacy", action="store_true",
+                    help="delete datasets on an older/unversioned schema")
+    ap.add_argument("--force", action="store_true",
+                    help="delete_dataset force=true, for datasets with dependencies")
+    ap.add_argument("--yes", action="store_true",
+                    help="actually delete; without this everything is a dry run")
+    args = ap.parse_args()
+
+    client = XDRActionCenter()
+    try:
+        current, legacy, newer = client.classify_yara_datasets()
+    except Exception as e:
+        print("Could not list datasets: %s" % e, file=sys.stderr)
+        return 2
+    now_yyyymm = datetime.date.today().strftime("%Y%m")
+
+    # No window and no legacy flag means there is nothing to select, so report instead.
+    # This is also why a bare --yes is harmless.
+    if args.report or (args.older_than_months is None and not args.delete_legacy):
+        print(render_report(current, legacy, newer, now_yyyymm))
+        return 0
+
+    targets, skipped = [], []
+    if args.older_than_months is not None:
+        t, s = select_rotated_for_deletion(current, args.older_than_months, now_yyyymm)
+        targets += t
+        skipped += s
+    if args.delete_legacy:
+        targets += select_legacy_for_deletion(legacy)
+
+    for s in skipped:
+        print("  skip  %s" % s)
+    if not targets:
+        print("Nothing to delete.")
+        return 0
+
+    print("\n%d dataset(s) selected for deletion:" % len(targets))
+    for name in targets:
+        print("  %s" % name)
+    if not args.yes:
+        print("\nDRY RUN - nothing deleted. Re-run with --yes to apply.")
+        return 0
+
+    failures = 0
+    for name in targets:
+        try:
+            client.delete_dataset(name, force=args.force)
+            print("  deleted %s" % name)
+        except Exception as e:
+            # Continue: one dataset with dependencies must not strand the whole cleanup.
+            failures += 1
+            print("  FAILED  %s: %s" % (name, e))
+    print("\n%d deleted, %d failed." % (len(targets) - failures, failures))
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
