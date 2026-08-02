@@ -72,6 +72,20 @@ def months_between(older_yyyymm, newer_yyyymm):
     return (n.year - o.year) * 12 + (n.month - o.month)
 
 
+def has_rotated_sibling(name, all_names):
+    """Does an unsuffixed dataset have rotated siblings for the same kind+host?
+
+    If yes it is an ABANDONED pre-rotation dataset - rotation was enabled later and
+    writes moved to the dated names, so this one is frozen, not growing. If no, the
+    deployment is genuinely running CONFIG_LOOKUP_ROTATION="none" and the dataset really
+    will grow without bound. The two need opposite advice, and telling someone to enable
+    a setting that is already enabled sends them looking in the wrong place.
+    """
+    prefix = name + "_"
+    return any(n != name and n.startswith(prefix) and n[len(prefix):].isdigit()
+               and len(n) - len(prefix) == 6 for n in (all_names or []))
+
+
 def select_rotated_for_deletion(current_names, older_than_months, now_yyyymm):
     """Pick rotated datasets older than the window. Returns (candidates, skip_reasons).
 
@@ -91,9 +105,14 @@ def select_rotated_for_deletion(current_names, older_than_months, now_yyyymm):
             skipped.append("%s: not a YARA dataset name" % name)
             continue
         if not info["month"]:
-            skipped.append(
-                '%s: not rotated (no YYYYMM) - set CONFIG_LOOKUP_ROTATION="monthly" in '
-                "the scanner so this dataset stops growing" % name)
+            if has_rotated_sibling(name, current_names):
+                skipped.append(
+                    "%s: abandoned pre-rotation dataset (rotated siblings exist) - "
+                    "frozen, not growing" % name)
+            else:
+                skipped.append(
+                    '%s: not rotated (no YYYYMM) - set CONFIG_LOOKUP_ROTATION="monthly" '
+                    "in the scanner so this dataset stops growing" % name)
             continue
         if info["month"] == now_yyyymm:
             skipped.append("%s: current month - a scan may be writing to it" % name)
@@ -125,7 +144,7 @@ def render_report(current, legacy, newer, now_yyyymm):
     lines = ["YARA lookup datasets (schema v%s current, now %s)" % (schema, now_yyyymm), ""]
     lines.append("%-52s %-8s %-14s %6s" % ("dataset", "kind", "host", "age"))
     lines.append("-" * 84)
-    unrotated = []
+    unrotated, abandoned = [], []
     for name in current:
         info = parse_dataset_name(name)
         if info is None:
@@ -134,8 +153,8 @@ def render_report(current, legacy, newer, now_yyyymm):
         if info["month"]:
             age = "%dmo" % months_between(info["month"], now_yyyymm)
         else:
-            age = "n/a"
-            unrotated.append(name)
+            age = "frozen" if has_rotated_sibling(name, current) else "n/a"
+            (abandoned if age == "frozen" else unrotated).append(name)
         lines.append("%-52s %-8s %-14s %6s"
                      % (name[:52], info["kind"], (info["host"] or "-")[:14], age))
     if not current:
@@ -147,6 +166,16 @@ def render_report(current, legacy, newer, now_yyyymm):
         lines += ["", "NEWER schema - never deleted by this tool. Your "
                       "YARA_LOOKUP_SCHEMA_VER may be stale:"]
         lines += ["  " + n for n in newer]
+    if abandoned:
+        lines += [
+            "",
+            "NOTE: %d dataset(s) predate rotation (rotated siblings exist for the same"
+            % len(abandoned),
+            "      host). They are frozen, not growing - writes moved to the dated names.",
+            "      This tool will not delete them: an unsuffixed dataset holds ALL",
+            "      pre-rotation history for that host, so removing one is a bigger",
+            "      decision than dropping a month. Delete manually if you want the space.",
+        ]
     if unrotated:
         lines += [
             "",

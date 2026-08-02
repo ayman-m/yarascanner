@@ -137,3 +137,37 @@ def test_legacy_selection_passes_names_through():
 def test_legacy_selection_handles_empty():
     assert select_legacy_for_deletion([]) == []
     assert select_legacy_for_deletion(None) == []
+
+
+# ------------------------------------------- abandoned vs genuinely-unrotated datasets
+from xdr_data_management import has_rotated_sibling  # noqa: E402
+
+
+def test_unsuffixed_with_rotated_siblings_is_abandoned():
+    """Found live: unsuffixed datasets sitting beside _YYYYMM ones are pre-rotation
+    leftovers, NOT a rotation=none deployment. Telling the operator to enable a setting
+    that is already enabled sends them looking in the wrong place."""
+    names = ["yara_scanner_matches_v2_h", "yara_scanner_matches_v2_h_202607"]
+    assert has_rotated_sibling("yara_scanner_matches_v2_h", names) is True
+    _, skipped = select_rotated_for_deletion(names, older_than_months=99,
+                                             now_yyyymm="202608")
+    assert any("abandoned pre-rotation" in s for s in skipped)
+    assert not any("set CONFIG_LOOKUP_ROTATION" in s for s in skipped)
+
+
+def test_unsuffixed_alone_is_genuinely_unrotated():
+    names = ["yara_scanner_matches_v2_h"]
+    assert has_rotated_sibling("yara_scanner_matches_v2_h", names) is False
+    _, skipped = select_rotated_for_deletion(names, older_than_months=99,
+                                             now_yyyymm="202608")
+    assert any("set CONFIG_LOOKUP_ROTATION" in s for s in skipped)
+
+
+def test_sibling_check_ignores_different_host():
+    names = ["yara_scanner_matches_v2_hostA", "yara_scanner_matches_v2_hostB_202607"]
+    assert has_rotated_sibling("yara_scanner_matches_v2_hostA", names) is False
+
+
+def test_sibling_check_requires_exactly_six_digits():
+    names = ["yara_scanner_matches_v2_h", "yara_scanner_matches_v2_h_20260"]
+    assert has_rotated_sibling("yara_scanner_matches_v2_h", names) is False
