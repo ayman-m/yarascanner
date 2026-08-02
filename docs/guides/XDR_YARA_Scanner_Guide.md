@@ -271,6 +271,44 @@ the flag was detected.
 > Use the console Cancel when you just need it dead immediately and do not care about the
 > findings discovered so far.
 >
+> #### Evidence (action 564, three endpoints, 2026-08-02)
+>
+> One console Cancel against a three-endpoint scan. `xdr-agent` had already finished; the
+> two Windows endpoints were mid-scan.
+>
+> | | `xdragent2` | `xdragent` | `xdr-agent` |
+> |---|---|---|---|
+> | action status | `ABORTED` | `ABORTED` | `COMPLETED_SUCCESSFULLY` |
+> | payload PID | **dead** | **dead** | exited normally |
+> | `cancel.flag` written | no | no | no |
+> | `"cancelled by operator"` in log | **no** | **no** | n/a |
+> | `CLEANUP AND FINALIZATION` | **no** | **no** | yes |
+> | `scan_summary_*.json` | **not written** | **not written** | written |
+> | last system-log line | mid-walk, no cleanup | mid-walk, no cleanup | normal completion |
+>
+> Uploads were still succeeding shortly before termination (`Lookup batch ok (170 rows)`),
+> so delivery was healthy — the process was killed mid-flight, not failing.
+>
+> #### The consequence that matters: orphaned lifecycle rows
+>
+> A killed scan **never writes a terminal row**, so its lifecycle is stuck permanently:
+>
+> ```
+> xdr-agent   20260802_163940_695801   initiated -> completed   (210,170 files)
+> xdragent2   20260802_163943_963902   initiated                 <- stuck forever
+> xdragent    20260802_163945_164907   initiated -> running      <- stuck forever
+> ```
+>
+> Any dashboard widget counting "scans in progress" or "initiated vs completed" will show
+> console-cancelled scans as **running indefinitely**, long after the process is dead. If
+> you judge cancellation by the dashboard rather than the action status, it looks as though
+> the cancel did nothing — the process stopped, but the record never closed.
+>
+> **The scanner cannot fix this.** Signal handlers cannot be installed (scripts run off the
+> main thread), and on Windows termination is `TerminateProcess`, which no handler could
+> intercept. Writing a terminal row on console cancel is impossible by construction. The
+> `cancel` entry point exists precisely because it is the only path that closes the record.
+>
 > **There is no public API to cancel an action.** The cancel/abort endpoints live under
 > `/api/webapp/` — the console's private backend, which needs an interactive MFA session and
 > is not supported for automation. The `cancel` entry point is therefore the *only*
