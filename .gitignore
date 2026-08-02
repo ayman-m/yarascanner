@@ -215,3 +215,6 @@ docs/superpowers/
 
 # Test run outputs (environment-specific: hostnames, action IDs)
 tests/results/
+
+# Generated CA bundle for corporate-proxy TLS (rebuilt per session by make_ca_bundle.sh)
+xdr_ca_bundle.pem
