@@ -23,9 +23,21 @@ Every row and alert is tagged with a **`tenant_id`** derived from your API URL, 
 data is safe to consolidate across tenants.
 
 > **v2 highlights:** Advanced (HMAC) authentication with auto-detection, per-channel
-> output flags, configurable CPU throttling with an OS-managed mode, cooperative scan
-> cancellation, fixed-name lookup datasets, a dedicated dashboard, and automation
+> output flags, a CPU governor that bounds the scan's share of the host, cooperative scan
+> cancellation, per-endpoint rotated lookup datasets, a dedicated dashboard, and automation
 > playbooks.
+
+## Topic guides
+
+This guide covers deployment and the capabilities as shipped. Four companion documents go
+deeper where operators usually need it:
+
+| Guide | Answers |
+|---|---|
+| [CPU Impact Control](topics/CPU_Impact_Control.md) | *"Will this scan slow my machine, and how do you know?"* |
+| [Scan Cancellation](topics/Scan_Cancellation.md) | *"How do I stop a scan, and why does a cancelled one still show as running?"* |
+| [Rule Compatibility](topics/Rule_Compatibility.md) | *"Why do my rules work locally but get skipped on the endpoint?"* |
+| [Datasets and Maintenance](topics/Datasets_and_Maintenance.md) | *"Why these dataset names, and how do I stop them growing forever?"* |
 
 ---
 
@@ -185,11 +197,10 @@ re-upload. These are the deployment-wide behaviour knobs (no per-run input neede
 | `CONFIG_LOOKUP_ROTATION` | `monthly`/`none` | `monthly` | Monthly dataset rotation (§11) |
 | `CONFIG_OPTIONS` | `key=value,key=value` | `""` | Rarely-needed extra overrides applied every run |
 
-**Retired constants.** `CONFIG_THROTTLE_MODE`, `CONFIG_CPU_HIGH_THRESHOLD`,
-`CONFIG_CPU_CRITICAL_THRESHOLD` and `CONFIG_MAX_PAUSE_SECS` no longer exist — see §10 for
-why. The equivalent *runtime options* are still accepted and translated, so existing
-scripts and scheduled jobs keep running: `throttle_mode=off` → `cpu_guarantee=none`;
-`throttle_mode=script` or `os` → `cpu_guarantee=headroom`. Unknown keys still fail loudly.
+**Upgrading from an earlier build.** The old `throttle_mode` runtime option is still
+accepted and translated (`off` → `cpu_guarantee=none`; `script` or `os` →
+`cpu_guarantee=headroom`), so existing scheduled jobs and playbooks keep running unchanged.
+Unknown keys still fail loudly.
 
 > Advanced / automation only: the internal `run(...)` API and the CLI still accept a per-run
 > `options` string that overrides any constant above — but the Action Center `main` entry point
@@ -202,8 +213,9 @@ scripts and scheduled jobs keep running: `throttle_mode=off` → `cpu_guarantee=
 ## 8.1 Ad-hoc run from the UI
 
 **Action Center → Scripts** → select the script → **Run** → pick target endpoints →
-supply inputs (`yarafile` = your base64, `scan_folder`, `alert_severity`, `mode=scan`,
-`options`). Track under **Action Center → All Actions**.
+supply the three inputs (`yarafile` = your base64, `scan_folder`, `alert_severity`).
+Track under **Action Center → All Actions**. To stop a scan, run the same script with
+Entry Point = `cancel` (§9).
 
 ## 8.2 Programmatic (API)
 
@@ -213,8 +225,11 @@ POST /public_api/v1/scripts/run_script/
 {"request_data": {"script_uid": "<uid-from-get_scripts>", "timeout": 3600,
   "filters": [{"field": "endpoint_id_list", "operator": "in", "value": ["<endpoint-id>"]}],
   "parameters_values": {"yarafile": "<b64>", "scan_folder": "default",
-                        "alert_severity": "low", "mode": "scan", "options": ""}}}
+                        "alert_severity": "low"}}}
 ```
+
+`parameters_values` must match the library script's inputs **exactly** — the three above
+for `main`, and an empty set for the `cancel` entry point. Any extra key is rejected.
 
 Advanced-key tenants must HMAC-sign the request (§3). Poll
 `/public_api/v1/actions/get_action_status/` (by `group_action_id`) and read
@@ -237,214 +252,82 @@ validating rules/credentials before a production rollout.
 
 # 9. Step 5 — Scan Cancellation
 
-To stop a running scan, run the **`cancel` entry point** as a second Action Center action
-against the same endpoints (or use `YARA_Scanner_Canceller.yml`). This writes a flag file
-that the running scan polls; the scan **stops scanning within ~5 s**, drains what it has,
-writes a terminal `cancelled` row to `yara_scanner_scans`, and returns
+There are two ways to stop a running scan, and they behave differently.
+
+**To stop a scan and keep what it has found**, run the script's **`cancel` entry point** as
+a second Action Center action against the same endpoints (or use
+`YARA_Scanner_Canceller.yml`). The scan stops within ~5 seconds, drains its queued alerts
+and dataset rows, writes a terminal `cancelled` row to `yara_scanner_scans`, and returns
 `Scan cancelled by operator: …`.
 
-Verified live: a scan stopped after 7,592 files with both workers halting **4.45 s** after
-the flag was detected.
+**To stop a scan immediately**, use the console's own **Cancel** in Action Center. This
+terminates the payload outright — faster, but the scan writes no terminal row, no summary,
+and any findings not yet delivered are lost.
 
-> ### Console Cancel vs the `cancel` entry point — they are not equivalent
->
-> **Measured on agent 9.2.0.90 (Windows), 2026-08-02.** Cancelling a running *script*
-> action from the console **does stop it — by killing the payload process**. Two endpoints
-> mid-scan went to status `ABORTED`, both payload PIDs died, and neither wrote a terminal
-> `cancelled` row or a scan summary. Their logs stop mid-walk with no cleanup.
->
-> Note this contradicts the wording in the Cortex documentation for *agent upgrades*
-> (*"once the Status is In Progress… cannot be canceled from the management console"*).
-> That statement describes upgrades, **not script executions**, and should not be assumed to
-> generalise.
->
-> | | Console Cancel | `cancel` entry point |
-> |---|---|---|
-> | Stops the scan | yes, immediately | yes, within ~5 s |
-> | Method | **hard kill** of the payload | cooperative flag |
-> | Terminal `cancelled` row | **no** | yes |
-> | Scan summary written | **no** | yes |
-> | Queued alerts / dataset rows | **discarded** | drained first |
-> | Drivable from API / SOAR | **no** | yes |
->
-> **Use the `cancel` entry point when you want to stop a scan and keep what it found.**
-> Use the console Cancel when you just need it dead immediately and do not care about the
-> findings discovered so far.
->
-> #### Evidence (action 564, three endpoints, 2026-08-02)
->
-> One console Cancel against a three-endpoint scan. `xdr-agent` had already finished; the
-> two Windows endpoints were mid-scan.
->
-> | | `xdragent2` | `xdragent` | `xdr-agent` |
-> |---|---|---|---|
-> | action status | `ABORTED` | `ABORTED` | `COMPLETED_SUCCESSFULLY` |
-> | payload PID | **dead** | **dead** | exited normally |
-> | `cancel.flag` written | no | no | no |
-> | `"cancelled by operator"` in log | **no** | **no** | n/a |
-> | `CLEANUP AND FINALIZATION` | **no** | **no** | yes |
-> | `scan_summary_*.json` | **not written** | **not written** | written |
-> | last system-log line | mid-walk, no cleanup | mid-walk, no cleanup | normal completion |
->
-> Uploads were still succeeding shortly before termination (`Lookup batch ok (170 rows)`),
-> so delivery was healthy — the process was killed mid-flight, not failing.
->
-> #### The consequence that matters: orphaned lifecycle rows
->
-> A killed scan **never writes a terminal row**, so its lifecycle is stuck permanently:
->
-> ```
-> xdr-agent   20260802_163940_695801   initiated -> completed   (210,170 files)
-> xdragent2   20260802_163943_963902   initiated                 <- stuck forever
-> xdragent    20260802_163945_164907   initiated -> running      <- stuck forever
-> ```
->
-> Any dashboard widget counting "scans in progress" or "initiated vs completed" will show
-> console-cancelled scans as **running indefinitely**, long after the process is dead. If
-> you judge cancellation by the dashboard rather than the action status, it looks as though
-> the cancel did nothing — the process stopped, but the record never closed.
->
-> **The scanner cannot fix this.** Signal handlers cannot be installed (scripts run off the
-> main thread), and on Windows termination is `TerminateProcess`, which no handler could
-> intercept. Writing a terminal row on console cancel is impossible by construction. The
-> `cancel` entry point exists precisely because it is the only path that closes the record.
->
-> **There is no public API to cancel an action.** The cancel/abort endpoints live under
-> `/api/webapp/` — the console's private backend, which needs an interactive MFA session and
-> is not supported for automation. The `cancel` entry point is therefore the *only*
-> API-drivable way to stop a running scan, which is what makes it usable from SOAR.
->
-> **Signals do not work either.** The agent runs scripts on a worker thread, so
-> `signal.signal()` raises *"signal only works in main thread of the main interpreter"* on
-> both Windows and Linux. A polled flag file is the only cooperative mechanism available.
+| | Console Cancel | `cancel` entry point |
+|---|---|---|
+| Stops the scan | immediately | within ~5 s |
+| Findings preserved | no | yes |
+| Terminal row + summary | no | yes |
+| Usable from API / SOAR | no | yes |
 
-**Known latency.** The scan stops *scanning* within ~5 s, but the process can take up to
-about a minute to *exit*, because the directory walk observes the flag only between
-`os.walk` yields — an interval that is unbounded on large trees. No files are scanned in
-that window and results are unaffected. The same cause makes `control/running.json` go stale
-during long walks, so a `cancel` may report `scanner running: no` while a scan is in fact
-running.
+> A scan stopped by the console Cancel leaves its lifecycle row at `initiated` or `running`
+> permanently, so dashboards will show it as running long after it has stopped. Use the
+> `cancel` entry point if that matters to you.
+
+**Detail:** [Scan Cancellation](topics/Scan_Cancellation.md) — the two mechanisms, the
+orphaned-lifecycle-row behaviour, fleet-scale considerations, and API limitations.
 
 ---
 
-# 10. Resource Management — the CPU governor
+# 10. Resource Management — CPU impact
 
-The scanner bounds **its own share of the machine**. It does *not* react to load other
-processes create. Answering "will this scan slow my host?" is this section.
-
-## 10.1 Policies
+The scanner bounds **its own share of the host**, so a scan does not degrade the machine it
+runs on.
 
 | `CONFIG_CPU_GUARANTEE` | Behaviour |
 |---|---|
-| `headroom` (default) | **Adaptive.** Target = `100 − CONFIG_CPU_HEADROOM_PCT − (what everyone else is using)`. A quiet machine gets a fast scan; a busy one gets a quiet scanner. |
-| `budget` | **Fixed.** Never exceed `CONFIG_CPU_BUDGET_PCT` of the host, whatever else is happening. Predictable, and easy to state in a change request. |
+| `headroom` (default) | Always leave `CONFIG_CPU_HEADROOM_PCT` of the host free. A quiet machine gets a fast scan; a busy one gets a quiet scanner. |
+| `budget` | Never exceed `CONFIG_CPU_BUDGET_PCT` of the host, whatever else is running. Predictable, easy to state in a change request. |
 | `none` | No CPU governing. Low process priority still applies. |
 
-**How it acts.** The governor measures the scanner's own CPU as a share of the whole host
-(`process_cpu ÷ cpu_count`), compares it to the target, and sleeps each worker *in
-proportion to the work it just did*. Proportional sleeping keeps the slowdown factor stable
-regardless of file size or machine speed.
+Under heavy external load the target falls to `CONFIG_CPU_FLOOR_PCT` and the scan continues
+slowly — it degrades, it does not stall.
 
-**The floor is the anti-stall guarantee.** Under heavy external load the target drops to
-`CONFIG_CPU_FLOOR_PCT` and the scan continues slowly — it never stops. No throttle can
-create headroom that another process is consuming, so the scanner shrinks to its floor
-rather than waiting for room that will not appear.
+**Worker count.** `CONFIG_WORKERS` defaults to `2`. Scanning is disk-bound as well as
+CPU-bound, so more workers is generally slower. Raise it only if you have measured a gain on
+your storage.
 
-## 10.2 Why the old `script`/`os`/`off` modes were replaced
+**Verifying impact after a scan.** `scan_summary_<run_id>.json` carries a `cpu_governor`
+block showing the target, the share actually used, and time surrendered. The endpoint's
+`performance_<run_id>.log` carries the same figures over time.
 
-The previous design watched **system-wide** CPU and paused while it exceeded a threshold.
-Measured on an 8-core Linux endpoint:
-
-- With unrelated load holding ~74% CPU, the scanner **parked 285 s of a 347 s scan** waiting
-  for a resume condition (CPU below 70%) that sustained external load never allowed. With a
-  longer load it parked **593 s of a 594 s scan** — a 65.9× slowdown.
-- It was reacting to load it did not cause.
-- Across 2, 4 and 8 cores under saturating load, throttling protected the competing workload
-  by **−3% to +1% versus not throttling at all**.
-- `os` mode was not a safe substitute: idle priority **starved** on a saturated 8-core host,
-  taking 252 s versus 77 s unthrottled.
-
-The governor fixes the stall (65.9× → 2.07×) and can state a number. Be aware what it does
-*not* claim: on a host where the scanner only ever uses a small share, throttling of any
-kind changes host impact very little. Its real value is that a scan **never stalls** on a
-busy machine, and that the promise is measurable after the fact.
-
-## 10.3 Worker count
-
-`CONFIG_WORKERS` defaults to **2. Leave it there unless you have measured otherwise.**
-More workers measured *slower* (8-core Linux, 93k files, warm cache):
-
-| Workers | Wall clock |
-|---|---|
-| **2** | **71 s** |
-| 4 | 93 s (+31%) |
-| 8 | 101 s (+42%) |
-
-Scanning is disk-bound as well as CPU-bound, so extra concurrent readers cause seek
-contention rather than useful overlap. The setting exists so operators with fast NVMe can
-raise it *after measuring* — not as a default to tune upward.
-
-## 10.4 Measured behaviour
-
-Linux, 8 cores, `/usr` (93,116 files), 3 rounds:
-
-| Condition | Wall clock | Slept |
-|---|---|---|
-| idle, `none` | 64 s | 0 s |
-| idle, `headroom` | 68 s | 0 s |
-| **saturating external load, `headroom`** | **153 s** | 40 s |
-| saturating external load, `budget=20%` | 131 s | 0 s |
-
-Governing an idle host costs about **6%**. Under load the scan still completes.
-
-## 10.5 Telemetry
-
-`performance_<run_id>.log` carries one header per run and a `CPU_GOVERNOR` line on
-meaningful change or every 30 s:
-
-```
-THROTTLE_CONFIG {"cpu_guarantee":"headroom","cpu_headroom_pct":30.0,...,
-                 "host_cores":8,"cpu_affinity_count":2,"cpu_priority":"below_normal"}
-CPU_GOVERNOR    {"policy":"headroom","target":70.0,"own":8.1,"others":0.0,
-                 "ratio":0.0,"slept_secs":0.0,"floor_hits":0,"t":...}
-```
-
-`own` is a share of the **whole host** — it should never exceed 100. The scan summary
-carries the same figures under `cpu_governor`, which is your after-the-fact evidence that
-the promise held.
-
-## 10.6 Windows note
-
-The Cortex agent pins payload processes to **2 CPU cores** regardless of host size
-(visible in every scan as `host_cores: 8, cpu_affinity_count: 2`). The scanner therefore
-cannot exceed roughly **25% of an 8-core Windows host whatever you configure** — the agent
-has already applied coarse containment. The governor stays effectively idle there until
-other processes push the target below that ceiling.
+**Detail:** [CPU Impact Control](topics/CPU_Impact_Control.md) — how the governor works,
+what it guarantees and what it does not, tuning, telemetry reference, measured behaviour,
+and the Windows CPU ceiling.
 
 ---
 
 # 11. Datasets & Schema
 
-## Per-writer sharding (why the names have a suffix)
-
-XDR's `lookups/add_data` is **not concurrency-safe**: two endpoints writing the *same*
-lookup dataset at once collide on a server-side clone-table race and lose rows (measured
-~2/8 landing at 8-way concurrency, and client-side retries/jitter do not fix it). The
-scanner therefore writes **one dataset per endpoint** — no two writers ever touch the same
-dataset — which lands **100%** at any fleet scale. Names are:
+## Dataset naming
 
 ```
 yara_scanner_matches_v2_<host>_<YYYYMM>     yara_scanner_scans_v2_<host>_<YYYYMM>
 ```
 
-`_v2` is a **schema version** (bumped only when the row shape changes; `add_data` silently
-drops rows carrying fields an existing dataset doesn't know, so a new shape needs a new
-name). `<host>` is a slugged, hash-suffixed endpoint id. Sharding is configurable via the
-`lookup_shard` option / `YARA_LOOKUP_SHARD` env: `endpoint` (default), `none` (one legacy
-shared dataset — only safe at ~1 concurrency), or a literal wave/site label.
+Each host writes **its own pair of datasets** (`CONFIG_LOOKUP_SHARD = "endpoint"`), and a
+fresh pair begins **each month** (`CONFIG_LOOKUP_ROTATION = "monthly"`). Both defaults exist
+to keep writes reliable at fleet scale: one writer per dataset avoids a concurrency race in
+`lookups/add_data`, and monthly rotation keeps each dataset small enough that write time
+stays flat. `_v2` is the schema version.
 
 **Dashboards fan the shards back in with a wildcard** — `dataset = yara_scanner_matches*`
-spans every host and schema version at once (XQL supports `*` and `union`).
+spans every host, month and schema version at once.
+
+> Change these defaults only for a single-endpoint deployment. At fleet scale, `shard=none`
+> loses rows and `rotation=none` eventually goes write-dead. See the
+> [Datasets and Maintenance](topics/Datasets_and_Maintenance.md) guide.
 
 ## `yara_scanner_matches_v2_<host>_<YYYYMM>` — one row per matched string
 
@@ -461,9 +344,6 @@ spans every host and schema version at once (XQL supports `*` and `union`).
 `scan_rate_fps`, `elapsed_secs`, `total_paused_secs`, `throttle_mode`, `posture`,
 `event_timestamp_ms`, `message`.
 
-Growth is bounded by the `scan_date` column — prune with targeted `lookups/remove_data` by
-`scan_date` as an operational procedure.
-
 ## Per-scan summary on the endpoint
 
 Every run also writes a machine-readable `scan_summary_<run_id>.json` under the scanner's
@@ -471,51 +351,24 @@ Every run also writes a machine-readable `scan_summary_<run_id>.json` under the 
 rules, and the resolved dataset names) — one file to parse instead of six text logs. Log
 retention keeps the last 10 scans (`YARA_LOG_KEEP`).
 
-## Keeping datasets bounded — `xdr_data_management.py`
+## Keeping datasets bounded
 
-Rotation bounds each dataset's **size**, which is what keeps `add_data` fast. It does not
-delete anything: old months accumulate on the tenant indefinitely. `xdr_data_management.py`
-is a small standalone script that removes them.
-
-**It is deliberately not a prerequisite for anything.** The scanner creates its own datasets
-and writes to them self-sufficiently. If this script never runs, datasets get large and
-eventually slow, but **every scan still succeeds**. Cleanup is optional work; creation is
-not, and coupling them would mean a scan could fail because a different script had not run.
-
-Run it from a workstation with the same credentials as the toolkit:
+Rotation bounds each dataset's size, but never deletes anything — old months accumulate.
+`xdr_data_management.py` removes them:
 
 ```bash
-python3 xdr_data_management.py --report                      # inventory (default action)
+python3 xdr_data_management.py --report                      # inventory (default)
 python3 xdr_data_management.py --older-than-months 6 --yes   # drop months older than 6
-python3 xdr_data_management.py --delete-legacy --yes         # drop pre-v2 schema datasets
 ```
 
-`--report` lists every YARA dataset with kind, host and age in months, and flags two
-conditions worth knowing about:
+Dry run unless `--yes`. It never deletes the current month, a future-dated month, an
+unsuffixed dataset, a newer schema version, or anything outside the `yara_scanner_*` naming
+contract. **No scan depends on it having run** — if it never runs, datasets grow but every
+scan still succeeds.
 
-- **`frozen`** — an unsuffixed dataset that has rotated siblings. It predates rotation, is
-  no longer written to, and is not deleted by this tool: an unsuffixed dataset holds *all*
-  pre-rotation history for that host, so removing one is a bigger decision than dropping a
-  month.
-- **not rotated** — an unsuffixed dataset with *no* rotated siblings, i.e. the deployment is
-  running `CONFIG_LOOKUP_ROTATION="none"` and that dataset really will grow without bound.
-  The report names the exact config change.
-
-### Safety rails
-
-Nothing is deleted if it is the **current month** (a scan may be writing to it), a
-**future-dated month** (clock skew), **unsuffixed**, on a **newer schema version** than this
-host understands, or **outside the `yara_scanner_*` naming contract**. On top of that it is
-a **dry run unless `--yes`**, and `--older-than-months` has no default — so a bare `--yes`
-deletes nothing.
-
-> Deleting a dataset a scan is actively writing to does not error the scan: the scanner
-> keeps POSTing rows to a name that no longer exists and gets HTTP 400 per batch. Across a
-> fleet mid-scan that is silent, partial data loss discovered days later as a dashboard gap.
-> Hence the current-month guard.
-
-A failed delete is reported and the run continues to the next dataset, so one dataset with
-dependencies cannot strand the whole cleanup. Exit code is non-zero if any deletion failed.
+**Detail:** [Datasets and Maintenance](topics/Datasets_and_Maintenance.md) — why sharding
+and rotation both exist, the report's `frozen` vs *not rotated* distinction, all safety
+rails, and schema-change rules.
 
 ---
 
