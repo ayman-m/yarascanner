@@ -5731,6 +5731,60 @@ rule test {{
             self.log_manager.log_performance(
                 "CPU_GOVERNOR " + json.dumps(dict(s, t=round(now, 3))))
 
+    def _walk_cancellable(self, target):
+        """os.walk replacement whose cancellation latency is bounded by ONE scandir.
+
+        os.walk yields only after its internal recursion produces the next directory, so
+        `scan_active` can go unobserved for an unbounded interval. Measured on C:\\ : both
+        workers stopped 4.45s after a cancel, but the process took a further 50s to exit
+        because the walk was still inside the generator. Same cause left running.json
+        stale, which made `cancel` report "scanner running: no" during a live scan.
+
+        Driving the traversal with an explicit stack puts the check under our control: it
+        runs before every directory and between entries, so a cancel is honoured within a
+        single scandir call.
+
+        Contract matches os.walk(topdown=True): yields (dirpath, dirnames, filenames), and
+        the caller may prune `dirnames` in place to skip subtrees - the stack is extended
+        after the yield, so pruning is respected.
+        """
+        stack = [target]
+        while stack:
+            if not self.scan_active:
+                return
+            current = stack.pop()
+            dirnames, filenames, symlinked = [], [], set()
+            try:
+                with os.scandir(current) as it:
+                    for entry in it:
+                        if not self.scan_active:
+                            return
+                        try:
+                            # Classify like os.walk: is_dir() FOLLOWS symlinks, so a
+                            # symlinked directory is listed under dirnames...
+                            if entry.is_dir():
+                                dirnames.append(entry.name)
+                                # ...but is not recursed into, matching followlinks=False.
+                                if entry.is_symlink():
+                                    symlinked.add(entry.name)
+                            else:
+                                filenames.append(entry.name)
+                        except OSError:
+                            # Entry vanished or is unreadable mid-iteration; skip it.
+                            continue
+            except (PermissionError, NotADirectoryError, FileNotFoundError):
+                continue
+            except OSError:
+                continue
+
+            yield current, dirnames, filenames
+
+            # Read dirnames AFTER the yield so caller-side pruning takes effect.
+            for name in dirnames:
+                if name in symlinked:
+                    continue
+                stack.append(os.path.join(current, name))
+
     def _enqueue_scan_path(self, path):
         """Block gently when workers are saturated instead of dropping files."""
         while self.scan_active:
@@ -6436,7 +6490,10 @@ rule test {{
                         {'target_index': target_idx + 1, 'target_path': target}
                     )
                     
-                    for root, dirs, files in os.walk(target):
+                    # _walk_cancellable, not os.walk: the flag is checked before every
+                    # directory so a cancel is honoured within one scandir, instead of
+                    # whenever os.walk next happens to yield (measured 50s on C:\).
+                    for root, dirs, files in self._walk_cancellable(target):
                         if not self.scan_active:
                             break
                             
