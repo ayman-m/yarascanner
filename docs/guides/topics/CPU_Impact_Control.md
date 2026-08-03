@@ -86,7 +86,48 @@ Honest framing matters more than a flattering one:
 - If you need a hard, kernel-enforced ceiling that survives a bug in the scanner, this is
   not that. It is self-governed.
 
-## 5. Worker count
+## 5. Why this replaced the old `script` / `os` throttle modes
+
+Earlier builds offered `throttle_mode = script | os | off`. `script` watched **system-wide**
+CPU and paused the scan whenever it crossed a threshold; `os` dropped the process to the
+operating system's idle priority tier. Both are gone. Four measured reasons:
+
+**1. It reacted to load it did not cause.** System-wide CPU includes every other process on
+the machine. On a busy host the scan paused itself for someone else's work, and kept pausing
+for as long as that work continued. Measured: **285 s of a 347 s scan spent parked**, and up
+to **65.9× slower** than the same scan unthrottled. Operators experienced this as a scan that
+never finished.
+
+**2. It bought almost nothing.** Across 2, 4 and 8 cores under saturating load, every mode
+preserved the competing workload to within **−3% to +1%** of not throttling at all. The
+slowdown was real; the protection was not.
+
+**3. `os` mode starved.** The idle priority tier only gets CPU when nothing else wants it, so
+on a saturated host the scan barely ran — **252 s versus 77 s** for the same work on 8 cores.
+
+**4. You could not state what it would do.** *"Pause when system CPU exceeds 80%"* tells you
+nothing about how much CPU the scan will use. There was no number to put in a change request
+and nothing to check afterwards.
+
+### What changed
+
+| | Old (`script` / `os`) | New (CPU governor) |
+|---|---|---|
+| Watches | total system CPU | the scan's **own** share |
+| Response | stop entirely, then resume | slow down proportionally |
+| On a busy host | can park indefinitely | floors at `CONFIG_CPU_FLOOR_PCT` and keeps going |
+| Can you state the impact? | no | yes — a percentage of the host |
+| Can you verify it afterwards? | no | yes — §8 telemetry |
+
+The honest summary: **the old design's cost was large and its benefit was near zero.** The new
+one does not claim to protect the host either (§4) — what it adds is a bound you can state
+before the scan, a guarantee the scan will finish, and evidence afterwards that the bound held.
+
+**Nothing to change on upgrade.** The retired options are still accepted and translated, so
+existing playbooks and scheduled jobs keep running: `throttle_mode=off` → `cpu_guarantee=none`,
+and `throttle_mode=script` or `os` → `cpu_guarantee=headroom`.
+
+## 6. Worker count
 
 `CONFIG_WORKERS` defaults to **2**. Leave it there unless you have measured otherwise on
 your storage.
@@ -101,7 +142,7 @@ More workers is **slower**. Scanning is disk-bound as well as CPU-bound, so addi
 concurrent readers cause seek contention rather than useful overlap. The setting exists so
 operators with fast NVMe can raise it after measuring — not as a default to tune upward.
 
-## 6. Windows: the agent's own CPU ceiling
+## 7. Windows: the agent's own CPU ceiling
 
 The Cortex agent pins payload processes to **2 CPU cores**, regardless of how many the host
 has. Every scan records this:
@@ -120,7 +161,7 @@ Consequences:
   scanner is throttled down to it. Verified: with 86% external load the Windows target
   floored at 5% and the scanner was held to 6.6–9.2%.
 
-## 7. Telemetry — verifying the promise after the fact
+## 8. Telemetry — verifying the promise after the fact
 
 `performance_<run_id>.log` on the endpoint carries one header per run, plus a governor line
 on meaningful change or every 30 seconds:
@@ -146,7 +187,7 @@ CPU_GOVERNOR    {"policy":"headroom","target":5.0,"own":8.7,"others":85.6,
 The same figures appear under `cpu_governor` in `scan_summary_<run_id>.json` — that is your
 after-the-fact evidence that the promise held.
 
-## 8. Tuning
+## 9. Tuning
 
 | Symptom | Change |
 |---|---|

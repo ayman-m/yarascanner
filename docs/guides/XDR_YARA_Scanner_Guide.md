@@ -311,8 +311,8 @@ block showing the target, the share actually used, and time surrendered. The end
 `performance_<run_id>.log` carries the same figures over time.
 
 **Detail:** [CPU Impact Control](topics/CPU_Impact_Control.md) — how the governor works,
-what it guarantees and what it does not, tuning, telemetry reference, measured behaviour,
-and the Windows CPU ceiling.
+what it guarantees and what it does not, **why it replaced the old `script` / `os` throttle
+modes**, tuning, telemetry reference, measured behaviour, and the Windows CPU ceiling.
 
 ---
 
