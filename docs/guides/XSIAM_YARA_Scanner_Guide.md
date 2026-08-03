@@ -81,9 +81,29 @@ This is the **light** variant, tuned for live production hosts:
 | Aspect | Light profile |
 |--------|---------------|
 | Worker count | Capped at **2** regardless of `YARA_THREADS` |
-| CPU throttling | **Always on** |
+| CPU throttling | **Always on** — fixed-sleep design (see note below) |
 | Performance / resource / FD monitors | **Off** by default — opt in with the `YARA_ENABLE_*` env vars |
 | Process priority | **Lowered** at startup (Below-Normal / nice) |
+
+> ### The two editions have diverged on CPU control
+>
+> As of August 2026 the **XDR edition** uses a *CPU governor* that bounds the scanner's own
+> share of the host (`CONFIG_CPU_GUARANTEE` = `headroom` / `budget` / `none`). The **XSIAM
+> edition documented here still uses the original fixed-sleep throttle** and is unchanged.
+>
+> **This is not an oversight, and XSIAM is not carrying the bug that prompted the redesign.**
+> The XDR rewrite was driven by a *park-until-CPU-drops* loop that could stall a scan for as
+> long as external load persisted (measured: 285 s parked in a 347 s scan, up to 65.9×).
+> XSIAM's throttle never had that structure — it applies a **bounded** sleep when system CPU
+> is above the high or critical threshold, so it slows down but cannot stall.
+>
+> XSIAM does share the underlying design point: it reacts to **system-wide** CPU, including
+> load it did not cause. Since the sleep is bounded, the consequence is mild — the scan runs
+> slower on a busy host rather than halting on one.
+>
+> Porting the governor to XSIAM is deliberately deferred until the XDR design has more
+> production mileage. See §10 of the XDR Scanner Guide for the governor, and
+> `docs/superpowers/specs/2026-08-02-cpu-impact-governor-design.md` for the rationale.
 
 **Use the light profile** when scanning live production servers, user workstations
 during business hours, or any environment where the host must stay responsive.

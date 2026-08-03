@@ -84,6 +84,19 @@ then upload — operators never type these again:
 | `CONFIG_CPU_BUDGET_PCT` | int | `25` | *budget:* max % of the host we may use |
 | `CONFIG_CPU_FLOOR_PCT` | int | `5` | Never target below this — guarantees progress |
 | `CONFIG_WORKERS` | int | `2` | Worker threads. More measured SLOWER (disk-bound); leave at 2 |
+
+**Per-run overrides.** The `options` string (`key=value,key=value`) overrides any constant
+for a single run, without re-uploading — handy for testing:
+
+```
+cpu_guarantee=budget,cpu_budget_pct=20     # hard 20% cap for this run
+cpu_guarantee=none                         # no governing
+create_alerts=false,write_dataset=false    # scan only, no delivery
+```
+
+Valid keys: `create_alerts, write_dataset, collect_files, cpu_guarantee, cpu_headroom_pct,
+cpu_budget_pct, cpu_floor_pct, workers, tenant_id, lookup_shard`. Retired `throttle_*` keys
+are still accepted and translated, so existing scripts keep running. Unknown keys fail loudly.
 | `CONFIG_TENANT_ID` | string | `""` | Tenant tag (`""` = derive from API URL) |
 | `CONFIG_LOOKUP_SHARD` | endpoint/none/label | `endpoint` | Per-writer dataset sharding |
 | `CONFIG_ALERT_MAX_PER_SCAN` | int | `500` | Storm cap: max per-finding alerts per scan (`≤0` = uncapped) |

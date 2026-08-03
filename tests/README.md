@@ -29,7 +29,10 @@ python3 tests/analyze.py                       # summary + XDR cross-check + per
 
 - **All 20 rule files** against the seeded corpus (compilation + matching correctness).
 - **Output flags:** `create_alerts=false`, `write_dataset=false`, `collect_files=true`.
-- **Throttle modes:** `throttle_mode=os`, `throttle_mode=off` (with the 500-rule pack).
+- **CPU policies:** `cpu_guarantee=budget`, `cpu_guarantee=none` (with the 500-rule pack).
+  The retired `throttle_mode=os|off|script` keys are still accepted and translated, but new
+  tests should use `cpu_guarantee`. Governor behaviour under real load is covered separately
+  by `tests/throttle/` (load generator + zone walk + core sweep).
 - **Throughput:** a real large folder (`C:\Windows\System32` / `/usr/bin`).
 - **Cancellation** is exercised separately (start a long scan, deliver `mode=cancel`).
 
@@ -56,3 +59,42 @@ Live dry-run verification against the EU tenant:
 Found by this run: unsuffixed datasets sitting beside rotated ones are *abandoned*, not
 evidence of `rotation=none`. The original message told operators to enable a setting that
 was already enabled. Fixed via `has_rotated_sibling`.
+
+---
+
+## `tests/throttle/` — CPU governor harness
+
+Everything used to design, validate and regression-test the CPU governor. These are
+**API-driven or ssh-driven**, and several run on the endpoint itself.
+
+| File | Purpose |
+|------|---------|
+| `test_cpu_governor.py` | **pytest, no network.** Target computation per policy, the `cpu_percent ÷ cpu_count` normalisation, ratio clamping, pacing, migration shim. Run: `pytest tests/throttle/ -q` |
+| `loadgen.py` | Open-loop CPU load generator (Linux/macOS, and usable as an agent snippet). Fixed duty cycle, per-second work-rate + CPU sampling, `--calibrate` sweep, hard deadline. |
+| `loadgen.ps1` | Windows equivalent — PowerShell, because the Windows endpoint has **no Python** outside the agent's embedded runtime. |
+| `governor_live.sh` | Four acceptance checks: idle overhead, anti-stall under saturating load, the `own ≤ target` promise, throughput ceiling. |
+| `governor_reps.sh` | The same, repeated over N rounds for variance. |
+| `throttle_matrix.sh` / `analyze_throttle.py` | Original head-to-head: `script` vs `os` vs `off`, with scan-only and load-only baselines. |
+| `throttle_zones.sh` / `analyze_zones.py` | Walks load through every zone (below high → above high → above critical → recovery) in one scan, correlating throttle events to zones by timestamp. |
+| `throttle_cores.sh` / `analyze_repeats.py` | Emulates 2/4/8-core hosts with `taskset` (thresholds scaled by N/8) to test whether throttling pays off on small machines. |
+
+### Two traps this harness exists to avoid
+
+**The load generator must be able to hurt.** An early version ran at 85% duty, which
+voluntarily yields 15% of every window — the scanner filled gaps the workload was already
+leaving, and *every* mode showed ~1.0 degradation including `off`. A control condition
+showing no effect means the instrument is broken, not the hypothesis. Saturating load
+(duty 100) is what makes degradation measurable.
+
+**Measurement windows must not scale with the thing being measured.** A later version
+computed degradation over each scan's duration — 7 s for a fast mode, 69 s for a slow one —
+against a fixed baseline, and produced degradation values *above 1.0* (the workload
+apparently doing more work while contended). Pick a target large enough that every mode
+runs long enough for a stable window.
+
+### Load generation and the GIL
+
+`loadgen.py` hashes a **~1 MiB** buffer per work unit, deliberately. CPython's `hashlib`
+only releases the GIL above `HASHLIB_GIL_MINSIZE` (2048 bytes) — with a smaller buffer,
+7 threads delivered exactly **one core** of load (12.5% on 8 cores). It also widens its own
+CPU affinity at startup, because the Cortex agent pins payload processes to 2 cores.

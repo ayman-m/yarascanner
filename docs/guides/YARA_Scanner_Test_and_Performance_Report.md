@@ -141,8 +141,19 @@ scan reuses the dataset.
 
 ## 4.4 Throttle
 
+> **Superseded.** This section describes the original `throttle_mode` design
+> (`script`/`os`/`off`), which was replaced by the CPU governor in August 2026. It is kept
+> as a record of what was measured at the time. See §10 of the XDR Scanner Guide for the
+> current design and `docs/superpowers/specs/2026-08-02-cpu-impact-governor-design.md`
+> for why it changed.
+
 Under the (idle) test hosts no CPU pressure occurred, so `total_paused_secs=0` across all modes;
 `throttle_mode=os`/`off` completed identically to `script`.
+
+**This result is the reason the flaw went unnoticed.** Testing only on idle hosts meant the
+pause loop never engaged. Under sustained external load it parked 285 s of a 347 s scan — a
+65.9x slowdown — while protecting the competing workload by -3% to +1% versus no throttling
+at all. A throttle can only be evaluated against a host that is actually busy.
 
 ---
 

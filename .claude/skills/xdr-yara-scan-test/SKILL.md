@@ -61,10 +61,16 @@ Pass `--options` (a `key=value,key=value` string mapped to the scanner's options
 python3 run_scan.py --hostname WINSERVER01 --seed-files 0 --options create_alerts=false
 python3 run_scan.py --hostname WINSERVER01 --seed-files 0 --options write_dataset=false
 python3 run_scan.py --hostname WINSERVER01 --seed-files 0 --options collect_files=true
-python3 run_scan.py --hostname WINSERVER01 --seed-files 0 --options throttle_mode=os
+python3 run_scan.py --hostname WINSERVER01 --seed-files 0 --options cpu_guarantee=budget,cpu_budget_pct=20
+python3 run_scan.py --hostname WINSERVER01 --seed-files 0 --options cpu_guarantee=none
 ```
-Valid keys: `create_alerts, write_dataset, collect_files, throttle_mode,
-cpu_high_threshold, cpu_critical_threshold, max_pause_secs, tenant_id`.
+Valid keys: `create_alerts, write_dataset, collect_files, cpu_guarantee,
+cpu_headroom_pct, cpu_budget_pct, cpu_floor_pct, workers, tenant_id, lookup_shard`.
+
+**Retired keys** (`throttle_mode`, `cpu_high_threshold`, `cpu_critical_threshold`,
+`max_pause_secs`) are still *accepted and translated* — `throttle_mode=off` →
+`cpu_guarantee=none`, `script`/`os` → `cpu_guarantee=headroom` — so old test scripts keep
+running. Prefer the new keys in anything you write now. Unknown keys still fail loudly.
 
 ### Testing cancellation
 
