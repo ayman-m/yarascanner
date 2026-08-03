@@ -74,9 +74,6 @@ Everything used to design, validate and regression-test the CPU governor. These 
 | `loadgen.ps1` | Windows equivalent — PowerShell, because the Windows endpoint has **no Python** outside the agent's embedded runtime. |
 | `governor_live.sh` | Four acceptance checks: idle overhead, anti-stall under saturating load, the `own ≤ target` promise, throughput ceiling. |
 | `governor_reps.sh` | The same, repeated over N rounds for variance. |
-| `throttle_matrix.sh` / `analyze_throttle.py` | Original head-to-head: `script` vs `os` vs `off`, with scan-only and load-only baselines. |
-| `throttle_zones.sh` / `analyze_zones.py` | Walks load through every zone (below high → above high → above critical → recovery) in one scan, correlating throttle events to zones by timestamp. |
-| `throttle_cores.sh` / `analyze_repeats.py` | Emulates 2/4/8-core hosts with `taskset` (thresholds scaled by N/8) to test whether throttling pays off on small machines. |
 
 ### Two traps this harness exists to avoid
 

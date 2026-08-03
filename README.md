@@ -350,7 +350,7 @@ endpoint map (`references/public-api-map.md`) — including why console-internal
 
 - `XDR_YARA_Scanner_Guide.md` / `.docx` — deployment + operations, XDR edition
 - `XSIAM_YARA_Scanner_Guide.md` / `.docx` — deployment + operations, XSIAM edition
-- `YARA_Scanner_Test_and_Performance_Report.md` / `.docx` — measured performance & test coverage
+- [`CHANGELOG.md`](CHANGELOG.md) — release notes: what changed in each version, and why
 
 ---
 
