@@ -25,27 +25,61 @@ The name carries four things, and each is there for a reason:
 The scanner **creates these itself** if they do not exist. It never depends on any other
 script having run first.
 
-## 2. Per-host sharding — why every host gets its own dataset
+## 2. Why not one dataset for everything?
 
-`CONFIG_LOOKUP_SHARD = "endpoint"` (the default) gives each host its own dataset pair.
+**One dataset would be the better design.** One object to manage, one place to query, no
+proliferation. Every row already carries `scan_id`, `run_id`, `scan_date`, `hostname` and
+`tenant_id`, so a single dataset would give you everything you need by filtering — nothing
+about the *data* requires splitting it.
 
-**This is not organisational tidiness — it works around a server-side race.** XDR's
-`lookups/add_data` stages each write through a per-write clone table. Concurrent writes to
-the *same* dataset collide, producing a transient `HTTP 500 ..._clone was not found`, and
-**rows are silently lost**.
+**We chose per-host datasets anyway, because the platform will not support the better
+design.** This is a deliberate trade-off forced by a limitation in `lookups/add_data`, and
+it is worth being precise about what goes wrong, because the failure is silent.
 
-Measured: with 8 endpoints writing to one shared dataset, roughly **2 of 8 batches landed**.
-Client-side time-spreading does not fix it — even 45 seconds of jitter across 8 writers
-still lost most of them, because the server holds the dataset through a slow merge.
+### What happens if you point a fleet at one dataset
 
-With per-host sharding there is exactly one writer per dataset, and delivery was verified at
-**8/8**.
+XDR stages every `add_data` write through a per-write clone table. Two endpoints writing the
+**same** dataset at the same time collide, the server returns a transient
+`HTTP 500 ..._clone was not found`, and **the rows are lost**. Not rejected — lost. The
+retry returns HTTP 200 and nothing anywhere reports a problem.
 
-Dashboards are unaffected: every widget matches `yara_scanner_matches*` / `yara_scanner_scans*`
-wildcards, so shards fan back in automatically.
+Measured on a live tenant with 8 endpoints writing one shared dataset: roughly **2 of 8
+batches landed**. Spreading the writes client-side does not fix it — 45 seconds of jitter
+across those 8 writers still lost most of them, because the server holds the dataset through
+a slow merge that no amount of client-side politeness can shorten.
 
-> Set `CONFIG_LOOKUP_SHARD = "none"` only if you have a single scanning endpoint. At fleet
-> scale it loses data.
+It also degrades as it grows. Merge time scales with the **size of the dataset**, not the
+size of the write (§3), so a single fleet-wide dataset becomes the largest and slowest
+object you have, widening the very window in which collisions happen. The failure mode
+compounds.
+
+With one writer per dataset the collision cannot occur by construction. Delivery was
+verified at **8/8**.
+
+### The cost we accept in exchange
+
+**Dataset count.** Per-host sharding combined with monthly rotation means a 500-endpoint
+fleet creates on the order of **1,000 datasets a month**. That is a real operational cost
+and the honest reason it is tolerated is that the alternative loses customer data.
+
+Two levers control it:
+
+- **Bucket instead of per-host.** `CONFIG_LOOKUP_SHARD` accepts a literal label, so you can
+  group hosts into a fixed set of shards — `wave1`, `emea`, `site-3` — rather than one per
+  endpoint. Ten buckets across 500 hosts is 10 datasets, not 500. Choose a bucket count high
+  enough that few endpoints in the same bucket scan concurrently; the risk returns as the
+  number of simultaneous writers per dataset rises above one.
+- **Delete old months.** `xdr_data_management.py` (§4) removes them on whatever retention
+  you choose.
+
+**What you do not lose is the query experience.** Dashboards match
+`yara_scanner_matches*` / `yara_scanner_scans*` wildcards, so shards fan back in
+automatically and a query spans the whole estate regardless of how many datasets sit behind
+it. Filtering by `scan_id`, `scan_date` or `hostname` works exactly as it would against a
+single dataset.
+
+> Set `CONFIG_LOOKUP_SHARD = "none"` only for a single scanning endpoint. At fleet scale it
+> is the configuration measured above at 2/8 delivery.
 
 ## 3. Monthly rotation — why the name carries a date
 

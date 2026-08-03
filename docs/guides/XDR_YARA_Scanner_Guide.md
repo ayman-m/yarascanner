@@ -325,17 +325,31 @@ yara_scanner_matches_v2_<host>_<YYYYMM>     yara_scanner_scans_v2_<host>_<YYYYMM
 ```
 
 Each host writes **its own pair of datasets** (`CONFIG_LOOKUP_SHARD = "endpoint"`), and a
-fresh pair begins **each month** (`CONFIG_LOOKUP_ROTATION = "monthly"`). Both defaults exist
-to keep writes reliable at fleet scale: one writer per dataset avoids a concurrency race in
-`lookups/add_data`, and monthly rotation keeps each dataset small enough that write time
-stays flat. `_v2` is the schema version.
+fresh pair begins **each month** (`CONFIG_LOOKUP_ROTATION = "monthly"`). `_v2` is the schema
+version.
 
-**Dashboards fan the shards back in with a wildcard** — `dataset = yara_scanner_matches*`
-spans every host, month and schema version at once.
+**This is a workaround, not a preference.** A single dataset for the whole estate would be
+the better design — every row already carries `scan_id`, `run_id`, `scan_date`, `hostname`
+and `tenant_id`, so filtering alone would give you everything. It is not used because
+`lookups/add_data` is not concurrency-safe: two endpoints writing the same dataset collide
+on a server-side clone-table race and the rows are **silently lost** (measured: ~2 of 8
+batches landed at 8-way concurrency; client-side jitter does not help). One writer per
+dataset makes the collision impossible — verified at 8/8. Monthly rotation exists for a
+second platform limit: `add_data` merge time scales with dataset size, so an unbounded
+dataset eventually stops accepting writes.
 
-> Change these defaults only for a single-endpoint deployment. At fleet scale, `shard=none`
-> loses rows and `rotation=none` eventually goes write-dead. See the
-> [Datasets and Maintenance](topics/Datasets_and_Maintenance.md) guide.
+The cost is dataset count: a 500-endpoint fleet produces on the order of 1,000 datasets a
+month. Control it by bucketing rather than per-host — `CONFIG_LOOKUP_SHARD` accepts a
+literal label (`wave1`, `emea`) so hosts group into a fixed number of shards — and by
+deleting old months with `xdr_data_management.py`.
+
+**Querying is unaffected either way.** Dashboards match `yara_scanner_matches*` wildcards,
+so shards fan back in automatically and filtering by `scan_id` or `scan_date` behaves
+exactly as it would against one dataset.
+
+> Set `CONFIG_LOOKUP_SHARD = "none"` only for a single scanning endpoint — at fleet scale
+> that is the configuration measured at 2/8 delivery. Full detail and the reasoning behind
+> both defaults: [Datasets and Maintenance](topics/Datasets_and_Maintenance.md).
 
 ## `yara_scanner_matches_v2_<host>_<YYYYMM>` — one row per matched string
 

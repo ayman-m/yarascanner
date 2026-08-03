@@ -6684,6 +6684,49 @@ def upload_final_comprehensive_report(scanner, total_scan_time):
         logging.error(f"Error uploading final comprehensive report: {e}")
 
 
+def _delivery_shortfall(scanner, config):
+    """Human summary of findings that did NOT reach XDR, or "" when all delivered.
+
+    Counts anything queued for a channel that we cannot show as landed. Deliberately
+    counts read-timeout batches ('rows_unconfirmed') as NOT delivered: the server may
+    have committed them, but 'may have' is not evidence, and over-reporting success is
+    the failure mode this exists to prevent. Local logs and the evidence ZIP always hold
+    the complete record either way, so the operator is told where to look.
+    """
+    parts = []
+    try:
+        if getattr(config, "create_alerts", False):
+            a = (scanner.results_uploader.get_upload_stats()
+                 if getattr(scanner, "results_uploader", None) else {}) or {}
+            queued = int(a.get("alerts_queued", 0) or 0)
+            lost = queued - int(a.get("successful_uploads", 0) or 0)
+            if lost > 0:
+                parts.append("alerts: %d of %d NOT delivered" % (lost, queued))
+    except Exception:
+        pass
+    try:
+        if getattr(config, "write_dataset", False):
+            d = dict(getattr(getattr(scanner, "lookup_uploader", None), "upload_stats", {}) or {})
+            queued = int(d.get("queued", 0) or 0)
+            landed = (int(d.get("records_added", 0) or 0)
+                      + int(d.get("records_updated", 0) or 0)
+                      + int(d.get("records_skipped", 0) or 0))
+            lost = queued - landed
+            if lost > 0:
+                detail = []
+                if d.get("rows_unconfirmed"):
+                    detail.append("%d unconfirmed" % int(d["rows_unconfirmed"]))
+                if d.get("undelivered"):
+                    detail.append("%d never sent" % int(d["undelivered"]))
+                parts.append("dataset rows: %d of %d NOT confirmed%s"
+                             % (lost, queued, (" (%s)" % ", ".join(detail)) if detail else ""))
+    except Exception:
+        pass
+    if not parts:
+        return ""
+    return "; ".join(parts) + " — findings are complete in the local logs on this endpoint"
+
+
 def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, options=None,
         create_alerts=None, write_dataset=None, collect_files=None, cpu_guarantee=None,
         cpu_headroom_pct=None, cpu_budget_pct=None, cpu_floor_pct=None, workers=None,
@@ -7076,6 +7119,17 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
                 f"{error_logger.failed_rules_count} rules failed compilation | "
                 f"{scanner.total_detections} matches found | "
                 f"cpu-slept {scanner.cpu_governor.slept_total:.0f}s | {config.posture}")
+
+        # A scan that found everything and delivered none of it must not read as a clean
+        # success. 'undelivered' only counts items never ATTEMPTED (drain budget expired);
+        # anything attempted and failed lands in send_failures/failed_uploads, so a total
+        # delivery outage (bad key, revoked permission, unreachable tenant) previously
+        # showed undelivered=0, outcome=completed and no error log at all — the operator's
+        # only clue was one line in the upload log. Report the shortfall where it is seen.
+        shortfall = _delivery_shortfall(scanner, config)
+        if shortfall:
+            summary += " | " + shortfall
+            log_manager.log_error("DELIVERY INCOMPLETE — " + shortfall)
         return summary
         
     except Exception as e:
@@ -7180,6 +7234,12 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
                                            if hasattr(scanner, "results_uploader") and scanner.results_uploader else {}),
                         "dataset_delivery": (dict(getattr(scanner.lookup_uploader, "upload_stats", {}))
                                              if hasattr(scanner, "lookup_uploader") and scanner.lookup_uploader else {}),
+                        # "" when everything queued reached XDR. Non-empty means findings
+                        # exist only in the local logs — the one field to check when asking
+                        # "did this scan's results actually land?". Local summary file only:
+                        # the lookup datasets have a fixed schema and silently skip rows
+                        # carrying unknown fields, so this must never be added to a row.
+                        "delivery_shortfall": _delivery_shortfall(scanner, config),
                         "top_rules": sorted(_det.items(), key=lambda rc: rc[1], reverse=True)[:10],
                     })
                 except Exception as _se:
