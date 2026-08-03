@@ -10,7 +10,17 @@ Features:
 - Comprehensive logging and statistics
 - Circuit breaker for upload resilience
 - System resource monitoring
+
+    VERSION : 2.0.0
+    RELEASED: 2026-08-03
+    SOURCE  : https://github.com/ayman-m/yarascanner
+    NOTES   : https://github.com/ayman-m/yarascanner/releases/tag/v2.0.0
+
+Report the version with any support request.
 """
+
+__version__ = "2.0.0"
+__release_date__ = "2026-08-03"
 
 # Standard library imports
 import base64

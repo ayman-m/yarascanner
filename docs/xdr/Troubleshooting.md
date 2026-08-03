@@ -36,9 +36,9 @@ usefulness:
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `0 files scanned`, with a skip-path warning in the log | The target sits under a platform skip-list (`/tmp`, `/proc`, `/private/tmp`, and similar) | Scan a path outside the exclusion. The warning names both the folder and the rule that caught it. |
-| Far fewer matches than expected | Rules were skipped, not run | Check `skipped_rules_count` in the summary. Rules importing an unavailable module are skipped, not fatal — see [Rule Compatibility](Rule_Compatibility.md). |
+| Far fewer matches than expected | Rules were skipped, not run | Check `skipped_rules_count` in the summary. Rules importing an unavailable module are skipped, not fatal — see [Rule Compatibility](topics/Rule_Compatibility.md). |
 | `Scan failed: N rules failed compilation` | YARA syntax errors | Inspect `failed_rules/` on the endpoint. Valid rules still ran. |
-| Rules work locally but not on the endpoint | Different libyara build | Expected. Compare `yara.YARA_VERSION`, not Python versions — see [Rule Compatibility](Rule_Compatibility.md). |
+| Rules work locally but not on the endpoint | Different libyara build | Expected. Compare `yara.YARA_VERSION`, not Python versions — see [Rule Compatibility](topics/Rule_Compatibility.md). |
 
 ## Running the script
 
@@ -54,14 +54,14 @@ usefulness:
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | Scan won't stop | — | Run the script's `cancel` entry point against the same endpoints. It stops within ~5 s and keeps the findings. |
-| A cancelled scan still shows as running on the dashboard | It was stopped with the **console** Cancel | Expected. That path kills the process, so no terminal row is ever written. See [Scan Cancellation](Scan_Cancellation.md). |
+| A cancelled scan still shows as running on the dashboard | It was stopped with the **console** Cancel | Expected. That path kills the process, so no terminal row is ever written. See [Scan Cancellation](topics/Scan_Cancellation.md). |
 | `scanner running: no` from the cancel command | No scan in progress on that endpoint | The scan already finished, or it was killed by the console Cancel. |
 
 ## Host impact
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Scan is very slow on a busy machine | Working as designed — the governor yielded to other load | Confirm with `floor_hits` in the summary. Raise `CONFIG_CPU_FLOOR_PCT` to guarantee more pace, or switch to `budget`. See [CPU Impact Control](CPU_Impact_Control.md). |
+| Scan is very slow on a busy machine | Working as designed — the governor yielded to other load | Confirm with `floor_hits` in the summary. Raise `CONFIG_CPU_FLOOR_PCT` to guarantee more pace, or switch to `budget`. See [CPU Impact Control](topics/CPU_Impact_Control.md). |
 | Scan uses less CPU than configured on Windows | The agent pins payloads to 2 cores | A hard platform ceiling of ~25% on an 8-core host, below anything you configure. |
 | Raising `CONFIG_WORKERS` made it slower | Scanning is disk-bound | Expected. 2 is the default because it measures fastest. |
 
@@ -69,7 +69,7 @@ usefulness:
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Too many datasets | Per-host sharding plus monthly rotation | Bucket hosts with a literal `CONFIG_LOOKUP_SHARD` label, and delete old months with `xdr_data_management.py`. See [Datasets and Maintenance](Datasets_and_Maintenance.md). |
+| Too many datasets | Per-host sharding plus monthly rotation | Bucket hosts with a literal `CONFIG_LOOKUP_SHARD` label, and delete old months with `xdr_data_management.py`. See [Datasets and Maintenance](topics/Datasets_and_Maintenance.md). |
 | Writes got slower over time | Merge time scales with dataset size | Confirm `CONFIG_LOOKUP_ROTATION = "monthly"`. |
 | Rows accepted but absent (`records_skipped=N`) | Row carries a field the dataset's schema doesn't have | Schemas are fixed at creation. A changed row shape needs a new schema version. |
 | `tenant_id` shows `unknown` | Non-standard API URL | Set `CONFIG_TENANT_ID`, or pass `tenant_id=<slug>` per run. |

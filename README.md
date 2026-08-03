@@ -1,6 +1,6 @@
 # YARA Scanner for Cortex XDR & XSIAM
 
-**Current version: v2.0.0** (2026-08-03) · [Release notes](CHANGELOG.md) · [Deployment guide](docs/guides/XDR_YARA_Scanner_Guide.md)
+**Current version: v2.0.0** (2026-08-03) · [Release notes](CHANGELOG.md) · [Deployment guide](docs/xdr/Deployment_Guide.md)
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#)
@@ -293,7 +293,7 @@ correlation rules over the ingested dataset.
 | `dashboards/Yara Scan Performance.json` | XSIAM | Scan operations: throughput, workers, cache, resources |
 
 Import via **Dashboards → Import**. Every widget's XQL is in `widgets/` (XSIAM) and
-`widgets/xdr_lookup/` (XDR) for customization. The XDR queries use wildcard dataset references, so
+`widgets/xdr/` (XDR) for customization. The XDR queries use wildcard dataset references, so
 they span all endpoint shards and months automatically.
 
 Example ad-hoc XQL against the XDR datasets:
@@ -346,11 +346,22 @@ endpoint map (`references/public-api-map.md`) — including why console-internal
 (multi-host scan matrix), `analyze.py` (results → report tables). The
 `.claude/skills/xdr-yara-scan-test` skill packages the same flow for assistant-driven testing.
 
-### Guides (`docs/guides/`)
+### Documentation
 
-- `XDR_YARA_Scanner_Guide.md` / `.docx` — deployment + operations, XDR edition
-- `XSIAM_YARA_Scanner_Guide.md` / `.docx` — deployment + operations, XSIAM edition
-- [`CHANGELOG.md`](CHANGELOG.md) — release notes: what changed in each version, and why
+**Cortex XDR**
+- [Deployment Guide](docs/xdr/Deployment_Guide.md) — install, configure, run
+- [Troubleshooting](docs/xdr/Troubleshooting.md) — symptom, cause, fix
+- Topic guides — [CPU Impact Control](docs/xdr/topics/CPU_Impact_Control.md) ·
+  [Scan Cancellation](docs/xdr/topics/Scan_Cancellation.md) ·
+  [Rule Compatibility](docs/xdr/topics/Rule_Compatibility.md) ·
+  [Datasets and Maintenance](docs/xdr/topics/Datasets_and_Maintenance.md)
+
+**Cortex XSIAM**
+- [Deployment Guide](docs/xsiam/Deployment_Guide.md) — collector, parsing rule, run
+- [Troubleshooting](docs/xsiam/Troubleshooting.md) — symptom, cause, fix
+
+**Both**
+- [CHANGELOG.md](CHANGELOG.md) — release notes: what changed in each version, and why
 
 ---
 
@@ -392,7 +403,7 @@ queue and batch sizes. All figures come from live tenant runs recorded in the pe
 
 ## 10. Troubleshooting
 
-Symptom, cause and fix: **[Troubleshooting](docs/guides/topics/Troubleshooting.md)**.
+Symptom, cause and fix: **[Troubleshooting](docs/xdr/Troubleshooting.md)**.
 
 Start with `scan_summary_<run_id>.json` on the endpoint — it carries the scanner version,
 the outcome, every delivery counter, and the CPU governor result in one file. Report
@@ -400,18 +411,34 @@ the outcome, every delivery counter, and the CPU governor result in one file. Re
 
 ## 11. Repository layout
 
+Everything is split by edition — **XDR** and **XSIAM** never share a folder.
+
 ```
-├── xdr_yara_scanner.py            # XDR edition (Action Center: main / cancel)
-├── xsiam_yara_scanner.py          # XSIAM edition (HTTP Collector)
-├── xdr_action_center.py           # API toolkit: run/cancel/verify/xql/prune
+├── xdr_yara_scanner.py            # XDR edition   (Action Center: main / cancel)
+├── xdr_data_management.py         # XDR: lookup-dataset retention
+├── xdr_action_center.py           # XDR: API toolkit — run / cancel / verify / xql
+├── xsiam_yara_scanner.py          # XSIAM edition (HTTP Log Collector)
 ├── encode_rules.py                # rules.yar -> base64 for the yarafile input
 ├── test_rules.yar                 # sample rules (stock-binary matches for smoke tests)
-├── dashboards/                    # 3 importable dashboards (XDR lookup + 2 XSIAM)
-├── widgets/                       # per-widget XQL (XSIAM) + xdr_lookup/ (XDR)
-├── playbooks/                     # Runner / Canceller + README
-├── docs/guides/                   # deployment guides + performance report (md + docx)
-└── tests/                         # rule generator, corpus seeder, scan matrix, analyzer
+├── CHANGELOG.md                   # release notes — what changed in each version, and why
+│
+├── docs/
+│   ├── xdr/                       # XDR: deployment guide, troubleshooting, presentation
+│   │   └── topics/                #      CPU, cancellation, rule compatibility, datasets
+│   ├── xsiam/                     # XSIAM: deployment guide, troubleshooting
+│   └── RELEASING.md               # internal: release process
+│
+├── dashboards/{xdr,xsiam}/        # importable dashboards, per edition
+├── widgets/{xdr,xsiam}/           # per-widget XQL, per edition
+├── playbooks/                     # Runner / Canceller — work on both editions
+├── images/                        # dashboard screenshots
+└── tests/                         # XDR: rule generator, corpus seeder, scan matrix, unit tests
 ```
+
+**Where things belong.** Product documentation describes the current release only.
+Anything historical — why a design changed, what a past version measured, defects and their
+fixes — lives in [CHANGELOG.md](CHANGELOG.md). Symptom/cause/fix material lives in each
+edition's Troubleshooting guide, not in its deployment guide.
 
 ---
 

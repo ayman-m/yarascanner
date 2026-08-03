@@ -6,12 +6,14 @@
 
 # 1. Overview
 
+> **Which edition is this?** This guide covers `xdr_yara_scanner.py` for **Cortex XDR**.
+> For Cortex XSIAM, see the [XSIAM Deployment Guide](../xsiam/Deployment_Guide.md).
+
 This guide explains how to deploy `xdr_yara_scanner.py` as a managed response script in
 **Cortex XDR Action Center** and land its results in XDR as **alerts** and **lookup
 datasets** for hunting, dashboards, and incident response.
 
-Unlike the XSIAM edition (which streams telemetry to a generic HTTP collector), the XDR
-edition uses the **Cortex XDR public API** directly:
+This edition uses the **Cortex XDR public API** directly:
 
 | Channel | XDR API | Result |
 |---------|---------|--------|
@@ -39,7 +41,7 @@ deeper where operators usually need it:
 | [Scan Cancellation](topics/Scan_Cancellation.md) | *"How do I stop a scan, and why does a cancelled one still show as running?"* |
 | [Rule Compatibility](topics/Rule_Compatibility.md) | *"Which YARA library does each agent ship, and why do my rules work locally but get skipped on the endpoint?"* |
 | [Datasets and Maintenance](topics/Datasets_and_Maintenance.md) | *"Why these dataset names, and how do I stop them growing forever?"* |
-| [Troubleshooting](topics/Troubleshooting.md) | *"It didn't work — where do I look?"* |
+| [Troubleshooting](Troubleshooting.md) | *"It didn't work — where do I look?"* |
 
 ---
 
@@ -402,7 +404,7 @@ Import `dashboards/Yara XDR Scanner (Lookup).json` (**Dashboards → Import**). 
 widgets** across detections (by OS / scan-folder / file-size / severity / matched-length), fleet
 coverage, rule health (valid/failed/skipped), throughput & throttle, single-value KPI tiles, and
 alert-channel trends. Widgets build on the sharded lookup datasets via the `*` wildcard (plus the
-reliable `alerts` dataset); individual queries are in `widgets/xdr_lookup/*.xql`, each validated
+reliable `alerts` dataset); individual queries are in `widgets/xdr/*.xql`, each validated
 live against the tenant.
 
 Lookup rows carry no `_time`, so time-filtering uses `event_timestamp_ms`. The `*` wildcard
@@ -442,7 +444,7 @@ dataset = yara_scanner_scans* | filter status = "cancelled"
 # 13. Troubleshooting
 
 Symptom, cause and fix for delivery failures, empty scans, rejected parameters,
-cancellation and dataset problems: **[Troubleshooting](topics/Troubleshooting.md)**.
+cancellation and dataset problems: **[Troubleshooting](Troubleshooting.md)**.
 
 Start with `scan_summary_<run_id>.json` on the endpoint — it carries the scanner version,
 the outcome, every delivery counter, and the CPU governor result in one file.

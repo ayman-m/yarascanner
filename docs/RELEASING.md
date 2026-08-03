@@ -43,9 +43,11 @@ Only tag and publish after an explicit yes.
    This is the **only** place history lives. Measurements about a design we replaced, bugs we
    found, how we tested — all of it here, none of it in the guides.
 
-4. **Re-stamp the guides.** Every doc in `docs/guides/` carries the version it describes:
-   - `XDR_YARA_Scanner_Guide.md` — the `% Version` header line
-   - `docs/guides/topics/*.md` — the *"Applies to scanner **vX.Y.Z**"* line
+4. **Re-stamp the guides.** Every doc under `docs/` carries the version it describes:
+   - `docs/xdr/Deployment_Guide.md` and `docs/xsiam/Deployment_Guide.md` — the `% Version` header
+   - `docs/xdr/Troubleshooting.md`, `docs/xsiam/Troubleshooting.md`, `docs/xdr/topics/*.md` —
+     the *"Applies to scanner **vX.Y.Z**"* line
+   - `docs/xdr/presentation.html` — the version chip on the cover slide
 
    Then re-read them against the diff. Guides describe the **current** version only: no "this
    used to work differently", no bug narratives, no test evidence except what proves a claim

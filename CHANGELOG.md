@@ -3,7 +3,7 @@
 Every released version of `xdr_yara_scanner.py` and its companion scripts. Each entry
 records what changed and **why**, so you can decide whether a release is worth taking.
 
-The guides in `docs/guides/` describe the **current** version only. Anything about how a
+The guides in `docs/xdr/` and `docs/xsiam/` describe the **current** version only. Anything about how a
 behaviour used to work, or the testing behind a change, lives here.
 
 **Which version am I running?** Read `scanner_version` in `scan_summary_<run_id>.json`, or

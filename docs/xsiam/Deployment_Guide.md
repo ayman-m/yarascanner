@@ -1,6 +1,6 @@
 % YARA Scanner for Cortex XSIAM — Deployment Guide
 % Cortex XSIAM edition (`xsiam_yara_scanner.py`)
-% Version 2.0 · 2026-07-10
+% Version 2.0.0 · Released 2026-08-03
 
 ---
 
@@ -30,7 +30,7 @@ prebuilt dashboards.
 > **XDR vs. XSIAM:** this repository ships two editions. `xsiam_yara_scanner.py` (this
 > guide) streams full telemetry to a **generic HTTP Log Collector / webhook**.
 > `xdr_yara_scanner.py` uses the Cortex XDR **Insert Parsed Alerts API** plus **lookup
-> datasets** and is covered by the companion *XDR edition* guide.
+> datasets**, and is covered by the [XDR Deployment Guide](../xdr/Deployment_Guide.md).
 
 ---
 
@@ -85,25 +85,14 @@ This is the **light** variant, tuned for live production hosts:
 | Performance / resource / FD monitors | **Off** by default — opt in with the `YARA_ENABLE_*` env vars |
 | Process priority | **Lowered** at startup (Below-Normal / nice) |
 
-> ### The two editions have diverged on CPU control
+> ### CPU throttling in this edition
 >
-> As of August 2026 the **XDR edition** uses a *CPU governor* that bounds the scanner's own
-> share of the host (`CONFIG_CPU_GUARANTEE` = `headroom` / `budget` / `none`). The **XSIAM
-> edition documented here still uses the original fixed-sleep throttle** and is unchanged.
+> The XSIAM edition applies a **bounded sleep** when system CPU is above its high or
+> critical threshold, so a scan slows down on a busy host rather than stopping. Thresholds
+> and the maximum pause are configurable at the top of the script.
 >
-> **This is not an oversight, and XSIAM is not carrying the bug that prompted the redesign.**
-> The XDR rewrite was driven by a *park-until-CPU-drops* loop that could stall a scan for as
-> long as external load persisted (measured: 285 s parked in a 347 s scan, up to 65.9×).
-> XSIAM's throttle never had that structure — it applies a **bounded** sleep when system CPU
-> is above the high or critical threshold, so it slows down but cannot stall.
->
-> XSIAM does share the underlying design point: it reacts to **system-wide** CPU, including
-> load it did not cause. Since the sleep is bounded, the consequence is mild — the scan runs
-> slower on a busy host rather than halting on one.
->
-> Porting the governor to XSIAM is deliberately deferred until the XDR design has more
-> production mileage. See §10 of the XDR Scanner Guide for the governor, and
-> `docs/superpowers/specs/2026-08-02-cpu-impact-governor-design.md` for the rationale.
+> Because it reacts to **system-wide** CPU, it also yields to load it did not itself cause.
+> The sleep is bounded, so the effect is a slower scan, never a stalled one.
 
 **Use the light profile** when scanning live production servers, user workstations
 during business hours, or any environment where the host must stay responsive.
@@ -292,9 +281,10 @@ curl -sS -X POST \
 
 The response includes `action_id`; poll `/public_api/v1/actions/get_action_status/`.
 
-> If your tenant issues **Advanced** API keys, this call requires HMAC signing
-> (`x-xdr-nonce` + `x-xdr-timestamp` + `Authorization = sha256(key+nonce+timestamp)`) —
-> see the XDR edition guide's authentication section.
+> If your tenant issues **Advanced** API keys, this call requires HMAC signing. Send
+> `x-xdr-nonce` (a random string), `x-xdr-timestamp` (epoch milliseconds) and
+> `Authorization = sha256(api_key + nonce + timestamp)`, plus `x-xdr-auth-id` with your key
+> id. **Standard** keys instead send the key directly as `Authorization`.
 
 ## 10.4 What the script does on the endpoint
 
@@ -422,17 +412,7 @@ Center execution form or pre-set on the endpoint:
 
 # 15. Troubleshooting
 
-| Symptom | Likely cause | Fix |
-|---------|--------------|-----|
-| `yara_scans_raw` returns nothing | Token/endpoint wrong, or DNS/TLS blocked | Re-verify Step 3. From the endpoint, `curl <api-url>` should resolve. |
-| Rows arrive but `rule_id`/`file_name` are null | Parsing rule not saved/disabled, or `target_dataset` typo | Confirm Step 2 — the `[INGEST: …]` header. |
-| `Default YARA_RULE is empty` | First arg was empty | Always pass a base64 string in `yarafile`, or pre-populate the `YARA_RULE` constant. |
-| `Base64 decode failed` | Pasted plain `.yar` text | Re-run the base64 step; strip trailing newlines. |
-| `Scan failed: N rules failed compilation` | Bad YARA syntax in some rules | Check the `failed_rules/` directory on the endpoint; valid rules still ran. |
-| Dashboards show zero on Windows | Agent has no embedded Python | Ensure the Cortex Agent Python add-on is present, or install `yara-python psutil requests`. |
-| `WARNING: N upload operations failed` | Transient network / 5xx on the collector | The script retried; check collector status and re-run if the count is high. |
-| Scan stuck > 6 h | Action Center timeout | Raise the script timeout (Step 4); the engine has no internal time cap. |
-| macOS: many "Permission denied" | Not root / no Full Disk Access | Re-run elevated, or grant the Cortex Agent Full Disk Access in System Settings → Privacy. |
+Symptom, cause and fix: **[Troubleshooting](Troubleshooting.md)**.
 
 ---
 
