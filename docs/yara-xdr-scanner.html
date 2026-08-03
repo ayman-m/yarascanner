@@ -331,28 +331,6 @@ svg .flow{stroke:var(--acc);stroke-width:2.5;fill:none;stroke-linecap:round;stro
 .npart.acc{border-color:var(--acc)} .npart.acc .nv{color:var(--acc)}
 .npart.a2{border-color:var(--acc2)} .npart.a2 .nv{color:var(--acc2)}
 
-/* ================= RACE : two runs, same work, different policy ================= */
-.race{display:flex;flex-direction:column;gap:16px}
-.rlane{display:flex;align-items:center;gap:16px}
-.rlab{width:196px;flex:none;font-family:var(--label);font-size:13.5px;font-weight:600;color:var(--ink)}
-.rlab span{display:block;font-weight:450;font-size:12px;color:var(--ink-2);margin-top:3px}
-.rtrack{flex:1;position:relative;height:42px;border-radius:10px;overflow:hidden;
-  border:1px solid var(--panel-line);background:var(--panel)}
-.rfill{position:absolute;left:0;top:0;bottom:0;width:0}
-.rnum{width:104px;flex:none;text-align:right;font-family:var(--mono);font-size:15px;color:var(--ink)}
-/* the old policy parks whenever someone else is busy, so progress comes in bursts and the
-   run does not finish inside the window; the governor is slower but never stops */
-.slide.active .rfill.old{background:var(--crit);animation:raceOld 8s var(--ease) infinite}
-.slide.active .rfill.new{background:var(--acc);animation:raceNew 8s linear infinite}
-@keyframes raceOld{
-  0%{width:0} 5%{width:11%} 30%{width:11%}
-  35%{width:22%} 58%{width:22%}
-  63%{width:31%} 88%{width:31%}
-  100%{width:38%}}
-@keyframes raceNew{0%{width:0} 100%{width:100%}}
-.rpark{position:absolute;inset:0;pointer-events:none;
-  background:repeating-linear-gradient(135deg,transparent 0 8px,color-mix(in srgb,var(--crit) 22%,transparent) 8px 16px)}
-
 /* ================= GAUGE : CPU governor ================= */
 .gauge{position:relative;width:100%;height:210px;border-radius:13px;overflow:hidden;
   border:1px solid var(--panel-line);background:var(--panel)}
@@ -760,8 +738,9 @@ svg .flow{stroke:var(--acc);stroke-width:2.5;fill:none;stroke-linecap:round;stro
       <p class="dek" style="margin-top:22px;max-width:80ch"><b>xdr_yara_scanner.py</b> — a multi-threaded YARA scanner that runs as a managed Cortex XDR response script and lands its findings as alerts and lookup datasets, with a CPU governor, cooperative cancellation and per-endpoint sharding.</p>
     </div>
     <div style="display:flex;gap:12px;margin-top:34px" data-fx>
-      <span class="chip koi">Action Center script</span><span class="chip">Insert Parsed Alerts</span>
-      <span class="chip">Lookup datasets</span><span class="chip">Windows · Linux · macOS</span>
+      <span class="chip koi">v2.0.0</span><span class="chip">Action Center script</span>
+      <span class="chip">Insert Parsed Alerts</span><span class="chip">Lookup datasets</span>
+      <span class="chip">Windows · Linux · macOS</span>
     </div>
   </div>
 </section>
@@ -1157,66 +1136,34 @@ svg .flow{stroke:var(--acc);stroke-width:2.5;fill:none;stroke-linecap:round;stro
 </section>
 
 <!-- WHY NOT PAUSE -->
-<section class="slide" data-t="Why not pause" data-sec="Workflows" data-tags="overview deep"
-  data-note="This slide exists because someone will ask why the behaviour changed, and because anyone who used an earlier build remembers scans that never finished. Earlier builds offered throttle_mode with three settings. script watched SYSTEM-WIDE cpu and paused the scan whenever it crossed a threshold. os simply dropped the process to the operating system's idle priority tier. Both are gone, for four measured reasons. First and worst: the old design reacted to load it did not cause. System-wide CPU includes every other process, so on a busy host the scan paused itself for someone else's work and kept pausing for as long as that work continued — 285 seconds of a 347 second scan spent parked, and up to 65.9 times slower than running unthrottled. That is what operators experienced as a scan that never finished. Second: it bought almost nothing — across 2, 4 and 8 cores under saturating load every mode preserved the competing workload to within minus 3 to plus 1 percent of not throttling at all. The slowdown was real, the protection was not. Third: os mode starved outright, because the idle tier only gets CPU when nothing else wants it — 252 seconds against 77 for the same work on 8 cores. Fourth, and the one a change-approval board cares about: pause when system CPU exceeds 80 percent tells you nothing about how much CPU the scan will actually use, so there was no number to commit to and nothing to verify afterwards. Be honest about what the new design does and does not claim: it does not protect the host either. What it adds is a bound you can state before the scan, a guarantee the scan finishes, and evidence afterwards that the bound held. Close on the upgrade line — nobody has to change anything, the retired options are still accepted and translated.">
+<section class="slide" data-t="Upgrading" data-sec="Workflows" data-tags="overview deep"
+  data-note="Use this slide only if someone is coming from an earlier build; skip it for a new deployment. The message is that upgrading costs them nothing. Earlier builds exposed throttle_mode with script, os and off settings, plus separate high and critical CPU thresholds. None of those constants exist any more, but every one of the old option keys is still accepted and translated, so scheduled jobs and playbooks that pass them keep running untouched — throttle_mode=off becomes cpu_guarantee=none, and script or os becomes headroom. The numeric thresholds are accepted and ignored, because there is no longer a two-level high/critical model for them to map onto; the governor holds a single continuous target instead. If they ask WHY the design changed, that is in the release notes rather than this deck — it is a long answer with measurements behind it and it is not what this session is for. Point them at the release notes and move on. The other half of the slide is the practical one: nothing about datasets, alerts, rules or entry points changed, so the only thing they do is drop in the new file and re-upload.">
   <div class="head">
-    <h2>The governor slows down. <span class="a">The old modes stopped.</span></h2>
-    <p class="dek">Earlier builds watched <b>system-wide</b> CPU and paused whenever it crossed a threshold — so a scan parked itself for work it was not causing, and kept parking for as long as that work continued. That is the difference between a slow scan and one that never finishes.</p>
+    <h2>Upgrading is <span class="a">a drop-in.</span></h2>
+    <p class="dek">Earlier builds exposed <b>throttle_mode</b> and a two-level high/critical CPU threshold. Those constants are gone, replaced by the governor in the previous slides — but every retired option key is still accepted and translated, so nothing you have scheduled needs editing.</p>
   </div>
   <div class="body" style="gap:18px">
-    <div class="card" data-fx style="flex:none;padding:22px 26px 24px">
-      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:18px">
-        <h3 style="margin:0">Same work, same busy host, two policies</h3>
-        <span class="stat-l" style="margin:0">measured — 347 s of scanning to do</span></div>
-      <div class="race">
-        <div class="rlane">
-          <div class="rlab">Old &mdash; <span class="mono">throttle_mode=script</span><span>pauses on system CPU</span></div>
-          <div class="rtrack"><div class="rfill old"></div><div class="rpark"></div></div>
-          <div class="rnum" style="color:var(--crit)">285 s parked</div></div>
-        <div class="rlane">
-          <div class="rlab">New &mdash; <span class="mono">cpu_guarantee</span><span>bounds its own share</span></div>
-          <div class="rtrack"><div class="rfill new"></div></div>
-          <div class="rnum" style="color:var(--acc)">finishes</div></div>
-      </div>
-    </div>
-    <div class="grid" style="grid-template-columns:repeat(4,1fr);gap:16px;flex:none">
-      <div class="tile" data-fx style="border-color:var(--crit)">
-        <div class="stat crit" style="font-size:34px">65.9&times;</div>
-        <div class="stat-l">slower than unthrottled</div>
-        <div class="fmeta">it reacted to load it did not cause</div></div>
-      <div class="tile" data-fx>
-        <div class="stat warn" style="font-size:34px">&minus;3% &rarr; +1%</div>
-        <div class="stat-l">effect on the competing workload</div>
-        <div class="fmeta">the slowdown was real; the protection was not</div></div>
-      <div class="tile" data-fx>
-        <div class="stat" style="font-size:34px">252 s</div>
-        <div class="stat-l"><span class="mono">os</span> mode vs 77 s on 8 cores</div>
-        <div class="fmeta">the idle tier only runs when nothing else wants CPU</div></div>
-      <div class="tile" data-fx>
-        <div class="stat word" style="font-size:26px">unstateable</div>
-        <div class="stat-l">no number for a change request</div>
-        <div class="fmeta">"pause above 80%" says nothing about your share</div></div>
-    </div>
     <div class="grid" style="grid-template-columns:1.35fr 1fr;gap:20px;flex:1;min-height:0">
       <div data-fx="left" style="display:flex;flex-direction:column;min-height:0">
         <table class="mx">
-          <tr><th></th><th>Old &mdash; script / os</th><th>New &mdash; CPU governor</th></tr>
-          <tr><td>Watches</td><td class="mono">total system CPU</td><td class="mono">the scan's own share</td></tr>
-          <tr><td>Response</td><td class="mono">stop, then resume</td><td class="mono">slow down proportionally</td></tr>
-          <tr><td>On a busy host</td><td><span class="no">can park indefinitely</span></td><td><span class="yes">floors and keeps going</span></td></tr>
-          <tr><td>State the impact?</td><td><span class="no">no</span></td><td><span class="yes">a % of the host</span></td></tr>
-          <tr><td>Verify afterwards?</td><td><span class="no">no</span></td><td><span class="yes">yes, from telemetry</span></td></tr>
+          <tr><th>Retired option</th><th>Translated to</th></tr>
+          <tr><td class="mono">throttle_mode=off</td><td class="mono">cpu_guarantee=none</td></tr>
+          <tr><td class="mono">throttle_mode=script</td><td class="mono">cpu_guarantee=headroom</td></tr>
+          <tr><td class="mono">throttle_mode=os</td><td class="mono">cpu_guarantee=headroom</td></tr>
+          <tr><td class="mono">cpu_high_threshold</td><td><span class="no">accepted, ignored</span></td></tr>
+          <tr><td class="mono">cpu_critical_threshold</td><td><span class="no">accepted, ignored</span></td></tr>
+          <tr><td class="mono">max_pause_secs</td><td><span class="no">accepted, ignored</span></td></tr>
         </table>
       </div>
       <div class="grid" style="grid-template-rows:1fr 1fr;gap:16px;min-height:0">
         <div class="tile" data-fx style="border-color:var(--acc)">
           <div class="stat koi word" style="font-size:21px">nothing to change</div>
           <div class="stat-l">on upgrade</div>
-          <div class="fmeta"><span class="mono">throttle_mode=off</span> &rarr; <span class="mono">cpu_guarantee=none</span>; <span class="mono">script</span> or <span class="mono">os</span> &rarr; <span class="mono">headroom</span>. Existing jobs and playbooks keep running.</div></div>
+          <div class="fmeta">Datasets, alerts, rules and entry points are unchanged. Edit the credentials and the <span class="mono">CUSTOMER CONFIG</span> block, re-upload, done.</div></div>
         <div class="tile" data-fx>
-          <div class="stat word" style="font-size:21px">the honest summary</div>
-          <div class="stat-l">what actually improved</div>
-          <div class="fmeta">The new design does not claim to protect the host either. It adds a bound you can state, a scan that finishes, and evidence the bound held.</div></div>
+          <div class="stat word" style="font-size:21px">why it changed</div>
+          <div class="stat-l">release notes</div>
+          <div class="fmeta">The reasoning and the measurements behind every change live in the repository's release notes, versioned alongside the script.</div></div>
       </div>
     </div>
   </div>
