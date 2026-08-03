@@ -58,9 +58,40 @@ compiling locally and being skipped on the endpoint.
 > considerably newer interpreters. Do not use the documented version to reason about rule
 > compatibility.
 
-## 4. Windows and Linux agents differ
+## 4. Which YARA library each agent ships
 
-The two platforms carry different libyara versions, so the **same rule pack can behave
+The agent version does **not** tell you which YARA library you get. The **platform** does.
+
+Measured directly on four endpoints by running an introspection snippet through Action
+Center, so these are the runtimes as reported by the agents themselves:
+
+| Agent version | OS | Embedded Python | yara-python / libyara |
+|---|---|---|---|
+| 9.1.0.20483 | Windows Server 2019 | 3.12.4 | **4.1.0** |
+| 9.2.0.90 | Windows Server 2022 | 3.12.4 | **4.1.0** |
+| 9.3.0.209 | Windows Server 2022 | 3.12.4 | **4.1.0** |
+| 9.2.0.134 | Ubuntu 22.04 | 3.13.1 | **3.11.0** |
+
+Three Windows agents spanning **9.1 → 9.2 → 9.3** report the byte-identical Python build
+string and the same libyara 4.1.0. **"Newer agent means newer YARA" is false** across that
+range.
+
+Two things follow that are easy to get backwards:
+
+- **Do not plan a rule pack around an agent-version upgrade.** Upgrading 9.1 → 9.3 on
+  Windows changed neither the Python nor the libyara version. If a rule is rejected today,
+  the same rule is rejected after the upgrade.
+- **Python version and YARA version are independent.** Linux ships a *newer* Python (3.13.1)
+  with a much *older* libyara (3.11.0) than Windows. Never infer one from the other.
+
+> **Scope of these measurements.** Three Windows samples, one Linux sample, all on one
+> tenant. **macOS was never probed** and is a third runtime variant with unknown versions.
+> Treat the table as strong evidence that version-based reasoning fails, not as a
+> guaranteed matrix for every build in your estate. §8 shows how to check your own.
+
+## 5. Windows and Linux agents differ
+
+Because the two platforms carry different libyara versions, the **same rule pack can behave
 differently across your fleet**:
 
 | Rule feature | Windows agent | Linux agent |
@@ -76,7 +107,7 @@ differently across your fleet**:
 maintain separate packs per platform. A pack using `base64` modifiers will fail to compile
 on Linux agents.
 
-## 5. What the scanner does with incompatible rules
+## 6. What the scanner does with incompatible rules
 
 Rules that need an unavailable module are **skipped, not fatal**. The scan proceeds with
 everything else.
@@ -93,7 +124,7 @@ Skipped rules are visible in three places:
 > **If a rule pack appears to shrink silently, `skipped_rules_count` is where to look.** It
 > tells you exactly how many rules were dropped and which module caused each.
 
-## 6. Practical guidance
+## 7. Practical guidance
 
 - **Restrict packs intended for XDR agents** to `pe`, `elf`, `math`, `hash` and `time`.
 - **Test a new pack on a small folder first** and read `skipped_rules_count` and `top_rules`
@@ -104,14 +135,16 @@ Skipped rules are visible in three places:
 - **Do not use "it works with my local Python" as evidence** of agent compatibility. Compare
   `yara.YARA_VERSION` instead.
 
-## 7. Checking what an endpoint actually supports
+## 8. Checking what an endpoint actually supports
 
 The authoritative answer comes from the endpoint itself. Run this as an Action Center
 snippet to enumerate the modules its libyara accepts:
 
 ```python
-import yara
-print("yara-python", yara.__version__, "| libyara", yara.YARA_VERSION)
+import platform, sys, yara
+print("host     ", platform.node(), "|", platform.platform())
+print("python   ", sys.version.split()[0], "| frozen:", getattr(sys, "frozen", False))
+print("libyara  ", yara.YARA_VERSION, "| yara-python", yara.__version__)
 for m in ("pe","elf","math","hash","cuckoo","magic","dotnet","time",
           "console","string","macho","dex","lnk"):
     try:
@@ -121,5 +154,10 @@ for m in ("pe","elf","math","hash","cuckoo","magic","dotnet","time",
         print("  %-8s FAIL  %s" % (m, e))
 ```
 
-This is worth running once per agent version in your estate, since the answer is a property
-of the agent build rather than of anything you control.
+`frozen: True` confirms you are looking at the agent's embedded interpreter and not a
+Python installed on the host.
+
+**Run it once per platform, not once per agent version** — §4 shows the platform is what
+changes the answer. One Windows endpoint and one Linux endpoint will normally characterise
+your whole estate. Re-check after a major agent release rather than after every minor one,
+and check macOS separately if you scan Macs.

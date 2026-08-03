@@ -36,7 +36,7 @@ deeper where operators usually need it:
 |---|---|
 | [CPU Impact Control](topics/CPU_Impact_Control.md) | *"Will this scan slow my machine, and how do you know?"* |
 | [Scan Cancellation](topics/Scan_Cancellation.md) | *"How do I stop a scan, and why does a cancelled one still show as running?"* |
-| [Rule Compatibility](topics/Rule_Compatibility.md) | *"Why do my rules work locally but get skipped on the endpoint?"* |
+| [Rule Compatibility](topics/Rule_Compatibility.md) | *"Which YARA library does each agent ship, and why do my rules work locally but get skipped on the endpoint?"* |
 | [Datasets and Maintenance](topics/Datasets_and_Maintenance.md) | *"Why these dataset names, and how do I stop them growing forever?"* |
 
 ---
@@ -107,7 +107,7 @@ the scanner probes `get_datasets` once with Advanced then Standard and caches th
 | XDR role | A user/API key with permission to run scripts and write lookup datasets |
 | API key | Standard or Advanced — the scanner auto-detects (§3) |
 | Cortex Agent | Installed and connected on each target endpoint |
-| Endpoint OS | Windows, Linux, or macOS (the agent ships an embedded Python 3.x with `yara`, `psutil`, `requests`) |
+| Endpoint OS | Windows, Linux, or macOS. The agent ships its **own** embedded Python with `yara`, `psutil` and `requests` — nothing to install on the endpoint. The YARA library version depends on the **platform**, not the agent version, and decides which rule features compile: see [Rule Compatibility](topics/Rule_Compatibility.md) |
 | Privileges | Run as **root / SYSTEM** for full coverage |
 | Disk space | ~200 MB on the endpoint for the working directory and evidence ZIP |
 | Network | Outbound HTTPS from the endpoint to your XDR API URL |
