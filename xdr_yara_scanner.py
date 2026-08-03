@@ -136,10 +136,6 @@ CONFIG_LOOKUP_ROTATION = "monthly"      # "monthly" (recommended) | "none"
 CONFIG_OPTIONS = ""                     # extra "key=value,key=value" overrides applied every run (rarely needed)
 # ============================================================================
 
-XDR_INSERT_PARSED_ALERTS_PATH = "/public_api/v1/alerts/insert_parsed_alerts"
-XDR_LOOKUPS_ADD_DATA_PATH = "/public_api/v1/xql/lookups/add_data"
-XDR_GET_DATASETS_PATH = "/public_api/v1/xql/get_datasets"
-XDR_ADD_DATASET_PATH = "/public_api/v1/xql/add_dataset"
 # XDR's lookups/add_data is NOT concurrency-safe server-side: it stages each write through a
 # per-write BigQuery "clone" table, and concurrent writes to the SAME lookup dataset race with
 # a transient HTTP 500 "...<dataset>_clone was not found". The server holds the dataset through
@@ -477,6 +473,18 @@ def _dataset_shard_suffix(raw_label: str) -> str:
         slug = "h_" + slug
     h = hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:6]
     return f"{slug}_{h}"
+
+
+# ============================================================================
+# INTERNAL — Cortex XDR public API paths. NOT customer-editable.
+# Kept beside the URL builders that consume them rather than up in the CUSTOMER
+# CONFIG region, so the only block an operator edits contains only settings they
+# are meant to change.
+# ============================================================================
+XDR_INSERT_PARSED_ALERTS_PATH = "/public_api/v1/alerts/insert_parsed_alerts"
+XDR_LOOKUPS_ADD_DATA_PATH = "/public_api/v1/xql/lookups/add_data"
+XDR_GET_DATASETS_PATH = "/public_api/v1/xql/get_datasets"
+XDR_ADD_DATASET_PATH = "/public_api/v1/xql/add_dataset"
 
 
 def _build_xdr_insert_alerts_url(api_url: str) -> str:
