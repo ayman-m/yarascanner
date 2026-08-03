@@ -1,6 +1,6 @@
 % YARA Scanner for Cortex XDR — Deployment Guide
 % Cortex XDR edition (`xdr_yara_scanner.py`, v2)
-% Version 2.0 · 2026-07-10
+% Version 2.0.0 · Released 2026-08-03
 
 ---
 
@@ -29,7 +29,8 @@ data is safe to consolidate across tenants.
 
 ## Topic guides
 
-This guide covers deployment and the capabilities as shipped. Four companion documents go
+This guide covers deployment and the capabilities of **v2.0.0** as shipped. What changed
+between versions, and why, is in the [release notes](../../CHANGELOG.md). Four companion documents go
 deeper where operators usually need it:
 
 | Guide | Answers |
@@ -38,6 +39,7 @@ deeper where operators usually need it:
 | [Scan Cancellation](topics/Scan_Cancellation.md) | *"How do I stop a scan, and why does a cancelled one still show as running?"* |
 | [Rule Compatibility](topics/Rule_Compatibility.md) | *"Which YARA library does each agent ship, and why do my rules work locally but get skipped on the endpoint?"* |
 | [Datasets and Maintenance](topics/Datasets_and_Maintenance.md) | *"Why these dataset names, and how do I stop them growing forever?"* |
+| [Troubleshooting](topics/Troubleshooting.md) | *"It didn't work — where do I look?"* |
 
 ---
 
@@ -439,15 +441,11 @@ dataset = yara_scanner_scans* | filter status = "cancelled"
 
 # 13. Troubleshooting
 
-| Symptom | Likely cause | Fix |
-|---------|--------------|-----|
-| No alerts and no dataset rows | Standard-only auth against an **Advanced** key (HTTP 401) | Ensure v2; leave `XDR_AUTH_TYPE=auto` (or force `advanced`). Verify creds in Step 1. |
-| `Dataset not found` on `add_data` | Dataset not created yet | The scanner creates both datasets on start; check the upload log for the create call and API permissions. |
-| `parameters_values contain invalid/missing parameters` | Library script inputs don't match the entry point | With Entry Point `main`, pass only the 3 inputs in §7 (`yarafile, scan_folder, alert_severity`); with Entry Point `cancel`, pass none. |
-| Playbook can't find the script | `script_name` mismatch | Set the playbook's `script_name` input to the exact library script name. |
-| `Scan failed: N rules failed compilation` | Bad YARA syntax | Inspect `failed_rules/` on the endpoint; valid rules still ran. |
-| Scan won't stop | — | Run `mode=cancel` (or the Canceller playbook) on the same targets; watch for the terminal `cancelled` row. |
-| `tenant_id` shows `unknown` | Non-standard API URL | Pass `tenant_id=<slug>` in `options`. |
+Symptom, cause and fix for delivery failures, empty scans, rejected parameters,
+cancellation and dataset problems: **[Troubleshooting](topics/Troubleshooting.md)**.
+
+Start with `scan_summary_<run_id>.json` on the endpoint — it carries the scanner version,
+the outcome, every delivery counter, and the CPU governor result in one file.
 
 ---
 

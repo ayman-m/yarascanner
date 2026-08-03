@@ -3,13 +3,31 @@ YARA Scanner (XDR API Edition)
 ==================================
 Enterprise-grade file scanner with real-time threat detection and Cortex XDR API reporting.
 
-Features:
-- Multi-threaded scanning with configurable workers
-- Real-time Cortex XDR API alert insertion
-- Scan caching for enhanced performance (Roadmap)
-- Comprehensive logging and statistics
-- System resource monitoring
+    VERSION : 2.0.0
+    RELEASED: 2026-08-03
+    SOURCE  : https://github.com/ayman-m/yarascanner
+    NOTES   : https://github.com/ayman-m/yarascanner/releases/tag/v2.0.0
+
+Capabilities in this version:
+- Multi-threaded YARA scanning of one or more paths, with per-run rule delivery
+- Cortex XDR alerts via Insert Parsed Alerts, one per finding, with a storm cap
+- Lookup datasets for matches and scan lifecycle, per endpoint, monthly-rotated
+- CPU governor bounding the scan's own share of the host (headroom / budget / none)
+- Cooperative scan cancellation that preserves findings
+- Evidence ZIP, local forensic logs, and a machine-readable per-scan summary
+- Advanced (HMAC) and Standard API authentication, auto-detected
+
+To confirm which build an endpoint is running, read "scanner_version" in
+scan_summary_<run_id>.json, or the VERSION line at the top of
+yara_processing_<run_id>.log. Both come from __version__ below, so a shared copy of
+this file always identifies itself.
+
+Report the version with any support request: behaviour differs between releases and
+the release notes above record what changed.
 """
+
+__version__ = "2.0.0"
+__release_date__ = "2026-08-03"
 
 # Standard library imports
 import base64
@@ -2828,6 +2846,8 @@ class ScanConfig:
         self.error_logger.error_logger.info("XDR API ID: Using default embedded credential")
         self.error_logger.error_logger.info(f"XDR API URL: {XDR_API_URL}")
         self.error_logger.error_logger.info(f"Tenant ID: {self.tenant_id}")
+        self.error_logger.error_logger.info(
+            f"YARA Scanner VERSION {__version__} (released {__release_date__})")
         self.error_logger.error_logger.info(f"Runtime posture: {self.posture}")
         self.error_logger.error_logger.info(f"Default XDR alert severity: {self.alert_severity}")
         self.error_logger.error_logger.info(
@@ -7229,6 +7249,7 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
                         if getattr(scanner, "cpu_governor", None) else None,
                         "compile_source": getattr(scanner, "_compile_source", None),
                         "compile_seconds": round(getattr(scanner, "_compile_seconds", 0) or 0, 2),
+                        "scanner_version": __version__,
                         "cancel_source": getattr(scanner, "cancel_source", None),
                         "alert_delivery": (scanner.results_uploader.get_upload_stats()
                                            if hasattr(scanner, "results_uploader") and scanner.results_uploader else {}),

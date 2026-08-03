@@ -1,5 +1,7 @@
 # Scan Cancellation — technical detail
 
+*Applies to scanner **v2.0.0**. History of changes: [release notes](../../../CHANGELOG.md).*
+
 Companion to the XDR YARA Scanner Guide. Read this if you need to stop scans at scale, or
 to understand why a cancelled scan can still appear to be running.
 
@@ -24,27 +26,24 @@ the wrong one loses data.
 **Use the console Cancel** when you just need it dead immediately and do not care about
 what it had found so far.
 
-## 2. Console Cancel hard-kills the payload
+## 2. What the console Cancel actually does
 
-Measured on agent 9.2.0.90, one Cancel against a three-endpoint scan. One endpoint had
-already finished; two were mid-scan.
+It **terminates the payload process**. Not a request to stop — the process is killed where
+it stands.
 
-| | mid-scan #1 | mid-scan #2 | already finished |
-|---|---|---|---|
-| action status | `ABORTED` | `ABORTED` | `COMPLETED_SUCCESSFULLY` |
-| payload process | **killed** | **killed** | exited normally |
-| `"cancelled by operator"` in log | no | no | n/a |
-| cleanup / finalisation | **none** | **none** | full |
-| `scan_summary_*.json` | **not written** | **not written** | written |
-| last log line | mid-walk, no cleanup | mid-walk, no cleanup | normal completion |
+Consequences, all of them immediate:
 
-Uploads were succeeding right up to termination (`Lookup batch ok (170 rows)`), so the
-process was healthy and killed mid-flight — not failing.
+- No cleanup or finalisation runs.
+- No `scan_summary_<run_id>.json` is written.
+- Anything queued for delivery is discarded.
+- The action's status becomes `ABORTED`.
 
-> Cortex documentation states that once an action is *In Progress* it *"cannot be canceled
-> from the management console."* **That statement is about agent upgrades and does not
-> apply to script executions.** For scripts, the console Cancel does stop them — by killing
-> the process.
+An endpoint that had already finished before you clicked Cancel is unaffected and stays
+`COMPLETED_SUCCESSFULLY`.
+
+> Cortex documentation states that an action already *In Progress* *"cannot be canceled from
+> the management console."* **That statement is about agent upgrades, not script
+> executions.** For scripts the console Cancel does stop them — by killing the process.
 
 ## 3. The consequence: orphaned lifecycle rows
 

@@ -1,5 +1,7 @@
 # Datasets and Maintenance — technical detail
 
+*Applies to scanner **v2.0.0**. History of changes: [release notes](../../../CHANGELOG.md).*
+
 Companion to the XDR YARA Scanner Guide. Read this to understand why the dataset names look
 the way they do, and how to stop them growing forever.
 

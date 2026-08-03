@@ -1,5 +1,7 @@
 # YARA Rule Compatibility — technical detail
 
+*Applies to scanner **v2.0.0**. History of changes: [release notes](../../../CHANGELOG.md).*
+
 Companion to the XDR YARA Scanner Guide. Read this if rules that compile on your
 workstation are skipped or rejected when the scan runs on an endpoint.
 

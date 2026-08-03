@@ -1,5 +1,7 @@
 # YARA Scanner for Cortex XDR & XSIAM
 
+**Current version: v2.0.0** (2026-08-03) · [Release notes](CHANGELOG.md) · [Deployment guide](docs/guides/XDR_YARA_Scanner_Guide.md)
+
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
@@ -390,21 +392,11 @@ queue and batch sizes. All figures come from live tenant runs recorded in the pe
 
 ## 10. Troubleshooting
 
-| Symptom | Meaning / fix |
-|---|---|
-| Result says `SCAN ABORTED — … credentials are not set` | Delivery is enabled but the script still has placeholder creds — edit the `DEFAULT_*` values and re-upload |
-| `alert_delivery.undelivered > 0` | Alert budget saturated (fleet too concurrent, or a match storm) — see §4.3 |
-| `dataset_delivery.undelivered > 0` | Dataset write budget exhausted by a match storm — tune the offending rule (`top_rules` in the summary) |
-| `records_skipped > 0` in dataset delivery | Row shape doesn't match the dataset's schema — bump `LOOKUP_SCHEMA_VERSION` so a fresh dataset is created |
-| A rule never matches | Check `rules_failed` + the failed-rules log on the endpoint: unavailable module imports are skipped by design |
-| Scan is slow on a busy host | The governor is holding the scanner to its share. Raise `CONFIG_CPU_HEADROOM_PCT`'s complement (i.e. allow more), switch to `CONFIG_CPU_GUARANTEE=budget` with a higher `CONFIG_CPU_BUDGET_PCT`, or `none` for a maintenance window. Check `cpu_governor` in the scan summary to see what it actually used |
-| Alerts don't appear in XDR | Verify the key type/permissions; the scanner auto-detects Advanced (HMAC) vs Standard auth — check `uploads_<run_id>.log` for HTTP status lines |
+Symptom, cause and fix: **[Troubleshooting](docs/guides/topics/Troubleshooting.md)**.
 
-Per-run logs on the endpoint (`logs/` under the scanner directory): `scanner_`, `uploads_`,
-`scan_errors_`, `statistics_`, `performance_`, `system_`, `yara_processing_` + the
-`scan_summary_<run_id>.json`.
-
----
+Start with `scan_summary_<run_id>.json` on the endpoint — it carries the scanner version,
+the outcome, every delivery counter, and the CPU governor result in one file. Report
+`scanner_version` with any support request.
 
 ## 11. Repository layout
 

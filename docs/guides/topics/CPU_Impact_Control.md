@@ -1,5 +1,7 @@
 # CPU Impact Control — technical detail
 
+*Applies to scanner **v2.0.0**. History of changes: [release notes](../../../CHANGELOG.md).*
+
 Companion to the XDR YARA Scanner Guide. Read this if you need to answer *"will this scan
 slow my machine, and how do you know?"*
 
@@ -46,32 +48,22 @@ continues slowly.
 > is using 90% of the machine, the scanner cannot give you 30% free — it can only decline
 > to make things worse. That is what the floor encodes.
 
-## 3. Measured behaviour
+## 3. What it actually holds
 
-Linux, 8 cores, `/usr` (93,116 files), 3 rounds, competing workload saturating the host:
+Measured on a live endpoint while an unrelated workload held ~86% of the CPU, alongside a
+control endpoint running the same scan with no competing load:
 
-| Condition | Wall clock | Time slept |
+| | Under load | Control (no load) |
 |---|---|---|
-| idle host, `none` | 64 s | 0 s |
-| idle host, `headroom` | 68 s | 0 s |
-| **saturating load, `headroom`** | **153 s** | 40 s |
-| saturating load, `budget=20%` | 131 s | 0 s |
+| Other processes | 84.7–87.0% | 0.5–7.9% |
+| Governor target | 5.0 (floored) | 62–69 |
+| **Scan's actual share** | **6.6–9.2%** | 13.9–17.2% |
+| Sleep ratio | 3.2 → 4.1 | **0.0** |
 
-**Governing an idle host costs about 6%.** Under heavy load the scan takes longer but
-completes — degradation, never stalling.
+The control endpoint never throttled, so the difference is attributable to the governor and
+nothing else. Under load the scan slowed and kept going; it did not stall.
 
-Live telemetry captured with an external workload holding ~86% CPU:
-
-| | Windows (loaded) | Linux (loaded) | Windows (control, no load) |
-|---|---|---|---|
-| `others` | 84.7–87.0% | 84.7–86.3% | 0.5–7.9% |
-| `target` | 5.0 (floored) | 5.0 (floored) | 62–69 |
-| `own` | 6.6–9.2% | 4.2–4.7% | 13.9–17.2% |
-| sleep ratio | 3.2 → 4.1 | 1.75–2.28 | **0.0** |
-| floor hits | 52 | 101 | **0** |
-
-The control endpoint ran the same scan on the same platform with no competing load and
-never throttled — the difference is attributable to the governor and nothing else.
+**Governing an idle host costs roughly 6%** in wall-clock time.
 
 ## 4. What this does **not** claim
 
@@ -86,46 +78,20 @@ Honest framing matters more than a flattering one:
 - If you need a hard, kernel-enforced ceiling that survives a bug in the scanner, this is
   not that. It is self-governed.
 
-## 5. Why this replaced the old `script` / `os` throttle modes
+## 5. Upgrading from an earlier build
 
-Earlier builds offered `throttle_mode = script | os | off`. `script` watched **system-wide**
-CPU and paused the scan whenever it crossed a threshold; `os` dropped the process to the
-operating system's idle priority tier. Both are gone. Four measured reasons:
+The retired options are still accepted and translated, so existing playbooks and scheduled
+jobs keep running unchanged:
 
-**1. It reacted to load it did not cause.** System-wide CPU includes every other process on
-the machine. On a busy host the scan paused itself for someone else's work, and kept pausing
-for as long as that work continued. Measured: **285 s of a 347 s scan spent parked**, and up
-to **65.9× slower** than the same scan unthrottled. Operators experienced this as a scan that
-never finished.
+| Old option | Now |
+|---|---|
+| `throttle_mode=off` | `cpu_guarantee=none` |
+| `throttle_mode=script` or `os` | `cpu_guarantee=headroom` |
+| `cpu_high_threshold`, `cpu_critical_threshold`, `max_pause_secs` | accepted, value ignored |
 
-**2. It bought almost nothing.** Across 2, 4 and 8 cores under saturating load, every mode
-preserved the competing workload to within **−3% to +1%** of not throttling at all. The
-slowdown was real; the protection was not.
-
-**3. `os` mode starved.** The idle priority tier only gets CPU when nothing else wants it, so
-on a saturated host the scan barely ran — **252 s versus 77 s** for the same work on 8 cores.
-
-**4. You could not state what it would do.** *"Pause when system CPU exceeds 80%"* tells you
-nothing about how much CPU the scan will use. There was no number to put in a change request
-and nothing to check afterwards.
-
-### What changed
-
-| | Old (`script` / `os`) | New (CPU governor) |
-|---|---|---|
-| Watches | total system CPU | the scan's **own** share |
-| Response | stop entirely, then resume | slow down proportionally |
-| On a busy host | can park indefinitely | floors at `CONFIG_CPU_FLOOR_PCT` and keeps going |
-| Can you state the impact? | no | yes — a percentage of the host |
-| Can you verify it afterwards? | no | yes — §8 telemetry |
-
-The honest summary: **the old design's cost was large and its benefit was near zero.** The new
-one does not claim to protect the host either (§4) — what it adds is a bound you can state
-before the scan, a guarantee the scan will finish, and evidence afterwards that the bound held.
-
-**Nothing to change on upgrade.** The retired options are still accepted and translated, so
-existing playbooks and scheduled jobs keep running: `throttle_mode=off` → `cpu_guarantee=none`,
-and `throttle_mode=script` or `os` → `cpu_guarantee=headroom`.
+There is no two-level *high* / *critical* threshold any more — §1 and §2 describe what
+replaced it. For why that design changed and the measurements behind it, see the
+[release notes](../../../CHANGELOG.md).
 
 ## 6. Worker count
 
