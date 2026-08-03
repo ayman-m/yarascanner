@@ -193,8 +193,8 @@ re-upload. These are the deployment-wide behaviour knobs (no per-run input neede
 | `CONFIG_WORKERS` | int | `2` | Scan worker threads. `0` = auto (`cores // 2`). **Leave at 2** (§10) |
 | `CONFIG_TENANT_ID` | string | `""` | Tenant tag (`""` = derive from API URL) |
 | `CONFIG_LOOKUP_SHARD` | `endpoint`/`none`/`<label>` | `endpoint` | Dataset sharding (§11) |
-| `CONFIG_ALERT_MAX_PER_SCAN` | int | `500` | Max per-finding alerts per scan; beyond → one rollup per rule |
-| `CONFIG_LOOKUP_ROTATION` | `monthly`/`none` | `monthly` | Monthly dataset rotation (§11) |
+| `CONFIG_ALERT_MAX_PER_SCAN` | int | `500` | Max per-finding alerts per scan; beyond → one rollup per rule. **Constant only** |
+| `CONFIG_LOOKUP_ROTATION` | `monthly`/`none` | `monthly` | Monthly dataset rotation (§11). **Constant only** |
 | `CONFIG_OPTIONS` | `key=value,key=value` | `""` | Rarely-needed extra overrides applied every run |
 
 **Upgrading from an earlier build.** The old `throttle_mode` runtime option is still
@@ -202,9 +202,17 @@ accepted and translated (`off` → `cpu_guarantee=none`; `script` or `os` →
 `cpu_guarantee=headroom`), so existing scheduled jobs and playbooks keep running unchanged.
 Unknown keys still fail loudly.
 
-> Advanced / automation only: the internal `run(...)` API and the CLI still accept a per-run
-> `options` string that overrides any constant above — but the Action Center `main` entry point
-> deliberately does **not** expose it, so operators aren't faced with a long input list.
+**Per-run overrides.** A per-run `options` string (`key=value,key=value`) beats the constant
+for the ten runtime keys: `create_alerts`, `write_dataset`, `collect_files`, `cpu_guarantee`,
+`cpu_headroom_pct`, `cpu_budget_pct`, `cpu_floor_pct`, `workers`, `tenant_id`, `lookup_shard`.
+The two marked **constant only** have no options equivalent and are rejected as unknown keys —
+both are deployment-wide by nature (rotation decides dataset naming; the alert cap protects a
+per-API-key ceiling shared across every concurrent scan). Unknown keys always fail loudly with
+the valid list, rather than being silently ignored.
+
+> Advanced / automation only: the internal `run(...)` API and the CLI accept that `options`
+> string, but the Action Center `main` entry point deliberately does **not** expose it, so
+> operators aren't faced with a long input list.
 
 ---
 

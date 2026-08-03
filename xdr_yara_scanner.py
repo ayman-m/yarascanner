@@ -92,8 +92,16 @@ DEFAULT_XDR_API_URL = "replace_with_xdr_standard_api_url"
 # alert_severity — instead of a long options string on every scan.
 #
 # Precedence: an explicit Action Center `options` value (key=value,key=value)
-# still OVERRIDES the matching constant below, so per-run overrides remain
-# possible without editing the script. Leave a value as-is to use it fleet-wide.
+# OVERRIDES the matching constant below, so per-run overrides remain possible
+# without editing the script. Leave a value as-is to use it fleet-wide.
+#
+# This applies to the ten keys in _VALID_OPTION_KEYS only. CONFIG_LOOKUP_ROTATION
+# and CONFIG_ALERT_MAX_PER_SCAN have NO options equivalent and can be changed only
+# here — passing them in an options string is rejected as an unknown key. Both are
+# deployment-wide by nature: rotation decides dataset naming (mixing rotated and
+# unrotated runs on one host splits its history across two datasets), and the alert
+# cap protects a per-API-key ceiling that is shared across every concurrent scan,
+# so a single run is the wrong scope to raise it from.
 # ============================================================================
 CONFIG_MODE = "scan"                    # "scan" (run a scan) or "cancel" (stop a running scan)
 CONFIG_CREATE_ALERTS = True             # push one XDR alert per YARA match (feeds incidents)
