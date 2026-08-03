@@ -984,11 +984,21 @@ def _apply_light_process_priority(log_manager=None, throttle_mode="script", conf
         # so the scanner may be unable to move system-wide CPU anywhere near
         # cpu_high_threshold on its own. Record it: without this, throttle behaviour
         # on Windows is inexplicable from the logs.
+        # host_cores is recorded FIRST and separately: it is platform-independent, and the
+        # governor's own-share maths is (process_cpu / cpu_count), so a log without it
+        # cannot be interpreted at all. cpu_affinity() does NOT exist on macOS (psutil
+        # raises AttributeError on Darwin) — when host_cores lived inside that same try,
+        # every macOS run recorded "host_cores": null and lost the denominator.
+        details["host_cores"] = os.cpu_count()
         try:
             affinity = process.cpu_affinity()
             details["cpu_affinity"] = affinity
             details["cpu_affinity_count"] = len(affinity)
-            details["host_cores"] = os.cpu_count()
+        except (AttributeError, NotImplementedError):
+            # Platform does not expose affinity (macOS). Not an error: the process is
+            # free to use every core, so the affinity count IS the host core count.
+            details["cpu_affinity_count"] = os.cpu_count()
+            details["cpu_affinity"] = "unrestricted"
         except Exception as e:
             details["cpu_affinity_error"] = str(e)
 
