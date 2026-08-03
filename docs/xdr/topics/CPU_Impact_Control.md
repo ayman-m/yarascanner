@@ -108,7 +108,9 @@ More workers is **slower**. Scanning is disk-bound as well as CPU-bound, so addi
 concurrent readers cause seek contention rather than useful overlap. The setting exists so
 operators with fast NVMe can raise it after measuring — not as a default to tune upward.
 
-## 7. Windows: the agent's own CPU ceiling
+## 7. Platform differences
+
+### Windows: the agent's own CPU ceiling
 
 The Cortex agent pins payload processes to **2 CPU cores**, regardless of how many the host
 has. Every scan records this:
@@ -126,6 +128,33 @@ Consequences:
 - Under **load** it does engage — when other processes push the target below 25%, the
   scanner is throttled down to it. Verified: with 86% external load the Windows target
   floored at 5% and the scanner was held to 6.6–9.2%.
+
+### macOS: the agent competes with the scan
+
+macOS imposes **no affinity cap** — the scanner may use every core, and the run header
+records this:
+
+```
+THROTTLE_CONFIG {..., "platform": "Darwin", "host_cores": 8, "cpu_affinity_count": 8, "cpu_priority": "nice=10"}
+```
+
+But a scan on macOS provokes heavy activity from the **Cortex agent's own processes**, which
+monitor file access. Measured on macOS 15.1 (8 cores, arm64) while scanning `/Applications`,
+`pmd` and `authorized` together held well over 100% CPU — and the governor correctly counts
+that as `others` and yields to it.
+
+The practical consequence:
+
+- A macOS scan can spend much of its life at the **floor**, throttled by load its own
+  activity provoked. Across one run: `others` moved 0% → 90%, the target fell 70% → 5%,
+  and the scan surrendered 146 s across 96 floor hits.
+- **The scan still completes** — that is what the floor guarantees — but expect it to take
+  substantially longer on macOS than the same work on an idle Linux host.
+- If macOS scans are too slow, raise `CONFIG_CPU_FLOOR_PCT`. The competing load is the
+  security agent doing its job, so it will not go away on its own.
+
+> An idle-host baseline is difficult to obtain on macOS for this reason: the agent reacts to
+> the scan, so the machine stops being idle the moment scanning starts.
 
 ## 8. Telemetry — verifying the promise after the fact
 

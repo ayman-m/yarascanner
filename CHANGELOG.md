@@ -101,6 +101,17 @@ Scans now report the shortfall in three places — the `SCAN_RESULT` line, an ER
 batches count as *not* delivered: the server may have committed them, but "may have" is not
 evidence.
 
+### Fixed — macOS runs recorded no CPU core count
+
+Every macOS run logged `"host_cores": null` in its `THROTTLE_CONFIG` header.
+`psutil.Process.cpu_affinity()` does not exist on Darwin, and `host_cores` was assigned
+inside the same try block, so it was never reached.
+
+That field is the denominator behind every `own` percentage the governor reports
+(`process_cpu / cpu_count`), so a macOS performance log could not be interpreted — there was
+no way to verify the promised CPU share had been held. macOS now reports `host_cores` and,
+because the platform imposes no affinity cap, an equal `cpu_affinity_count`.
+
 ### Fixed — running the script directly printed nothing
 
 The CLI path exited 0 having reported nothing at all. Anyone validating the scanner outside
