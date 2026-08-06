@@ -191,9 +191,45 @@ def render_report(current, legacy, newer, now_yyyymm):
     return "\n".join(lines)
 
 
+def _run_consolidate(client, args):
+    """Drive xdr_consolidate.run_consolidation for both kinds. Verify-before-delete and the
+    finished-scan gate live in that module; this just wires the CLI flags to it."""
+    import xdr_consolidate as C
+    kwargs = {"dry_run": not args.yes}
+    if args.quiet_secs is not None:
+        kwargs["quiet_secs"] = args.quiet_secs
+    if args.row_ceiling is not None:
+        kwargs["row_ceiling"] = args.row_ceiling
+
+    total_ok = total_deferred = total_fail = 0
+    for kind in ("scans", "matches"):
+        print("\n=== consolidate %s ===" % kind)
+        try:
+            plans = C.run_consolidation(client, kind, **kwargs)
+        except Exception as e:
+            print("  error: %s" % e, file=sys.stderr)
+            total_fail += 1
+            continue
+        for p in plans:
+            if p.get("ok"):
+                total_ok += 1
+            elif p.get("ok") is None:
+                pass  # dry run
+            elif p.get("reason") in ("host_not_terminal", "within_quiet_period"):
+                total_deferred += 1
+            else:
+                total_fail += 1
+    print("\nconsolidation summary: %d verified, %d deferred (scan still active), %d failed"
+          % (total_ok, total_deferred, total_fail))
+    if not args.yes:
+        print("DRY RUN — nothing written or deleted. Re-run with --yes to apply.")
+    return 1 if total_fail else 0
+
+
 def main():
     ap = argparse.ArgumentParser(
-        description="Bound YARA lookup dataset growth by deleting whole old datasets.")
+        description="Bound YARA lookup dataset growth: delete old datasets, or consolidate "
+                    "per-host shards into one dataset per scan.")
     ap.add_argument("--report", action="store_true",
                     help="inventory of YARA datasets (default action)")
     ap.add_argument("--older-than-months", type=int,
@@ -204,9 +240,22 @@ def main():
                     help="delete_dataset force=true, for datasets with dependencies")
     ap.add_argument("--yes", action="store_true",
                     help="actually delete; without this everything is a dry run")
+    ap.add_argument("--consolidate", action="store_true",
+                    help="fold per-host shards into one dataset per scan, then delete the "
+                         "shards (only for scans whose hosts have finished). Dry run unless --yes")
+    ap.add_argument("--quiet-secs", type=int, default=None,
+                    help="consolidate: a host shard is processed only when its newest row is "
+                         "older than this (default 900, >= the scanner's drain budget)")
+    ap.add_argument("--row-ceiling", type=int, default=None,
+                    help="consolidate: refuse a per-scan consolidation larger than this "
+                         "many rows rather than half-building it (default 2,000,000)")
     args = ap.parse_args()
 
     client = XDRActionCenter()
+
+    if args.consolidate:
+        return _run_consolidate(client, args)
+
     try:
         current, legacy, newer = client.classify_yara_datasets()
     except Exception as e:
