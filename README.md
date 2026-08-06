@@ -1,6 +1,6 @@
 # YARA Scanner for Cortex XDR & XSIAM
 
-**Current version: v2.0.0** (2026-08-03) · [Release notes](CHANGELOG.md) · [Deployment guide](docs/xdr/Deployment_Guide.md)
+**Current version: v2.1.0** (2026-08-06) · [Release notes](CHANGELOG.md) · [Deployment guide](docs/xdr/Deployment_Guide.md)
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#)
@@ -415,7 +415,8 @@ Everything is split by edition — **XDR** and **XSIAM** never share a folder.
 
 ```
 ├── xdr_yara_scanner.py            # XDR edition   (Action Center: main / cancel)
-├── xdr_data_management.py         # XDR: lookup-dataset retention
+├── xdr_data_management.py         # XDR: lookup-dataset retention + consolidation
+├── xdr_consolidate.py             # XDR: per-scan dataset consolidation logic
 ├── xdr_action_center.py           # XDR: API toolkit — run / cancel / verify / xql
 ├── xsiam_yara_scanner.py          # XSIAM edition (HTTP Log Collector)
 ├── encode_rules.py                # rules.yar -> base64 for the yarafile input

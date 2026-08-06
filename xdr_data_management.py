@@ -22,7 +22,7 @@ Usage:
     python3 xdr_data_management.py --delete-legacy --yes
 """
 
-__version__ = "2.0.0"   # released with xdr_yara_scanner 2.0.0; see repo releases
+__version__ = "2.1.0"   # released with xdr_yara_scanner 2.1.0; see repo releases
 import argparse
 import datetime
 import os

@@ -1,6 +1,6 @@
 % YARA Scanner for Cortex XDR — Deployment Guide
 % Cortex XDR edition (`xdr_yara_scanner.py`, v2)
-% Version 2.0.0 · Released 2026-08-03
+% Version 2.1.0 · Released 2026-08-06
 
 ---
 
@@ -31,7 +31,7 @@ data is safe to consolidate across tenants.
 
 ## Topic guides
 
-This guide covers deployment and the capabilities of **v2.0.0** as shipped. What changed
+This guide covers deployment and the capabilities of **v2.1.0** as shipped. What changed
 between versions, and why, is in the [release notes](../../CHANGELOG.md). Four companion documents go
 deeper where operators usually need it:
 
