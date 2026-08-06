@@ -167,9 +167,16 @@ class FakeClient:
         return {"status": "ok"}
 
     def add_lookup_data(self, name, rows):
-        # Mirror the real API: rows carrying fields outside the schema (here, any key
-        # starting with "_", i.e. the system columns XQL read-back injects) are SKIPPED.
-        good = [r for r in rows if not any(k.startswith("_") for k in r)]
+        # Mirror the real API: a row is SKIPPED if it carries a field outside the schema
+        # (here any "_"-prefixed system column), OR if a 'number' field (offset) holds a
+        # non-numeric value — the exact two failure modes seen live. Coercion must fix both.
+        def ok(r):
+            if any(k.startswith("_") for k in r):
+                return False
+            if "offset" in r and not isinstance(r["offset"], (int, float)):
+                return False
+            return True
+        good = [r for r in rows if ok(r)]
         self.ds.setdefault(name, []).extend(good)
         return {"rows added": len(good), "rows skipped": len(rows) - len(good)}
 
@@ -189,10 +196,17 @@ class FakeClient:
             return [{"scan_id": s, "n": n, "newest": nw} for s, (n, nw) in agg.items()]
         if "comp count()" in query:
             return [{"n": len(rows)}]
-        if "filter scan_id" in query:   # _rows_for_scan — inject a system column like the API
+        def readback(r):
+            # Mirror XQL read-back: add a system column, and return numbers as strings
+            # (offset comes back as text) so coercion is exercised.
+            out = dict(r, _insert_time=1)
+            if "offset" in out:
+                out["offset"] = str(out["offset"])
+            return out
+        if "filter scan_id" in query:   # _rows_for_scan
             want = query.split('filter scan_id = "', 1)[1].split('"', 1)[0]
-            return [dict(r, _insert_time=1) for r in rows if r.get("scan_id") == want]
-        return [dict(r, _insert_time=1) for r in rows]
+            return [readback(r) for r in rows if r.get("scan_id") == want]
+        return [readback(r) for r in rows]
 
 
 def _seed(fc, ds, rows):
@@ -249,6 +263,36 @@ def test_orchestration_keeps_shard_holding_an_unconsolidated_second_scan():
     assert len(fc.ds["yara_scanner_matches_v2_scan_s1"]) == 10   # S1 consolidated
     assert shard in fc.ds                                        # shard KEPT (S2 not done)
     assert len(fc.ds[shard]) == 17                              # S2 rows intact
+
+
+RNOW = 1_800_000_000_000   # realistic epoch-ms so RNOW - 48h stays positive
+
+
+def test_orchestration_abandoned_scan_consolidated_after_cutoff():
+    # A non-terminal scan whose newest row is older than the cutoff is treated as abandoned
+    # (console-Cancel orphan) and consolidated, so its shard stops being blocked.
+    fc = FakeClient()
+    old = RNOW - 48 * 3600 * 1000   # 48h old, past the 24h cutoff
+    _seed(fc, "yara_scanner_matches_v2_hostz_ee0009", _m("S9", "hostz", 12, ts=old))
+    _seed(fc, "yara_scanner_scans_v2_hostz_ee0009", _s("S9", "hostz", "running", ts=old))
+    plans = C.run_consolidation(fc, "matches", quiet_secs=1, dry_run=False, now_ms=RNOW,
+                                abandoned_after_secs=24 * 3600, log=lambda *a: None)
+    assert plans[0]["ok"] is True
+    assert len(fc.ds["yara_scanner_matches_v2_scan_s9"]) == 12   # findings preserved
+    assert "yara_scanner_matches_v2_hostz_ee0009" not in fc.ds   # shard now deletable
+
+
+def test_orchestration_recent_nonterminal_still_defers():
+    # The same running scan, but only 1h old, is still deferred — it might be active.
+    fc = FakeClient()
+    recent = RNOW - 3600 * 1000
+    _seed(fc, "yara_scanner_matches_v2_hostz_ee0009", _m("S9", "hostz", 12, ts=recent))
+    _seed(fc, "yara_scanner_scans_v2_hostz_ee0009", _s("S9", "hostz", "running", ts=recent))
+    plans = C.run_consolidation(fc, "matches", quiet_secs=1, dry_run=False, now_ms=RNOW,
+                                abandoned_after_secs=24 * 3600, log=lambda *a: None)
+    assert plans[0]["reason"] == "host_not_terminal"
+    assert "yara_scanner_matches_v2_scan_s9" not in fc.ds
+    assert "yara_scanner_matches_v2_hostz_ee0009" in fc.ds   # shard preserved
 
 
 def test_orchestration_idempotent_second_run_no_duplicates():

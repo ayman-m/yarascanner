@@ -52,6 +52,13 @@ TERMINAL_ACTION = {"COMPLETED_SUCCESSFULLY", "FAILED", "ABORTED", "EXPIRED",
 
 DEFAULT_QUIET_SECS = 900       # >= the scanner's max lookup drain budget (600s) + margin
 DEFAULT_ROW_CEILING = 2_000_000
+# A non-terminal scan whose newest row is older than this is treated as ABANDONED: the
+# scanner never wrote a terminal row (typically a console-Cancel hard-kill, which orphans
+# the lifecycle at "running"/"initiated" forever). Past this age it stops blocking its
+# shard's cleanup. 24h comfortably exceeds the 6h Action Center script timeout, so a scan
+# still legitimately running cannot be mistaken for abandoned. Its partial matches are REAL
+# findings, so an abandoned scan is still consolidated (preserved), not dropped.
+DEFAULT_ABANDONED_SECS = 24 * 3600
 DELETE_CONCURRENCY = 12        # a single dataset delete is ~60s server-side; different-dataset
                                # deletes don't race, so delete in bounded-concurrent batches
 
@@ -225,6 +232,35 @@ def _scan_stats(client, dataset):
     return out
 
 
+def _coerce_row(row, schema):
+    """Project a read-back row to the schema's fields AND coerce values to the schema's
+    types. XQL read-back does not round-trip types: a 'number' field can come back as the
+    string '0' or the float 9.0, and add_data SKIPS a whole row whose value type does not
+    match the field type (verified live: real match rows had offset='0' as text and were all
+    skipped, records_added=0). Coercing number->int/float, text->str, bool->bool makes the
+    rows land. System columns (_insert_time, ...) are dropped by the projection."""
+    out = {}
+    for k in schema:
+        if k not in row:
+            continue
+        v, t = row[k], schema[k]
+        if v is None:
+            out[k] = v
+        elif t == "number":
+            try:
+                f = float(v)
+                out[k] = int(f) if f == int(f) else f
+            except (TypeError, ValueError):
+                out[k] = v
+        elif t == "bool":
+            out[k] = v if isinstance(v, bool) else str(v).strip().lower() in ("true", "1", "yes")
+        elif t == "text":
+            out[k] = v if isinstance(v, str) else str(v)
+        else:
+            out[k] = v
+    return out
+
+
 def _stats_from_rows(rows):
     """Same shape as _scan_stats but from already-read rows (used for tiny scans shards)."""
     out = {}
@@ -242,7 +278,8 @@ def _stats_from_rows(rows):
 
 def run_consolidation(client, kind, ver="2", quiet_secs=DEFAULT_QUIET_SECS,
                       row_ceiling=DEFAULT_ROW_CEILING, dry_run=True, log=print,
-                      now_ms=None, action_state_for=None, only_scan_ids=None):
+                      now_ms=None, action_state_for=None, only_scan_ids=None,
+                      abandoned_after_secs=DEFAULT_ABANDONED_SECS):
     """Consolidate every finished scan's shards of one kind. Returns a list of per-scan
     plans. Deletes sources only when dry_run is False AND a scan's plan verifies.
 
@@ -300,7 +337,8 @@ def run_consolidation(client, kind, ver="2", quiet_secs=DEFAULT_QUIET_SECS,
     plans = []
     for scan_id, counts in sorted(groups.items()):
         srcs = sorted(counts)
-        deferred = _gate_scan(scan_id, srcs, newest_by, tmap, now_ms, quiet_secs, log)
+        deferred = _gate_scan(scan_id, srcs, newest_by, tmap, now_ms, quiet_secs,
+                              abandoned_after_secs, log)
         if deferred:
             plans.append({"scan_id": scan_id, "ok": False, "reason": deferred, "deletable": []})
             continue
@@ -341,12 +379,12 @@ def run_consolidation(client, kind, ver="2", quiet_secs=DEFAULT_QUIET_SECS,
         written = 0
         for ds in srcs:
             rows = _rows_for_scan(client, ds, scan_id)
-            # XQL read-back adds system columns (_insert_time, _collector_name, ...) that are
-            # NOT in the schema, and add_data SILENTLY SKIPS any row carrying unknown fields
-            # (records_skipped, records_added=0). Project each row to the schema's keys so the
-            # rows actually land. (Caught live: without this, every write skipped and the
-            # verify-before-delete gate correctly refused to delete the un-consolidated shards.)
-            rows = [{k: r[k] for k in schema if k in r} for r in rows]
+            # Project to the schema's fields AND coerce to the schema's types. XQL read-back
+            # both adds system columns (_insert_time, ...) that add_data rejects, and returns
+            # numbers as strings/floats that a 'number' field also rejects — either skips the
+            # whole row silently. _coerce_row fixes both. (Caught live twice: synthetic data
+            # only hit the field problem; real match rows also hit the type problem.)
+            rows = [_coerce_row(r, schema) for r in rows]
             for i in range(0, len(rows), _WRITE_BATCH):
                 written += _added(client.add_lookup_data(target, rows[i:i + _WRITE_BATCH]))
         time.sleep(min(30, 2 + src_total // 500))  # let merges settle before counting
@@ -401,21 +439,32 @@ def _delete_many(client, names, log, concurrency=None):
         log("    deleted %d/%d shards" % (done["n"], len(names)))
 
 
-def _gate_scan(scan_id, srcs, newest_by, tmap, now_ms, quiet_secs, log):
+def _gate_scan(scan_id, srcs, newest_by, tmap, now_ms, quiet_secs, abandoned_after_secs, log):
     """Return a defer-reason string if any source host is not safe yet, else ''.
 
-    Terminality is looked up in the scans-derived tmap by (scan_id, host); a host absent
-    from the map has no terminal lifecycle row and is treated as not-safe. The quiet-period
-    check uses the shard's newest-row timestamp (from the per-(scan,shard) stats), so the
-    kind being consolidated has finished draining."""
+    A source is eligible when its scan is FINISHED — terminal lifecycle/action state, OR
+    ABANDONED (non-terminal but its newest row is older than abandoned_after_secs, so the
+    scanner will never write a terminal row; typically a console-Cancel orphan). An
+    abandoned scan is still consolidated so its partial matches, which are real findings,
+    are preserved rather than dropped. A non-terminal scan younger than the cutoff may still
+    be running, so it defers."""
     for ds in srcs:
         host = (parse_shard(ds) or {}).get("host", "")
         entry = tmap.get((scan_id, host))
-        if not entry or not entry["terminal"]:
-            log("  scan %s: host %s not terminal (%s) — deferring"
-                % (scan_id, host, "no lifecycle row" if not entry else entry.get("status")))
-            return "host_not_terminal"
-        if not newest_row_age_ok(newest_by.get((scan_id, ds)), now_ms, quiet_secs):
+        is_terminal = bool(entry and entry["terminal"])
+        newest = newest_by.get((scan_id, ds))
+        if not is_terminal:
+            age_ms = (now_ms - newest) if newest is not None else None
+            if age_ms is not None and age_ms >= abandoned_after_secs * 1000:
+                log("  scan %s: host %s non-terminal (%s) but newest row is %.1fh old — "
+                    "treating as ABANDONED, consolidating to preserve its findings"
+                    % (scan_id, host, (entry.get("status") if entry else "no lifecycle row"),
+                       age_ms / 3_600_000.0))
+            else:
+                log("  scan %s: host %s not terminal (%s) — deferring"
+                    % (scan_id, host, "no lifecycle row" if not entry else entry.get("status")))
+                return "host_not_terminal"
+        if not newest_row_age_ok(newest, now_ms, quiet_secs):
             log("  scan %s: host shard %s within quiet period — deferring" % (scan_id, ds))
             return "within_quiet_period"
     return ""
