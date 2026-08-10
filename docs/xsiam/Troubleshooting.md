@@ -1,6 +1,6 @@
 # Troubleshooting — XSIAM YARA Scanner
 
-*Applies to scanner **v2.0.0**. History of changes: [release notes](../../CHANGELOG.md).*
+*Applies to scanner **v2.1.0**. History of changes: [release notes](../../CHANGELOG.md).*
 
 Companion to the [XSIAM Deployment Guide](Deployment_Guide.md).
 

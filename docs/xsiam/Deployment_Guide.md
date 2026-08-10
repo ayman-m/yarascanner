@@ -1,6 +1,6 @@
 % YARA Scanner for Cortex XSIAM — Deployment Guide
 % Cortex XSIAM edition (`xsiam_yara_scanner.py`)
-% Version 2.0.0 · Released 2026-08-03
+% Version 2.1.0 · Released 2026-08-06
 
 ---
 

@@ -311,13 +311,22 @@ class XDRActionCenter:
         return out.get(endpoint_id, "")
 
     # ---- XQL ----
-    def xql(self, query, poll_secs=3, max_polls=40, limit=1000):
+    def xql(self, query, poll_secs=3, max_polls=60, limit=1000):
         qid = self.reply("/public_api/v1/xql/start_xql_query/", {"query": query})
         if isinstance(qid, dict):
             qid = qid.get("query_id") or qid.get("reply") or qid
         for _ in range(max_polls):
-            st, data = self.call("/public_api/v1/xql/get_query_results/",
-                                 {"query_id": qid, "pending_flag": True, "limit": limit, "format": "json"})
+            # A single results poll can hit the read timeout on a busy tenant while the query
+            # keeps running server-side. Treat a poll timeout/transient error as "still
+            # pending" and poll again with the SAME query_id, rather than failing the whole
+            # query — otherwise slow-tenant latency looks like a logic failure.
+            try:
+                st, data = self.call("/public_api/v1/xql/get_query_results/",
+                                     {"query_id": qid, "pending_flag": True, "limit": limit,
+                                      "format": "json"}, timeout=90)
+            except requests.exceptions.RequestException:
+                time.sleep(poll_secs)
+                continue
             reply = data.get("reply", data) if isinstance(data, dict) else data
             status = reply.get("status") if isinstance(reply, dict) else None
             if status and status != "PENDING":
@@ -333,11 +342,76 @@ class XDRActionCenter:
     def get_datasets(self):
         return self.reply("/public_api/v1/xql/get_datasets/", {}, wrap="request")
 
-    def delete_dataset(self, dataset_name, force=False):
+    def create_lookup_dataset(self, dataset_name, schema):
+        """Create an empty lookup dataset with an explicit schema. add_data does NOT
+        auto-create — the dataset must exist first (verified live: add_data to an unknown
+        name returns HTTP 400 'Dataset ... not found'). schema maps field -> one of
+        text|number|datetime|bool. Idempotent: an already-exists 500 is treated as success."""
+        try:
+            return self.reply("/public_api/v1/xql/add_dataset/",
+                              {"dataset_name": dataset_name, "dataset_type": "lookup",
+                               "dataset_schema": schema}, wrap="request")
+        except RuntimeError as e:
+            if "already exists" in str(e).lower():
+                return {"status": "exists"}
+            raise
+
+    def add_lookup_data(self, dataset_name, rows, create_lag_retries=6):
+        """Append rows to a lookup dataset created with create_lookup_dataset.
+
+        Returns the raw reply, which carries the added/skipped counts (keys 'rows added' /
+        'rows skipped', or 'records_*'). add_data SILENTLY skips rows whose fields are not in
+        the existing schema — the caller must check the counts, not just the status.
+
+        Retries a transient "has no schema" / "not found" 500: dataset creation is eventually
+        consistent, so a write immediately after create_lookup_dataset can briefly race ahead
+        of the schema being visible (verified live — the 2nd of two fresh datasets failed
+        where the 1st succeeded). This matters for the consolidation tool itself, which
+        creates its per-scan target and writes to it in the same breath.
+
+        NOT concurrency-safe across DIFFERENT writers: two processes writing the SAME dataset
+        race on a server-side clone table and lose rows. Consolidation is the only writer to
+        its target, so it is safe; this retry is only for the create→write lag, not sharing."""
+        last = None
+        for attempt in range(create_lag_retries):
+            try:
+                return self.reply("/public_api/v1/xql/lookups/add_data/",
+                                  {"dataset_name": dataset_name, "data": list(rows)},
+                                  wrap="request", timeout=200)
+            except RuntimeError as e:
+                msg = str(e).lower()
+                if ("no schema" in msg or "not found" in msg) and attempt < create_lag_retries - 1:
+                    last = e
+                    time.sleep(3 * (attempt + 1))   # 3,6,9,... let creation propagate
+                    continue
+                raise
+        raise last
+
+    def delete_dataset(self, dataset_name, force=False, retries=3):
         """Delete an entire dataset (schema + all rows). NOTE the v2 path. force=True is only
-        needed to delete a dataset that has dependencies (correlation rules / scheduled queries)."""
-        return self.reply("/public_api/v2/xql/delete_dataset/",
-                          {"dataset_name": dataset_name, "force": bool(force)}, wrap="request")
+        needed to delete a dataset that has dependencies (correlation rules / scheduled queries).
+
+        Deletes can be slow server-side and occasionally exceed the read timeout while still
+        committing — so a longer timeout plus retries, and an already-gone 'not found' on a
+        retry is treated as success (the first attempt landed)."""
+        last = None
+        for attempt in range(retries):
+            try:
+                return self.reply("/public_api/v2/xql/delete_dataset/",
+                                  {"dataset_name": dataset_name, "force": bool(force)},
+                                  wrap="request", timeout=180)
+            except Exception as e:
+                last = e
+                msg = str(e).lower()
+                # Two already-gone signatures, both mean success: an explicit "not found",
+                # and a server 500 "'NoneType' object has no attribute 'dataset_type'" which
+                # XDR raises when the delete target does not exist (verified live — a delete
+                # that times out on the client still commits server-side, so the retry hits
+                # a dataset that is already gone).
+                if "not found" in msg or "nonetype" in msg:
+                    return {"status": "already_deleted"}
+                time.sleep(5 * (attempt + 1))
+        raise last
 
     def remove_lookup_data(self, dataset_name, filters):
         """Remove rows matching filter blocks (OR across blocks, AND within a block; EXACT values

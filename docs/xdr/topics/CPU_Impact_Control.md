@@ -1,6 +1,6 @@
 # CPU Impact Control — technical detail
 
-*Applies to scanner **v2.0.0**. History of changes: [release notes](../../../CHANGELOG.md).*
+*Applies to scanner **v2.1.0**. History of changes: [release notes](../../../CHANGELOG.md).*
 
 Companion to the XDR YARA Scanner Guide. Read this if you need to answer *"will this scan
 slow my machine, and how do you know?"*

@@ -14,6 +14,69 @@ fixes without changing behaviour you rely on.
 
 ---
 
+## v2.1.0 — 2026-08-06
+
+Adds dataset consolidation and a macOS telemetry fix. The scanner's scan/deliver
+behaviour is unchanged — nothing about running scans differs from v2.0.0.
+
+### Upgrading
+
+**Drop-in.** No config or dataset changes. `xdr_consolidate.py` is a new companion file;
+`xdr_data_management.py` gains a `--consolidate` action. If you never run consolidation,
+nothing changes.
+
+### New — dataset consolidation (`xdr_data_management.py --consolidate`)
+
+Folds the per-host lookup datasets a scan produces into **one dataset per scan**
+(`yara_scanner_<kind>_v2_scan_<scan_id>`) and deletes the per-host shards, so a large fleet
+no longer leaves two datasets per host accumulating on the tenant. The scanner still writes
+per-host (that is what avoids the `add_data` write collision); consolidation is a separate,
+optional maintenance pass. Dry run unless `--yes`.
+
+Safety, because it deletes datasets:
+
+- **One sequential writer** to each target, so consolidation is never exposed to the
+  concurrent-write collision it is cleaning up after.
+- **Verify before delete** — a shard is deleted only after the target's row count equals the
+  sum of the sources. Every failure mode found in testing tripped this and preserved the
+  data rather than losing it.
+- **A shard is deleted only when every scan in it is consolidated** — a host re-scanned in
+  the same month shares one dataset, so deleting after a single scan would destroy the
+  others. Re-runs are idempotent.
+- **Abandoned-scan cutoff** — a console-cancelled scan leaves its lifecycle row stuck at
+  `running`/`initiated` forever (see the known limitation in v2.0.0), which would block its
+  shard from ever being cleaned. A non-terminal scan whose newest row is older than 24 h
+  (`--abandoned-after-hours`, comfortably past the 6 h action timeout) is treated as
+  abandoned so it stops blocking cleanup; its partial matches are still consolidated, not
+  dropped.
+- **Row ceiling** refuses a consolidation too large to finish rather than half-building it.
+
+Operational notes measured on a live tenant: a single dataset delete is ~60 s server-side,
+but deletes of *different* datasets do not race, so the cleanup runs them concurrently
+(12 at a time) — turning a fleet's days of serial deletion into hours. Reporting is
+unaffected throughout: dashboards already query `yara_scanner_*` wildcards, so query results
+are identical whether the data sits in per-host or per-scan datasets.
+
+### Fixed — macOS runs recorded no CPU core count
+
+`psutil.Process.cpu_affinity()` does not exist on macOS, and `host_cores` was assigned
+inside the same try block, so every macOS run logged `"host_cores": null` — the denominator
+behind every CPU-governor percentage. macOS now reports it (and an equal
+`cpu_affinity_count`, since macOS applies no affinity cap).
+
+### Validation
+
+Consolidation was validated end-to-end against a live tenant, not just unit-mocked: the
+collision that justifies per-host sharding was measured directly (8 concurrent writers to
+one dataset lost 87 % of rows), both a happy-path and a finished-scan-gate scenario passed
+end to end, and a dry run plus a scoped real consolidation ran against genuine scanner data
+(72/65 scans across the per-host shards) with the orphaned scans correctly deferred. Six
+issues that only appear against a real tenant were found and fixed in the process — dataset
+enumeration key, create→write schema lag, read-back system columns, read-back type
+round-tripping, terminality source, and results-poll timeouts.
+
+---
+
 ## v2.0.0 — 2026-08-03
 
 First formally released version. Everything below is relative to the unversioned builds

@@ -1,6 +1,6 @@
 # Datasets and Maintenance — technical detail
 
-*Applies to scanner **v2.0.0**. History of changes: [release notes](../../../CHANGELOG.md).*
+*Applies to scanner **v2.1.0**. History of changes: [release notes](../../../CHANGELOG.md).*
 
 Companion to the XDR YARA Scanner Guide. Read this to understand why the dataset names look
 the way they do, and how to stop them growing forever.
@@ -154,7 +154,58 @@ deletes nothing.
 A failed delete is reported and the run continues to the next dataset, so one dataset with
 dependencies cannot strand the whole cleanup. Exit code is non-zero if any deletion failed.
 
-## 5. Row shapes
+## 5. Consolidation — one dataset per scan (`--consolidate`)
+
+Deleting old months (§4) bounds *age*. It does not bound *count*: a large fleet still
+produces two datasets per host every month. Consolidation addresses the count directly — it
+folds each scan's per-host shards into a **single dataset per scan** and deletes the shards.
+
+```bash
+python3 xdr_data_management.py --consolidate                 # dry run — plan only
+python3 xdr_data_management.py --consolidate --yes           # apply
+python3 xdr_data_management.py --consolidate --scan-id <id>  # one scan (repeatable)
+```
+
+The result is `yara_scanner_matches_v2_scan_<scan_id>` / `..._scans_v2_scan_<scan_id>`: all
+hosts for one scan, in one place, filterable by the same fields as before.
+
+**This is a housekeeping step, not a requirement, and not a reporting fix.** Reporting never
+needed it — dashboards query `yara_scanner_*` wildcards, so a query spans per-host and
+per-scan datasets identically. Consolidation only reduces how many datasets exist.
+
+### Why it is safe to run against live data
+
+It deletes datasets, so it is deliberately conservative:
+
+- **One sequential writer** per target — never exposed to the concurrent-write collision
+  that per-host sharding exists to avoid (§2).
+- **Verify before delete** — a shard is deleted only after the target's row count equals the
+  sum of its sources. A mismatch keeps every source and reports it.
+- **A shard is deleted only when every scan in it is consolidated.** A host re-scanned in
+  the same month shares one dataset; deleting after a single scan would destroy the others.
+  Re-running is idempotent — an already-consolidated scan is detected and not rewritten.
+- **Abandoned-scan cutoff.** A scan stopped by the console Cancel leaves its lifecycle stuck
+  at `running`/`initiated` forever (§5, and the Scan Cancellation guide), which would block
+  its shard from ever being cleaned. A non-terminal scan whose newest row is older than
+  **24 hours** (`--abandoned-after-hours`, past the 6 h action timeout so a live scan is
+  never mistaken for one) is treated as abandoned: it stops blocking cleanup, and its partial
+  matches are still consolidated rather than dropped.
+- **Row ceiling** (`--row-ceiling`, default 2,000,000) refuses a consolidation too large to
+  finish rather than half-building a target.
+
+### What it will and will not clean
+
+A scan is consolidated once it is **finished** — a terminal lifecycle row, or abandoned past
+the cutoff. Scans still genuinely in progress are deferred to a later run. A per-host shard
+is removed only once *all* of its scans are handled, so on a busy host you may see per-scan
+targets appear while the shard persists until its last scan clears.
+
+> Deleting a whole dataset takes ~60 seconds server-side on the tenants measured. Deletes of
+> different datasets do not conflict, so consolidation runs them concurrently (12 at a time);
+> even so, cleaning a large fleet is an hours-scale background job, not instant. Run it off-
+> peak.
+
+## 6. Row shapes
 
 **`yara_scanner_matches_v2_*`** — one row per matched string: host, rule, file path, offset,
 matched length, severity, scan id, timestamps.
@@ -166,7 +217,7 @@ row (`completed` / `cancelled` / `failed`), plus periodic `running` rows.
 > stays at `initiated` or `running` permanently and dashboards show it as running forever.
 > See the Scan Cancellation topic guide.
 
-## 6. Schema changes
+## 7. Schema changes
 
 The row shape is pinned by the `_v2` tag for a reason: **`add_data` silently skips rows
 carrying fields that are not in the existing dataset's schema.** It returns
