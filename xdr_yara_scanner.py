@@ -1607,7 +1607,23 @@ class ErrorLogger:
             return logging.getLogger()
         
         return error_logger
-    
+
+    def close(self):
+        """Close the yara_processing FileHandler. Idempotent — safe to call more than once.
+
+        Never previously needed: nothing tried to delete this file while the process was
+        still alive, so an unclosed handler was harmless until host cleanup's end-of-run
+        removal made it not — Windows refuses to delete a file that is still open
+        (WinError 32), where POSIX does not, so this went unnoticed until measured on a
+        real Windows agent. Mirrors LogManager.stop_logging()'s handler-closing pattern.
+        """
+        for handler in self.error_logger.handlers[:]:
+            try:
+                handler.close()
+            except Exception:
+                pass
+            self.error_logger.removeHandler(handler)
+
     def _analyze_compilation_error(self, error_msg, rule_content, error_line_num):
         """Analyze compilation error and provide diagnostics."""
         analysis = {
@@ -7430,22 +7446,44 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
                     # the case an operator would want to inspect afterwards, not have wiped.
                     # Isolated in its own try/except so a failure here can never mask this
                     # run's actual result or escape main()'s finally block.
+                    #
+                    # log_manager.stop_logging() AND config.error_logger.close() are called
+                    # HERE, before cleanup, not left to the unconditional call further down.
+                    # Both hold per-category log files open via a persistent
+                    # logging.FileHandler for the whole run — LogManager for six of the
+                    # seven categories, and ErrorLogger (config.error_logger) separately for
+                    # yara_processing, which is NOT one of LogManager's own handlers. POSIX
+                    # allows unlinking a file that is still open (Linux tolerates the
+                    # ordering either way), but Windows refuses to delete one — os.remove()
+                    # fails with WinError 32 and HostCleanup silently records it as an error
+                    # rather than crashing the scan. Verified live, in two rounds: closing
+                    # only log_manager's handlers fixed six of the seven files; the seventh
+                    # (yara_processing) needed error_logger.close() too, since it was never
+                    # closed anywhere in the codebase before host cleanup existed — nothing
+                    # had previously tried to delete it while the process was still alive.
+                    # Host cleanup's OWN status/error messages therefore cannot go through
+                    # log_manager (its handlers are already closed) — the plain `logging`
+                    # module is used instead, the same convention CleanupManager already
+                    # uses for messages outside the per-run structured-log lifecycle.
                     try:
                         if _outcome == "completed":
+                            if log_manager:
+                                log_manager.stop_logging()
+                            if _el is not None and hasattr(_el, "close"):
+                                _el.close()
                             _hc = HostCleanup(config, CONFIG_HOST_CLEANUP, CONFIG_HOST_CLEANUP_KEEP)
                             _delivery_enabled = bool(getattr(config, "create_alerts", False)
                                                      or getattr(config, "write_dataset", False))
                             _ok, _reason = _hc.should_run(_shortfall, _delivery_enabled)
                             if _ok:
-                                _removed, _errs = _hc.run(_summary_path, log=log_manager.log_error)
-                                log_manager.log_system(
-                                    f"Host cleanup removed {len(_removed)} path(s)"
-                                    + (f", {len(_errs)} error(s)" if _errs else ""),
-                                    {"removed": _removed, "errors": _errs})
+                                _removed, _errs = _hc.run(_summary_path, log=logging.warning)
+                                logging.info(
+                                    "Host cleanup removed %d path(s)%s"
+                                    % (len(_removed), (", %d error(s)" % len(_errs)) if _errs else ""))
                             elif CONFIG_HOST_CLEANUP != "off":
-                                log_manager.log_system(f"Host cleanup skipped: {_reason}")
+                                logging.info("Host cleanup skipped: %s" % _reason)
                     except Exception as _hce:
-                        log_manager.log_error(f"Host cleanup failed: {_hce}")
+                        logging.warning(f"Host cleanup failed: {_hce}")
                 except Exception as _se:
                     log_manager.log_error(f"scan summary write failed: {_se}")
             if log_manager:

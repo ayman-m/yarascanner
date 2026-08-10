@@ -12,7 +12,7 @@ import tempfile
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from xdr_yara_scanner import HostCleanup  # noqa: E402
+from xdr_yara_scanner import HostCleanup, ErrorLogger  # noqa: E402
 
 
 class FakeConfig:
@@ -209,6 +209,57 @@ def test_run_collects_removal_errors_without_raising(cfg, monkeypatch):
     assert "system_" in errors[0]
     # everything else still got removed despite the one failure
     assert not os.path.isfile(os.path.join(cfg.logs_dir, "upload_%s.log" % cfg.run_id))
+
+
+def test_scanner_closes_log_handles_before_host_cleanup_runs():
+    # Regression guard for a bug caught only by a REAL Windows agent run, not reproducible
+    # on macOS/Linux dev machines. Two DISTINCT logging mechanisms each hold a per-category
+    # log file open via a persistent FileHandler for the whole run: LogManager for six
+    # categories, and ErrorLogger (config.error_logger) separately for yara_processing —
+    # which is NOT one of LogManager's own handlers, and was never closed anywhere in the
+    # codebase before host cleanup existed. POSIX allows unlinking an open file, so Linux
+    # tolerated the ordering either way — verified live, all seven per-run log files were
+    # removed correctly there. The SAME code on Windows left files behind, in two rounds:
+    # first all six LogManager-owned files (WinError 32, "process cannot access the file"),
+    # then — after fixing that — the seventh, yara_processing, alone, because ErrorLogger's
+    # handle was still open. HostCleanup catches each as a per-file error rather than
+    # crashing, so both failures were silent - the run still reported outcome=="completed".
+    #
+    # A real functional test needs Windows file-locking semantics this machine cannot
+    # reproduce, so this checks the two things that actually matter: log_manager.stop_logging()
+    # AND config.error_logger.close() are both called BEFORE HostCleanup is dispatched in
+    # main()'s finally block. If either ordering regresses, this fails loudly here instead
+    # of silently on a customer's Windows fleet.
+    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "xdr_yara_scanner.py"), encoding="utf-8").read()
+    marker = "# End-of-run host cleanup"
+    start = src.index(marker)
+    end = src.index("if log_manager:\n                log_manager.stop_logging()", start)
+    block = src[start:end]
+    stop_pos = block.find("log_manager.stop_logging()")
+    close_pos = block.find("_el.close()")
+    hc_pos = block.find("HostCleanup(config")
+    assert -1 not in (stop_pos, close_pos, hc_pos), \
+        "expected markers not found — has this code moved?"
+    assert stop_pos < hc_pos, (
+        "log_manager.stop_logging() must be called BEFORE HostCleanup runs, or the six "
+        "LogManager-owned log files silently fail to delete on Windows")
+    assert close_pos < hc_pos, (
+        "config.error_logger.close() must be called BEFORE HostCleanup runs, or "
+        "yara_processing_<run_id>.log silently fails to delete on Windows — it is a "
+        "SEPARATE FileHandler from LogManager's and closing log_manager alone is not enough")
+
+
+def test_error_logger_close_is_idempotent():
+    class _Cfg:
+        logs_dir = tempfile.mkdtemp(prefix="errlogger_")
+        run_id = "20260810_000000_000000"
+
+    el = ErrorLogger(_Cfg())
+    assert el.error_logger.handlers, "expected a FileHandler to have been attached"
+    el.close()
+    assert el.error_logger.handlers == []
+    el.close()  # must not raise on a second call
 
 
 def test_run_returns_empty_when_summary_path_missing(cfg):
