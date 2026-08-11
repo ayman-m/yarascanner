@@ -174,7 +174,7 @@ XQL columns.
 
 1. **Settings → Configurations → Data Management → Parsing Rules → New Rule**.
 2. Name it `yara_scans_raw_parsing_rule`.
-3. Paste your parsing-rule body. The header must read:
+3. Paste the full rule body from [`parsing_rule.xql`](parsing_rule.xql) in this repo. The header reads:
 
 ```text
 [INGEST:vendor="yara", product="scans", target_dataset="yara_scans_raw", no_hit = keep]
@@ -183,6 +183,12 @@ XQL columns.
 - `vendor` and `product` must match the HTTP Collector exactly.
 - `target_dataset` must be `yara_scans_raw`.
 - `no_hit = keep` ensures records matching no filter still land in the dataset.
+- The rest of the file extracts every field the shipped dashboards filter or aggregate on as a
+  bare column (`rule_id`, `active_workers`, `sys_cpu_percent`, `worker_id`, etc.) out of the raw
+  `data` JSON object. Without it, matching rows still land in `yara_scans_raw` — `hostname`,
+  `type`, `message`, and the platform's own collector metadata populate correctly — but every
+  dashboard widget that filters on one of those extracted fields (which is most of them) shows
+  **"Could not Visualize"**, indistinguishable at a glance from a scanner bug.
 
 4. **Validate**, then **Save**.
 
