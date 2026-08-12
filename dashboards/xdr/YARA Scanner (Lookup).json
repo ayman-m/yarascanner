@@ -1069,6 +1069,35 @@
                             }
                         }
                     ]
+                },
+                {
+                    "id": "row-21",
+                    "data": [
+                        {
+                            "key": "xql_b0e9a7528ee77930",
+                            "data": {
+                                "type": "Custom XQL",
+                                "width": 100.0,
+                                "height": 360,
+                                "phrase": "/**************************************************************************\n  Consolidation Run Health\n\n  One row per completed YaraConsolidateApply pass (the XSOAR playbook's\n  mutating step, meant to run twice daily as a scheduled Job) - status is\n  success / partial_failure / crashed, plus how many scans were\n  consolidated or failed that pass.\n\n  This is the only tenant-visible signal for whether the consolidation\n  pipeline itself is healthy. Task 8 (\"Flag failures for attention\") in\n  playbook-YARA_Dataset_Consolidation.yml only writes to that one run's own\n  ephemeral XSOAR investigation context - nothing else reads it, and a\n  total execution crash (task 1/4/6 erroring before task 8 is ever\n  reached) bypasses it entirely. This dataset and widget cover both cases.\n\n  Dataset(s): yara_scanner_consolidation_runs. Lookup rows carry no _time;\n  read run_time (derived from run_ts_ms) instead. No row in the last ~24h\n  (roughly 2x the twice-daily schedule interval) means the Job did not\n  complete a pass recently - check the Job's own run history, since a\n  crash before task 8 leaves no \"needs attention\" flag either.\n**************************************************************************/\ndataset = yara_scanner_consolidation_runs*\n| sort desc run_ts_ms\n| alter run_time = to_timestamp(run_ts_ms, \"MILLIS\")\n| fields run_time, status, consolidated_count, failed_count, failed_scan_ids, error_message\n| limit 20\n\n| view graph type = table header = \"Consolidation Run Health\"\n",
+                                "time_frame": {
+                                    "relativeTime": 604800000
+                                },
+                                "viewOptions": {
+                                    "type": "gauge",
+                                    "commands": [
+                                        {
+                                            "command": {
+                                                "op": "=",
+                                                "name": "header",
+                                                "value": "\"Consolidation Run Health\""
+                                            }
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    ]
                 }
             ],
             "default_dashboard_id": 1,
@@ -2354,6 +2383,38 @@
             "additional_info": {
                 "query_tables": [
                     "yara_scanner_scans"
+                ],
+                "query_uses_library": false
+            },
+            "creator_mail": ""
+        },
+        {
+            "widget_key": "xql_b0e9a7528ee77930",
+            "title": "Yara XDR - Consolidation Run Health",
+            "creation_time": 1783600000000,
+            "description": "",
+            "data": {
+                "phrase": "/**************************************************************************\n  Consolidation Run Health\n\n  One row per completed YaraConsolidateApply pass (the XSOAR playbook's\n  mutating step, meant to run twice daily as a scheduled Job) - status is\n  success / partial_failure / crashed, plus how many scans were\n  consolidated or failed that pass.\n\n  This is the only tenant-visible signal for whether the consolidation\n  pipeline itself is healthy. Task 8 (\"Flag failures for attention\") in\n  playbook-YARA_Dataset_Consolidation.yml only writes to that one run's own\n  ephemeral XSOAR investigation context - nothing else reads it, and a\n  total execution crash (task 1/4/6 erroring before task 8 is ever\n  reached) bypasses it entirely. This dataset and widget cover both cases.\n\n  Dataset(s): yara_scanner_consolidation_runs. Lookup rows carry no _time;\n  read run_time (derived from run_ts_ms) instead. No row in the last ~24h\n  (roughly 2x the twice-daily schedule interval) means the Job did not\n  complete a pass recently - check the Job's own run history, since a\n  crash before task 8 leaves no \"needs attention\" flag either.\n**************************************************************************/\ndataset = yara_scanner_consolidation_runs*\n| sort desc run_ts_ms\n| alter run_time = to_timestamp(run_ts_ms, \"MILLIS\")\n| fields run_time, status, consolidated_count, failed_count, failed_scan_ids, error_message\n| limit 20\n\n| view graph type = table header = \"Consolidation Run Health\"\n",
+                "time_frame": {
+                    "relativeTime": 604800000
+                },
+                "viewOptions": {
+                    "type": "gauge",
+                    "commands": [
+                        {
+                            "command": {
+                                "op": "=",
+                                "name": "header",
+                                "value": "\"Consolidation Run Health\""
+                            }
+                        }
+                    ]
+                }
+            },
+            "support_time_range": true,
+            "additional_info": {
+                "query_tables": [
+                    "yara_scanner_consolidation_runs"
                 ],
                 "query_uses_library": false
             },
