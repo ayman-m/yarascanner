@@ -13,13 +13,18 @@
 // against the actual scanner code first.
 
 [INGEST:vendor="yara", product="scans", target_dataset="yara_scans_raw", no_hit = keep]
-filter type= "yara_match" 
-| alter 
+filter type= "yara_match"
+| alter
   file_name = json_extract_scalar(data, "$.filename"),
-  match = json_extract_scalar(data, "$.match"), 
   offset = json_extract_scalar(data, "$.offset"),
   rule_id = json_extract_scalar(data, "$.rule"),
-  string = json_extract_scalar(data, "$.string");
+  string = json_extract_scalar(data, "$.string"),
+  match_scope = json_extract_scalar(data, "$.match_scope"),
+  match_count = json_extract_scalar(data, "$.match_count"),
+  offsets = json_extract_scalar(data, "$.offsets"),
+  strings = json_extract_scalar(data, "$.strings"),
+  match_ids = json_extract_scalar(data, "$.match_ids"),
+  truncated = json_extract_scalar(data, "$.truncated");
 filter type= "performance" 
 | alter 
   worker_id = json_extract_scalar(data, "$.worker_id"),
