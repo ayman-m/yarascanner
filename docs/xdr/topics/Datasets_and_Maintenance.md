@@ -142,9 +142,17 @@ Nothing is deleted if it is:
 3. **unsuffixed** — see above
 4. **on a newer schema version** than this host understands
 5. **outside the `yara_scanner_*` naming contract** — unrelated tenant data is unreachable
+6. **written to more recently than `--min-quiet-hours`** (default 24h, checked live via
+   XQL) — a rotation suffix reflects when a dataset was *created*, not when it was last
+   written; a long-running scan against a host whose shard rotated months ago is still
+   writing to that "old-looking" name
+7. **still holding a scan_id `--consolidate` (§5) hasn't fully verified into a per-scan
+   target** — most often a scan that tripped the row ceiling, or was never consolidated at
+   all; deleting it would be the only copy of that scan's findings gone for good
 
 Plus: **dry run unless `--yes`**, and `--older-than-months` has no default, so a bare `--yes`
-deletes nothing.
+deletes nothing. Rails 6 and 7 each cost one extra XQL query per candidate dataset and, like
+every other rail here, skip (keep) the dataset rather than delete it if that query errors.
 
 > **Why the current-month guard matters.** Deleting a dataset a scan is actively writing to
 > does not error the scan — the scanner keeps POSTing rows to a name that no longer exists
@@ -192,6 +200,14 @@ It deletes datasets, so it is deliberately conservative:
   matches are still consolidated rather than dropped.
 - **Row ceiling** (`--row-ceiling`, default 2,000,000) refuses a consolidation too large to
   finish rather than half-building a target.
+
+> **What "verify before delete" does *not* check.** The row-count comparison confirms the
+> target has as many rows as its sources combined — it does not compare row *content*. A
+> corrupted or duplicated write that happens to land on the same count would still pass and
+> the source would still be deleted. And once `delete_dataset` runs, the platform has no
+> undelete or dataset versioning to fall back on — a mismatch or bug caught after the fact
+> cannot be recovered, only avoided by verifying before you run with `--yes`. Treat
+> consolidation, like the pruning in §4, as one-way.
 
 ### What it will and will not clean
 

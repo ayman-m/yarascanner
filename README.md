@@ -102,6 +102,7 @@ are still accepted and translated, so existing scripts keep running. Unknown key
 | `CONFIG_TENANT_ID` | string | `""` | Tenant tag (`""` = derive from API URL) |
 | `CONFIG_LOOKUP_SHARD` | endpoint/none/label | `endpoint` | Per-writer dataset sharding |
 | `CONFIG_ALERT_MAX_PER_SCAN` | int | `500` | Storm cap: max per-finding alerts per scan (`≤0` = uncapped) |
+| `CONFIG_LOOKUP_ROWS_PER_FINDING_MAX` | int | `50` | Max offsets/strings sampled into one (rule, file) finding's row (`≤0` = uncapped) — see §3.2 |
 | `CONFIG_LOOKUP_ROTATION` | monthly/none | `monthly` | Monthly dataset rotation (`_YYYYMM`) |
 | `CONFIG_OPTIONS` | `key=value,...` | `""` | Extra overrides applied every run (rarely needed) |
 
@@ -144,6 +145,23 @@ python3 xdr_data_management.py --older-than-months 6 --yes   # drop months older
 
 Dry run unless `--yes`. Never deletes the current month, a future-dated month, an unsuffixed dataset, a newer schema version, or anything outside the `yara_scanner_*` naming contract. **No scan depends on it having run** — if it never runs, datasets grow but every scan still succeeds.
 
+Two more gates run before any `--older-than-months` deletion, both checked live against the
+tenant and both "skip to be safe" on error: a dataset whose *newest row* is younger than
+`--min-quiet-hours` (default 24h) is kept even if its calendar label looks old — its rotation
+suffix reflects when it was created, not whether a long-running scan is still writing to it;
+and a dataset still holding a scan_id that `xdr_consolidate.py` hasn't fully folded into a
+per-scan target (row ceiling hit, or never consolidated) is kept rather than losing that
+scan's only copy of its findings. Both checks add their own XQL query per candidate dataset,
+so `--report`/`--older-than-months` runs cost more calls against the tenant than name-only
+filtering would — expected, not a bug, on a large fleet.
+
+**Verify-before-delete checks row-count parity only, not content correctness** — a target
+whose row count happens to match its sources' combined count is treated as fully
+consolidated even if the rows differ (a corrupted write with the same count could still slip
+through). The platform has no undelete or dataset versioning: once `delete_dataset` runs, a
+mismatch or bug caught after the fact cannot be recovered from a backup, only from whatever
+copy the API happened to have prior. Treat consolidation and pruning as one-way.
+
 ## 3. How results are delivered (XDR edition)
 
 ### 3.1 Alerts — sized for triage
@@ -168,10 +186,16 @@ later delivery window. The end-of-scan drain scales with the backlog.
 
 Two datasets per endpoint per month:
 
-- **`yara_scanner_matches_v2_<host>_<YYYYMM>`** — one row per matched string: `rule`, `filename`,
-  `file_size`, `file_sha256`, `offset`, `matched_length`, `string`, `severity`, `os_type`,
-  `scan_folder`, `tenant_id`, `scan_id`/`run_id`, timestamps
-- **`yara_scanner_scans_v2_<host>_<YYYYMM>`** — scan lifecycle: `initiated` / `running` heartbeat /
+- **`yara_scanner_matches_v3_<host>_<YYYYMM>`** — **one row per (rule, file) finding** (same grain
+  as the alert channel below): `rule`, `filename`, `file_size`, `file_sha256`, `severity`, `os_type`,
+  `scan_folder`, `tenant_id`, `scan_id`/`run_id`, timestamps, plus `match_count` (the TRUE total
+  matched offsets, even when the sample below is capped), `truncated` (bool), and three JSON-encoded
+  text fields carrying the per-offset detail: `offsets` (sample of matched byte offsets, up to
+  `CONFIG_LOOKUP_ROWS_PER_FINDING_MAX`), `strings` (rendered matched strings, aligned 1:1 with
+  `offsets`), and `string_ids` (TRUE, uncapped per-string-identifier counts, e.g.
+  `{"$ext2": 12, "$note1": 3}` — useful when a rule has several string variables and you need to
+  know which ones actually fired)
+- **`yara_scanner_scans_v3_<host>_<YYYYMM>`** — scan lifecycle: `initiated` / `running` heartbeat /
   `completed` / `cancelled` / `failed`, with counts, throttle posture, and paused time
 
 Why this shape (both are XDR `add_data` platform characteristics):
@@ -180,11 +204,43 @@ Why this shape (both are XDR `add_data` platform characteristics):
   one writer per dataset lands 100% at any fleet scale.
 - **Rotation (`_<YYYYMM>`)** — `add_data` merge time grows with the dataset's total size, so a
   bounded dataset keeps bounded write time, permanently.
+- **One row per finding, not per offset (`_v3`)** — an earlier schema (`_v2`, still queryable on
+  old data) wrote one row per matched *string offset*. That repeats every per-file column
+  (hostname, filename, sha256, scan context — ~18 of 20 fields) unchanged on every row, and an
+  unanchored/short pattern hitting one large file can multiply that into tens of thousands of
+  near-duplicate rows — measured live: **33,118 rows from one rule against one `.evtx` event log**,
+  enough to exhaust a scan's whole upload budget before other findings in the same scan got a turn
+  (two endpoints in that test lost data entirely as a result). Folding every offset for a finding
+  into one row, with `match_count`/`truncated` tracking the true total, fixes that at the root
+  instead of just capping row emission. Re-verified live after the change: total dataset rows for a
+  53-match scan dropped to exactly 53 (one row per finding, matching the scan summary).
 
-Dashboards and queries are unaffected by either: they fan in with a wildcard
-(`dataset = yara_scanner_matches*`). Old months are pruned explicitly with
-`xdr_action_center.py prune-datasets` / the `delete_dataset` API. The `_v2` tag is the row-schema
+Dashboards and queries fan in with a wildcard (`dataset = yara_scanner_matches*`), but **`_v2` and
+`_v3` data have different columns** — a query selecting `offset`/`string`/`match`/`matched_length`
+finds those only on `_v2` rows; `_v3` rows carry the aggregated fields instead. Update saved queries
+before relying on `_v3` data. Old months/versions are pruned explicitly with
+`xdr_action_center.py prune-datasets` / the `delete_dataset` API. The version tag is the row-schema
 version — bump it on any row-shape change (datasets can't alter schemas in place).
+
+Caveats worth knowing before you rely on the `_v3` dataset:
+
+- **The embedded sample is still a sample.** `offsets`/`strings` hold the *first* N occurrences
+  (effectively file-offset order) up to `CONFIG_LOOKUP_ROWS_PER_FINDING_MAX` (default 50), not a
+  random or representative selection — check `truncated` before assuming you're seeing everything.
+  `match_count` and `string_ids`, however, are always TRUE totals, never sampled.
+- **No native XQL filtering on individual offsets/strings.** XDR lookup datasets only support
+  scalar columns (`text`/`number`/`datetime`/`bool` — no array/nested type), so `offsets`/`strings`/
+  `string_ids` are JSON-encoded text. You can pull a row and parse it (e.g. in a playbook
+  enrichment step), but you can no longer `filter`/`comp` across individual offsets the way `_v2`'s
+  flat `offset` column allowed.
+- **Bounds per finding, not per scan.** A rule matching moderately across thousands of *different*
+  files still produces one row per file — this fixes the single-finding explosion, not a scan-wide
+  noisy-rule problem (that's what tuning the rule pack, §4.3, is for).
+- **Local artifacts are still uncapped.** The local JSON results file and the per-rule local alert
+  `.txt` file on the endpoint both retain every offset — only the network upload is aggregated.
+- **The embedded sample is uniform, not rule-aware.** Every finding gets the same
+  `CONFIG_LOOKUP_ROWS_PER_FINDING_MAX` sample size regardless of rule confidence — there's no
+  per-rule exemption today.
 
 ### 3.3 Delivery accounting — the books always balance
 
@@ -225,13 +281,27 @@ against them, and well-tuned rule packs never come near them.
 
 ### 4.2 When you would actually hit them
 
-One condition produces both: **a rule pack that matches far more than intended** on a large
-filesystem — e.g. a string common in benign files (a config keyword, a library banner, a copyright
-line) matching tens of thousands of files on a full-drive scan. A measured worst case: one
-over-broad rule on a 465k-file Windows system produced **36,243 string matches across 401 files**
-in a single scan. The finding-grain alert model absorbed it (401 alerts, all delivered), but the
-dataset channel — which records every string hit — queued 36k rows against write times of ~35 s per
-500-row batch, and 7,719 rows hit the drain budget: counted, logged, but absent from the dataset.
+One condition produces both: **a rule pack that matches far more than intended**, either spread
+across a large filesystem or concentrated in one file. Both measured cases below predate the `_v3`
+per-finding dataset grain (§3.2) — since dataset rows are now bounded by *finding* count rather than
+*match* count, both scenarios now produce roughly one dataset row per matched file instead of one
+per string hit, which structurally closes most of the dataset-side exposure. They're kept here
+because the *alert* budget ceiling (per-key, not per-finding-size) is unaffected by the dataset
+schema and can still be hit by either shape:
+
+- **Many files, moderate hits each.** A string common in benign files (a config keyword, a library
+  banner, a copyright line) matching tens of thousands of files on a full-drive scan. A measured
+  worst case (pre-`_v3`): one over-broad rule on a 465k-file Windows system produced **36,243 string
+  matches across 401 files** in a single scan. The finding-grain alert model absorbed it (401
+  alerts, all delivered); the pre-`_v3` dataset channel queued 36k rows and 7,719 hit the drain
+  budget — under `_v3` this would be ~401 rows, well inside the write-time ceiling.
+- **One file, extreme hits.** An unanchored short pattern (a bare word like `"powershell"`) inside a
+  single text-dense file — a log, a `.dll`, an event trace. Measured live (pre-`_v3`): one rule
+  against one `.evtx` event log produced **33,118 offsets from a single (rule, file) pair**, on a
+  host whose other findings then went entirely undelivered — the write budget was spent before they
+  got a turn. This is the case that motivated the `_v3` redesign; re-verified after the change, the
+  same file now produces exactly one dataset row (`match_count` still reports the true 33k+, via
+  `truncated=true` — see §3.2).
 
 A very large fleet scanning concurrently on one API key can also saturate the *alert* budget alone,
 even with tuned rules.
@@ -316,6 +386,14 @@ dataset = yara_scanner_matches*
 plus scheduling guidance for recurring scan Jobs. See `playbooks/README.md` for the required
 3-input script upload.
 
+### Dataset consolidation automation (`Packs/YaraDatasetManagement/`)
+
+An XSOAR pack — playbook + automations — that runs `xdr_consolidate.py`'s per-scan
+consolidation (§2 above) as a **twice-daily scheduled Job** instead of a manual CLI
+invocation. Deployment, credentials, troubleshooting (including the pack-specific HTTP 401
+symptom), and the `yara_scanner_consolidation_runs` health dataset/widget:
+[Packs/YaraDatasetManagement/README.md](Packs/YaraDatasetManagement/README.md).
+
 ### API toolkit (`xdr_action_center.py`)
 
 A single CLI/library for driving the whole lifecycle from anywhere with API access:
@@ -354,7 +432,8 @@ endpoint map (`references/public-api-map.md`) — including why console-internal
 - Topic guides — [CPU Impact Control](docs/xdr/topics/CPU_Impact_Control.md) ·
   [Scan Cancellation](docs/xdr/topics/Scan_Cancellation.md) ·
   [Rule Compatibility](docs/xdr/topics/Rule_Compatibility.md) ·
-  [Datasets and Maintenance](docs/xdr/topics/Datasets_and_Maintenance.md)
+  [Datasets and Maintenance](docs/xdr/topics/Datasets_and_Maintenance.md) ·
+  [Known Limitations](docs/xdr/topics/Known_Limitations.md)
 
 **Cortex XSIAM**
 - [Deployment Guide](docs/xsiam/Deployment_Guide.md) — collector, parsing rule, run
@@ -425,13 +504,14 @@ Everything is split by edition — **XDR** and **XSIAM** never share a folder.
 │
 ├── docs/
 │   ├── xdr/                       # XDR: deployment guide, troubleshooting, presentation
-│   │   └── topics/                #      CPU, cancellation, rule compatibility, datasets
+│   │   └── topics/                #      CPU, cancellation, rule compatibility, datasets, known limitations
 │   ├── xsiam/                     # XSIAM: deployment guide, troubleshooting
 │   └── RELEASING.md               # internal: release process
 │
 ├── dashboards/{xdr,xsiam}/        # importable dashboards, per edition
 ├── widgets/{xdr,xsiam}/           # per-widget XQL, per edition
 ├── playbooks/                     # Runner / Canceller — work on both editions
+├── Packs/YaraDatasetManagement/   # XSOAR pack: consolidation as a scheduled Job (§7)
 ├── images/                        # dashboard screenshots
 └── tests/                         # XDR: rule generator, corpus seeder, scan matrix, unit tests
 ```

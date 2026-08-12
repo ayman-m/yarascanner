@@ -15,6 +15,217 @@ fixes without changing behaviour you rely on.
 
 ---
 
+## Tier 3 edge-case fixes — 2026-08-12
+
+Nine confirmed Tier-3 gaps fixed in this pass, found through systematic edge-case review of
+the consolidation pipeline's operator-facing failure modes (API key rotation, playbook
+failure visibility, Action Center's full terminal-state vocabulary, heartbeat liveness under
+throttling) — not through a live incident. A tenth item on the same confirmed list turned out,
+on closer inspection while writing this entry, to still be open in the working tree; it's
+recorded below as a known gap rather than claimed fixed.
+
+### Fixed — `xdr_consolidate.py` v2.6.0: two more Action Center states recognized as terminal (edge case #2)
+
+`TERMINAL_ACTION` (`xdr_consolidate.py:55`, was `{"COMPLETED_SUCCESSFULLY", "FAILED",
+"ABORTED", "EXPIRED", "TIMEOUT", "CANCELED", "CANCELLED"}`) was missing
+`COMPLETED_WITH_ERRORS` and `COMPLETED_PARTIAL` — two Action Center statuses this repo's own
+`xdr_action_center.py` and the `xdr-yara-scan-test` skill's `xdr_lib.py` already treat as
+terminal, confirmed from live polling. A scan whose Action Center action ended in either state
+(Gate B, `action_state_for`) was invisible to `shard_is_terminal()`, which returned `False` for
+it forever — it could never consolidate on its own, only get swept up later by the 24h
+abandoned-scan cutoff, and only if nothing else about it looked more broken along the way.
+Both states are now in the set, mirrored into
+`Packs/YaraDatasetManagement/Scripts/YaraConsolidateCommon/YaraConsolidateCommon.py`'s own
+copy of `TERMINAL_ACTION` so the console automations get the same fix. Verified with a new
+unit test, `test_terminal_action_includes_partial_and_with_errors_states`.
+
+### Fixed — independent heartbeat thread decouples dataset liveness from walker progress (edge case #8)
+
+Distinct from v3.0.1's self-healing dataset recreation below (that fixed the *consequence* of
+an abandoned-cutoff misjudgment; this fixes a different way a scan can go quiet in the first
+place, and is the follow-up that entry's own last line pointed to). `_maybe_heartbeat()` was
+previously called only from the directory-walker loop, once per directory finished.
+`_enqueue_scan_path()` blocks — retrying on `queue_backoff_secs` — rather than dropping files
+when the scan queue is saturated, so a large single directory on a heavily CPU-governor-
+throttled host could leave the walker parked there, and the heartbeat unsent, well past the
+consolidation tool's quiet period — making a scan that is still genuinely running look
+abandoned or finished to the consolidation gates for no reason but throttling pressure.
+`xdr_yara_scanner.py` now runs a dedicated daemon thread (`_start_heartbeat_thread` /
+`_heartbeat_worker`, polling every `YARA_HEARTBEAT_POLL_SECS` seconds, default 30) that calls
+`_maybe_heartbeat()` on a fixed cadence independent of walker progress. The check-and-set on
+`_last_heartbeat` is now guarded by a new `_heartbeat_lock` so the walker thread and the
+heartbeat thread can't both pass the interval gate and emit a duplicate `running` row.
+
+### Fixed — `CoreApiClient` fails fast on a rotated/expired API key, and says so (edge case #47)
+
+A revoked/rotated/expired `DEFAULT_XDR_API_KEY` previously produced a bare `HTTP 401` that
+`CoreApiClient.add_lookup_data`/`delete_dataset` retried into several pointless backoff sleeps
+before finally surfacing, with nothing in the repo telling an operator that a 401 here means
+"check the key" rather than "transient API/network blip" — the twice-daily Job's first task
+would just fail, unexplained. Both methods
+(`YaraConsolidateCommon.py:706` / `:734`) now re-raise immediately on `HTTP 401` instead of
+retrying. `Packs/YaraDatasetManagement/README.md` gets a new Troubleshooting table row mapping
+the exact symptom (`... failed: ... HTTP 401 ...` in the Job's task error) to cause
+(rotated/revoked/expired/mistyped key, or a Standard/Advanced type mismatch — the response body
+alone can't distinguish these) and fix (regenerate an Advanced-type key, edit the three
+`DEFAULT_XDR_*` constants, re-deliver the pack — editing the repo file alone does nothing until
+it's re-imported/re-installed).
+
+### Fixed — Task 8's placeholder is no longer the only signal, and a whole-playbook crash now leaves a record (edge case #36/#53, parts 1 and 3)
+
+Task 8 ("Flag failures for attention") still only writes a flag into its own run's ephemeral
+XSOAR context — turning that into a real push notification is a product decision, see the
+next entry — but the two structural gaps under it are closed. `YaraConsolidateCommon.py`
+adds `record_consolidation_run()` (`:143`), which writes one row per `YaraConsolidateApply`
+pass to a new `yara_scanner_consolidation_runs` lookup dataset: `status`
+(`success`/`partial_failure`/`crashed`), plus counts, failed scan IDs/reasons, and — for a
+crash — the exception text. `YaraConsolidateApply.py` calls it on *both* the normal-completion
+path and inside the `except` block wrapping `consolidate_all()`, writing the `"crashed"` row
+*before* calling `return_error()` — which is exactly the failure mode task 8 can never record,
+since `return_error` halts the whole playbook run before task 8's condition is ever evaluated.
+Task 8's own `description` field in `playbook-YARA_Dataset_Consolidation.yml` now points at
+this dataset and the new widget below instead of just calling itself a placeholder with nowhere
+else to point.
+
+### Documented, not fixed — no independent Job-failure alerting is provisioned (edge case #36/#53, part 4) — needs_decision
+
+Still true, and left that way deliberately: this repo provisions no push-style alert
+(Slack/email/incident) for a failed or missing Job run — no `Jobs/*.json` ships in the pack,
+and task 8 remains an unwired placeholder by design, since which channel to wire it to is a
+product decision, not something to invent a default for. What changed is visibility:
+`Packs/YaraDatasetManagement/README.md`'s new Monitoring section says this explicitly instead
+of the gap being silently undocumented, and points at the `yara_scanner_consolidation_runs`
+dataset/widget as the closest thing to a health signal available today — still pull-based, an
+operator has to know to look, not push.
+
+### Fixed — new "Consolidation Run Health" dashboard widget (edge case #36/#53, part 5)
+
+Every existing widget in this repo was scan-result-focused (matches, detections, throughput);
+nothing showed whether the consolidation/maintenance pipeline itself was healthy or running at
+all. New `widgets/xdr/Consolidation Run Health.xql`, added as a row on the
+`YARA Scanner (Lookup)` dashboard, reads the last 20 rows of `yara_scanner_consolidation_runs`
+(run time, status, consolidated/failed counts, failed scan IDs, error message). No row in
+roughly the last 24h (2x the twice-daily schedule interval) means the Job did not complete a
+pass recently, independent of whether task 8 flagged anything.
+
+### Fixed — `lock_held_by_other_run` is now visible in the Job's readable output (edge case 37c)
+
+`YaraConsolidateApply.py` previously flattened a lock collision into the same generic
+`"0 scan(s) consolidated"` message as a genuinely empty pass, so an operator scanning Job run
+history for the exact CLI/Job collision scenario this case investigates would see nothing
+distinctive. It now branches on `result.get("lock_held_by_other_run")` and reports
+`"Skipped this pass — consolidation lock is held by another concurrent run (CLI or another Job
+execution)."` instead, and the pack's README Troubleshooting table documents the symptom.
+
+### Fixed — pack-specific deployment documentation (edge case #56 part 3)
+
+Nothing in the repo previously told an operator that `Packs/YaraDatasetManagement` needs
+console Import or a pack-zip install to become Job-selectable — a raw item-level
+`demisto-sdk upload` of just the playbook registers it as an invisible private draft, runnable
+directly but absent from the Job-creation picker, so it looks deployed right up until someone
+tries to attach it to a scheduled Job and can't find it. New
+`Packs/YaraDatasetManagement/README.md` covers this (plus credentials, troubleshooting, and
+monitoring); the top-level `README.md` §7 now links to it and the repo layout tree lists the
+pack.
+
+### Known gap (not fixed here) — endpoint clock skew in the quiet-period/abandoned-scan gates (edge case #6)
+
+On the same confirmed list as the fixes above, but **not actually fixed** in the working
+tree — recorded here rather than silently claimed done. `newest_row_age_ok()`
+(`xdr_consolidate.py:226`) and `_gate_scan()`'s abandoned-scan check (`:705`, comparing
+`age_ms >= abandoned_after_secs * 1000`) still measure elapsed time as `now_ms` (this
+process's own clock) minus `newest_ms`, which comes from `_scan_stats()` /
+`_stats_from_rows()` (`:340`, `:383`) reading each row's `event_timestamp_ms` — an
+endpoint-stamped, uncorrected wall-clock value — with zero skew tolerance in either direction.
+A skew-immune, server-assigned `_insert_time` column already exists on every row (referenced
+only in `_coerce_row`'s docstring, `:360`, as something the write-back projection *drops*) but
+is never read for gate timing. A sufficiently clock-skewed endpoint can therefore make
+`within_quiet_period`/abandoned-cutoff judgments early or late in a way this tool cannot
+currently detect or correct for. Remains a follow-up; no fix proposed here.
+
+### Upgrading
+
+**Mostly drop-in.** `xdr_consolidate.py` v2.6.0's `TERMINAL_ACTION` change only widens what
+already counts as terminal — no config or dataset changes. `xdr_yara_scanner.py`'s heartbeat
+thread is internal; the new `YARA_HEARTBEAT_POLL_SECS` env var (default 30s) is optional. The
+`Packs/YaraDatasetManagement` changes (`record_consolidation_run`, the new
+`yara_scanner_consolidation_runs` dataset, the new widget, `CoreApiClient`'s fail-fast 401)
+only take effect once the pack is re-delivered via console Import or pack-zip install (see its
+README's Deployment section) — editing the repo files alone changes nothing on the tenant.
+
+Verified with the full suite: **102/102** passing (`python3 -m pytest tests/ -q`).
+
+---
+
+## xdr_consolidate.py v2.5.0 — 2026-08-12
+
+### New — immediate per-scan row cleanup closes the double-counting window (edge case #51)
+
+Root-cause half of edge case #51 (the dashboards' `dedup` clause from a prior pass was the
+defense-in-depth half, and stays as-is — not touched here).
+
+`run_consolidation` only ever deleted a per-host *shard* once **every** `scan_id` it had ever
+held was verified into its own per-scan target (the "Deletion pass" at the end of the
+function). A shard can hold many `scan_id`s — a host re-scanned repeatedly within the same
+month shares one dataset — so a scan whose own target had already been written and verified
+could still sit duplicated inside its source shard for a long time, waiting on every *other*
+scan sharing that shard to also finish. Any dashboard querying the `yara_scanner_matches*`
+wildcard during that window double-counted that scan's findings: once from the still-live
+shard, once from the already-complete per-scan target.
+
+`run_consolidation` now calls the already-existing `client.remove_lookup_data(shard, [{"scan_id":
+scan_id}])` against every source shard the instant a scan's target verifies — on **both** the
+idempotent already-complete short-circuit (a re-run finding the target already holds exactly
+this scan's rows) and the fresh-write-verified path, so a scan's rows never wait around in a
+shard it's already been safely copied out of. This is deliberately the idempotent path that
+matters most: it's exactly where a *retry* of a previously-failed cleanup call naturally
+lands — run 1 writes and verifies the target but the cleanup call throws (network blip), the
+source rows survive; run 2 sees the target already complete and, without this, would never
+retry the cleanup that failed last time. A follow-on case surfaced in testing: a scan whose
+rows span two source shards (a run straddling a monthly-rotation boundary) where cleanup
+succeeds on one shard but fails transiently on the other — the next run recomputes the source
+row total from whatever shards are *currently* live, which would now be permanently smaller
+than the target's fixed, correct count. Rather than misreport that forever as a data-integrity
+`count_mismatch` and give up retrying, this shape is now recognized as "cleanup already landed
+on some sources" and stays verified, retrying cleanup on what's left.
+
+This is **complementary to, not a replacement for**, the existing whole-shard `delete_dataset()`
+call at the end of the function, which is unchanged: row-level removal shrinks the
+double-counting window immediately; the shard-level delete still eventually removes the
+dataset object itself once every scan sharing it is also done. A `remove_lookup_data` failure
+is caught, logged, and otherwise ignored — it never crashes the run, never flips a scan's
+`plan["ok"]` (the scan's data is already safely verified in its target; only the redundant
+source-row cleanup failed), and never blocks the eventual whole-shard delete. Purely a
+dashboard-accuracy improvement — data safety is unaffected either way. Scoped to
+`kind=="matches"` only: a `"scans"` shard's rows are the sole source of `build_terminal_map`'s
+per-`(scan_id, host)` lifecycle signal, and stripping a verified scan's status row out early
+would make a still-pending sibling scan sharing that shard lose its terminal signal and get
+misclassified as stuck. Stays strictly sequential, matching `remove_lookup_data`'s own
+"NOT concurrency-safe — the caller must serialize" contract and `run_consolidation`'s existing
+single-sequential-writer design (the unrelated `_delete_many` concurrency at the very end, for
+different *datasets*, is untouched).
+
+Mirrored into `Packs/YaraDatasetManagement/Scripts/YaraConsolidateCommon/YaraConsolidateCommon.py`
+(the XSOAR-side hand-kept port of this same logic, including its own `CoreApiClient.
+remove_lookup_data`), so the console automations (`YaraConsolidateStatus`/`YaraConsolidateApply`)
+get the same fix.
+
+Verified with 8 new unit tests covering same-run cleanup on a fresh write, a shard holding a
+second still-pending scan keeping the shard but losing only the ready scan's rows, dry runs
+touching nothing, a cleanup failure not crashing or flipping `ok`, the idempotent path
+retrying a previously-failed cleanup, a scan spanning two source shards getting cleanup on
+both, `kind=="scans"` never stripping a lifecycle row out from under a pending sibling, and
+the transient-partial-failure case above resolving cleanly over three simulated runs — full
+suite now **101/101** passing.
+
+### Upgrading
+
+**Drop-in.** No config or dataset changes. The client already exposes `remove_lookup_data`
+(already live and used elsewhere in this repo, e.g. `xdr_action_center.py`'s pruning tooling);
+`run_consolidation` now just calls it automatically as an extra step after each scan verifies.
+
+---
+
 ## xsiam_yara_scanner.py v3.0.0 — 2026-08-12
 
 **Breaking.** First versioned release of the XSIAM edition since v2.0.0 (2026-08-03) — this
@@ -177,6 +388,323 @@ columns is a natural follow-up if you build on top of this dashboard.
 4. Expect a gap for historical data — old rows won't retroactively gain the new fields.
 
 No other config or dataset changes required.
+
+---
+
+## Docs — 2026-08-12
+
+### Clarified — verify-before-delete is row-count parity, not content verification (edge case #52)
+
+`README.md`, `docs/xdr/topics/Datasets_and_Maintenance.md`, and the
+`playbook-YARA_Dataset_Consolidation.yml` description now say explicitly what
+"verify before delete" checks and doesn't: a per-scan target's row count matching its
+sources' combined count is treated as fully consolidated, but that is parity, not a
+content comparison — a corrupted or duplicated write with a matching count would still
+pass. Combined with the platform having no undelete or dataset versioning, a bad delete
+from either `xdr_data_management.py --older-than-months` or `--consolidate` cannot be
+recovered after the fact. No code changed; this is documentation only, prompted by the
+same edge-case review that produced the two new pre-delete gates below.
+
+---
+
+## xdr_consolidate.py v2.4.0 — 2026-08-12
+
+### New — per-scan failure/block reasons surfaced, not just counted (edge case #19)
+
+`consolidate_all()` and `check_consolidation_status()` previously returned only
+`failed_scan_ids`/`blocked_scan_ids` — a bare list of which scans need attention, with no
+indication of *why*. An operator (or the XSOAR playbook) seeing `blocked_count: 3` had to
+re-run the tool by hand with logging cranked up just to learn whether the cause was a row
+ceiling worth raising, a genuine count mismatch worth investigating, or something else
+entirely — three very different next actions collapsed into one undifferentiated signal.
+
+Both functions now also return `failed_reasons`/`blocked_reasons`: a `{scan_id: reason}`
+map built from the same per-scan `reason` field `run_consolidation()` was already
+producing internally but discarding at the aggregation step. No new failure modes are
+introduced or classified differently — this is pure visibility, not a behavior change.
+
+`YaraConsolidateStatus`/`YaraConsolidateApply` (the XSOAR automations wrapping this
+module) now cite the specific reason per scan_id in their human-readable output instead of
+a generic "row ceiling or count mismatch" message, and declare the new context paths in
+their `.yml` output specs.
+
+Verified with 2 new unit tests (`test_consolidate_all_reports_why_a_scan_failed`,
+`test_check_consolidation_status_reports_why_a_scan_is_blocked`) plus the one existing test
+whose exact-dict assertion needed the new key added — 93/93 total passing.
+
+### Upgrading
+
+**Drop-in.** Both new fields are additive keys on the existing return dicts; nothing that
+previously read `failed_count`/`failed_scan_ids`/`blocked_count`/`blocked_scan_ids` needs
+to change.
+
+---
+
+## xdr_data_management.py v2.1.1 — 2026-08-12
+
+### New — two extra safety gates before deleting a rotated shard (edge cases #16, #19)
+
+`--older-than-months` selected purely on the dataset's name (its `_YYYYMM` suffix) and the
+current calendar month. Found through systematic edge-case review, not a live incident:
+two ways that selection could still delete a dataset a scan or the consolidation tool
+actively needed.
+
+- **`filter_recently_written`** (edge case #16): a shard's rotation suffix reflects when it
+  was *created*, not when it was last *written*. A long-running scan against a host whose
+  shard rotated months ago keeps writing to that same (now "old-looking") dataset name
+  until the scan finishes — `--older-than-months` had no way to tell "old name" from
+  "actively being written right now." This function queries each candidate's newest row
+  via XQL and drops it from the delete list if that row is younger than `--min-quiet-hours`
+  (default 24h), regardless of how old its calendar label is.
+- **`filter_unconsolidated`** (edge case #19): a shard can still hold a scan_id that
+  `xdr_consolidate.py` has not yet folded into a per-scan target — most often because that
+  scan tripped the row ceiling, or was never run through consolidation at all. Deleting
+  such a shard on a pure age basis would permanently lose that scan's findings with no
+  warning. This function checks, per scan_id in the candidate shard, whether a matching
+  per-scan target exists with an equal row count, and drops the shard from the delete list
+  if any scan_id inside it isn't fully, verifiably consolidated yet.
+
+Both functions default to **skipping (keeping) the dataset** on any XQL error rather than
+deleting — "skip to be safe," the same posture every other guard in this module already
+takes. Wired into the `--older-than-months` path in `main()`, after
+`select_rotated_for_deletion` and before deletion; each skip reason is included in the
+existing report output alongside the other rails (current-month, future-clock-skew,
+not-rotated).
+
+Verified with 8 new unit tests against an in-memory fake XQL client (still writing,
+genuinely quiet, no rows at all, query-error-skips-safe for the first function;
+never-verified, fully-verified, already-empty, foreign-name-passthrough for the second) —
+32/32 in `test_data_management.py`, 93/93 across the full suite.
+
+### Upgrading
+
+**Drop-in for `--report`/dry runs** (nothing deletes by default). For scheduled
+`--older-than-months --yes` runs: the new gates only make deletion *more* conservative, so
+existing automation keeps working, just with fewer false-positive deletions. New optional
+flag: `--min-quiet-hours` (default `24.0`) — raise it if your scans can legitimately run
+longer than a day against a single host.
+
+---
+
+## xdr_consolidate.py v2.3.0 — 2026-08-12
+
+### New — overlap guard against concurrent consolidation runs (edge case #31)
+
+`consolidate_all`'s intended protection against two runs overlapping is the XSOAR Job's own
+"don't trigger a new instance" queue-handling setting — a deployment-time console setting
+this code cannot verify is actually configured. If it's missing or fails, two overlapping
+runs would both write to the *same* per-scan target dataset concurrently — exactly the
+collision per-host sharding exists to prevent (measured elsewhere in this project: 87% row
+loss at 8 concurrent writers to one dataset).
+
+`consolidate_all` (and the `xdr_data_management.py --consolidate` CLI) now takes a
+best-effort lock before any write pass: `acquire_consolidation_lock` creates a marker
+dataset and relies on `create_lookup_dataset` distinguishing a fresh create from an
+already-exists response (confirmed live against the real API — `{"dataset_name": ...}` vs
+`{"status": "exists"}`). A second concurrent call sees the marker already exists, backs off
+immediately (`lock_held_by_other_run: true` in its return value, nothing touched), and the
+first call releases the lock in a `finally` block when it's done. A stale lock (holder
+crashed without releasing, default 2h) is detected by age and taken over rather than
+blocking forever.
+
+This is explicitly **not** a true distributed lock — there's an inherent check-then-act
+window between one caller's create call and another's. It's defense in depth for the common
+failure (a stuck or misconfigured scheduler), not a correctness guarantee under a genuine
+simultaneous race. Dry runs (`check_consolidation_status`, `--consolidate` without `--yes`)
+never touch the lock — they don't write or delete anything, so they're safe to run
+concurrently with anything.
+
+Verified with 7 new unit tests (fresh acquire, blocked-when-held, stale-lock takeover,
+release-then-reacquire, `consolidate_all` skipping cleanly when locked, dry runs ignoring
+the lock entirely, and the lock releasing after a normal run completes — 83/83 total
+passing) and live against the real tenant: manually held the lock, confirmed a concurrent
+`consolidate_all` call backed off with `lock_held_by_other_run: true` and touched nothing,
+released it, and confirmed the next call proceeded normally.
+
+### Upgrading
+
+**Drop-in.** No config or dataset changes — the lock is entirely internal, self-cleaning,
+and only engages on write passes.
+
+---
+
+## v3.0.1 — 2026-08-12
+
+Fixes a data-loss bug in the lookup-dataset write path, found through systematic edge-case
+testing of the consolidation tool's abandoned-scan cutoff (not through customer reports).
+No config or dataset changes required to upgrade.
+
+### Fixed — recreate the lookup dataset when a write finds it missing mid-scan
+
+`LookupDatasetUploader._ensure_datasets()` runs once, at scan startup. If the dataset it
+created is deleted *after* that — most plausibly by `xdr_consolidate.py`'s abandoned-scan
+cutoff misjudging a still-running scan as abandoned (its gate only looks at row age, not
+whether the scan is actually still executing), but equally by any operator or tool deleting
+it by hand — every subsequent `add_data` call failed with `HTTP 400 "Dataset not found"`
+and was silently dropped for the rest of the scan's lifetime. No retry, no recreation,
+findings gone.
+
+`_send_batch()` now recognizes this specific failure (`HTTP 400` + `"not found"`), calls
+`_ensure_one()` to recreate the dataset, and retries the batch once. Bounded to a single
+recreate attempt per batch so a genuinely broken create call can't loop forever.
+
+**Live-reproduced and fixed, not just code-traced.** Deliberately deleted a running scan's
+own lookup dataset mid-flight (twice — once via the abandoned-cutoff race on `xdragent2`,
+once by deleting the dataset directly on `xdr-agent` while tailing its log over SSH) and
+confirmed both halves:
+
+- **Pre-fix:** the dataset never reappeared; the scanner kept running but its per-host
+  matches dataset stayed gone for the rest of the scan.
+- **Post-fix**, from the scanner's own log:
+  ```
+  Lookup batch failed (HTTP 400, dataset not found) - '...' appears to have been deleted
+  mid-scan; recreating and retrying this batch once.
+  Lookup batch ok (55 rows): added=55, updated=0, skipped=0
+  ```
+  12 seconds from failure to recovery; every batch after that succeeded normally for the
+  rest of the scan.
+
+Verified locally first with mocked HTTP responses (recreate-once-then-succeed, and
+recreate-once-then-still-fails-cleanly, both asserted) before the live reproduction —
+76/76 unit tests passing throughout.
+
+The abandoned-cutoff misjudgment itself (`xdr_consolidate.py`'s gate not checking whether
+the scan's Action Center action is actually still running before applying its age-based
+cutoff) is not fixed by this change — this is a scanner-side safety net that makes the
+*consequence* non-destructive, not a fix to the gate's own precision. That remains a
+follow-up.
+
+---
+
+## v3.0.0 — 2026-08-11
+
+**Breaking.** Redesigns the matches lookup dataset's row grain. Supersedes v2.1.1's row-cap
+fix (same day) with a fix at the root instead of a cap on the symptom.
+
+### Changed — matches dataset is now one row per (rule, file) finding, not per offset
+
+v2.1.1 addressed the pathological-row-explosion bug (see its entry below) by capping how
+many *rows* one finding could emit. Further discussion of the tradeoffs that cap carried —
+sampling order, no queryable truncation flag, dataset row count still unrelated to finding
+count — led to a better fix: stop writing one row per matched offset at all.
+
+`yara_scanner_matches_v3_<host>_<YYYYMM>` now writes exactly one row per (rule, filename)
+match — the same grain the alert channel has always used. Every matched offset for that
+finding folds into the row instead of becoming its own row:
+
+- `match_count` — the TRUE total offsets matched, always accurate, never sampled
+- `truncated` — true when the embedded sample below is less than `match_count`
+- `offsets` / `strings` — JSON arrays, a sample of up to `CONFIG_LOOKUP_ROWS_PER_FINDING_MAX`
+  (default 50) offsets and their rendered matched strings, aligned 1:1
+- `string_ids` — JSON object of TRUE, uncapped per-string-identifier counts (e.g.
+  `{"$ext2": 12, "$note1": 3}`), for rules with multiple string variables
+
+The old per-offset columns (`offset`, `match`, `matched_length`, `string` as a single value)
+are gone from `_v3`; `_v2` data keeps them and remains queryable at its old grain. This is
+why it's a major bump: any dashboard or saved query built against `_v2`'s flat `offset`
+column will not find that column on `_v3` rows.
+
+Re-verified live against the same tenant and the same pathological file
+(`Microsoft-Windows-PowerShell%4Operational.evtx`, one rule, now 19,537 offsets — the file
+grew between test runs since it's a live event log): the finding is one row, `match_count`
+correctly reports 19,537, `truncated=true`, and `string_ids` sums back exactly to
+`match_count` (`{"$ps": 3501, "$enc": 424, "$hide": 14, "$np": 475}` = 4,414 on the
+`Diagtrack-Listener.etl.004` finding in the same run). Total dataset rows for the full
+53-match scan: **53** — one row per finding, matching the scan summary exactly.
+
+### Fixed — `xdr_consolidate.py` now schema-version-aware (2.1.0 → 2.2.0)
+
+Consolidation (`run_consolidation`) selected its shards by matching only `kind`
+(`matches`/`scans`), not schema version — on a tenant with both `_v2` and `_v3` matches
+shards (any tenant mid-rollout of this scanner version), a `ver="2"` consolidation run would
+have picked up `_v3` shards too and mis-projected their aggregated `match_count`/`offsets`/
+`string_ids` fields onto the `_v2` schema's per-offset columns, silently corrupting the
+merge. Shard selection now filters by `(kind, ver)` together, and `check_consolidation_status`
+/`consolidate_all` fan out across every known version by default
+(`KNOWN_MATCHES_SCHEMA_VERSIONS = ("2", "3")`) — `run_consolidation` itself still handles one
+version per call (breaking change: its `ver`/`vers` split is new; existing callers that never
+passed `ver=` explicitly are unaffected). The XSOAR automations
+(`YaraConsolidateStatus`/`YaraConsolidateApply`, via `YaraConsolidateCommon.py`, kept in sync
+with this file by hand) and the `xdr_data_management.py --consolidate` CLI both pick this up
+automatically — no argument changes needed on either.
+
+Verified with 5 new unit tests (mixed-version shard isolation, correct per-version target
+naming/schema, both wrapper functions covering both versions by default — 75/75 total passing).
+
+### Fixed — `consolidate_all`/`check_consolidation_status` now process matches before scans
+
+A second bug, found live while testing the fix above: both functions default to
+`kinds=("scans", "matches")`. Consolidating "scans" first deletes the per-host scans shard
+once verified — but that shard is the ONLY source of terminal-lifecycle truth
+(`build_terminal_map` rebuilds it fresh from whatever scans shards still exist on every
+`run_consolidation` call). By the time the separate "matches" pass ran moments later in the
+same `consolidate_all` call, the scans evidence was already gone, so a scan that had
+genuinely finished got deferred as `host_not_terminal ("no lifecycle row")` — a false
+negative caused by the tool's own ordering, not a real gate failure. Reproduced with a
+minimal single-host/single-scan unit test (`test_consolidate_all_processes_matches_before_scans`,
+76/76 total passing) and fixed by reordering the default to `("matches", "scans")` everywhere
+it appears (both wrapper functions here, `YaraConsolidateCommon.py`, and the
+`xdr_data_management.py --consolidate` CLI loop). This predates `_v3` entirely — it affects
+any consolidation run that processes both kinds together, so it would eventually have hit a
+`_v2`-only tenant too, just less easily reproduced (needs a host+scan combination where
+nothing else keeps the scans shard alive past that one scan).
+
+Verified end-to-end against the tenant's actual `_v3` data (scan `xdragent_..._104813_...`,
+the real scan this session's `_v3` testing produced — an earlier live-verification attempt
+targeted the wrong scan_id by mistake, which is what surfaced this ordering bug in the first
+place): matches (53 rows) and scans (2 rows) both consolidated cleanly into
+`yara_scanner_{matches,scans}_v3_scan_<scan_id>` in one pass, zero deferrals, sources
+verified and deleted. Row shape confirmed correct — `match_count`, `offsets`, `strings`,
+`string_ids`, `truncated` all present and internally consistent (`string_ids` sums to
+`match_count` on every row checked).
+
+### Upgrading
+
+**Not drop-in — dashboards/queries built on `_v2`'s per-offset columns need updating** before
+relying on `_v3` data (§3.2 README covers the caveats: JSON-encoded fields aren't natively
+XQL-filterable per-offset the way the old flat `offset` column was). Consolidation is
+drop-in: `xdr_consolidate.py` 2.2.0 handles `_v2` and `_v3` shards correctly and
+automatically in the same pass.
+
+---
+
+## v2.1.1 — 2026-08-11
+
+Fixes a dataset-upload starvation bug found during live fleet testing. No config or
+dataset changes required to upgrade.
+
+### Fixed — per-finding lookup-dataset row cap
+
+An unanchored or short string pattern (a bare word, a common byte pair) can occur
+thousands of times inside *one* file. Measured live: one test rule's `"powershell"`
+substring against a single `Microsoft-Windows-PowerShell%4Operational.evtx` produced
+**33,118 offsets from that one (rule, file) pair alone**, on a fleet scan where 3 of 8
+concurrently-scanned endpoints lost data — including one host that lost **100% of its
+matches and alerts** — because the pathological finding consumed the entire upload
+retry budget before the scan's other, legitimate findings ever got a turn. The alert
+channel already had a storm cap (`CONFIG_ALERT_MAX_PER_SCAN`, since day one); the
+lookup-dataset write loop had none.
+
+`CONFIG_LOOKUP_ROWS_PER_FINDING_MAX` (default `50`, `≤0` disables) now bounds dataset
+rows per (rule, file) finding the same way the alert cap bounds per-scan alert volume.
+Local artifacts (the JSON results file, the per-rule alert `.txt` log) are unaffected —
+only the network upload is capped. Truncation is logged locally
+(`Rule '<rule>' matched <file> at <N> offsets; capped lookup-dataset upload to the
+first 50`); see the README §3.2 caveats section for what this does and does not
+guarantee (sampling order, no queryable truncation flag, per-file not per-scan scope).
+
+Re-verified against the same live tenant after the fix: the three previously-affected
+files now cap at exactly 50 rows each, and all three previously-degraded endpoints
+delivered cleanly. A fourth endpoint's total delivery failure in the same test turned
+out to be an unrelated, pre-existing network-reachability issue (that host's outbound
+HTTPS to the XDR API times out at the TCP-connect stage) — confirmed via its local
+upload log, not something this or any scanner-side fix can address.
+
+### Upgrading
+
+**Drop-in.** No config or dataset changes. `CONFIG_LOOKUP_ROWS_PER_FINDING_MAX` ships
+with a sensible default; tune it only if you have rules that legitimately need more
+than 50 samples per file (see README §3.2 for the tradeoffs).
 
 ---
 
