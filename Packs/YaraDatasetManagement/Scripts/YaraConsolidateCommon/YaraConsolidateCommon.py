@@ -20,9 +20,13 @@ from CommonServerPython import *  # noqa: F401,F403
 
 
 # ============================================================================
-# xdr_consolidate.py core logic — verbatim port, unit-tested with no network in
-# tests/test_consolidation.py against a FakeClient. See that module for full comments.
+# xdr_consolidate.py core logic — verbatim port. That module is the one unit-tested with no
+# network in tests/test_consolidation.py against a FakeClient; the copy below is held to it by
+# test_pack_copy_gate_logic_matches_xdr_consolidate, which compares the two files' gate
+# helpers statement-by-statement so this copy cannot silently drift out of sync again. See
+# xdr_consolidate.py for full comments.
 # ============================================================================
+import collections
 import re
 
 _PREFIX = "yara_scanner"
@@ -41,6 +45,10 @@ DEFAULT_ROW_CEILING = 2_000_000
 DEFAULT_ABANDONED_SECS = 24 * 3600
 DELETE_CONCURRENCY = 12
 _WRITE_BATCH = 500
+# Endpoint-clock-skew tolerances (edge case #6) — kept in sync with xdr_consolidate.py, see
+# that module for the reasoning and the live measurements behind both numbers.
+SKEW_TOLERANCE_MS = 5 * 60 * 1000
+DEFAULT_SKEW_BACKSTOP_SECS = 7 * 24 * 3600
 
 # v2: one row per matched string offset (pre-3.0.0 scanner). v3: one row per (rule, file)
 # finding — see xdr_yara_scanner.py's add_match docstring for why. Both stay consolidatable
@@ -194,6 +202,61 @@ def shard_is_terminal(latest_status, action_state):
     return False
 
 
+def _as_ms(v):
+    """Epoch-ms int from whatever XQL hands back (int, float, numeric/exponent string, ISO
+    timestamp), or None. Never raises - see xdr_consolidate.py for why each shape is accepted."""
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        pass
+    try:
+        from datetime import datetime, timezone
+        s = str(v).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except (TypeError, ValueError):
+        return None
+
+
+def _newest_ms(endpoint_ms, server_ms, now_ms=None):
+    """The freshness signal both time gates measure against: the LATER of the endpoint's own
+    event_timestamp_ms and the platform's server-side _insert_time, with implausible values
+    discarded first (endpoint stamp ahead of ingest = a clock running ahead; server stamp far
+    in the future of now_ms = a unit mismatch). Edge case #6 - see xdr_consolidate.py's copy
+    for the full reasoning, including why this must never be reduced to _insert_time alone and
+    why both callers may only ever be fed SOURCE SHARDS, never a per-scan target."""
+    ep, srv = _as_ms(endpoint_ms), _as_ms(server_ms)
+    if ep is not None and srv is not None and now_ms is not None \
+            and srv > now_ms + SKEW_TOLERANCE_MS:
+        srv = None                       # guard 2: implausible server stamp (unit mismatch)
+    if ep is not None and srv is not None and ep > srv + SKEW_TOLERANCE_MS:
+        ep = None                        # guard 1: endpoint clock ahead of ingest
+    vals = [v for v in (ep, srv) if v is not None]
+    return max(vals) if vals else None
+
+
+def _max_ms(a, b):
+    """max() over two optional epoch-ms values, ignoring Nones."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return max(a, b)
+
+
+_ScanStat = collections.namedtuple("_ScanStat", "count newest ep_newest")
+
+
 def build_terminal_map(scans_rows_by_ds, action_state_for=None):
     out = {}
     for ds, rows in scans_rows_by_ds.items():
@@ -207,9 +270,12 @@ def build_terminal_map(scans_rows_by_ds, action_state_for=None):
             if sid:
                 per.setdefault(sid, []).append(r)
         for sid, rs in per.items():
-            rs_sorted = sorted(rs, key=lambda r: int(r.get("event_timestamp_ms") or 0))
+            rs_sorted = sorted(rs, key=lambda r: _as_ms(r.get("event_timestamp_ms")) or 0)
             latest_status = rs_sorted[-1].get("status")
-            newest = max((int(r.get("event_timestamp_ms") or 0) for r in rs), default=None)
+            newest = None
+            for r in rs:
+                newest = _max_ms(newest, _newest_ms(r.get("event_timestamp_ms"),
+                                                    r.get("_insert_time")))
             astate = action_state_for(host) if action_state_for else None
             out[(sid, host)] = {"terminal": shard_is_terminal(latest_status, astate),
                                 "newest_ms": newest, "status": latest_status}
@@ -271,16 +337,30 @@ def _cleanup_verified_scan_rows(client, srcs, scan_id, log):
                 "whole-shard delete instead): %s" % (scan_id, ds, str(e)[:120]))
 
 
-def _scan_stats(client, dataset):
-    rows = client.xql("dataset = %s | comp count() as n, max(event_timestamp_ms) as newest "
-                      "by scan_id" % dataset, limit=10000) or []
-    out = {}
+def _scan_stats(client, dataset, now_ms=None, log=None):
+    """{scan_id: _ScanStat(count, newest, ep_newest)} via aggregation - no row pull. newest is
+    skew-proofed per _newest_ms: max(_insert_time) rides along in the same comp stage (verified
+    working on the live tenant). dataset MUST be a source shard, never a per-scan target."""
+    rows = client.xql("dataset = %s | comp count() as n, max(event_timestamp_ms) as newest, "
+                      "max(_insert_time) as srv_newest by scan_id" % dataset, limit=10000) or []
+    out, srv_seen = {}, False
     for r in rows:
         sid = r.get("scan_id")
-        if sid:
-            newest = r.get("newest")
-            out[sid] = (int(r.get("n") or 0), int(newest) if newest is not None else None)
+        if not sid:
+            continue
+        ep, srv = _as_ms(r.get("newest")), _as_ms(r.get("srv_newest"))
+        srv_seen = srv_seen or srv is not None
+        out[sid] = _ScanStat(int(r.get("n") or 0), _newest_ms(ep, srv, now_ms), ep)
+    _warn_if_no_server_stamp(dataset, bool(out), srv_seen, log)
     return out
+
+
+def _warn_if_no_server_stamp(dataset, had_rows, srv_seen, log):
+    """A silently-inactive skew protection (platform stopped returning _insert_time) must be
+    visible in the Job's log rather than degrade unnoticed to pre-fix behaviour."""
+    if had_rows and not srv_seen and log:
+        log("  note: %s returned no usable _insert_time — endpoint-clock-skew protection is "
+            "INACTIVE for this shard; gates fall back to event_timestamp_ms alone" % dataset)
 
 
 def _coerce_row(row, schema):
@@ -306,38 +386,58 @@ def _coerce_row(row, schema):
     return out
 
 
-def _stats_from_rows(rows):
-    out = {}
+def _stats_from_rows(rows, now_ms=None, log=None, dataset=""):
+    """Same shape as _scan_stats but from already-read rows (used for tiny scans shards); here
+    _insert_time arrives as a system column on each read-back row rather than from the
+    aggregation. Rows MUST come from a source shard, never a per-scan target."""
+    out, srv_seen = {}, False
     for r in rows:
         sid = r.get("scan_id")
         if not sid:
             continue
-        n, newest = out.get(sid, (0, None))
-        ts = r.get("event_timestamp_ms")
-        ts = int(ts) if ts is not None else None
-        newest = ts if newest is None else (max(newest, ts) if ts is not None else newest)
-        out[sid] = (n + 1, newest)
+        prev = out.get(sid) or _ScanStat(0, None, None)
+        ep, srv = _as_ms(r.get("event_timestamp_ms")), _as_ms(r.get("_insert_time"))
+        srv_seen = srv_seen or srv is not None
+        out[sid] = _ScanStat(prev.count + 1,
+                             _max_ms(prev.newest, _newest_ms(ep, srv, now_ms)),
+                             _max_ms(prev.ep_newest, ep))
+    _warn_if_no_server_stamp(dataset, bool(out), srv_seen, log)
     return out
 
 
-def _gate_scan(scan_id, srcs, newest_by, tmap, now_ms, quiet_secs, abandoned_after_secs, log):
+def _gate_scan(scan_id, srcs, newest_by, ep_newest_by, tmap, now_ms, quiet_secs,
+               abandoned_after_secs, log, skew_backstop_secs=DEFAULT_SKEW_BACKSTOP_SECS):
+    """Defer-reason string if any source host is not safe yet, else ''. Both age checks measure
+    the skew-proof `newest` EXCEPT the `settled` backstop, which uses the endpoint stamp alone -
+    the one value nothing but the endpoint itself can re-arm. See xdr_consolidate.py."""
     for ds in srcs:
         host = (parse_shard(ds) or {}).get("host", "")
         entry = tmap.get((scan_id, host))
         is_terminal = bool(entry and entry["terminal"])
         newest = newest_by.get((scan_id, ds))
+        ep_newest = (ep_newest_by or {}).get((scan_id, ds))
+        ep_age_ms = (now_ms - ep_newest) if ep_newest is not None else None
+        settled = ep_age_ms is not None and ep_age_ms >= skew_backstop_secs * 1000
+        if newest is not None and newest > now_ms + SKEW_TOLERANCE_MS:
+            log("  scan %s: shard %s newest stamp is %.1fh in the FUTURE of this run's clock "
+                "(endpoint clock ahead, no usable _insert_time to correct with) — this scan "
+                "will keep deferring until real time catches up"
+                % (scan_id, ds, (newest - now_ms) / 3_600_000.0))
         if not is_terminal:
             age_ms = (now_ms - newest) if newest is not None else None
-            if age_ms is not None and age_ms >= abandoned_after_secs * 1000:
-                log("  scan %s: host %s non-terminal (%s) but newest row is %.1fh old — "
-                    "treating as ABANDONED, consolidating to preserve its findings"
+            abandoned = age_ms is not None and age_ms >= abandoned_after_secs * 1000
+            if abandoned or settled:
+                log("  scan %s: host %s non-terminal (%s) but %s — treating as ABANDONED, "
+                    "consolidating to preserve its findings"
                     % (scan_id, host, (entry.get("status") if entry else "no lifecycle row"),
-                       age_ms / 3_600_000.0))
+                       ("newest row is %.1fh old" % (age_ms / 3_600_000.0)) if abandoned else
+                       ("the endpoint has written nothing for %.1f days (server-stamp "
+                        "backstop)" % (ep_age_ms / 86_400_000.0))))
             else:
                 log("  scan %s: host %s not terminal (%s) — deferring"
                     % (scan_id, host, "no lifecycle row" if not entry else entry.get("status")))
                 return "host_not_terminal"
-        if not newest_row_age_ok(newest, now_ms, quiet_secs):
+        if not newest_row_age_ok(newest, now_ms, quiet_secs) and not settled:
             log("  scan %s: host shard %s within quiet period — deferring" % (scan_id, ds))
             return "within_quiet_period"
     return ""
@@ -415,13 +515,14 @@ def run_consolidation(client, kind, ver="2", quiet_secs=DEFAULT_QUIET_SECS,
     scans_rows = {d: _rows_of(d, client) for d in scans_ds}
     tmap = build_terminal_map(scans_rows, action_state_for)
 
-    all_groups, newest_by = {}, {}
+    all_groups, newest_by, ep_newest_by = {}, {}, {}
     for ds in shards:
-        stats = (_stats_from_rows(scans_rows[ds]) if kind == "scans"
-                 else _scan_stats(client, ds))
-        for sid, (n, newest) in stats.items():
-            all_groups.setdefault(sid, {})[ds] = n
-            newest_by[(sid, ds)] = newest
+        stats = (_stats_from_rows(scans_rows[ds], now_ms=now_ms, log=log, dataset=ds)
+                 if kind == "scans" else _scan_stats(client, ds, now_ms=now_ms, log=log))
+        for sid, st in stats.items():
+            all_groups.setdefault(sid, {})[ds] = st.count
+            newest_by[(sid, ds)] = st.newest
+            ep_newest_by[(sid, ds)] = st.ep_newest
 
     shard_scans = {}
     for sid, counts in all_groups.items():
@@ -439,7 +540,7 @@ def run_consolidation(client, kind, ver="2", quiet_secs=DEFAULT_QUIET_SECS,
     plans = []
     for scan_id, counts in sorted(groups.items()):
         srcs = sorted(counts)
-        deferred = _gate_scan(scan_id, srcs, newest_by, tmap, now_ms, quiet_secs,
+        deferred = _gate_scan(scan_id, srcs, newest_by, ep_newest_by, tmap, now_ms, quiet_secs,
                               abandoned_after_secs, log)
         if deferred:
             plans.append({"scan_id": scan_id, "ok": False, "reason": deferred, "deletable": []})

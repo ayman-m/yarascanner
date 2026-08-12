@@ -17,12 +17,13 @@ fixes without changing behaviour you rely on.
 
 ## Tier 3 edge-case fixes — 2026-08-12
 
-Nine confirmed Tier-3 gaps fixed in this pass, found through systematic edge-case review of
+Ten confirmed Tier-3 gaps fixed in this pass, found through systematic edge-case review of
 the consolidation pipeline's operator-facing failure modes (API key rotation, playbook
 failure visibility, Action Center's full terminal-state vocabulary, heartbeat liveness under
-throttling) — not through a live incident. A tenth item on the same confirmed list turned out,
-on closer inspection while writing this entry, to still be open in the working tree; it's
-recorded below as a known gap rather than claimed fixed.
+throttling, endpoint clock skew in the consolidation time gates) — not through a live incident.
+The tenth, edge case #6, was recorded as still-open in an earlier draft of this entry and is
+now fixed; its section below is the authoritative account, including what it deliberately
+leaves open.
 
 ### Fixed — `xdr_consolidate.py` v2.6.0: two more Action Center states recognized as terminal (edge case #2)
 
@@ -128,32 +129,98 @@ tries to attach it to a scheduled Job and can't find it. New
 monitoring); the top-level `README.md` §7 now links to it and the repo layout tree lists the
 pack.
 
-### Known gap (not fixed here) — endpoint clock skew in the quiet-period/abandoned-scan gates (edge case #6)
+### Fixed — `xdr_consolidate.py` v2.7.0: the time gates no longer trust the endpoint's clock (edge case #6)
 
-On the same confirmed list as the fixes above, but **not actually fixed** in the working
-tree — recorded here rather than silently claimed done. `newest_row_age_ok()`
-(`xdr_consolidate.py:226`) and `_gate_scan()`'s abandoned-scan check (`:705`, comparing
-`age_ms >= abandoned_after_secs * 1000`) still measure elapsed time as `now_ms` (this
-process's own clock) minus `newest_ms`, which comes from `_scan_stats()` /
-`_stats_from_rows()` (`:340`, `:383`) reading each row's `event_timestamp_ms` — an
-endpoint-stamped, uncorrected wall-clock value — with zero skew tolerance in either direction.
-A skew-immune, server-assigned `_insert_time` column already exists on every row (referenced
-only in `_coerce_row`'s docstring, `:360`, as something the write-back projection *drops*) but
-is never read for gate timing. A sufficiently clock-skewed endpoint can therefore make
-`within_quiet_period`/abandoned-cutoff judgments early or late in a way this tool cannot
-currently detect or correct for. Remains a follow-up; no fix proposed here.
+Recorded in an earlier draft of this section as a known gap; now closed. Both time gates —
+the quiet period (`newest_row_age_ok`) and the abandoned-scan cutoff (`_gate_scan`) — measured
+a scan's age as `now_ms` (server-side) minus `event_timestamp_ms`, which is stamped **on the
+endpoint**. At fleet scale a wrong endpoint clock is routine, and one direction loses data: a
+clock running *behind* makes a live scan's rows look hours or days old, so the cutoff sweeps
+the scan as abandoned and the quiet period waves it through — and this tool then consolidates
+and **deletes the shard the scanner is still uploading into**.
+
+New `_newest_ms()` measures against the later of `event_timestamp_ms` and `_insert_time`, the
+platform's own server-side ingest stamp, which stays ~"now" for as long as a scan is actually
+uploading no matter what the endpoint's clock says. `_scan_stats()` gets it from
+`max(_insert_time)` riding along in the existing `comp ... by scan_id` stage (measured working
+on the live tenant); `_stats_from_rows()` reads it as a system column off the rows it already
+pulled. New `_as_ms()` coerces whatever shape XQL returns a stamp in (int, float, numeric or
+exponent string, ISO-8601) and degrades to "no signal" rather than raising — the same
+type-fidelity problem `_coerce_row` exists for.
+
+**Why `max()` and not simply replacing one stamp with the other:** `_insert_time` is a
+freshness signal *only on a source shard*. Consolidation reads a shard's rows and re-writes
+them into the per-scan target, which resets `_insert_time` while `event_timestamp_ms` keeps
+the original scan time — measured on a real target, the gap was ~**31 days**, against 3.2s /
+3.7s / 5.2s / 5.4s / 66.8s (ordinary upload latency) on real shards. Both stats helpers are
+therefore fed source shards only, which `parse_shard` enforces structurally by refusing to
+recognise a `…_scan_<id>` target as a shard.
+
+Two guards keep the correction from creating a worse failure than the one it fixes, since a
+value that is too *new* is unbounded rather than merely inconvenient (`now_ms - newest` goes
+negative, so the quiet period can never be satisfied **and** the abandoned cutoff can never
+fire — the scan is stuck and its shard undeletable forever):
+
+- an endpoint stamp more than `SKEW_TOLERANCE_MS` (5 min) ahead of the ingest stamp is
+  discarded, not maxed in — a row cannot be authored after the platform received it, so that
+  is a clock running ahead, and the trustworthy stamp is used instead;
+- a server stamp implausibly far in the future of `now_ms` (the tell for a unit mismatch, e.g.
+  microseconds) is dropped in favour of the endpoint stamp, so an unexpected platform
+  representation degrades to pre-fix behaviour instead of stalling every scan on the tenant.
+
+`_gate_scan` also gains a **backstop** (`DEFAULT_SKEW_BACKSTOP_SECS`, 7 days) measured on the
+endpoint stamp alone, which nothing but the endpoint itself can re-arm. The cutoff's whole
+purpose is to guarantee nothing blocks cleanup forever, and `_insert_time` only means "when
+this row was ingested" as long as nothing rewrites the shard — this tool's own
+`_cleanup_verified_scan_rows` rewrites shards that may still hold other scans' rows. Whether
+the platform implements that removal as a rewrite (which would re-stamp the survivors) is
+**not verified** — settling it needs a destructive `remove_lookup_data` against a real shard —
+so the backstop makes the answer not matter: past a week of endpoint silence, a non-terminal
+scan is abandoned and the quiet period is satisfied regardless. The trade is explicit: skew
+protection is given back only for a clock wrong by more than a week, which is far rarer than
+one wrong by hours.
+
+Mirrored verbatim into
+`Packs/YaraDatasetManagement/Scripts/YaraConsolidateCommon/YaraConsolidateCommon.py` — that
+copy, not `xdr_consolidate.py`, is what the scheduled `YaraConsolidateApply` Job actually runs,
+so a fix landing only in the standalone module would leave the data-loss window fully open in
+production. New `test_pack_copy_gate_logic_matches_xdr_consolidate` now compares the two files'
+whole ported core statement-by-statement (docstrings and comments stripped), so the copies
+cannot silently drift again. As with every pack change, it only takes effect once the pack is
+re-delivered (console Import or pack-zip install) — editing the repo file changes nothing on
+the tenant.
+
+Also in this change: `build_terminal_map`'s `newest_ms` goes through the same skew-proof path
+(and through `_as_ms`, so a non-numeric stamp no longer raises `ValueError` and aborts a whole
+pass), so the value sitting next to `terminal` cannot silently reintroduce this bug if a future
+caller reaches for it; `_scan_stats`/`_stats_from_rows` log when a shard returns no usable
+`_insert_time`, so a silently-inactive protection is visible in the run log; and the fake
+client's aggregation in `tests/test_consolidation.py` now derives its response from the query
+text instead of hardcoded output keys — previously, reverting the query to its pre-fix form or
+renaming the alias disabled the fix completely with the suite still green.
+
+**Residual, deliberately open:** an endpoint whose clock runs *ahead* on a platform that
+returns no usable `_insert_time` still defers indefinitely, because there is then no
+trustworthy stamp to correct against (clamping to `now_ms` would reset the age to zero every
+pass and livelock the same way). `_gate_scan` logs that case distinctly so it is diagnosable
+rather than silently permanent.
 
 ### Upgrading
 
-**Mostly drop-in.** `xdr_consolidate.py` v2.6.0's `TERMINAL_ACTION` change only widens what
-already counts as terminal — no config or dataset changes. `xdr_yara_scanner.py`'s heartbeat
-thread is internal; the new `YARA_HEARTBEAT_POLL_SECS` env var (default 30s) is optional. The
-`Packs/YaraDatasetManagement` changes (`record_consolidation_run`, the new
-`yara_scanner_consolidation_runs` dataset, the new widget, `CoreApiClient`'s fail-fast 401)
+**Mostly drop-in.** `xdr_consolidate.py` ships from this pass as **v2.7.0**. Its
+`TERMINAL_ACTION` change only widens what already counts as terminal — no config or dataset
+changes. The edge-case-#6 gate change is also
+drop-in but is a **behavioural** change to when a scan is consolidated: a scan whose endpoint
+clock is wrong now waits longer (and, in the ahead direction, is no longer stuck forever),
+which is why the module version moves to 2.7.0 — a tenant can tell a skew-protected
+consolidator from an unprotected one by that number. `xdr_yara_scanner.py`'s heartbeat thread
+is internal; the new `YARA_HEARTBEAT_POLL_SECS` env var (default 30s) is optional. The
+`Packs/YaraDatasetManagement` changes (the mirrored gate fix, `record_consolidation_run`, the
+new `yara_scanner_consolidation_runs` dataset, the new widget, `CoreApiClient`'s fail-fast 401)
 only take effect once the pack is re-delivered via console Import or pack-zip install (see its
 README's Deployment section) — editing the repo files alone changes nothing on the tenant.
 
-Verified with the full suite: **102/102** passing (`python3 -m pytest tests/ -q`).
+Verified with the full suite: **125/125** passing (`python3 -m pytest tests/ -q`).
 
 ---
 

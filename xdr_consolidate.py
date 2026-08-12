@@ -32,11 +32,12 @@ The pure decision logic (parsing, grouping, gates, plan) is below and unit-teste
 network. The live orchestration (run_consolidation) uses an injected client so it can be
 driven against the real API or a fake.
 """
+import collections
 import re
 import sys
 import time
 
-__version__ = "2.6.0"
+__version__ = "2.7.0"
 
 # ---- naming -----------------------------------------------------------------
 # per-host shard:  yara_scanner_<kind>_v<ver>_<host>_<6hex>[_<YYYYMM>]
@@ -67,6 +68,27 @@ DEFAULT_ROW_CEILING = 2_000_000
 DEFAULT_ABANDONED_SECS = 24 * 3600
 DELETE_CONCURRENCY = 12        # a single dataset delete is ~60s server-side; different-dataset
                                # deletes don't race, so delete in bounded-concurrent batches
+
+# ---- clock-skew tolerances (edge case #6) ----------------------------------
+# How far apart the endpoint's own event_timestamp_ms and the platform's _insert_time may
+# legitimately be in the "endpoint newer" direction. A row cannot be AUTHORED after the
+# platform INGESTED it, so any excess is the endpoint's clock running ahead. Measured live on
+# real shards, the honest gap (upload latency, ingest first) was 3.2s / 3.7s / 5.2s / 5.4s /
+# 66.8s; 5 minutes is generous headroom over that without tolerating a genuinely wrong clock.
+SKEW_TOLERANCE_MS = 5 * 60 * 1000
+# Backstop that keeps the abandoned cutoff from being deferrable without limit. The cutoff now
+# measures age from max(event_timestamp_ms, _insert_time) (see _newest_ms), and _insert_time is
+# only guaranteed to mean "when this row was ingested" as long as nothing REWRITES the shard.
+# This tool itself rewrites: _cleanup_verified_scan_rows removes one scan's rows from a shard
+# that may still hold OTHER scans' rows. If the platform implements that removal as a
+# rewrite/compaction rather than an in-place tombstone (unverified — a live check needs a
+# destructive remove against a real shard), the surviving siblings get a fresh _insert_time on
+# every cleanup pass, and a host scanned daily could reset an orphan's age before the 24h
+# cutoff ever elapses — its shard would then never be deletable. Past this backstop, the
+# ENDPOINT stamp alone is enough to call a non-terminal scan abandoned and to satisfy the quiet
+# period. The trade is explicit: it gives back skew protection only for a clock wrong by more
+# than a week (far rarer than one wrong by hours), and only that far past any plausible scan.
+DEFAULT_SKEW_BACKSTOP_SECS = 7 * 24 * 3600
 
 # ---- overlap guard --------------------------------------------------------
 # Two consolidate_all runs writing to the SAME per-scan target concurrently is exactly the
@@ -190,6 +212,110 @@ def shard_is_terminal(latest_status, action_state):
     return False
 
 
+def _as_ms(v):
+    """Epoch-ms int from whatever XQL hands back, or None. Never raises: a stamp this can't
+    read must degrade to 'no signal', not kill a run.
+
+    Accepts int, float, and the string forms XQL is known to return numbers as — this repo has
+    live evidence (see _coerce_row) that read-back stringifies numeric columns ('0') and floats
+    them (9.0), so '1799999995000', '1799999995000.0' and '1.8e12' must all parse. An
+    ISO-8601 form is also accepted, because whether _insert_time comes back as epoch ms or as a
+    formatted timestamp on a RAW row pull (as opposed to the max(_insert_time) aggregation,
+    which was measured live and does return a number) is not verified on this tenant — parsing
+    it costs nothing and silently losing the skew signal costs the whole protection."""
+    if v is None:
+        return None
+    if isinstance(v, bool):          # bools are ints in Python; a bool stamp is nonsense
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        pass
+    try:
+        from datetime import datetime, timezone
+        s = str(v).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except (TypeError, ValueError):
+        return None
+
+
+def _newest_ms(endpoint_ms, server_ms, now_ms=None):
+    """The freshness signal both time gates measure against: the LATER of the endpoint's own
+    event_timestamp_ms and the platform's server-side _insert_time, with implausible values
+    discarded first. Either may be None.
+
+    WHY max() OF THE TWO, and not just one of them (edge case #6):
+
+    event_timestamp_ms is stamped ON THE ENDPOINT, so it carries that endpoint's clock error.
+    At fleet scale a wrong endpoint clock is routine, and one direction is dangerous: a clock
+    running BEHIND makes a live scan's rows look hours or days old, so the abandoned cutoff
+    sweeps it and the quiet period waves it through — and this tool then consolidates and
+    DELETES the shard of a scan that is still writing to it. _insert_time is stamped by the
+    platform at ingest, so while a scan is actively uploading it stays ~"now" no matter what
+    the endpoint's clock says, and taking the max makes that dangerous direction impossible.
+
+    WHY THE TWO GUARDS, and not a bare max():
+
+    1. endpoint AHEAD of ingest (ep > srv + SKEW_TOLERANCE_MS) — impossible in reality (a row
+       cannot be authored after the platform received it), so the endpoint stamp is discarded
+       rather than maxed in. A bare max() would keep it, and a future stamp makes
+       `now_ms - newest` NEGATIVE FOREVER: the quiet period can never be satisfied AND the
+       abandoned cutoff can never fire, so the scan is permanently un-consolidatable and its
+       shard permanently un-deletable — the exact stuck-forever failure the cutoff exists to
+       prevent, not the "harmless delay" it looks like at a glance.
+    2. server stamp implausibly in the future of now_ms — the tell for a unit mismatch (epoch
+       microseconds reads ~1000x now_ms). Dropped in favour of the endpoint stamp, so a
+       platform returning _insert_time in unexpected units degrades to pre-fix behaviour
+       instead of stalling every scan on the tenant. Only applied when the endpoint stamp
+       survives to take over: returning None would mean "no signal at all", which the quiet
+       gate reads as "nothing to wait for" — the delete-happy direction.
+
+    Absent/unreadable _insert_time falls back to event_timestamp_ms alone, i.e. exactly the
+    pre-fix behaviour — never worse. Residual, deliberately not closed here: an endpoint clock
+    running ahead on a platform that returns NO usable _insert_time still stalls, because there
+    is then no trustworthy stamp to fall back to (and clamping to now_ms would reset the age to
+    zero on every pass, which livelocks the same way). _gate_scan logs that case distinctly.
+
+    DO NOT "simplify" this to _insert_time alone. That stamp is only a freshness signal on a
+    SOURCE SHARD. Consolidation READS a shard's rows and RE-WRITES them into the per-scan
+    target, which resets _insert_time to the consolidation time while event_timestamp_ms
+    keeps the original scan time — measured on a real target: _insert_time was ~31 DAYS newer
+    than the scan it describes. Both callers below are invoked only on source shards (see
+    run_consolidation, which draws them from `shards`/`scans_ds`, and parse_shard, which
+    returns None for a per-scan target); that restriction is what keeps this valid."""
+    ep, srv = _as_ms(endpoint_ms), _as_ms(server_ms)
+    if ep is not None and srv is not None and now_ms is not None \
+            and srv > now_ms + SKEW_TOLERANCE_MS:
+        srv = None                       # guard 2: implausible server stamp (unit mismatch)
+    if ep is not None and srv is not None and ep > srv + SKEW_TOLERANCE_MS:
+        ep = None                        # guard 1: endpoint clock ahead of ingest
+    vals = [v for v in (ep, srv) if v is not None]
+    return max(vals) if vals else None
+
+
+def _max_ms(a, b):
+    """max() over two optional epoch-ms values, ignoring Nones."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return max(a, b)
+
+
+# count      : rows for this scan_id in this shard
+# newest     : skew-proof freshness signal both gates measure against (see _newest_ms)
+# ep_newest  : the ENDPOINT stamp alone — only used by _gate_scan's backstop, which must not
+#              be re-armable by a server-side re-stamp (see DEFAULT_SKEW_BACKSTOP_SECS)
+_ScanStat = collections.namedtuple("_ScanStat", "count newest ep_newest")
+
+
 def build_terminal_map(scans_rows_by_ds, action_state_for=None):
     """Derive terminality per (scan_id, host) from the SCANS shards.
 
@@ -198,7 +324,13 @@ def build_terminal_map(scans_rows_by_ds, action_state_for=None):
     finished. Returns {(scan_id, host): {terminal, newest_ms, status}}.
 
     A (scan_id, host) that is absent here has no terminal lifecycle row yet, which the
-    caller must treat as NOT safe: matches can stream before the terminal row is written."""
+    caller must treat as NOT safe: matches can stream before the terminal row is written.
+
+    newest_ms here is informational (the gates read their own per-(scan_id, shard) value from
+    newest_by, not this) but is computed through the same skew-proof _newest_ms, so a future
+    caller reaching for the value sitting next to `terminal` cannot silently reintroduce edge
+    case #6. Every stamp goes through _as_ms, so a non-numeric timestamp degrades to "no
+    signal" instead of raising ValueError and aborting the whole consolidation pass."""
     out = {}
     for ds, rows in scans_rows_by_ds.items():
         p = parse_shard(ds)
@@ -211,9 +343,12 @@ def build_terminal_map(scans_rows_by_ds, action_state_for=None):
             if sid:
                 per.setdefault(sid, []).append(r)
         for sid, rs in per.items():
-            rs_sorted = sorted(rs, key=lambda r: int(r.get("event_timestamp_ms") or 0))
+            rs_sorted = sorted(rs, key=lambda r: _as_ms(r.get("event_timestamp_ms")) or 0)
             latest_status = rs_sorted[-1].get("status")
-            newest = max((int(r.get("event_timestamp_ms") or 0) for r in rs), default=None)
+            newest = None
+            for r in rs:
+                newest = _max_ms(newest, _newest_ms(r.get("event_timestamp_ms"),
+                                                    r.get("_insert_time")))
             astate = action_state_for(host) if action_state_for else None
             out[(sid, host)] = {
                 "terminal": shard_is_terminal(latest_status, astate),
@@ -225,7 +360,17 @@ def build_terminal_map(scans_rows_by_ds, action_state_for=None):
 
 def newest_row_age_ok(newest_ms, now_ms, quiet_secs):
     """True if the newest row is old enough that the uploader has surely finished draining.
-    No rows (newest_ms None) is not a blocker — nothing to wait for."""
+    No rows (newest_ms None) is not a blocker — nothing to wait for.
+
+    newest_ms must be the skew-proof value from _newest_ms, not a bare event_timestamp_ms:
+    now_ms is server-side while event_timestamp_ms is endpoint-side, so subtracting one from
+    the other measures the endpoint's clock error as well as the row's age.
+
+    None is deliberately "not blocked" and not "defer": it means neither stamp on any of the
+    shard's rows was readable at all, and deferring on that would make such a shard
+    permanently undeletable with no path out. _scan_stats/_stats_from_rows log when a shard's
+    server stamp is missing, so the degraded case is visible in the run log rather than
+    silent."""
     if newest_ms is None:
         return True
     return (now_ms - int(newest_ms)) >= quiet_secs * 1000
@@ -337,18 +482,35 @@ def _cleanup_verified_scan_rows(client, srcs, scan_id, log):
                 "whole-shard delete instead): %s" % (scan_id, ds, str(e)[:120]))
 
 
-def _scan_stats(client, dataset):
-    """{scan_id: (count, newest_ms)} via aggregation — no row pull. This is what lets the
-    tool scale: a matches shard with millions of rows is summarised in one query."""
-    rows = client.xql("dataset = %s | comp count() as n, max(event_timestamp_ms) as newest "
-                      "by scan_id" % dataset, limit=10000) or []
-    out = {}
+def _scan_stats(client, dataset, now_ms=None, log=None):
+    """{scan_id: _ScanStat(count, newest, ep_newest)} via aggregation — no row pull. This is
+    what lets the tool scale: a matches shard with millions of rows is summarised in one query.
+
+    newest is skew-proofed per _newest_ms: max(_insert_time) rides along in the same comp stage
+    (verified working on the live tenant) so one endpoint's wrong clock cannot make a running
+    scan look finished. dataset MUST be a source shard, never a per-scan target."""
+    rows = client.xql("dataset = %s | comp count() as n, max(event_timestamp_ms) as newest, "
+                      "max(_insert_time) as srv_newest by scan_id" % dataset, limit=10000) or []
+    out, srv_seen = {}, False
     for r in rows:
         sid = r.get("scan_id")
-        if sid:
-            newest = r.get("newest")
-            out[sid] = (int(r.get("n") or 0), int(newest) if newest is not None else None)
+        if not sid:
+            continue
+        ep, srv = _as_ms(r.get("newest")), _as_ms(r.get("srv_newest"))
+        srv_seen = srv_seen or srv is not None
+        out[sid] = _ScanStat(int(r.get("n") or 0), _newest_ms(ep, srv, now_ms), ep)
+    _warn_if_no_server_stamp(dataset, bool(out), srv_seen, log)
     return out
+
+
+def _warn_if_no_server_stamp(dataset, had_rows, srv_seen, log):
+    """The skew protection is only active while the platform actually returns _insert_time.
+    If it ever stops (column dropped, renamed alias, an aggregation form a future platform
+    version rejects), every gate silently reverts to the pre-fix, skew-vulnerable behaviour
+    with green tests and no symptom. Say so in the run log instead."""
+    if had_rows and not srv_seen and log:
+        log("  note: %s returned no usable _insert_time — endpoint-clock-skew protection is "
+            "INACTIVE for this shard; gates fall back to event_timestamp_ms alone" % dataset)
 
 
 def _coerce_row(row, schema):
@@ -380,18 +542,25 @@ def _coerce_row(row, schema):
     return out
 
 
-def _stats_from_rows(rows):
-    """Same shape as _scan_stats but from already-read rows (used for tiny scans shards)."""
-    out = {}
+def _stats_from_rows(rows, now_ms=None, log=None, dataset=""):
+    """Same shape as _scan_stats but from already-read rows (used for tiny scans shards).
+
+    Same skew-proof newest (see _newest_ms) — here _insert_time comes along as a system column
+    on each read-back row rather than from an aggregation, so it is read through _as_ms, which
+    also accepts the string/ISO forms XQL read-back is known to hand numbers back in. Rows MUST
+    come from a source shard, never a per-scan target."""
+    out, srv_seen = {}, False
     for r in rows:
         sid = r.get("scan_id")
         if not sid:
             continue
-        n, newest = out.get(sid, (0, None))
-        ts = r.get("event_timestamp_ms")
-        ts = int(ts) if ts is not None else None
-        newest = ts if newest is None else (max(newest, ts) if ts is not None else newest)
-        out[sid] = (n + 1, newest)
+        prev = out.get(sid) or _ScanStat(0, None, None)
+        ep, srv = _as_ms(r.get("event_timestamp_ms")), _as_ms(r.get("_insert_time"))
+        srv_seen = srv_seen or srv is not None
+        out[sid] = _ScanStat(prev.count + 1,
+                             _max_ms(prev.newest, _newest_ms(ep, srv, now_ms)),
+                             _max_ms(prev.ep_newest, ep))
+    _warn_if_no_server_stamp(dataset, bool(out), srv_seen, log)
     return out
 
 
@@ -439,15 +608,20 @@ def run_consolidation(client, kind, ver="2", quiet_secs=DEFAULT_QUIET_SECS,
     # Group + count + newest-timestamp per (scan_id, shard) WITHOUT pulling every row. A
     # matches shard can hold millions of rows; pulling them all just to group by scan_id does
     # not scale and (measured) makes the read phase outlast the run. Use an XQL aggregation
-    # (comp count(), max(ts) by scan_id) instead; full rows are pulled ONLY for the one scan
-    # being written, later. Scans shards reuse the rows already read above.
-    all_groups, newest_by = {}, {}
+    # (comp count(), max(ts), max(_insert_time) by scan_id) instead; full rows are pulled ONLY
+    # for the one scan being written, later. Scans shards reuse the rows already read above.
+    # Both stats helpers are fed SOURCE SHARDS ONLY (`shards` and `scans_ds` are both filtered
+    # through parse_shard, which returns None for a per-scan target) — required, because the
+    # _insert_time half of their freshness signal is meaningless on a target: consolidation
+    # re-writes rows there, resetting it. See _newest_ms.
+    all_groups, newest_by, ep_newest_by = {}, {}, {}
     for ds in shards:
-        stats = (_stats_from_rows(scans_rows[ds]) if kind == "scans"
-                 else _scan_stats(client, ds))
-        for sid, (n, newest) in stats.items():
-            all_groups.setdefault(sid, {})[ds] = n
-            newest_by[(sid, ds)] = newest
+        stats = (_stats_from_rows(scans_rows[ds], now_ms=now_ms, log=log, dataset=ds)
+                 if kind == "scans" else _scan_stats(client, ds, now_ms=now_ms, log=log))
+        for sid, st in stats.items():
+            all_groups.setdefault(sid, {})[ds] = st.count
+            newest_by[(sid, ds)] = st.newest
+            ep_newest_by[(sid, ds)] = st.ep_newest
 
     # A shard can hold rows for MORE THAN ONE scan (a host re-scanned in the same month
     # shares its dataset). Deleting a shard after consolidating ONE of its scans would
@@ -470,7 +644,7 @@ def run_consolidation(client, kind, ver="2", quiet_secs=DEFAULT_QUIET_SECS,
     plans = []
     for scan_id, counts in sorted(groups.items()):
         srcs = sorted(counts)
-        deferred = _gate_scan(scan_id, srcs, newest_by, tmap, now_ms, quiet_secs,
+        deferred = _gate_scan(scan_id, srcs, newest_by, ep_newest_by, tmap, now_ms, quiet_secs,
                               abandoned_after_secs, log)
         if deferred:
             plans.append({"scan_id": scan_id, "ok": False, "reason": deferred, "deletable": []})
@@ -702,7 +876,8 @@ def _delete_many(client, names, log, concurrency=None):
         log("    deleted %d/%d shards" % (done["n"], len(names)))
 
 
-def _gate_scan(scan_id, srcs, newest_by, tmap, now_ms, quiet_secs, abandoned_after_secs, log):
+def _gate_scan(scan_id, srcs, newest_by, ep_newest_by, tmap, now_ms, quiet_secs,
+               abandoned_after_secs, log, skew_backstop_secs=DEFAULT_SKEW_BACKSTOP_SECS):
     """Return a defer-reason string if any source host is not safe yet, else ''.
 
     A source is eligible when its scan is FINISHED — terminal lifecycle/action state, OR
@@ -710,24 +885,47 @@ def _gate_scan(scan_id, srcs, newest_by, tmap, now_ms, quiet_secs, abandoned_aft
     scanner will never write a terminal row; typically a console-Cancel orphan). An
     abandoned scan is still consolidated so its partial matches, which are real findings,
     are preserved rather than dropped. A non-terminal scan younger than the cutoff may still
-    be running, so it defers."""
+    be running, so it defers.
+
+    Both age checks measure against the skew-proof `newest` (see _newest_ms), EXCEPT for the
+    `settled` backstop, which measures the ENDPOINT stamp alone. The backstop exists because
+    `newest` can in principle be re-armed server-side — this tool's own row-level cleanup of a
+    sibling scan may re-stamp _insert_time on a shard's surviving rows — and an age that can be
+    reset by someone else's cleanup is an age that can be deferred forever, which is exactly
+    what the abandoned cutoff exists to prevent (see DEFAULT_SKEW_BACKSTOP_SECS). Nothing can
+    re-arm the endpoint stamp except the endpoint itself writing a new row."""
     for ds in srcs:
         host = (parse_shard(ds) or {}).get("host", "")
         entry = tmap.get((scan_id, host))
         is_terminal = bool(entry and entry["terminal"])
         newest = newest_by.get((scan_id, ds))
+        ep_newest = (ep_newest_by or {}).get((scan_id, ds))
+        ep_age_ms = (now_ms - ep_newest) if ep_newest is not None else None
+        settled = ep_age_ms is not None and ep_age_ms >= skew_backstop_secs * 1000
+        if newest is not None and newest > now_ms + SKEW_TOLERANCE_MS:
+            # Only reachable when there is no usable server stamp to correct against (with one,
+            # _newest_ms discards an endpoint stamp that is ahead of ingest). Nothing can be
+            # done about it here — clamping to now_ms would reset the age to zero every pass —
+            # but a permanently-deferring scan must at least be diagnosable.
+            log("  scan %s: shard %s newest stamp is %.1fh in the FUTURE of this run's clock "
+                "(endpoint clock ahead, no usable _insert_time to correct with) — this scan "
+                "will keep deferring until real time catches up"
+                % (scan_id, ds, (newest - now_ms) / 3_600_000.0))
         if not is_terminal:
             age_ms = (now_ms - newest) if newest is not None else None
-            if age_ms is not None and age_ms >= abandoned_after_secs * 1000:
-                log("  scan %s: host %s non-terminal (%s) but newest row is %.1fh old — "
-                    "treating as ABANDONED, consolidating to preserve its findings"
+            abandoned = age_ms is not None and age_ms >= abandoned_after_secs * 1000
+            if abandoned or settled:
+                log("  scan %s: host %s non-terminal (%s) but %s — treating as ABANDONED, "
+                    "consolidating to preserve its findings"
                     % (scan_id, host, (entry.get("status") if entry else "no lifecycle row"),
-                       age_ms / 3_600_000.0))
+                       ("newest row is %.1fh old" % (age_ms / 3_600_000.0)) if abandoned else
+                       ("the endpoint has written nothing for %.1f days (server-stamp "
+                        "backstop)" % (ep_age_ms / 86_400_000.0))))
             else:
                 log("  scan %s: host %s not terminal (%s) — deferring"
                     % (scan_id, host, "no lifecycle row" if not entry else entry.get("status")))
                 return "host_not_terminal"
-        if not newest_row_age_ok(newest, now_ms, quiet_secs):
+        if not newest_row_age_ok(newest, now_ms, quiet_secs) and not settled:
             log("  scan %s: host shard %s within quiet period — deferring" % (scan_id, ds))
             return "within_quiet_period"
     return ""

@@ -14,7 +14,7 @@ manual CLI invocation.
 | `YARA Dataset Consolidation` | Playbook | Orchestrates one pass: check readiness → wait on in-progress scans → apply → flag failures. Meant to run **twice daily** as a scheduled Job. |
 | `YaraConsolidateStatus` | Automation | Read-only readiness check. Never writes or deletes. |
 | `YaraConsolidateApply` | Automation | The mutating step — creates per-scan targets, writes rows, deletes fully-verified source shards. |
-| `YaraConsolidateCommon` | Automation (library only) | Not invoked directly. A verbatim port of `xdr_consolidate.py`'s core logic, hand-kept in sync (see the comment block at the top of the file), plus `CoreApiClient` — a direct, signed-HTTPS client for this tenant's own public API. |
+| `YaraConsolidateCommon` | Automation (library only) | Not invoked directly. A verbatim port of `xdr_consolidate.py`'s core logic, kept in sync by `tests/test_consolidation.py::test_pack_copy_gate_logic_matches_xdr_consolidate` (which compares both files' ported functions and constants statement-by-statement and fails on any drift), plus `CoreApiClient` — a direct, signed-HTTPS client for this tenant's own public API. |
 
 ## Deployment — pack install or console Import, not a bare item push
 
