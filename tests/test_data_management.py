@@ -1,4 +1,5 @@
-"""Unit tests for xdr_data_management. Pure functions only - no tenant access."""
+"""Unit tests for xdr_data_management. No real tenant access - the two functions that take a
+client (filter_recently_written, filter_unconsolidated) are driven by an in-memory fake."""
 import os
 import sys
 
@@ -171,3 +172,96 @@ def test_sibling_check_ignores_different_host():
 def test_sibling_check_requires_exactly_six_digits():
     names = ["yara_scanner_matches_v2_h", "yara_scanner_matches_v2_h_20260"]
     assert has_rotated_sibling("yara_scanner_matches_v2_h", names) is False
+
+
+# --------------------------------------------------------- recency + consolidation-state gates
+from xdr_data_management import filter_recently_written, filter_unconsolidated  # noqa: E402
+
+NOW = 10_000_000_000  # arbitrary fixed "now", in ms
+
+
+class FakeXqlClient:
+    """Responds to an XQL query by matching a configured substring - just enough to drive
+    filter_recently_written/filter_unconsolidated without a real tenant."""
+    def __init__(self, responses):
+        self.responses = responses  # {substring: canned_result_list}
+        self.calls = []
+
+    def xql(self, query, limit=1000):
+        self.calls.append(query)
+        for key, result in self.responses.items():
+            if key in query:
+                return result
+        return []
+
+
+def test_filter_recently_written_drops_a_shard_still_being_written_to():
+    c = FakeXqlClient({
+        "dataset = ds_recent | comp max": [{"newest": NOW - 1000}],       # 1s ago
+    })
+    survivors, skipped = filter_recently_written(c, ["ds_recent"], min_quiet_secs=3600, now_ms=NOW)
+    assert survivors == []
+    assert any("ds_recent" in s and "may still be writing" in s for s in skipped)
+
+
+def test_filter_recently_written_keeps_a_genuinely_quiet_shard():
+    c = FakeXqlClient({
+        "dataset = ds_old | comp max": [{"newest": NOW - 7200 * 1000}],   # 2h ago
+    })
+    survivors, skipped = filter_recently_written(c, ["ds_old"], min_quiet_secs=3600, now_ms=NOW)
+    assert survivors == ["ds_old"]
+    assert skipped == []
+
+
+def test_filter_recently_written_keeps_a_shard_with_no_rows_at_all():
+    # No rows -> nothing to protect against, matches newest_row_age_ok's own semantics
+    # elsewhere in this project.
+    c = FakeXqlClient({"dataset = ds_empty | comp max": []})
+    survivors, skipped = filter_recently_written(c, ["ds_empty"], min_quiet_secs=3600, now_ms=NOW)
+    assert survivors == ["ds_empty"]
+
+
+def test_filter_recently_written_skips_to_be_safe_on_query_error():
+    class ErrorClient:
+        def xql(self, query, limit=1000):
+            raise RuntimeError("tenant hiccup")
+    survivors, skipped = filter_recently_written(ErrorClient(), ["ds_x"], min_quiet_secs=3600, now_ms=NOW)
+    assert survivors == []
+    assert any("could not check recency" in s for s in skipped)
+
+
+def test_filter_unconsolidated_drops_a_shard_with_a_never_verified_scan():
+    shard = "yara_scanner_matches_v2_hostx_ab1234_202607"
+    c = FakeXqlClient({
+        "dataset = %s | comp count() as n by scan_id" % shard: [{"scan_id": "S1", "n": 463}],
+        # target exists but only 0 rows landed - never actually verified/consolidated
+        "dataset = yara_scanner_matches_v2_scan_s1 | comp count": [{"n": 0}],
+    })
+    survivors, skipped = filter_unconsolidated(c, [shard])
+    assert survivors == []
+    assert any("S1" in s and "would lose data" in s for s in skipped)
+
+
+def test_filter_unconsolidated_keeps_a_fully_verified_shard():
+    shard = "yara_scanner_matches_v2_hostx_ab1234_202607"
+    c = FakeXqlClient({
+        "dataset = %s | comp count() as n by scan_id" % shard: [{"scan_id": "S1", "n": 463}],
+        "dataset = yara_scanner_matches_v2_scan_s1 | comp count": [{"n": 463}],  # matches exactly
+    })
+    survivors, skipped = filter_unconsolidated(c, [shard])
+    assert survivors == [shard]
+    assert skipped == []
+
+
+def test_filter_unconsolidated_keeps_an_already_empty_shard():
+    shard = "yara_scanner_matches_v2_hostx_ab1234_202607"
+    c = FakeXqlClient({"dataset = %s | comp count() as n by scan_id" % shard: []})
+    survivors, skipped = filter_unconsolidated(c, [shard])
+    assert survivors == [shard]
+
+
+def test_filter_unconsolidated_passes_through_names_outside_the_naming_contract():
+    # Not this function's job to gate foreign names - select_rotated_for_deletion already
+    # excludes them before this ever runs, but stay safe if called with one anyway.
+    survivors, skipped = filter_unconsolidated(FakeXqlClient({}), ["not_a_yara_dataset"])
+    assert survivors == ["not_a_yara_dataset"]
