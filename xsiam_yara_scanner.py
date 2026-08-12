@@ -64,6 +64,13 @@ UPLOAD_RESULTS = True  # Match and telemetry uploads to webhook
 UPLOAD_NON_MATCH_DATA = True  # Keep telemetry uploads enabled in webhook mode
 DEFAULT_TIMEOUT_SECS = 20            # increased request timeout everywhere
 MAX_RETRIES_PER_ITEM = 2             # hard cap to avoid infinite loops
+MAX_MATCH_SAMPLES_PER_FINDING = int(os.environ.get("YARA_MAX_MATCH_SAMPLES", "50") or 50)
+# ^ Ported from the XDR edition after it hit this live: one loosely-written rule matching one
+# large file can produce tens of thousands of string-offset instances (measured there: 33,118
+# rows from one rule against one .evtx log; measured here: 36,213 in one match-upload backlog),
+# because the original design queued ONE upload item PER MATCHED STRING OFFSET. Fold all offsets
+# for a given (rule, file) into ONE upload with a capped sample - full per-offset detail still
+# goes to self.results (local, unbounded); only the network representation is capped.
 BASE_BACKOFF_SECS = 1.0              # initial backoff
 MAX_BACKOFF_SECS = 30.0              # backoff ceiling
 CIRCUIT_FAILURE_THRESHOLD = 5        # open after N consecutive failures
@@ -71,6 +78,39 @@ CIRCUIT_RESET_TIMEOUT_SECS = 40      # stay open before probing again
 WORKER_GET_TIMEOUT_SECS = 2.0        # queue.get timeout to allow graceful exit checks
 THREAD_CLEANUP_TIMEOUT = 60          # Maximum time to wait for thread cleanup
 
+# Backlog-proportional shutdown drain, ported from the XDR edition's lookup-uploader design:
+# a flat drain window is either too short for a heavy scan's backlog (events get dropped, not
+# delayed - confirmed live: a 12s scan's own "scan completed" event needed ~250s to actually
+# reach the collector) or wastefully long for a light one. Scale the budget to queue size
+# instead, same as XDR's LOOKUP_DRAIN_* constants.
+#
+# UNLIKE XDR - which drains one consolidated lookup-uploader queue - this edition has FOUR
+# independent drain points (LogManager's webhook_queue plus three separate uploader classes'
+# upload_queue). They drain sequentially at shutdown, so DRAIN_MAX_SECS is a per-site cap, not
+# a total: confirmed live under concurrent fleet load that an earlier, more generous cap here
+# (300s) let multiple sites each approach their max back-to-back, several times exceeding the
+# snippet's own timeout and getting the whole process killed mid-drain by the agent - losing
+# everything still queued, strictly worse than the flat-timeout bug this was meant to fix. Kept
+# low enough that even all four sites maxing out at once (4 * 60s = 240s) stays well inside a
+# normal script timeout.
+DRAIN_MIN_SECS = float(os.environ.get("YARA_DRAIN_MIN_SECS", "15") or 15)              # floor - matches prior fast-path behavior
+DRAIN_PER_ITEM_SECS = float(os.environ.get("YARA_DRAIN_PER_ITEM_SECS", "0.3") or 0.3)  # rough per-POST budget incl. occasional retry
+DRAIN_MAX_SECS = float(os.environ.get("YARA_DRAIN_MAX_SECS", "60") or 60)              # per-site ceiling (there are 4 sites - see above)
+
+
+def _compute_drain_budget(pending_items):
+    """Backlog-proportional shutdown drain budget - a storm scan's large backlog gets
+    proportionally more time to flush; a normal scan's 1-2 pending items doesn't wait
+    around at the floor for no reason. Capped so a dead collector can't hang shutdown."""
+    return min(DRAIN_MAX_SECS, max(DRAIN_MIN_SECS, pending_items * DRAIN_PER_ITEM_SECS))
+
+
+# Fixed sentinels for the shipped placeholder values, independent of DEFAULT_API_KEY/
+# DEFAULT_API_ENDPOINT below - the deployment guide has editors overwrite THOSE constants
+# directly, so comparing "still equals DEFAULT_API_KEY" can never detect a placeholder once
+# the constant itself has been edited to a real value.
+_PLACEHOLDER_API_KEY = "http_collector_key"
+_PLACEHOLDER_API_ENDPOINT = "http_collector_api"
 
 DEFAULT_API_KEY = "http_collector_key"
 DEFAULT_API_ENDPOINT = "http_collector_api"
@@ -1807,6 +1847,54 @@ class LogManager:
         """Log statistics message."""
         self._log_with_webhook(LogType.STATISTICS, message, "INFO", data)
 
+    def _log_critical(self, log_type: LogType, message: str, data=None):
+        """Log a message, attempting an immediate synchronous webhook send first so
+        it is not stuck behind whatever backlog already exists in the normal async
+        queue - falls back to that same queue only if the direct send fails.
+
+        For dashboard-critical, once-per-scan signals (scan started, target
+        completed) where the scan can otherwise still be running - and the
+        delivery queue backlogged with the telemetry it has produced so far - by
+        the time this fires.
+        """
+        self.loggers[log_type].info(message)
+        self.upload_stats['total_logs'] += 1
+        self.upload_stats['by_type'][log_type.value] += 1
+
+        if not (UPLOAD_RESULTS and UPLOAD_NON_MATCH_DATA and API_ENDPOINT):
+            return
+
+        standard_log = create_standard_log(
+            log_type=log_type.value, hostname=self.hostname, os_info=self.os_info,
+            ip_address=self.ip_address, scan_id=self.scan_id, message=message, level="INFO",
+            data=data
+        )
+        try:
+            response = requests.post(
+                url=_get_webhook_endpoint(API_ENDPOINT),
+                headers={"Authorization": API_KEY, "Content-Type": "application/json"},
+                json=standard_log.to_dict(),
+                timeout=DEFAULT_TIMEOUT_SECS
+            )
+            if 200 <= response.status_code < 300:
+                return
+        except Exception:
+            pass
+
+        if self.webhook_thread and self.webhook_thread.is_alive():
+            try:
+                self.webhook_queue.put(standard_log, timeout=1.0)
+            except Exception:
+                pass
+
+    def log_statistics_critical(self, message: str, data=None):
+        """log_statistics, but see _log_critical."""
+        self._log_critical(LogType.STATISTICS, message, data)
+
+    def log_performance_critical(self, message: str, data=None):
+        """log_performance, but see _log_critical."""
+        self._log_critical(LogType.PERFORMANCE, message, data)
+
     def log_error(self, message: str, data=None):
         """Log error message."""
         self._log_with_webhook(LogType.ERROR, message, "ERROR", data)
@@ -1826,13 +1914,17 @@ class LogManager:
     def log_scan_progress(self, files_scanned: int, files_skipped: int, detections: int,
                          queue_size: int, scan_rate: float, additional_metrics=None):
         """Log comprehensive scan progress."""
+        additional_metrics = additional_metrics or {}
         progress_data = {
             'files_scanned': files_scanned,
             'files_skipped': files_skipped,
             'total_detections': detections,
             'queue_size': queue_size,
             'scan_rate_files_per_sec': scan_rate,
-            'metrics': additional_metrics or {}
+            # Flattened for the "Capacity vs Backpressure" dashboard widget, which filters on a
+            # top-level active_workers column - previously only reachable at metrics.active_workers.
+            'active_workers': additional_metrics.get('active_workers'),
+            'metrics': additional_metrics
         }
         
         message = (
@@ -1946,12 +2038,12 @@ class LogManager:
             return
         self._stopped = True
         if self.webhook_thread and self.webhook_thread.is_alive():
-            max_wait_time = THREAD_CLEANUP_TIMEOUT
             start_wait = time.time()
             initial_queue_size = self.webhook_queue.qsize()
+            max_wait_time = _compute_drain_budget(initial_queue_size)
             if initial_queue_size > 0:
                 self.log_upload(
-                    f"Waiting for {initial_queue_size} pending standardized log uploads (max {max_wait_time}s)..."
+                    f"Waiting for {initial_queue_size} pending standardized log uploads (max {max_wait_time:.0f}s)..."
                 )
             while self.webhook_queue.qsize() > 0 and (time.time() - start_wait) < max_wait_time:
                 time.sleep(0.2)
@@ -2186,9 +2278,16 @@ class SystemResourceMonitor:
             enhanced_data = resource_data.copy()
             enhanced_data.update({
                 'trends': trends,
-                'alert_count_last_hour': len([a for a in self.alert_history 
+                'alert_count_last_hour': len([a for a in self.alert_history
                                             if time.time() - a['timestamp'] < 3600]),
-                'monitoring_duration_minutes': (time.time() - self.system_boot_time) / 60
+                'monitoring_duration_minutes': (time.time() - self.system_boot_time) / 60,
+                # Flattened for the dashboard's CPU/memory widgets, which filter on these exact
+                # top-level column names - previously only reachable nested under process/system,
+                # so sys_cpu_percent != null (etc.) never matched and the widgets stayed empty.
+                'proc_cpu_percent': resource_data['process']['cpu_percent'],
+                'proc_memory_mb': resource_data['process']['memory_mb'],
+                'sys_cpu_percent': resource_data['system']['cpu_percent'],
+                'sys_memory_used_percent': resource_data['system']['memory_used_percent'],
             })
             
             standard_log = create_standard_log(
@@ -2821,12 +2920,12 @@ class ResultsUploader:
         self._stop_done = True
         try:
             if wait and self.upload_thread and self.upload_thread.is_alive():
-                max_wait_time = THREAD_CLEANUP_TIMEOUT
                 start_wait = time.time()
                 initial_queue_size = self.upload_queue.qsize()
+                max_wait_time = _compute_drain_budget(initial_queue_size)
                 if initial_queue_size > 0 and self.log_manager:
                     self.log_manager.log_upload(
-                        f"Waiting for {initial_queue_size} pending match uploads (max {max_wait_time}s)..."
+                        f"Waiting for {initial_queue_size} pending match uploads (max {max_wait_time:.0f}s)..."
                     )
                 while self.upload_queue.qsize() > 0 and (time.time() - start_wait) < max_wait_time:
                     time.sleep(0.2)
@@ -2874,16 +2973,27 @@ class ResultsUploader:
                 self.log_manager.log_error(f"Error stopping results uploader: {e}")
 
     def add_match(self, filename, rule, match_data, file_sha256=None, file_creation_time=None, fallback_detail=None):
-        """Add YARA match and queue for upload."""
+        """Add YARA match and queue for upload.
+
+        Grain split (ported from the XDR edition): the UPLOAD gets ONE ITEM PER (rule, file)
+        finding, with every matched offset folded into that one item as a capped sample, rather
+        than emitted as its own upload. The full per-offset detail still goes to self.results
+        (local, unbounded) - only the network representation is aggregated+sampled.
+        """
         raw_matches = list(match_data or [])
         fallback_text = str(fallback_detail or "").strip()
         upload_entries = raw_matches or [
             (None, None, fallback_text or "Condition-only YARA match; no string instances were produced.")
         ]
         match_count = 0
-        for string_id, offset, string_data in upload_entries:
-            is_rule_only_match = string_id is None and offset is None
+        is_rule_only_match = len(upload_entries) == 1 and upload_entries[0][0] is None and upload_entries[0][1] is None
+        _first_offset = None
+        _first_string = ""
+        _offsets_sample = []
+        _strings_sample = []
+        _match_id_counts = {}   # true per-string-identifier counts across every offset, uncapped
 
+        for string_id, offset, string_data in upload_entries:
             if string_data is None:
                 string_data = ""
             else:
@@ -2900,7 +3010,7 @@ class ResultsUploader:
                 "string": string_data,
                 "offset": "" if offset is None else str(offset),
                 "match": "" if string_id is None else str(string_id),
-                "match_scope": "rule" if is_rule_only_match else "string",
+                "match_scope": "rule" if (string_id is None and offset is None) else "string",
                 "string_match_count": len(raw_matches),
                 "file_sha256": file_sha256,
                 "file_creation_time": file_creation_time,
@@ -2908,53 +3018,69 @@ class ResultsUploader:
             self.results.append(result)
             self.upload_stats['total_matches'] += 1
             match_count += 1
-            
-            if UPLOAD_RESULTS and self.upload_thread and self.upload_thread.is_alive():
-                try:
-                    standard_log = create_standard_log(
-                        log_type='yara_match',
-                        hostname=self.hostname,
-                        os_info=self.os_info,
-                        ip_address=self.ip_address,
-                        scan_id=self.scan_id,
-                        message=(
-                            f"YARA rule-only match: rule '{rule}' in {filename}"
-                            if is_rule_only_match
-                            else f"YARA match: rule '{rule}' in {filename}"
-                        ),
-                        level="INFO",
-                        data={
-                            'filename': filename,
-                            'rule': rule,
-                            'threat_level': getattr(self.config, "alert_severity", "low"),
-                            'string': string_data,
-                            'offset': "" if offset is None else str(offset),
-                            'match': "" if string_id is None else str(string_id),
-                            'match_scope': "rule" if is_rule_only_match else "string",
-                            'string_match_count': len(raw_matches),
-                            'dateOfScan': self.date_of_scan,
-                            'file_sha256': file_sha256,
-                            'file_creation_time': file_creation_time
-                        }
+
+            match_key = "" if string_id is None else str(string_id)
+            _match_id_counts[match_key] = _match_id_counts.get(match_key, 0) + 1
+            if _first_offset is None:
+                _first_offset = offset
+                _first_string = string_data
+            if len(_offsets_sample) < MAX_MATCH_SAMPLES_PER_FINDING:
+                _offsets_sample.append("" if offset is None else str(offset))
+                _strings_sample.append(string_data)
+
+        truncated = match_count > len(_offsets_sample)
+
+        if UPLOAD_RESULTS and self.upload_thread and self.upload_thread.is_alive():
+            try:
+                standard_log = create_standard_log(
+                    log_type='yara_match',
+                    hostname=self.hostname,
+                    os_info=self.os_info,
+                    ip_address=self.ip_address,
+                    scan_id=self.scan_id,
+                    message=(
+                        f"YARA rule-only match: rule '{rule}' in {filename}"
+                        if is_rule_only_match
+                        else f"YARA match: rule '{rule}' in {filename} ({match_count} string hit(s))"
+                    ),
+                    level="INFO",
+                    data={
+                        'filename': filename,
+                        'rule': rule,
+                        # Flattened aliases matching the "Yara Matches" dashboard's actual
+                        # column names (rule_id/file_name) - the dashboard queries these
+                        # exact names in every widget, and never matches on rule/filename.
+                        'file_name': filename,
+                        'rule_id': rule,
+                        'threat_level': getattr(self.config, "alert_severity", "low"),
+                        'string': _first_string,
+                        'offset': "" if _first_offset is None else str(_first_offset),
+                        'match_scope': "rule" if is_rule_only_match else "string",
+                        'match_count': match_count,
+                        'offsets': json.dumps(_offsets_sample),
+                        'strings': json.dumps(_strings_sample),
+                        'match_ids': json.dumps(_match_id_counts),
+                        'truncated': truncated,
+                        'string_match_count': len(raw_matches),
+                        'dateOfScan': self.date_of_scan,
+                        'file_sha256': file_sha256,
+                        'file_creation_time': file_creation_time
+                    }
+                )
+                self.upload_queue.put(standard_log, timeout=1.0)
+                if self.log_manager:
+                    self.log_manager.log_upload(
+                        f"Queued finding for upload: rule='{rule}', file={filename}, "
+                        f"hits={match_count}" + (" (truncated)" if truncated else "")
                     )
-                    self.upload_queue.put(standard_log, timeout=1.0)
-                    if self.log_manager:
-                        if is_rule_only_match:
-                            self.log_manager.log_upload(
-                                f"Queued rule-only match for upload: rule='{rule}'"
-                            )
-                        else:
-                            self.log_manager.log_upload(
-                                f"Queued match for upload: rule='{rule}', offset={offset}"
-                            )
-                except Exception:
-                    if self.log_manager:
-                        self.log_manager.log_upload("Upload queue full - skipping real-time upload for match")
-        
+            except Exception:
+                if self.log_manager:
+                    self.log_manager.log_upload("Upload queue full - skipping real-time upload for finding")
+
         if self.log_manager:
             self.log_manager.log_upload(
-                f"Added {match_count} uploadable entries for rule '{rule}' in file: {filename} "
-                f"(string matches: {len(raw_matches)})"
+                f"Added {match_count} local result entries for rule '{rule}' in file: {filename} "
+                f"(1 upload item, {len(_offsets_sample)} of {match_count} sampled)"
             )
 
     def save_results(self):
@@ -2990,14 +3116,14 @@ class ResultsUploader:
             if self.log_manager:
                 self.log_manager.log_upload("Stopping real-time upload thread...")
             
-            max_wait_time = 15
             start_wait = time.time()
             initial_queue_size = self.upload_queue.qsize()
-            
+            max_wait_time = _compute_drain_budget(initial_queue_size)
+
             if initial_queue_size > 0 and self.log_manager:
-                self.log_manager.log_upload(f"Waiting for {initial_queue_size} pending uploads (max {max_wait_time}s)...")
-            
-            while (self.upload_queue.qsize() > 0 and 
+                self.log_manager.log_upload(f"Waiting for {initial_queue_size} pending uploads (max {max_wait_time:.0f}s)...")
+
+            while (self.upload_queue.qsize() > 0 and
                 time.time() - start_wait < max_wait_time):
                 time.sleep(0.5)
             
@@ -3343,12 +3469,12 @@ class WebhookUploader:
         self._stop_done = True
         try:
             if self.upload_thread and self.upload_thread.is_alive():
-                max_wait_time = THREAD_CLEANUP_TIMEOUT
                 start_wait = time.time()
                 initial_queue_size = self.upload_queue.qsize()
+                max_wait_time = _compute_drain_budget(initial_queue_size)
                 if initial_queue_size > 0:
                     self.log_manager.log_upload(
-                        f"Waiting for {initial_queue_size} pending telemetry uploads (max {max_wait_time}s)..."
+                        f"Waiting for {initial_queue_size} pending telemetry uploads (max {max_wait_time:.0f}s)..."
                     )
                 while self.upload_queue.qsize() > 0 and (time.time() - start_wait) < max_wait_time:
                     time.sleep(0.2)
@@ -4764,13 +4890,12 @@ rule test {{
         except Exception as e:
             self.log_manager.log_error(f"Error stopping file cache: {e}")
 
-        try:
-            if getattr(self, 'resource_monitor', None) is not None:
-                self.resource_monitor.stop_monitoring()
-            self.stats_manager.stop_monitoring()
-        except Exception as e:
-            self.log_manager.log_error(f"Error stopping monitoring: {e}")
-        
+        # Resource/stats monitoring is stopped AFTER the worker-thread join below, not
+        # here. File discovery finishing (which is where control reaches this point) is
+        # not the same as the workers finishing the matching work still sitting in
+        # scan_queue - on a large scan those can be minutes apart, and stopping the
+        # monitor here was cutting resource telemetry off for most of the real scan
+        # duration.
         self.log_manager.log_system("Initiating worker thread cleanup")
         
         for _ in range(self.config.max_workers):
@@ -4805,6 +4930,13 @@ rule test {{
         self.log_manager.log_performance(
             f"Worker cleanup: {successful_joins} stopped, {failed_joins} timed out in {worker_join_time:.1f}s"
         )
+
+        try:
+            if getattr(self, 'resource_monitor', None) is not None:
+                self.resource_monitor.stop_monitoring()
+            self.stats_manager.stop_monitoring()
+        except Exception as e:
+            self.log_manager.log_error(f"Error stopping monitoring: {e}")
 
         self.scan_active = False
         cleanup_total_time = time.time() - cleanup_start
@@ -4875,7 +5007,7 @@ rule test {{
             self.scan_threads.append(t)
         
         worker_startup_time = time.time() - worker_start_time
-        self.log_manager.log_performance(
+        self.log_manager.log_performance_critical(
             f"Worker thread startup completed in {worker_startup_time:.2f} seconds",
             {'worker_startup_time_seconds': worker_startup_time, 'workers_started': len(self.scan_threads)}
         )
@@ -4945,7 +5077,7 @@ rule test {{
                     target_scan_time = time.time() - target_start_time
                     files_per_target[target] = target_files_found
                     
-                    self.log_manager.log_statistics(
+                    self.log_manager.log_statistics_critical(
                         f"Target scan completed: {target}",
                         {
                             'target': target,
@@ -5129,8 +5261,8 @@ def main(yarafile=None, scan_folder=None, alert_severity="low"):
         # An explicit abort surfaces the misconfiguration in the Action Center result instead.
         _ep = str(API_ENDPOINT or "").strip()
         _key = str(API_KEY or "").strip()
-        _ep_bad = (not _ep) or (_ep == DEFAULT_API_ENDPOINT) or (not _ep.lower().startswith("http"))
-        _key_bad = (not _key) or (_key == DEFAULT_API_KEY)
+        _ep_bad = (not _ep) or (_ep == _PLACEHOLDER_API_ENDPOINT) or (not _ep.lower().startswith("http"))
+        _key_bad = (not _key) or (_key == _PLACEHOLDER_API_KEY)
         if UPLOAD_RESULTS and (_ep_bad or _key_bad):
             abort_msg = (
                 "SCAN ABORTED - XSIAM HTTP Collector credentials are not set. Edit DEFAULT_API_KEY / "
