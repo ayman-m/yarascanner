@@ -174,7 +174,7 @@ XQL columns.
 
 1. **Settings → Configurations → Data Management → Parsing Rules → New Rule**.
 2. Name it `yara_scans_raw_parsing_rule`.
-3. Paste the full rule body from [`parsing_rule.xql`](parsing_rule.xql) in this repo. The header reads:
+3. Paste the full rule body from [`parsing_rule.xql`](../../parsing_rules/xsiam/parsing_rule.xql) in this repo. The header reads:
 
 ```text
 [INGEST:vendor="yara", product="scans", target_dataset="yara_scans_raw", no_hit = keep]
