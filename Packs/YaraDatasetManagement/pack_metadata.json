@@ -2,7 +2,7 @@
   "name": "YARA Dataset Management",
   "description": "Automations and a playbook that merge finished YARA scan datasets and prune old ones on a schedule, safely handling scans still in progress.",
   "support": "community",
-  "currentVersion": "1.0.0",
+  "currentVersion": "1.1.0",
   "author": "Ayman Mahmoud",
   "url": "",
   "email": "",

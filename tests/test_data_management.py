@@ -47,9 +47,50 @@ def test_six_digit_host_is_read_as_a_month():
     digits is indistinguishable from a rotation month. We resolve it AS a month, because
     the worst outcome of that reading is declining to delete something that looks recent -
     whereas reading it as a host could delete a whole host's history."""
-    d = parse_dataset_name("yara_scanner_matches_v2_123456")
-    assert d["month"] == "123456"
+    d = parse_dataset_name("yara_scanner_matches_v2_202601")
+    assert d["month"] == "202601"
     assert d["host"] is None
+
+
+def test_an_implausible_six_digit_group_is_a_host_not_a_month():
+    """The ambiguity above only resolves towards "recent" for a PLAUSIBLE YYYYMM. "123456"
+    read as a month is year 1234 - an age older than any retention window, so a bare \\d{6}
+    would resolve the ambiguity towards DELETING, the exact opposite of the stated rule.
+    Anything outside 20xx/01-12 is therefore part of the host name, which reads as unrotated
+    and is never a candidate."""
+    d = parse_dataset_name("yara_scanner_matches_v2_123456")
+    assert d["month"] is None and d["host"] == "123456"
+    d = parse_dataset_name("yara_scanner_matches_v2_h_202613")   # month 13
+    assert d["month"] is None and d["host"] == "h_202613"
+
+
+def test_a_timestamp_tail_does_not_crash_month_arithmetic():
+    """A scan_id of the shape <host>_<YYYYMMDD>_<HHMMSS> ends in six digits that are not a
+    month at all. Under a bare \\d{6} "143025" parsed as month 30 of year 1430 and raised
+    ValueError out of months_between - aborting the mutating prune AND the read-only report,
+    which is documented as safe to run from a poll loop."""
+    d = parse_dataset_name("yara_scanner_matches_v2_scan_winserver01_20260812_143025")
+    assert d["month"] is None
+    assert months_between("202601", "202607") == 6      # still works for real months
+
+
+def test_a_consolidated_per_scan_target_is_flagged_and_never_a_month():
+    """xdr_consolidate's OUTPUT (…_v<N>_scan_<slug>) is not a rotation shard: no month by
+    design, immutable, and once the sources were deleted it is a scan's only copy. A slug
+    ending in month-shaped digits must not make it look like an ancient rotated dataset."""
+    d = parse_dataset_name("yara_scanner_matches_v2_scan_winserver01_20260812_110501")
+    assert d["scan_target"] is True
+    assert d["month"] is None                            # NOT read as year 1105
+    assert parse_dataset_name("yara_scanner_matches_v2_h_202601")["scan_target"] is False
+
+
+def test_a_consolidated_target_is_never_a_rotation_candidate():
+    name = "yara_scanner_matches_v2_scan_winserver01_20260812_110501"
+    cands, skipped = select_rotated_for_deletion([name], older_than_months=6,
+                                                 now_yyyymm="202607")
+    assert cands == []
+    assert any("per-scan consolidated target" in s for s in skipped)
+    assert not any("CONFIG_LOOKUP_ROTATION" in s for s in skipped)
 
 
 # --------------------------------------------------------------- month arithmetic
@@ -130,14 +171,60 @@ def test_future_month_is_never_deleted():
     assert any("future" in s for s in skipped)
 
 
-def test_legacy_selection_passes_names_through():
-    names = ["yara_scanner_matches_v1_h", "yara_scanner_scans_h"]
-    assert sorted(select_legacy_for_deletion(names)) == sorted(names)
+def test_legacy_selection_passes_rotated_legacy_names_through():
+    names = ["yara_scanner_matches_v1_h_202601", "yara_scanner_scans_v1_h_202601"]
+    cands, skipped = select_legacy_for_deletion(names, now_yyyymm="202607")
+    assert sorted(cands) == sorted(names) and skipped == []
 
 
 def test_legacy_selection_handles_empty():
-    assert select_legacy_for_deletion([]) == []
-    assert select_legacy_for_deletion(None) == []
+    assert select_legacy_for_deletion([]) == ([], [])
+    assert select_legacy_for_deletion(None) == ([], [])
+
+
+def test_legacy_selection_refuses_everything_while_a_newer_schema_exists():
+    """A newer-schema dataset existing at all proves the assumed current version is stale -
+    which means the 'legacy' bucket may be full of live data. xdr_action_center.py's
+    prune-datasets already refused on exactly this signal; this brings the two into line."""
+    cands, skipped = select_legacy_for_deletion(["yara_scanner_matches_v1_h_202601"],
+                                                newer_names=["yara_scanner_matches_v9_h"],
+                                                now_yyyymm="202607")
+    assert cands == []
+    assert any("NEWER schema" in s and "cannot be trusted" in s for s in skipped)
+
+
+def test_legacy_selection_never_takes_an_unsuffixed_dataset():
+    """Same rail as the rotated path, same reason: an unsuffixed dataset holds ALL
+    pre-rotation history for that host, whatever schema it is on."""
+    cands, skipped = select_legacy_for_deletion(["yara_scanner_matches_v1_h"],
+                                                now_yyyymm="202607")
+    assert cands == []
+    assert any("ALL pre-rotation history" in s for s in skipped)
+
+
+def test_legacy_selection_never_takes_the_current_or_a_future_month():
+    """Mid-rollout, endpoints still on the old scanner are WRITING to legacy-schema shards."""
+    cands, skipped = select_legacy_for_deletion(
+        ["yara_scanner_matches_v1_h_202607", "yara_scanner_matches_v1_h_202612"],
+        now_yyyymm="202607")
+    assert cands == []
+    assert any("current month" in s for s in skipped)
+    assert any("future" in s for s in skipped)
+
+
+def test_legacy_selection_never_takes_a_consolidated_target():
+    cands, skipped = select_legacy_for_deletion(["yara_scanner_matches_v1_scan_abc_123456"],
+                                                now_yyyymm="202607")
+    assert cands == []
+    assert any("consolidated target" in s for s in skipped)
+
+
+def test_legacy_selection_still_allows_genuinely_ancient_unversioned_names():
+    """The rails must not make --delete-legacy vacuous: a pre-versioning name that predates
+    the whole naming contract has no month to check and is still a candidate (the live
+    recency/consolidation rails run after this and remain its last line of defence)."""
+    cands, skipped = select_legacy_for_deletion(["yara_matches_old"], now_yyyymm="202607")
+    assert cands == ["yara_matches_old"] and skipped == []
 
 
 # ------------------------------------------- abandoned vs genuinely-unrotated datasets

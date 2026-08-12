@@ -113,13 +113,25 @@ def _read_lock(client):
 
 
 def acquire_consolidation_lock(client, log=print, now_ms=None,
-                               stale_after_secs=DEFAULT_LOCK_STALE_SECS, holder="unknown"):
+                               stale_after_secs=DEFAULT_LOCK_STALE_SECS, holder="unknown",
+                               unreadable_is_held=False, on_takeover=None):
     """Best-effort mutual exclusion, NOT a true distributed lock. Relies on
     create_lookup_dataset distinguishing a fresh create ({"dataset_name": ...}) from an
     already-exists response ({"status": "exists"}) - verified live against the real API.
     Good enough to catch the common case (a stuck/misconfigured scheduler), not to guarantee
     correctness under a genuine simultaneous race (there is an inherent check-then-act window
     between the create call and any concurrent caller's own create call).
+
+    Two knobs exist for callers whose cost of a WRONG takeover is irreversible (dataset
+    deletion) rather than a retry (consolidation):
+
+    * unreadable_is_held - treat an existing lock dataset whose row cannot be read as HELD
+      instead of stale. That state is not exotic: it is exactly the window right after another
+      run created the marker, because add_lookup_data tolerates up to ~60s of create-lag with
+      its retries, so the dataset exists before its row does.
+    * on_takeover - called with the takeover message when this call DOES steal a lock, so the
+      caller can surface "I proceeded while another run's marker was in place" instead of
+      reporting an ordinary, uncontended pass.
 
     Returns True if the lock was acquired (caller MUST release it via
     release_consolidation_lock), False if another run appears to already hold it."""
@@ -132,8 +144,17 @@ def acquire_consolidation_lock(client, log=print, now_ms=None,
             log("consolidation lock held (age %.0fs) - another run appears to be in "
                 "progress; skipping this pass" % ((now_ms - held_ms) / 1000.0))
             return False
-        log("consolidation lock is stale or unreadable (%s) - taking over"
-            % ("age unknown" if held_ms is None else "age %.0fs" % ((now_ms - held_ms) / 1000.0)))
+        if held_ms is None and unreadable_is_held:
+            log("consolidation lock marker exists but its row is unreadable - another run "
+                "most likely just created it (add_data create-lag); standing down rather "
+                "than taking over")
+            return False
+        msg = ("consolidation lock is stale or unreadable (%s) - taking over"
+               % ("age unknown" if held_ms is None
+                  else "age %.0fs" % ((now_ms - held_ms) / 1000.0)))
+        log(msg)
+        if on_takeover:
+            on_takeover(msg)
         # Delete-then-recreate rather than just appending a fresh row: leaving the stale
         # row(s) in place would let a future _read_lock pick up an arbitrary (not
         # necessarily newest) row, and the dataset would accumulate one row per steal
