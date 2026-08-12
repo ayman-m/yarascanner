@@ -3,10 +3,10 @@ YARA Scanner (XDR API Edition)
 ==================================
 Enterprise-grade file scanner with real-time threat detection and Cortex XDR API reporting.
 
-    VERSION : 2.1.0
-    RELEASED: 2026-08-06
+    VERSION : 3.0.1
+    RELEASED: 2026-08-12
     SOURCE  : https://github.com/ayman-m/yarascanner
-    NOTES   : https://github.com/ayman-m/yarascanner/releases/tag/v2.1.0
+    NOTES   : https://github.com/ayman-m/yarascanner/releases/tag/v3.0.1
 
 Capabilities in this version:
 - Multi-threaded YARA scanning of one or more paths, with per-run rule delivery
@@ -26,8 +26,8 @@ Report the version with any support request: behaviour differs between releases 
 the release notes above record what changed.
 """
 
-__version__ = "2.1.0"
-__release_date__ = "2026-08-06"
+__version__ = "3.0.1"
+__release_date__ = "2026-08-12"
 
 # Standard library imports
 import base64
@@ -153,6 +153,14 @@ CONFIG_LOOKUP_SHARD = "endpoint"        # dataset sharding: "endpoint" (per-host
 # more files - see dataset"). Protects the shared ~600 alerts/min per-API-key ceiling while keeping
 # every suppressed finding visible (rollup + lookup dataset). <= 0 disables the cap.
 CONFIG_ALERT_MAX_PER_SCAN = 500         # max per-finding alerts per scan; beyond -> rollup per rule
+# Lookup-dataset row cap per (rule, file) finding: an unanchored/short string pattern (e.g. a bare
+# "powershell" substring) can occur tens of thousands of times inside one large file (measured live:
+# 33,118 offsets from one rule hitting one .evtx log). Unlike the alert channel above, this loop had
+# NO cap - one such finding could consume an entire scan's upload retry budget before genuinely
+# distinct findings elsewhere in the same scan ever got a turn, starving them out silently. Local
+# results/alert files keep every offset regardless (disk is not the scarce resource); only the
+# network upload is capped. <= 0 disables the cap.
+CONFIG_LOOKUP_ROWS_PER_FINDING_MAX = 50 # max dataset rows uploaded per (rule, file); rest logged only
 # Lookup dataset rotation: add_data merge time grows with DATASET SIZE (measured on-tenant: ~13s at
 # 15k rows, ~31s at 77k rows), so an ever-growing dataset eventually outlives any client timeout.
 # "monthly" starts a fresh _<YYYYMM> dataset each month -> bounded size -> bounded merge time,
@@ -209,7 +217,7 @@ LOOKUP_DATASET_SHARD = os.environ.get("YARA_LOOKUP_SHARD", "endpoint").strip() o
 # tag the dataset name with a schema version and bump it whenever the row shape changes. A fresh
 # version = a fresh dataset with the new schema; old-version datasets remain queryable (the
 # dashboards' `yara_scanner_matches*` wildcard spans every version). Bump this on any schema edit.
-LOOKUP_SCHEMA_VERSION = os.environ.get("YARA_LOOKUP_SCHEMA_VER", "2").strip() or "2"
+LOOKUP_SCHEMA_VERSION = os.environ.get("YARA_LOOKUP_SCHEMA_VER", "3").strip() or "3"
 # Rule-compilation DISK cache. Compiling a large pack (~500 rules) costs ~90s and is repeated on
 # every run because the scanner is a fresh process per action. yara-python's rules.save()/load()
 # lets us persist the compiled ruleset on the endpoint and skip the whole per-rule compile loop on
@@ -3653,15 +3661,26 @@ class ResultsUploader:
     def add_match(self, filename, rule, match_data, file_sha256=None, file_creation_time=None):
         """Add YARA match and queue for upload.
 
-        Grain split: the LOOKUP DATASET gets one row per matched string offset (forensic grain),
-        while the ALERT channel gets ONE alert per (file x rule) finding (triage grain) — yara
-        hands us all of a rule's string hits for a file in this single call, so the aggregation
-        needs no cross-call state. A SOC triages "this file matched this rule"; the per-offset
-        evidence lives in the dataset the alert points at."""
+        Grain split: the LOOKUP DATASET gets ONE ROW PER (rule, file) finding — same grain as the
+        ALERT channel below — with every matched offset folded into that row rather than emitted as
+        its own row. Earlier versions (schema v2) wrote one dataset row per matched string offset;
+        that grain repeats every per-file column (hostname, filename, sha256, scan context - ~18 of
+        20 fields) unchanged on every row, and an unanchored/short pattern hitting one large file
+        can multiply that into tens of thousands of near-duplicate rows (measured live: 33,118 rows
+        from one rule against one .evtx log), enough to exhaust a scan's whole upload budget before
+        other findings in the same scan get a turn. Folding offsets into one row keeps that fixed
+        per-file cost paid ONCE per finding instead of once per offset.
+
+        The full per-offset detail still goes to self.results (local, unbounded) — only the
+        NETWORK/dataset representation is aggregated+sampled here."""
         match_count = 0
         _first_offset = None
         _hit_samples = []      # first few "string_id@offset" pairs for the alert description
         _string_sample = ""    # first rendered matched string for the alert description
+        _offsets_sample = []   # capped sample embedded in the aggregated row
+        _strings_sample = []   # aligned 1:1 with _offsets_sample
+        _string_id_counts = {} # TRUE per-string-identifier counts across every offset, uncapped
+        _row_cap = CONFIG_LOOKUP_ROWS_PER_FINDING_MAX
         # Resolve per-file context once (not per matched string).
         try:
             _file_size = int(os.path.getsize(filename))
@@ -3669,11 +3688,6 @@ class ResultsUploader:
             _file_size = -1
         _scan_folder = str(getattr(self.config, "scan_folder", None) or "system")
         for string_id, offset, string_data in match_data:
-            # Capture the matched BYTE length BEFORE rendering. _render_match_data decodes wide
-            # matches to UTF-16 text (half the bytes) and binary matches to hex (double), so
-            # len() of the rendered string is not a consistent size. len() of the raw matched
-            # data is the byte length (capped by yara's max_match_data, ~512).
-            _matched_len = len(string_data) if string_data is not None else 0
             string_data = _render_match_data(string_data)
 
             result = {
@@ -3692,41 +3706,53 @@ class ResultsUploader:
             self.results.append(result)
             self.upload_stats['total_matches'] += 1
             match_count += 1
+            _string_id_counts[string_id] = _string_id_counts.get(string_id, 0) + 1
             if _first_offset is None:
                 _first_offset = offset
                 _string_sample = string_data
             if len(_hit_samples) < 3:
                 _hit_samples.append(f"{string_id}@{offset}")
+            if _row_cap <= 0 or len(_offsets_sample) < _row_cap:
+                _offsets_sample.append(offset)
+                _strings_sample.append(string_data)
 
-            lookup_uploader = getattr(self, "lookup_uploader", None)
-            if lookup_uploader is not None:
-                severity_map = {"critical": "High", "high": "High", "medium": "Medium", "low": "Low", "info": "Low"}
-                default_level = getattr(self.config, "alert_severity", "low")
-                severity = severity_map.get(str(default_level).lower(), "Low")
-                lookup_record = {
-                    "tenant_id": getattr(self.config, "tenant_id", "unknown"),
-                    "scan_id": self.scan_id,
-                    "run_id": getattr(self.config, "run_id", "") or "",
-                    "scan_date": (getattr(self.config, "run_id", "") or "").split("_", 1)[0],
-                    "hostname": self.hostname,
-                    "os_info": self.os_info,
-                    "os_type": _os_type(),
-                    "ip_address": self.ip_address,
-                    "rule": rule,
-                    "filename": filename,
-                    "file_size": _file_size,
-                    "file_sha256": file_sha256 or "",
-                    "file_creation_time": file_creation_time or "",
-                    "scan_folder": _scan_folder,
-                    "match": string_id,
-                    "offset": str(offset),
-                    "matched_length": _matched_len,
-                    "string": string_data,
-                    "severity": severity,
-                    "event_timestamp_ms": int(time.time() * 1000),
-                    "date_of_scan": self.date_of_scan,
-                }
-                lookup_uploader.add(lookup_record)
+        lookup_uploader = getattr(self, "lookup_uploader", None)
+        if lookup_uploader is not None and match_count > 0:
+            severity_map = {"critical": "High", "high": "High", "medium": "Medium", "low": "Low", "info": "Low"}
+            default_level = getattr(self.config, "alert_severity", "low")
+            severity = severity_map.get(str(default_level).lower(), "Low")
+            truncated = bool(_row_cap > 0 and match_count > len(_offsets_sample))
+            lookup_record = {
+                "tenant_id": getattr(self.config, "tenant_id", "unknown"),
+                "scan_id": self.scan_id,
+                "run_id": getattr(self.config, "run_id", "") or "",
+                "scan_date": (getattr(self.config, "run_id", "") or "").split("_", 1)[0],
+                "hostname": self.hostname,
+                "os_info": self.os_info,
+                "os_type": _os_type(),
+                "ip_address": self.ip_address,
+                "rule": rule,
+                "filename": filename,
+                "file_size": _file_size,
+                "file_sha256": file_sha256 or "",
+                "file_creation_time": file_creation_time or "",
+                "scan_folder": _scan_folder,
+                "match_count": match_count,
+                "offsets": json.dumps([str(o) for o in _offsets_sample]),
+                "strings": json.dumps(_strings_sample),
+                "string_ids": json.dumps(_string_id_counts),
+                "truncated": truncated,
+                "severity": severity,
+                "event_timestamp_ms": int(time.time() * 1000),
+                "date_of_scan": self.date_of_scan,
+            }
+            lookup_uploader.add(lookup_record)
+            if truncated and hasattr(self, "log_manager") and self.log_manager:
+                self.log_manager.log_upload(
+                    f"Rule '{rule}' matched {filename} at {match_count} offsets; embedded a sample "
+                    f"of {len(_offsets_sample)} in the dataset row (truncated=true; full detail "
+                    f"retained in local results)."
+                )
 
         # ---- Alert channel: ONE alert per finding (file x rule), storm-capped ----
         # The Insert Parsed Alerts budget is ~600/min SHARED across every endpoint on the API key,
@@ -3945,6 +3971,11 @@ class LookupDatasetUploader:
 
         # Matches schema — must match keys produced by ResultsUploader.add_match.
         # XDR add_dataset supports: text, number, datetime, bool.
+        # v3: one row per (rule, file) finding, not one row per matched offset (see add_match's
+        # docstring for why — v2's per-offset grain let one pathological finding exhaust a scan's
+        # upload budget). offsets/strings/string_ids are JSON-encoded text (XDR has no array/nested
+        # column type); match_count + truncated make the true total queryable even when the
+        # embedded sample is capped, instead of only visible in a local per-endpoint log.
         self.matches_schema = {
             "tenant_id": "text",
             "scan_id": "text",
@@ -3960,10 +3991,11 @@ class LookupDatasetUploader:
             "file_sha256": "text",
             "file_creation_time": "text",
             "scan_folder": "text",      # the target that was scanned (context for the hit)
-            "match": "text",
-            "offset": "text",
-            "matched_length": "number", # length of the matched string data
-            "string": "text",
+            "match_count": "number",    # TRUE total matched offsets for this (rule, file), even if capped
+            "offsets": "text",          # JSON array: sample of offsets (up to CONFIG_LOOKUP_ROWS_PER_FINDING_MAX)
+            "strings": "text",          # JSON array: rendered matched strings, aligned 1:1 with offsets
+            "string_ids": "text",       # JSON object: per-string-identifier counts, e.g. {"$ext2": 12, "$note1": 3}
+            "truncated": "bool",        # true when match_count exceeds the embedded offsets/strings sample
             "severity": "text",
             "event_timestamp_ms": "number",
             "date_of_scan": "text",
@@ -4247,6 +4279,7 @@ class LookupDatasetUploader:
         _deadline = time.monotonic() + max(1.0, _budget - 20)
 
         read_timeouts = 0
+        recreate_attempted = False
         attempt = 0
         while attempt < LOOKUP_ADD_DATA_MAX_RETRIES:
             # `attempt > 0` guarantees at least ONE POST regardless of how the drain/read knobs are
@@ -4293,6 +4326,31 @@ class LookupDatasetUploader:
                             f"Retry {attempt}/{LOOKUP_ADD_DATA_MAX_RETRIES} in {delay:.1f}s."
                         )
                     time.sleep(delay)
+                    continue
+
+                # Dataset missing mid-scan (HTTP 400 "Dataset not found") is not necessarily a
+                # config error - it happens for real if a consolidation/cleanup pass elsewhere
+                # deletes this scan's still-in-progress dataset (measured live: a scan whose
+                # newest row crossed a maintenance tool's abandoned-scan cutoff had its own
+                # dataset pulled out from under it mid-write). _ensure_one() only runs once, at
+                # startup, so without this the scan just keeps failing silently for its entire
+                # remaining lifetime. Recreate once and retry this same batch - bounded by
+                # `recreate_attempted` so a genuinely broken create call can't loop forever.
+                if (resp.status_code == 400 and not recreate_attempted
+                        and "not found" in resp.text.lower()):
+                    recreate_attempted = True
+                    if self.log_manager:
+                        self.log_manager.log_upload(
+                            f"Lookup batch failed (HTTP 400, dataset not found) - "
+                            f"'{target}' appears to have been deleted mid-scan; recreating and "
+                            f"retrying this batch once."
+                        )
+                    schema = self.matches_schema if target == self.matches_dataset else self.scans_schema
+                    try:
+                        self._ensure_one(target, schema)
+                    except Exception as e:
+                        if self.log_manager:
+                            self.log_manager.log_error(f"Dataset recreation failed: {e}")
                     continue
 
                 with self._stats_lock:
@@ -6378,13 +6436,11 @@ rule test {{
         except Exception as e:
             self.log_manager.log_error(f"Error stopping file cache: {e}")
 
-        try:
-            if getattr(self, 'resource_monitor', None) is not None:
-                self.resource_monitor.stop_monitoring()
-            self.stats_manager.stop_monitoring()
-        except Exception as e:
-            self.log_manager.log_error(f"Error stopping monitoring: {e}")
-        
+        # Resource/stats monitoring is stopped AFTER the worker-thread join below, not
+        # here (matches the XSIAM edition's fix) - file discovery finishing (which is where
+        # control reaches this point) is not the same as the workers finishing the matching
+        # work still sitting in scan_queue, and stopping the monitor here was cutting
+        # resource telemetry off for most of the real scan duration on a large scan.
         self.log_manager.log_system("Initiating worker thread cleanup")
         
         for _ in range(self.config.max_workers):
@@ -6419,6 +6475,13 @@ rule test {{
         self.log_manager.log_performance(
             f"Worker cleanup: {successful_joins} stopped, {failed_joins} timed out in {worker_join_time:.1f}s"
         )
+
+        try:
+            if getattr(self, 'resource_monitor', None) is not None:
+                self.resource_monitor.stop_monitoring()
+            self.stats_manager.stop_monitoring()
+        except Exception as e:
+            self.log_manager.log_error(f"Error stopping monitoring: {e}")
 
         self.scan_active = False
         cleanup_total_time = time.time() - cleanup_start
