@@ -11,16 +11,16 @@ Features:
 - Circuit breaker for upload resilience
 - System resource monitoring
 
-    VERSION : 2.0.0
-    RELEASED: 2026-08-03
+    VERSION : 3.0.0
+    RELEASED: 2026-08-12
     SOURCE  : https://github.com/ayman-m/yarascanner
-    NOTES   : https://github.com/ayman-m/yarascanner/releases/tag/v2.0.0
+    NOTES   : https://github.com/ayman-m/yarascanner/releases/tag/v3.0.0-xsiam
 
 Report the version with any support request.
 """
 
-__version__ = "2.0.0"
-__release_date__ = "2026-08-03"
+__version__ = "3.0.0"
+__release_date__ = "2026-08-12"
 
 # Standard library imports
 import base64
@@ -60,11 +60,26 @@ import yara
 # CONSTANTS
 # ============================================================================
 
+def _env_number(name, default, cast=float):
+    """Read a numeric tuning env var without letting a deployer typo (e.g. '60s',
+    'unlimited') crash the whole scanner at import time - fall back to default and warn."""
+    raw = os.environ.get(name, "")
+    if not raw:
+        return cast(default)
+    try:
+        return cast(raw)
+    except (TypeError, ValueError):
+        logging.warning(
+            "Ignoring invalid %s=%r (expected a number) - using default %r",
+            name, raw, default)
+        return cast(default)
+
+
 UPLOAD_RESULTS = True  # Match and telemetry uploads to webhook
 UPLOAD_NON_MATCH_DATA = True  # Keep telemetry uploads enabled in webhook mode
 DEFAULT_TIMEOUT_SECS = 20            # increased request timeout everywhere
 MAX_RETRIES_PER_ITEM = 2             # hard cap to avoid infinite loops
-MAX_MATCH_SAMPLES_PER_FINDING = int(os.environ.get("YARA_MAX_MATCH_SAMPLES", "50") or 50)
+MAX_MATCH_SAMPLES_PER_FINDING = _env_number("YARA_MAX_MATCH_SAMPLES", 50, cast=int)
 # ^ Ported from the XDR edition after it hit this live: one loosely-written rule matching one
 # large file can produce tens of thousands of string-offset instances (measured there: 33,118
 # rows from one rule against one .evtx log; measured here: 36,213 in one match-upload backlog),
@@ -93,9 +108,9 @@ THREAD_CLEANUP_TIMEOUT = 60          # Maximum time to wait for thread cleanup
 # everything still queued, strictly worse than the flat-timeout bug this was meant to fix. Kept
 # low enough that even all four sites maxing out at once (4 * 60s = 240s) stays well inside a
 # normal script timeout.
-DRAIN_MIN_SECS = float(os.environ.get("YARA_DRAIN_MIN_SECS", "15") or 15)              # floor - matches prior fast-path behavior
-DRAIN_PER_ITEM_SECS = float(os.environ.get("YARA_DRAIN_PER_ITEM_SECS", "0.3") or 0.3)  # rough per-POST budget incl. occasional retry
-DRAIN_MAX_SECS = float(os.environ.get("YARA_DRAIN_MAX_SECS", "60") or 60)              # per-site ceiling (there are 4 sites - see above)
+DRAIN_MIN_SECS = _env_number("YARA_DRAIN_MIN_SECS", 15)              # floor - matches prior fast-path behavior
+DRAIN_PER_ITEM_SECS = _env_number("YARA_DRAIN_PER_ITEM_SECS", 0.3)   # rough per-POST budget incl. occasional retry
+DRAIN_MAX_SECS = _env_number("YARA_DRAIN_MAX_SECS", 60)              # per-site ceiling (there are 4 sites - see above)
 
 
 def _compute_drain_budget(pending_items):
@@ -1877,15 +1892,36 @@ class LogManager:
                 timeout=DEFAULT_TIMEOUT_SECS
             )
             if 200 <= response.status_code < 300:
+                self.upload_stats['successful_uploads'] += 1
                 return
-        except Exception:
-            pass
+            self.loggers[LogType.UPLOAD].warning(
+                f"Critical log immediate send failed (HTTP {response.status_code}): "
+                f"{response.text} - falling back to async queue"
+            )
+        except Exception as e:
+            # Ambiguous outcome: the request may have reached the collector even though
+            # we never saw a clean response (e.g. a read timeout after the server already
+            # wrote the row). Requeuing risks a duplicate row for this once-per-scan event -
+            # logged here so that's visible rather than silent, consistent with this
+            # scanner's existing "honest books over exact-once" delivery philosophy.
+            self.loggers[LogType.UPLOAD].warning(
+                f"Critical log immediate send raised {type(e).__name__}: {e} - falling back "
+                f"to async queue (may deliver a duplicate if the request actually landed)"
+            )
 
         if self.webhook_thread and self.webhook_thread.is_alive():
             try:
                 self.webhook_queue.put(standard_log, timeout=1.0)
             except Exception:
-                pass
+                self.upload_stats['failed_uploads'] += 1
+                self.loggers[LogType.UPLOAD].error(
+                    f"Critical log dropped for {standard_log.type}: async queue unavailable"
+                )
+        else:
+            self.upload_stats['failed_uploads'] += 1
+            self.loggers[LogType.UPLOAD].error(
+                f"Critical log dropped for {standard_log.type}: no async queue to fall back to"
+            )
 
     def log_statistics_critical(self, message: str, data=None):
         """log_statistics, but see _log_critical."""
