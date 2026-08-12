@@ -75,6 +75,25 @@ def _env_number(name, default, cast=float):
         return cast(default)
 
 
+def _env_bool(name, default):
+    """Read a boolean toggle constant below, honoring an env var override (for automation)
+    without letting a malformed one crash the scanner at import time - same fail-safe
+    pattern as _env_number. The literal True/False below is what a console deployer
+    actually edits; the env var is an optional override on top of that."""
+    raw = os.environ.get(name, "")
+    if not raw:
+        return bool(default)
+    text = raw.strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    logging.warning(
+        "Ignoring invalid %s=%r (expected true/false) - using default %r",
+        name, raw, default)
+    return bool(default)
+
+
 UPLOAD_RESULTS = True  # Match and telemetry uploads to webhook
 UPLOAD_NON_MATCH_DATA = True  # Keep telemetry uploads enabled in webhook mode
 DEFAULT_TIMEOUT_SECS = 20            # increased request timeout everywhere
@@ -132,6 +151,15 @@ DEFAULT_API_ENDPOINT = "http_collector_api"
 
 API_KEY = DEFAULT_API_KEY
 API_ENDPOINT = DEFAULT_API_ENDPOINT
+
+# Monitoring toggles - edit these directly (an env var of the same name still overrides,
+# for automation/testing, but this literal is what a console deployer actually sees).
+# Previously these were ONLY os.getenv() reads buried inside ScanConfig.__init__ with no
+# constant here at all - unreachable in practice, since Action Center's "Run Script" has
+# no way to set process environment variables; only editing the uploaded script works.
+ENABLE_RESOURCE_MONITOR = _env_bool("YARA_ENABLE_RESOURCE_MONITOR", False)  # CPU/memory snapshots -> dashboard
+ENABLE_PERF_MONITOR = _env_bool("YARA_ENABLE_PERF_MONITOR", False)
+ENABLE_FD_MONITOR = _env_bool("YARA_ENABLE_FD_MONITOR", False)
 
 YARA_RULE = r""""""
 
@@ -2528,15 +2556,9 @@ class ScanConfig:
             2, int(os.getenv("YARA_QUEUE_SIZE", str(self.max_workers * 2)) or (self.max_workers * 2))
         )
         self.log_interval = int(os.getenv("YARA_PROGRESS_LOG_SECS", "120") or 120)
-        self.enable_performance_monitoring = str(
-            os.getenv("YARA_ENABLE_PERF_MONITOR", "false")
-        ).strip().lower() in ("1", "true", "yes", "on")
-        self.enable_resource_monitoring = str(
-            os.getenv("YARA_ENABLE_RESOURCE_MONITOR", "false")
-        ).strip().lower() in ("1", "true", "yes", "on")
-        self.enable_fd_monitoring = str(
-            os.getenv("YARA_ENABLE_FD_MONITOR", "false")
-        ).strip().lower() in ("1", "true", "yes", "on")
+        self.enable_performance_monitoring = ENABLE_PERF_MONITOR
+        self.enable_resource_monitoring = ENABLE_RESOURCE_MONITOR
+        self.enable_fd_monitoring = ENABLE_FD_MONITOR
         self.track_real_paths = False
         self.light_throttle_enabled = True
         self.throttle_check_interval_secs = float(os.getenv("YARA_LIGHT_THROTTLE_CHECK_SECS", "0.5") or 0.5)
@@ -4912,11 +4934,28 @@ rule test {{
                 cache_stats
             )
         
+    def _progress_heartbeat(self):
+        """Periodic _log_progress() call spanning the WHOLE scan (discovery + the time
+        workers spend draining scan_queue afterward), not just file discovery. The old
+        approach checked this only inline in the discovery os.walk loop, which almost
+        never runs long enough on its own to cross log_interval - file enumeration is
+        fast; matching file content in the worker threads is what actually takes minutes,
+        and that happens after discovery ends. Confirmed live: zero "Scan Progress"/
+        "Cache Performance" events were ever recorded under the old approach, on any host.
+        """
+        while not self._progress_heartbeat_stop.wait(self.config.log_interval):
+            if not self.scan_active:
+                break
+            try:
+                self._log_progress()
+            except Exception as e:
+                self.log_manager.log_error(f"Progress heartbeat error: {e}")
+
     def _perform_enhanced_cleanup(self, start_time, total_files_found, files_per_target):
         """Enhanced cleanup with aggressive timeouts."""
         self.log_manager.log_system("=== ENHANCED CLEANUP AND FINALIZATION ===")
         self.status_uploader.set_status("finishing")
-        
+
         cleanup_start = time.time()
        
         try:
@@ -4966,6 +5005,14 @@ rule test {{
         self.log_manager.log_performance(
             f"Worker cleanup: {successful_joins} stopped, {failed_joins} timed out in {worker_join_time:.1f}s"
         )
+
+        # Stopped here, AFTER the join above, for the same reason as resource/stats
+        # monitoring below - the heartbeat needs to keep firing for as long as workers
+        # are actually still draining scan_queue, not just until file discovery ends.
+        if getattr(self, '_progress_heartbeat_stop', None) is not None:
+            self._progress_heartbeat_stop.set()
+            if getattr(self, '_progress_heartbeat_thread', None) is not None:
+                self._progress_heartbeat_thread.join(timeout=2)
 
         try:
             if getattr(self, 'resource_monitor', None) is not None:
@@ -5048,7 +5095,12 @@ rule test {{
             {'worker_startup_time_seconds': worker_startup_time, 'workers_started': len(self.scan_threads)}
         )
 
-        last_log = time.time()
+        self._progress_heartbeat_stop = threading.Event()
+        self._progress_heartbeat_thread = threading.Thread(
+            target=self._progress_heartbeat, name="ProgressHeartbeat", daemon=True
+        )
+        self._progress_heartbeat_thread.start()
+
         last_comprehensive_stats = time.time()
         total_files_found = 0
         files_per_target = {}
@@ -5104,12 +5156,7 @@ rule test {{
                             
                             if not self._enqueue_scan_path(path):
                                 break
-                                
-                        current_time = time.time()
-                        if current_time - last_log >= self.config.log_interval:
-                            self._log_progress()
-                            last_log = current_time
-                            
+
                     target_scan_time = time.time() - target_start_time
                     files_per_target[target] = target_files_found
                     
