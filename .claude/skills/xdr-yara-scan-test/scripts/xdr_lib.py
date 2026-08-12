@@ -186,7 +186,28 @@ class XDRClient:
                 if status != "SUCCESS":
                     raise RuntimeError(f"XQL {status}: {json.dumps(reply)[:400]}")
                 results = reply.get("results", {})
-                rows = results.get("data", results) if isinstance(results, dict) else results
-                return rows if isinstance(rows, list) else []
+                if isinstance(results, dict) and "data" in results:
+                    rows = results["data"]
+                    return rows if isinstance(rows, list) else []
+                if isinstance(results, dict) and results.get("stream_id"):
+                    # Past ~1000 rows the platform streams instead of inlining results
+                    # (see xdr_action_center.py's xql() for the measured threshold and
+                    # the silent-empty-return bug this fixes).
+                    return self._xql_stream(qid, results["stream_id"])
+                return results if isinstance(results, list) else []
             time.sleep(poll_secs)
         raise RuntimeError("XQL timed out")
+
+    def _xql_stream(self, query_id, stream_id):
+        st, data = self.call("/public_api/v1/xql/get_query_results_stream/",
+                             {"query_id": query_id, "stream_id": stream_id,
+                              "is_gzip_compressed": False}, timeout=180)
+        raw = data.get("_raw") if isinstance(data, dict) else None
+        if raw is None:
+            return data if isinstance(data, list) else []
+        rows = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+        return rows

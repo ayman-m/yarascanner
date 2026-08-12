@@ -74,6 +74,17 @@ def test_shard_not_terminal_when_both_pending():
     assert shard_is_terminal(latest_status=None, action_state="IN_PROGRESS") is False
 
 
+def test_terminal_action_includes_partial_and_with_errors_states():
+    # Edge case #2: this repo's OTHER two live-verified "terminal Action Center state" sets
+    # (xdr_action_center.py's TERMINAL_STATES, xdr-yara-scan-test's xdr_lib.wait_action)
+    # already include COMPLETED_WITH_ERRORS/COMPLETED_PARTIAL as terminal. TERMINAL_ACTION
+    # must not silently disagree, or a host whose action ended in one of those states never
+    # gets rescued by Gate B and its shard is deferred forever.
+    assert {"COMPLETED_WITH_ERRORS", "COMPLETED_PARTIAL"} <= TERMINAL_ACTION
+    assert shard_is_terminal(latest_status="running", action_state="COMPLETED_WITH_ERRORS") is True
+    assert shard_is_terminal(latest_status="running", action_state="COMPLETED_PARTIAL") is True
+
+
 # ------------------------------------------------------ quiet-period gate
 def test_newest_row_age_gate():
     now_ms = 1_000_000_000
@@ -163,8 +174,13 @@ class FakeClient:
         return [{"dataset_name": n} for n in self.ds]
 
     def create_lookup_dataset(self, name, schema):
-        self.ds.setdefault(name, [])
-        return {"status": "ok"}
+        # Mirror the real API: a fresh create returns {"dataset_name": ...}, re-creating an
+        # existing dataset returns {"status": "exists"} instead — verified live, and what the
+        # consolidation lock relies on to detect another run already holding it.
+        if name in self.ds:
+            return {"status": "exists"}
+        self.ds[name] = []
+        return {"dataset_name": name}
 
     def add_lookup_data(self, name, rows):
         # Mirror the real API: a row is SKIPPED if it carries a field outside the schema
@@ -183,6 +199,17 @@ class FakeClient:
     def delete_dataset(self, name, force=False):
         self.ds.pop(name, None)
         return {"status": "deleted"}
+
+    def remove_lookup_data(self, name, filters):
+        # Mirror the real API: OR across filter dicts, AND within a dict (exact match).
+        # An unknown dataset is a harmless no-op (0 deleted), not an error.
+        if name not in self.ds:
+            return {"deleted": 0}
+        def matches(row):
+            return any(all(row.get(k) == v for k, v in f.items()) for f in filters)
+        before = len(self.ds[name])
+        self.ds[name] = [r for r in self.ds[name] if not matches(r)]
+        return {"deleted": before - len(self.ds[name])}
 
     def xql(self, query, limit=1000):
         name = query.split("dataset = ", 1)[1].split(" ", 1)[0].strip()
@@ -262,7 +289,10 @@ def test_orchestration_keeps_shard_holding_an_unconsolidated_second_scan():
     assert by["S2"]["reason"] == "host_not_terminal"
     assert len(fc.ds["yara_scanner_matches_v2_scan_s1"]) == 10   # S1 consolidated
     assert shard in fc.ds                                        # shard KEPT (S2 not done)
-    assert len(fc.ds[shard]) == 17                              # S2 rows intact
+    # S1's rows are stripped out immediately once verified (edge case #51a) — only S2's 7
+    # rows remain, not all 17; leaving S1's rows here too would double-count S1 in any
+    # dashboard querying the yara_scanner_matches* wildcard until S2 also finishes.
+    assert len(fc.ds[shard]) == 7
 
 
 RNOW = 1_800_000_000_000   # realistic epoch-ms so RNOW - 48h stays positive
@@ -306,6 +336,532 @@ def test_orchestration_idempotent_second_run_no_duplicates():
     _seed(fc, "yara_scanner_scans_v2_hosta_aa0001", _s("S1", "hosta", "completed"))
     C.run_consolidation(fc, "matches", quiet_secs=1, dry_run=False, now_ms=NOW, log=lambda *a: None)
     assert len(fc.ds["yara_scanner_matches_v2_scan_s1"]) == n_after_first == 30   # no dup
+
+
+# ------------------------------------------------- check_consolidation_status (read-only)
+def test_check_status_reports_eligible_when_scan_finished_and_settled():
+    fc = FakeClient()
+    _seed(fc, "yara_scanner_matches_v2_hosta_aa0001", _m("S1", "hosta", 5))
+    _seed(fc, "yara_scanner_scans_v2_hosta_aa0001", _s("S1", "hosta", "completed"))
+    status = C.check_consolidation_status(fc, kinds=("matches",), quiet_secs=1, now_ms=NOW,
+                                          log=lambda *a: None)
+    assert status["any_in_progress"] is False
+    assert status["eligible_count"] == 1
+    assert status["eligible_scan_ids"] == ["S1"]
+    assert status["pending_scan_ids"] == []
+    assert status["blocked_count"] == 0
+
+
+def test_check_status_reports_in_progress_when_scan_running():
+    fc = FakeClient()
+    _seed(fc, "yara_scanner_matches_v2_hosta_aa0001", _m("S1", "hosta", 5))
+    _seed(fc, "yara_scanner_scans_v2_hosta_aa0001", _s("S1", "hosta", "running"))
+    status = C.check_consolidation_status(fc, kinds=("matches",), quiet_secs=1, now_ms=NOW,
+                                          abandoned_after_secs=24 * 3600, log=lambda *a: None)
+    assert status["any_in_progress"] is True
+    assert status["eligible_count"] == 0
+    assert status["pending_scan_ids"] == ["S1"]
+
+
+def test_check_status_never_writes_or_deletes():
+    fc = FakeClient()
+    _seed(fc, "yara_scanner_matches_v2_hosta_aa0001", _m("S1", "hosta", 5))
+    _seed(fc, "yara_scanner_scans_v2_hosta_aa0001", _s("S1", "hosta", "completed"))
+    before = {k: list(v) for k, v in fc.ds.items()}
+    C.check_consolidation_status(fc, kinds=("matches", "scans"), quiet_secs=1, now_ms=NOW,
+                                 log=lambda *a: None)
+    assert fc.ds == before   # no target created, no shard deleted — pure read
+
+
+def test_check_status_eligible_requires_both_kinds_ready():
+    # S1's matches shard is done, but its scans shard shows still running - a status check
+    # that only looked at one kind would wrongly call this eligible.
+    fc = FakeClient()
+    _seed(fc, "yara_scanner_matches_v2_hosta_aa0001", _m("S1", "hosta", 5))
+    _seed(fc, "yara_scanner_scans_v2_hosta_aa0001", _s("S1", "hosta", "running"))
+    status = C.check_consolidation_status(fc, kinds=("matches", "scans"), quiet_secs=1,
+                                          now_ms=NOW, abandoned_after_secs=24 * 3600,
+                                          log=lambda *a: None)
+    assert status["eligible_count"] == 0
+    assert "S1" in status["pending_scan_ids"]
+
+
+# ------------------------------------------------------------- consolidate_all (mutating)
+def test_consolidate_all_matches_existing_behavior():
+    fc = FakeClient()
+    _seed(fc, "yara_scanner_matches_v2_hosta_aa0001", _m("S1", "hosta", 40))
+    _seed(fc, "yara_scanner_matches_v2_hostb_bb0002", _m("S1", "hostb", 25))
+    _seed(fc, "yara_scanner_scans_v2_hosta_aa0001", _s("S1", "hosta", "completed"))
+    _seed(fc, "yara_scanner_scans_v2_hostb_bb0002", _s("S1", "hostb", "completed"))
+    result = C.consolidate_all(fc, kinds=("matches",), dry_run=False, quiet_secs=1,
+                               now_ms=NOW, log=lambda *a: None)
+    assert result["consolidated_count"] == 1
+    assert result["consolidated_scan_ids"] == ["S1"]
+    assert result["deferred_count"] == 0
+    assert result["failed_count"] == 0
+    assert len(fc.ds["yara_scanner_matches_v2_scan_s1"]) == 65
+
+
+def test_consolidate_all_dry_run_reports_nothing_consolidated():
+    fc = FakeClient()
+    _seed(fc, "yara_scanner_matches_v2_hosta_aa0001", _m("S1", "hosta", 5))
+    _seed(fc, "yara_scanner_scans_v2_hosta_aa0001", _s("S1", "hosta", "completed"))
+    result = C.consolidate_all(fc, kinds=("matches",), dry_run=True, quiet_secs=1,
+                               now_ms=NOW, log=lambda *a: None)
+    assert result["consolidated_count"] == 0        # dry-run never sets ok=True
+    assert "yara_scanner_matches_v2_scan_s1" not in fc.ds   # nothing written
+
+
+def test_consolidate_all_reports_deferred_and_failed_separately():
+    fc = FakeClient()
+    _seed(fc, "yara_scanner_matches_v2_hosta_aa0001", _m("S1", "hosta", 5))
+    _seed(fc, "yara_scanner_scans_v2_hosta_aa0001", _s("S1", "hosta", "running"))
+    result = C.consolidate_all(fc, kinds=("matches",), dry_run=False, quiet_secs=1,
+                               now_ms=NOW, abandoned_after_secs=24 * 3600, log=lambda *a: None)
+    assert result["consolidated_count"] == 0
+    assert result["deferred_count"] == 1
+    assert result["deferred_scan_ids"] == ["S1"]
+    assert result["failed_count"] == 0
+
+
+# --------------------------------------------------------- schema-version isolation (v2/v3)
+def test_parse_shard_v3():
+    p = parse_shard("yara_scanner_matches_v3_winhost01_ab12cd_202608")
+    assert p["kind"] == "matches"
+    assert p["ver"] == "3"
+    assert p["host"] == "winhost01_ab12cd"
+
+
+def _m3(scan, host, n, ts=1000):
+    # v3 row shape: aggregated per (rule, file) finding, not per offset.
+    return [{"scan_id": scan, "hostname": host, "rule": "R", "filename": "f%d" % i,
+              "match_count": 5, "truncated": False, "offsets": "[]", "strings": "[]",
+              "string_ids": "{}", "event_timestamp_ms": ts} for i in range(n)]
+
+
+def test_run_consolidation_v2_ignores_v3_shards():
+    # A v2 and a v3 shard for the SAME scan/host both exist (mid-rollout tenant). Consolidating
+    # ver="2" must touch only the v2 shard — mixing the two under one schema would silently
+    # mis-project v3's aggregated fields onto v2's per-offset columns (or vice versa).
+    fc = FakeClient()
+    _seed(fc, "yara_scanner_matches_v2_hosta_aa0001", _m("S1", "hosta", 10))
+    _seed(fc, "yara_scanner_scans_v2_hosta_aa0001", _s("S1", "hosta", "completed"))
+    _seed(fc, "yara_scanner_matches_v3_hosta_aa0001", _m3("S1", "hosta", 4))
+    _seed(fc, "yara_scanner_scans_v3_hosta_aa0001", _s("S1", "hosta", "completed"))
+
+    plans = C.run_consolidation(fc, "matches", ver="2", quiet_secs=1, dry_run=False,
+                                now_ms=NOW, log=lambda *a: None)
+    assert plans[0]["ok"] is True
+    assert len(fc.ds["yara_scanner_matches_v2_scan_s1"]) == 10
+    assert "yara_scanner_matches_v2_hosta_aa0001" not in fc.ds     # v2 shard consolidated away
+    assert "yara_scanner_matches_v3_hosta_aa0001" in fc.ds         # v3 shard untouched
+    assert len(fc.ds["yara_scanner_matches_v3_hosta_aa0001"]) == 4  # and unmodified
+
+
+def test_run_consolidation_v3_uses_v3_target_and_schema():
+    fc = FakeClient()
+    _seed(fc, "yara_scanner_matches_v3_hostb_bb0002", _m3("S2", "hostb", 7))
+    _seed(fc, "yara_scanner_scans_v3_hostb_bb0002", _s("S2", "hostb", "completed"))
+
+    plans = C.run_consolidation(fc, "matches", ver="3", quiet_secs=1, dry_run=False,
+                                now_ms=NOW, log=lambda *a: None)
+    assert plans[0]["ok"] is True
+    assert "yara_scanner_matches_v3_scan_s2" in fc.ds
+    assert len(fc.ds["yara_scanner_matches_v3_scan_s2"]) == 7
+    row = fc.ds["yara_scanner_matches_v3_scan_s2"][0]
+    assert "match_count" in row and "offset" not in row   # v3 fields, not v2's
+
+
+def test_check_consolidation_status_covers_both_versions_by_default():
+    fc = FakeClient()
+    _seed(fc, "yara_scanner_matches_v2_hosta_aa0001", _m("S1", "hosta", 5))
+    _seed(fc, "yara_scanner_scans_v2_hosta_aa0001", _s("S1", "hosta", "completed"))
+    _seed(fc, "yara_scanner_matches_v3_hostb_bb0002", _m3("S2", "hostb", 3))
+    _seed(fc, "yara_scanner_scans_v3_hostb_bb0002", _s("S2", "hostb", "completed"))
+
+    status = C.check_consolidation_status(fc, quiet_secs=1, now_ms=NOW, log=lambda *a: None)
+    assert status["eligible_scan_ids"] == ["S1", "S2"]
+
+
+def test_consolidate_all_processes_matches_before_scans():
+    # Real bug found live: consolidating "scans" before "matches" deletes the ONLY source of
+    # terminal-lifecycle truth (the scans shard) before the matches pass ever reads it. The
+    # matches pass then rebuilds its OWN terminal map from whatever scans shards still exist
+    # -- finds none for this host -- and defers a scan that has, in fact, already finished.
+    # A single host/single scan is the minimal case: nothing else keeps the scans shard alive.
+    fc = FakeClient()
+    _seed(fc, "yara_scanner_matches_v2_hosta_aa0001", _m("S1", "hosta", 10))
+    _seed(fc, "yara_scanner_scans_v2_hosta_aa0001", _s("S1", "hosta", "completed"))
+    result = C.consolidate_all(fc, dry_run=False, quiet_secs=1, now_ms=NOW, log=lambda *a: None)
+    assert result["consolidated_scan_ids"] == ["S1"]
+    assert result["deferred_count"] == 0, (
+        "matches deferred as 'not terminal' because scans consolidation ran (and deleted its "
+        "source) first -- kinds must process matches before scans")
+    assert "yara_scanner_matches_v2_scan_s1" in fc.ds
+    assert "yara_scanner_scans_v2_scan_s1" in fc.ds
+
+
+def test_consolidate_all_reports_why_a_scan_failed():
+    # Edge case #19: failed_scan_ids alone can't tell row_ceiling_exceeded (safe, just
+    # oversized) apart from count_mismatch (a real integrity concern) - failed_reasons must
+    # carry plan_consolidation's own reason string through.
+    fc = FakeClient()
+    _seed(fc, "yara_scanner_matches_v2_hosta_aa0001", _m("S1", "hosta", 10))
+    _seed(fc, "yara_scanner_scans_v2_hosta_aa0001", _s("S1", "hosta", "completed"))
+    result = C.consolidate_all(fc, kinds=("matches",), dry_run=False, quiet_secs=1,
+                               row_ceiling=5, now_ms=NOW, log=lambda *a: None)
+    assert result["failed_scan_ids"] == ["S1"]
+    assert result["failed_reasons"] == {"S1": "row_ceiling_exceeded"}
+
+
+def test_check_consolidation_status_reports_why_a_scan_is_blocked():
+    fc = FakeClient()
+    _seed(fc, "yara_scanner_matches_v2_hosta_aa0001", _m("S1", "hosta", 10))
+    _seed(fc, "yara_scanner_scans_v2_hosta_aa0001", _s("S1", "hosta", "completed"))
+    status = C.check_consolidation_status(fc, kinds=("matches",), quiet_secs=1,
+                                          row_ceiling=5, now_ms=NOW, log=lambda *a: None)
+    assert status["blocked_scan_ids"] == ["S1"]
+    assert status["blocked_reasons"] == {"S1": "row_ceiling_exceeded"}
+
+
+def test_consolidate_all_covers_both_versions_by_default():
+    fc = FakeClient()
+    _seed(fc, "yara_scanner_matches_v2_hosta_aa0001", _m("S1", "hosta", 5))
+    _seed(fc, "yara_scanner_scans_v2_hosta_aa0001", _s("S1", "hosta", "completed"))
+    _seed(fc, "yara_scanner_matches_v3_hostb_bb0002", _m3("S2", "hostb", 3))
+    _seed(fc, "yara_scanner_scans_v3_hostb_bb0002", _s("S2", "hostb", "completed"))
+
+    result = C.consolidate_all(fc, kinds=("matches",), dry_run=False, quiet_secs=1,
+                               now_ms=NOW, log=lambda *a: None)
+    assert result["consolidated_scan_ids"] == ["S1", "S2"]
+    assert "yara_scanner_matches_v2_scan_s1" in fc.ds
+    assert "yara_scanner_matches_v3_scan_s2" in fc.ds
+
+
+# --------------------------------------------------------------- overlap guard (edge case #31)
+def test_acquire_lock_fresh():
+    fc = FakeClient()
+    assert C.acquire_consolidation_lock(fc, now_ms=NOW, log=lambda *a: None) is True
+    assert C._LOCK_DATASET in fc.ds
+    assert fc.ds[C._LOCK_DATASET][0]["started_ms"] == NOW
+
+
+def test_acquire_lock_blocked_when_already_held():
+    fc = FakeClient()
+    assert C.acquire_consolidation_lock(fc, now_ms=NOW, log=lambda *a: None) is True
+    # a second run, moments later, must NOT also acquire
+    assert C.acquire_consolidation_lock(fc, now_ms=NOW + 1000, log=lambda *a: None) is False
+
+
+def test_acquire_lock_steals_stale_lock():
+    fc = FakeClient()
+    assert C.acquire_consolidation_lock(fc, now_ms=NOW, log=lambda *a: None) is True
+    # a crashed run's lock, found MUCH later - past the staleness window
+    later = NOW + (C.DEFAULT_LOCK_STALE_SECS + 60) * 1000
+    assert C.acquire_consolidation_lock(fc, now_ms=later, log=lambda *a: None) is True
+    assert fc.ds[C._LOCK_DATASET][0]["started_ms"] == later  # re-stamped to the new holder
+
+
+def test_release_lock_allows_reacquire():
+    fc = FakeClient()
+    C.acquire_consolidation_lock(fc, now_ms=NOW, log=lambda *a: None)
+    C.release_consolidation_lock(fc, log=lambda *a: None)
+    assert C._LOCK_DATASET not in fc.ds
+    assert C.acquire_consolidation_lock(fc, now_ms=NOW + 1000, log=lambda *a: None) is True
+
+
+def test_consolidate_all_skips_when_locked_by_another_run():
+    fc = FakeClient()
+    _seed(fc, "yara_scanner_matches_v2_hosta_aa0001", _m("S1", "hosta", 5))
+    _seed(fc, "yara_scanner_scans_v2_hosta_aa0001", _s("S1", "hosta", "completed"))
+    C.acquire_consolidation_lock(fc, now_ms=NOW, holder="other-run", log=lambda *a: None)
+
+    result = C.consolidate_all(fc, kinds=("matches",), dry_run=False, quiet_secs=1,
+                               now_ms=NOW + 1000, log=lambda *a: None)
+    assert result == {"consolidated_count": 0, "consolidated_scan_ids": [],
+                       "deferred_count": 0, "deferred_scan_ids": [],
+                       "failed_count": 0, "failed_scan_ids": [], "failed_reasons": {},
+                       "lock_held_by_other_run": True}
+    assert "yara_scanner_matches_v2_scan_s1" not in fc.ds   # nothing touched
+
+
+def test_consolidate_all_dry_run_ignores_lock():
+    fc = FakeClient()
+    _seed(fc, "yara_scanner_matches_v2_hosta_aa0001", _m("S1", "hosta", 5))
+    _seed(fc, "yara_scanner_scans_v2_hosta_aa0001", _s("S1", "hosta", "completed"))
+    C.acquire_consolidation_lock(fc, now_ms=NOW, holder="other-run", log=lambda *a: None)
+
+    result = C.consolidate_all(fc, kinds=("matches",), dry_run=True, quiet_secs=1,
+                               now_ms=NOW + 1000, log=lambda *a: None)
+    assert result["lock_held_by_other_run"] is False   # dry runs never even check
+
+
+def test_consolidate_all_releases_lock_after_completing():
+    fc = FakeClient()
+    _seed(fc, "yara_scanner_matches_v2_hosta_aa0001", _m("S1", "hosta", 5))
+    _seed(fc, "yara_scanner_scans_v2_hosta_aa0001", _s("S1", "hosta", "completed"))
+
+    result = C.consolidate_all(fc, kinds=("matches",), dry_run=False, quiet_secs=1,
+                               now_ms=NOW, log=lambda *a: None)
+    assert result["lock_held_by_other_run"] is False
+    assert result["consolidated_scan_ids"] == ["S1"]
+    assert C._LOCK_DATASET not in fc.ds   # released, a following run isn't blocked
+    assert C.acquire_consolidation_lock(fc, now_ms=NOW + 1000, log=lambda *a: None) is True
+
+
+# ------------------ per-scan row-level source cleanup (edge case #51a) ------------------
+# Once an individual scan_id's target is verified, its rows must be stripped from every
+# source shard it came from RIGHT AWAY (via client.remove_lookup_data), rather than waiting
+# for the whole shard to become deletable -- otherwise a dashboard querying the
+# yara_scanner_matches* wildcard double-counts that scan for as long as any OTHER scan
+# sharing the shard is still unfinished.
+class SpyClient(FakeClient):
+    """FakeClient that also records remove_lookup_data/delete_dataset calls, in order, so
+    tests can assert WHICH datasets were cleaned up and that cleanup happens before the
+    eventual whole-shard delete -- not just infer it from final dataset membership, which
+    can't tell "removed by the new per-scan cleanup" apart from "removed by the pre-existing
+    whole-shard delete" when a shard holds only one scan."""
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    def remove_lookup_data(self, name, filters):
+        self.calls.append(("remove_lookup_data", name, filters))
+        return super().remove_lookup_data(name, filters)
+
+    def delete_dataset(self, name, force=False):
+        self.calls.append(("delete_dataset", name))
+        return super().delete_dataset(name, force=force)
+
+
+class RemoveFailsClient(FakeClient):
+    """remove_lookup_data always raises, to exercise the required try/except around the new
+    cleanup calls. Records that it was actually invoked, so a test using this client can't
+    pass vacuously just because the implementation never calls remove_lookup_data at all."""
+    def __init__(self):
+        super().__init__()
+        self.remove_attempts = 0
+
+    def remove_lookup_data(self, name, filters):
+        self.remove_attempts += 1
+        raise RuntimeError("simulated remove_lookup_data failure")
+
+
+def test_fresh_write_removes_scan_rows_from_source_shard_same_run():
+    # PATH B: a scan that verifies via a fresh write this run must have its source rows
+    # stripped out immediately, as part of THIS run_consolidation call.
+    fc = SpyClient()
+    shard = "yara_scanner_matches_v2_hosta_aa0001"
+    _seed(fc, shard, _m("S1", "hosta", 10))
+    _seed(fc, "yara_scanner_scans_v2_hosta_aa0001", _s("S1", "hosta", "completed"))
+
+    plans = C.run_consolidation(fc, "matches", quiet_secs=1, dry_run=False, now_ms=NOW, log=lambda *a: None)
+    assert plans[0]["ok"] is True
+    assert len(fc.ds["yara_scanner_matches_v2_scan_s1"]) == 10
+
+    remove_calls = [c for c in fc.calls if c[0] == "remove_lookup_data"]
+    assert remove_calls == [("remove_lookup_data", shard, [{"scan_id": "S1"}])]
+    delete_calls = [c for c in fc.calls if c[0] == "delete_dataset" and c[1] == shard]
+    assert delete_calls, "shard should still become fully deletable once its only scan is verified"
+    assert fc.calls.index(remove_calls[0]) < fc.calls.index(delete_calls[0]), (
+        "row-level cleanup must happen before the eventual whole-shard delete")
+
+
+def test_shard_with_second_pending_scan_keeps_shard_but_drops_ready_scans_rows():
+    # A shard holding TWO scan_ids, only one ready this run: the shard must SURVIVE (the
+    # other scan still needs it) but the ready scan's rows must already be gone -- not left
+    # duplicated in the shard until the other scan also finishes.
+    fc = FakeClient()
+    shard = "yara_scanner_matches_v2_hostx_cc0003"
+    _seed(fc, shard, _m("S1", "hostx", 10) + _m("S2", "hostx", 7))
+    _seed(fc, "yara_scanner_scans_v2_hostx_cc0003",
+          _s("S1", "hostx", "completed") + _s("S2", "hostx", "running"))
+
+    plans = C.run_consolidation(fc, "matches", quiet_secs=1, dry_run=False, now_ms=NOW, log=lambda *a: None)
+    by = {p["scan_id"]: p for p in plans}
+    assert by["S1"]["ok"] is True
+    assert by["S2"]["reason"] == "host_not_terminal"
+
+    assert shard in fc.ds                                   # kept: S2 still pending
+    remaining = fc.ds[shard]
+    assert len(remaining) == 7
+    assert all(r["scan_id"] == "S2" for r in remaining), (
+        "S1's rows must be stripped out immediately even though the shard itself survives")
+    assert len(fc.ds["yara_scanner_matches_v2_scan_s1"]) == 10
+
+
+def test_dry_run_never_calls_remove_lookup_data_or_mutates_shard():
+    fc = SpyClient()
+    shard = "yara_scanner_matches_v2_hosta_aa0001"
+    _seed(fc, shard, _m("S1", "hosta", 10))
+    _seed(fc, "yara_scanner_scans_v2_hosta_aa0001", _s("S1", "hosta", "completed"))
+    before = list(fc.ds[shard])
+
+    plans = C.run_consolidation(fc, "matches", quiet_secs=1, dry_run=True, now_ms=NOW, log=lambda *a: None)
+    assert plans[0]["reason"] == "dry_run"
+    assert fc.ds[shard] == before   # byte-identical, untouched
+    assert not any(c[0] == "remove_lookup_data" for c in fc.calls)
+
+
+def test_remove_lookup_data_failure_does_not_crash_or_flip_ok():
+    fc = RemoveFailsClient()
+    shard = "yara_scanner_matches_v2_hosta_aa0001"
+    _seed(fc, shard, _m("S1", "hosta", 10))
+    _seed(fc, "yara_scanner_scans_v2_hosta_aa0001", _s("S1", "hosta", "completed"))
+
+    plans = C.run_consolidation(fc, "matches", quiet_secs=1, dry_run=False, now_ms=NOW, log=lambda *a: None)
+    assert plans[0]["ok"] is True   # target write was already safely verified
+    assert len(fc.ds["yara_scanner_matches_v2_scan_s1"]) == 10
+    assert fc.remove_attempts >= 1, "cleanup must actually have been attempted (and failed)"
+    # the failed cleanup must not block the eventual whole-shard delete either
+    assert shard not in fc.ds
+
+
+def test_path_a_idempotent_reverify_also_removes_source_rows():
+    # PATH A: the target already holds exactly this scan's rows (a prior run wrote+verified
+    # it but its cleanup call failed). This run must take the idempotent short-circuit AND
+    # retry the cleanup -- otherwise a retry of a previously-failed cleanup never happens.
+    # A second, not-yet-ready scan in the same shard keeps the shard alive so the row-level
+    # effect is observable separately from the eventual whole-shard delete.
+    fc = FakeClient()
+    shard = "yara_scanner_matches_v2_hostx_cc0003"
+    _seed(fc, shard, _m("S1", "hostx", 10) + _m("S2", "hostx", 7))
+    _seed(fc, "yara_scanner_scans_v2_hostx_cc0003",
+          _s("S1", "hostx", "completed") + _s("S2", "hostx", "running"))
+    # Pre-seed S1's per-scan target as already complete.
+    fc.ds["yara_scanner_matches_v2_scan_s1"] = _m("S1", "hostx", 10)
+
+    plans = C.run_consolidation(fc, "matches", quiet_secs=1, dry_run=False, now_ms=NOW, log=lambda *a: None)
+    by = {p["scan_id"]: p for p in plans}
+    assert by["S1"]["ok"] is True
+    assert by["S1"]["reason"] != "dry_run"
+    assert by["S2"]["reason"] == "host_not_terminal"
+    assert len(fc.ds["yara_scanner_matches_v2_scan_s1"]) == 10   # unchanged, not doubled
+
+    assert shard in fc.ds                                   # kept: S2 still pending
+    remaining = fc.ds[shard]
+    assert len(remaining) == 7
+    assert all(r["scan_id"] == "S2" for r in remaining), (
+        "PATH A (idempotent re-verify) must ALSO trigger the row-level cleanup")
+
+
+def test_scan_spanning_two_source_shards_gets_cleanup_on_both():
+    # A scan whose run straddles a monthly-rotation boundary can have rows in two shards for
+    # the same host. Cleanup must be applied to EVERY source, not just the first.
+    fc = SpyClient()
+    shard1 = "yara_scanner_matches_v2_hosta_aa0001_202607"
+    shard2 = "yara_scanner_matches_v2_hosta_aa0001_202608"
+    _seed(fc, shard1, _m("S1", "hosta", 5))
+    _seed(fc, shard2, _m("S1", "hosta", 3))
+    _seed(fc, "yara_scanner_scans_v2_hosta_aa0001", _s("S1", "hosta", "completed"))
+
+    plans = C.run_consolidation(fc, "matches", quiet_secs=1, dry_run=False, now_ms=NOW, log=lambda *a: None)
+    assert plans[0]["ok"] is True
+    assert len(fc.ds["yara_scanner_matches_v2_scan_s1"]) == 8
+
+    remove_targets = sorted(c[1] for c in fc.calls if c[0] == "remove_lookup_data")
+    assert remove_targets == sorted([shard1, shard2]), (
+        "a scan spanning two source shards must get cleanup applied to BOTH, not just one")
+
+
+# ---------- review follow-up: scoping and idempotency of the row-level cleanup ----------
+def test_scans_kind_cleanup_does_not_strip_terminal_lifecycle_row():
+    # Review finding (major #2): the row-level cleanup must be scoped to kind=="matches"
+    # only. A "scans" shard's rows are the SOLE source of build_terminal_map's lifecycle
+    # signal for every scan_id on that host -- stripping a verified scan's status row out
+    # from under a still-pending sibling scan sharing the same shard would make a LATER,
+    # separate run_consolidation call lose its terminal signal entirely and misclassify a
+    # cleanly-finished scan as stuck (until the 24h abandoned-scan cutoff bails it out).
+    fc = SpyClient()
+    scans_shard = "yara_scanner_scans_v2_hostb_bb0002"
+    _seed(fc, scans_shard, _s("S1", "hostb", "completed") + _s("S2", "hostb", "running"))
+
+    plans = C.run_consolidation(fc, "scans", quiet_secs=1, dry_run=False, now_ms=NOW, log=lambda *a: None)
+    by = {p["scan_id"]: p for p in plans}
+    assert by["S1"]["ok"] is True
+    assert by["S2"]["reason"] == "host_not_terminal"
+
+    assert not any(c[0] == "remove_lookup_data" for c in fc.calls), (
+        "kind=='scans' must never call the row-level cleanup -- it would strip a scan's "
+        "terminal-lifecycle row out from under a still-pending sibling on the same shard")
+    assert scans_shard in fc.ds
+    assert len(fc.ds[scans_shard]) == 2   # both S1's and S2's status rows still intact
+
+    # A LATER, separate run_consolidation call for "matches" on the same scan must still see
+    # S1 as terminal via its lifecycle row, which the scans-kind cleanup must not have touched.
+    matches_shard = "yara_scanner_matches_v2_hostb_bb0002"
+    _seed(fc, matches_shard, _m("S1", "hostb", 5))
+    plans2 = C.run_consolidation(fc, "matches", quiet_secs=1, dry_run=False, now_ms=NOW, log=lambda *a: None)
+    assert plans2[0]["ok"] is True, (
+        "S1's matches consolidation must not defer as non-terminal -- its lifecycle row in "
+        "the scans shard must have survived the earlier scans-kind cleanup")
+
+
+class SelectiveRemoveFailsClient(FakeClient):
+    """remove_lookup_data raises for one specific dataset name, a bounded number of times,
+    then behaves normally -- models a TRANSIENT failure on ONE of a multi-shard scan's
+    sources (a network blip on that call only), not a permanently broken client."""
+    def __init__(self, fail_for, fail_times=1):
+        super().__init__()
+        self.fail_for = fail_for
+        self.fail_times = fail_times
+        self._fail_count = 0
+
+    def remove_lookup_data(self, name, filters):
+        if name == self.fail_for and self._fail_count < self.fail_times:
+            self._fail_count += 1
+            raise RuntimeError("simulated transient remove_lookup_data failure")
+        return super().remove_lookup_data(name, filters)
+
+
+def test_partial_cleanup_failure_does_not_cause_permanent_count_mismatch():
+    # Review findings (blocker #1 / major #3): S1's rows live in shard_a (S1 only) and
+    # shard_b (S1 + still-pending S2). remove_lookup_data fails ONCE, only on shard_b. Run 1:
+    # S1 verifies; cleanup succeeds on shard_a, which then becomes wholly deletable (S1 was
+    # its only scan) and IS whole-deleted in the same run's deletion pass; cleanup on shard_b
+    # fails (caught, logged), leaving shard_b's S1 rows in place (S2 keeps the shard alive
+    # regardless). A naive re-derivation of src_total from currently-live shards on run 2
+    # would then see only shard_b's count -- permanently smaller than the target's actual,
+    # correct row count -- misreport count_mismatch forever, never retry the failed cleanup
+    # again, and leave shard_b undeletable even after S2 later finishes.
+    shard_a = "yara_scanner_matches_v2_hosta_aa0001"
+    shard_b = "yara_scanner_matches_v2_hostb_bb0002"
+    fc = SelectiveRemoveFailsClient(fail_for=shard_b, fail_times=1)
+    _seed(fc, shard_a, _m("S1", "hosta", 5))
+    _seed(fc, shard_b, _m("S1", "hostb", 3) + _m("S2", "hostb", 4))
+    _seed(fc, "yara_scanner_scans_v2_hosta_aa0001", _s("S1", "hosta", "completed"))
+    _seed(fc, "yara_scanner_scans_v2_hostb_bb0002",
+          _s("S1", "hostb", "completed") + _s("S2", "hostb", "running"))
+
+    plans1 = C.run_consolidation(fc, "matches", quiet_secs=1, dry_run=False, now_ms=NOW, log=lambda *a: None)
+    by1 = {p["scan_id"]: p for p in plans1}
+    assert by1["S1"]["ok"] is True
+    assert len(fc.ds["yara_scanner_matches_v2_scan_s1"]) == 8
+    assert shard_a not in fc.ds          # fully cleaned + whole-deleted (S1 was its only scan)
+    assert shard_b in fc.ds              # S1's cleanup failed here; S2 keeps it alive anyway
+    assert len(fc.ds[shard_b]) == 7      # S1's 3 rows NOT removed (cleanup call failed)
+
+    # Run 2: identical inputs (S2 still running, nothing else changed). Must stay verified --
+    # NOT flip to count_mismatch -- and must retry (and this time succeed at) the cleanup
+    # that failed on shard_b.
+    plans2 = C.run_consolidation(fc, "matches", quiet_secs=1, dry_run=False, now_ms=NOW, log=lambda *a: None)
+    by2 = {p["scan_id"]: p for p in plans2}
+    assert by2["S1"]["ok"] is True
+    assert by2["S1"]["reason"] != "count_mismatch"
+    assert len(fc.ds["yara_scanner_matches_v2_scan_s1"]) == 8   # unchanged -- not rewritten/duplicated
+    assert shard_b in fc.ds                                     # S2 still pending, shard survives
+    assert all(r["scan_id"] == "S2" for r in fc.ds[shard_b]), (
+        "run 2 must have retried and succeeded at removing S1's stale rows from shard_b")
+
+    # Run 3, once S2 also finishes: shard_b must finally become whole-deletable.
+    _seed(fc, "yara_scanner_scans_v2_hostb_bb0002",
+          _s("S1", "hostb", "completed") + _s("S2", "hostb", "completed"))
+    plans3 = C.run_consolidation(fc, "matches", quiet_secs=1, dry_run=False, now_ms=NOW, log=lambda *a: None)
+    by3 = {p["scan_id"]: p for p in plans3}
+    assert by3["S2"]["ok"] is True
+    assert shard_b not in fc.ds, (
+        "shard_b must not be a permanent zombie -- once every scan sharing it is verified, "
+        "it must still become whole-deletable")
 
 
 if __name__ == "__main__":

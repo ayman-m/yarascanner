@@ -36,7 +36,7 @@ import re
 import sys
 import time
 
-__version__ = "2.1.0"
+__version__ = "2.6.0"
 
 # ---- naming -----------------------------------------------------------------
 # per-host shard:  yara_scanner_<kind>_v<ver>_<host>_<6hex>[_<YYYYMM>]
@@ -47,8 +47,14 @@ _SHARD_RE = re.compile(
 )
 
 TERMINAL_LIFECYCLE = {"completed", "cancelled", "failed"}
+# Union of every Action Center state this repo's tooling has observed as terminal from live
+# polling (xdr_action_center.py's TERMINAL_STATES / xdr-yara-scan-test's xdr_lib.wait_action)
+# plus ABORTED/CANCELLED, which those two don't carry but this module needs (Gate B rescues a
+# console-Cancel-killed host via exactly that state). COMPLETED_WITH_ERRORS/COMPLETED_PARTIAL
+# were missing here even though both live-verified-terminal sets already include them.
 TERMINAL_ACTION = {"COMPLETED_SUCCESSFULLY", "FAILED", "ABORTED", "EXPIRED",
-                   "TIMEOUT", "CANCELED", "CANCELLED"}
+                   "TIMEOUT", "CANCELED", "CANCELLED",
+                   "COMPLETED_WITH_ERRORS", "COMPLETED_PARTIAL"}
 
 DEFAULT_QUIET_SECS = 900       # >= the scanner's max lookup drain budget (600s) + margin
 DEFAULT_ROW_CEILING = 2_000_000
@@ -61,6 +67,68 @@ DEFAULT_ROW_CEILING = 2_000_000
 DEFAULT_ABANDONED_SECS = 24 * 3600
 DELETE_CONCURRENCY = 12        # a single dataset delete is ~60s server-side; different-dataset
                                # deletes don't race, so delete in bounded-concurrent batches
+
+# ---- overlap guard --------------------------------------------------------
+# Two consolidate_all runs writing to the SAME per-scan target concurrently is exactly the
+# collision per-host sharding exists to prevent (measured elsewhere in this project: 87% row
+# loss at 8 concurrent writers to one dataset). The intended safeguard is the XSOAR Job's own
+# "don't trigger a new instance" queue-handling setting - but that is a deployment-time console
+# setting this code cannot verify, so this is defense in depth for when it is missing or fails.
+_LOCK_DATASET = "yara_scanner_consolidation_lock"
+_LOCK_SCHEMA = {"holder": "text", "started_ms": "number"}
+DEFAULT_LOCK_STALE_SECS = 2 * 3600  # generous: real runs take minutes, not hours
+
+
+def _read_lock(client):
+    rows = client.xql("dataset = %s" % _LOCK_DATASET, limit=5) or []
+    if not rows:
+        return None
+    ts = rows[0].get("started_ms")
+    try:
+        return int(ts) if ts is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def acquire_consolidation_lock(client, log=print, now_ms=None,
+                               stale_after_secs=DEFAULT_LOCK_STALE_SECS, holder="unknown"):
+    """Best-effort mutual exclusion, NOT a true distributed lock. Relies on
+    create_lookup_dataset distinguishing a fresh create ({"dataset_name": ...}) from an
+    already-exists response ({"status": "exists"}) - verified live against the real API.
+    Good enough to catch the common case (a stuck/misconfigured scheduler), not to guarantee
+    correctness under a genuine simultaneous race (there is an inherent check-then-act window
+    between the create call and any concurrent caller's own create call).
+
+    Returns True if the lock was acquired (caller MUST release it via
+    release_consolidation_lock), False if another run appears to already hold it."""
+    now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+    resp = client.create_lookup_dataset(_LOCK_DATASET, _LOCK_SCHEMA)
+    fresh = isinstance(resp, dict) and "dataset_name" in resp
+    if not fresh:
+        held_ms = _read_lock(client)
+        if held_ms is not None and (now_ms - held_ms) < stale_after_secs * 1000:
+            log("consolidation lock held (age %.0fs) - another run appears to be in "
+                "progress; skipping this pass" % ((now_ms - held_ms) / 1000.0))
+            return False
+        log("consolidation lock is stale or unreadable (%s) - taking over"
+            % ("age unknown" if held_ms is None else "age %.0fs" % ((now_ms - held_ms) / 1000.0)))
+        # Delete-then-recreate rather than just appending a fresh row: leaving the stale
+        # row(s) in place would let a future _read_lock pick up an arbitrary (not
+        # necessarily newest) row, and the dataset would accumulate one row per steal
+        # forever.
+        client.delete_dataset(_LOCK_DATASET, force=True)
+        client.create_lookup_dataset(_LOCK_DATASET, _LOCK_SCHEMA)
+    client.add_lookup_data(_LOCK_DATASET, [{"holder": str(holder), "started_ms": now_ms}])
+    return True
+
+
+def release_consolidation_lock(client, log=print):
+    """Best-effort - a failed release just means the next run waits out stale_after_secs
+    rather than anything being corrupted."""
+    try:
+        client.delete_dataset(_LOCK_DATASET, force=True)
+    except Exception as e:
+        log("could not release consolidation lock: %s" % e)
 
 
 def target_name(kind, ver, scan_id):
@@ -182,6 +250,9 @@ def plan_consolidation(scan_id, source_counts, target_count, row_ceiling=DEFAULT
 
 
 # ---- live orchestration -----------------------------------------------------
+# v2: one row per matched string offset. Superseded by v3 (scanner v3.0.0) — one row per
+# (rule, file) finding, offsets/strings/string_ids folded into the row — but v2 shards may
+# still exist on a tenant from before the upgrade, so both stay consolidatable.
 MATCHES_SCHEMA = {
     "tenant_id": "text", "scan_id": "text", "run_id": "text", "scan_date": "text",
     "hostname": "text", "os_info": "text", "os_type": "text", "ip_address": "text",
@@ -190,6 +261,28 @@ MATCHES_SCHEMA = {
     "matched_length": "number", "string": "text", "severity": "text",
     "event_timestamp_ms": "number", "date_of_scan": "text",
 }
+MATCHES_SCHEMA_V3 = {
+    "tenant_id": "text", "scan_id": "text", "run_id": "text", "scan_date": "text",
+    "hostname": "text", "os_info": "text", "os_type": "text", "ip_address": "text",
+    "rule": "text", "filename": "text", "file_size": "number", "file_sha256": "text",
+    "file_creation_time": "text", "scan_folder": "text",
+    "match_count": "number", "offsets": "text", "strings": "text", "string_ids": "text",
+    "truncated": "bool", "severity": "text",
+    "event_timestamp_ms": "number", "date_of_scan": "text",
+}
+_MATCHES_SCHEMAS_BY_VER = {"2": MATCHES_SCHEMA, "3": MATCHES_SCHEMA_V3}
+# Versions run_consolidation/check_consolidation_status/consolidate_all cover by default when
+# no explicit version is requested — every schema version this tool knows how to read.
+KNOWN_MATCHES_SCHEMA_VERSIONS = tuple(sorted(_MATCHES_SCHEMAS_BY_VER))
+
+
+def matches_schema_for(ver):
+    """The matches-dataset schema for a given version tag. Unknown versions fall back to the
+    latest known schema rather than raising — a consolidation run should degrade to 'best
+    effort against an unrecognised newer shard', not hard-fail the whole pass."""
+    return _MATCHES_SCHEMAS_BY_VER.get(str(ver), MATCHES_SCHEMA_V3)
+
+
 SCANS_SCHEMA = {
     "tenant_id": "text", "scan_id": "text", "run_id": "text", "scan_date": "text",
     "hostname": "text", "os_info": "text", "os_type": "text", "ip_address": "text",
@@ -216,6 +309,32 @@ def _rows_for_scan(client, dataset, scan_id, limit=50000):
     """Only one scan's rows from a shard — a server-side filter, not a full pull."""
     safe = str(scan_id).replace('"', "")
     return client.xql('dataset = %s | filter scan_id = "%s"' % (dataset, safe), limit=limit) or []
+
+
+def _cleanup_verified_scan_rows(client, srcs, scan_id, log):
+    """Once scan_id's per-scan target is verified, strip just its rows out of every source
+    shard right away — narrowing the window where a dashboard querying the wildcard
+    double-counts it (once from the shard, once from the already-complete target), rather
+    than waiting for the whole shard to become deletable (every OTHER scan it holds also
+    finished). Sequential — remove_lookup_data is documented NOT concurrency-safe. Best
+    effort: a failure here must not affect the scan's (already-verified) plan, and must not
+    block the eventual whole-shard delete_dataset() once every scan sharing that shard is
+    also done — that cleanup is separate and unconditional on this succeeding.
+
+    Callers must only invoke this for kind=="matches". A "scans" shard's rows are also the
+    sole source of build_terminal_map's per-(scan_id, host) lifecycle signal, which a LATER,
+    separate run_consolidation call (any kind, rebuilt fresh from current scans shards each
+    time) needs for every OTHER scan still sharing that shard — stripping a verified scan's
+    status row out from under them would make that sibling's lifecycle silently vanish
+    (build_terminal_map: absent == not-terminal), misclassifying a cleanly-finished scan as
+    stuck until the 24h abandoned-scan cutoff bails it out. "matches" shards carry no
+    lifecycle data, so they have no such consumer and are always safe to strip."""
+    for ds in srcs:
+        try:
+            client.remove_lookup_data(ds, [{"scan_id": scan_id}])
+        except Exception as e:
+            log("  scan %s: row-level cleanup of %s FAILED (leaving rows for eventual "
+                "whole-shard delete instead): %s" % (scan_id, ds, str(e)[:120]))
 
 
 def _scan_stats(client, dataset):
@@ -284,21 +403,35 @@ def run_consolidation(client, kind, ver="2", quiet_secs=DEFAULT_QUIET_SECS,
     plans. Deletes sources only when dry_run is False AND a scan's plan verifies.
 
     client must provide: get_datasets(), xql(q, limit), create_lookup_dataset(name, schema),
-    add_lookup_data(name, rows), delete_dataset(name, force). action_state_for(host)->state
-    is optional (Gate B); without it only the lifecycle gate applies.
+    add_lookup_data(name, rows), remove_lookup_data(name, filters), delete_dataset(name, force).
+    action_state_for(host)->state is optional (Gate B); without it only the lifecycle gate
+    applies.
+
+    ver selects ONE schema version's shards, not every version present on the tenant — a v2
+    shard and a v3 shard for the same scan have different columns, so mixing them into one
+    target under one schema would silently mis-project every row. Call once per version (see
+    check_consolidation_status/consolidate_all, which already do this) to cover a tenant that
+    has both, e.g. mid-rollout of a new scanner version.
     """
-    schema = MATCHES_SCHEMA if kind == "matches" else SCANS_SCHEMA
+    ver = str(ver)
+    schema = matches_schema_for(ver) if kind == "matches" else SCANS_SCHEMA
     now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
 
     all_ds = _list_yara_datasets(client)
-    shards = [d for d in all_ds if (parse_shard(d) or {}).get("kind") == kind]
+    shards = [d for d in all_ds
+              if (parse_shard(d) or {}).get("kind") == kind and (parse_shard(d) or {}).get("ver") == ver]
     if not shards:
         log("no %s shards found" % kind)
         return []
 
     # Terminality lives in the SCANS shards (matches rows carry no status), so always load
     # them for the per-(scan_id, host) terminal map — even when consolidating matches. Scans
-    # shards are tiny (a few rows per scan), so a full read is cheap.
+    # shards are tiny (a few rows per scan), so a full read is cheap. Deliberately NOT
+    # filtered by ver like `shards` above: the scans row shape hasn't changed across schema
+    # versions (only the matches row shape has), scan_id is globally unique so there is no
+    # cross-version key collision, and reading every version's scans shards only makes the
+    # terminal map MORE complete — never wrong — regardless of which matches version this
+    # particular call is consolidating.
     scans_ds = [d for d in all_ds if (parse_shard(d) or {}).get("kind") == "scans"]
     scans_rows = {d: _rows_of(d, client) for d in scans_ds}
     tmap = build_terminal_map(scans_rows, action_state_for)
@@ -365,8 +498,36 @@ def run_consolidation(client, kind, ver="2", quiet_secs=DEFAULT_QUIET_SECS,
             log("  scan %s: target already complete (%d rows) — verified, not rewritten"
                 % (scan_id, pre))
             verified.add(scan_id)
+            # A retry of a previously-failed cleanup naturally lands here: this scan's target
+            # was already written+verified by an earlier run, but the row-level cleanup below
+            # may not have (fully) succeeded that time. Retry it now.
+            if kind == "matches":
+                _cleanup_verified_scan_rows(client, srcs, scan_id, log)
             plans.append(plan_consolidation(scan_id, counts, pre, row_ceiling))
-            continue
+            continue                                          # <-- PATH A: idempotent re-verify
+        if pre > src_total > 0:
+            # The target holds MORE rows than the sources currently visible sum to. This is
+            # NOT corruption — it is the expected shape once row-level cleanup has partially
+            # landed: `src_total` is recomputed EVERY run from whatever source shards are
+            # still live, so it shrinks as cleanup (row removal and/or eventual whole-shard
+            # delete) succeeds on some sources, while `pre` — the target's actual row count —
+            # stays fixed at the original, correct total written when every source still had
+            # its rows. A transient failure on just ONE of a multi-shard scan's sources (a
+            # sibling shard's cleanup/delete having already succeeded this run or an earlier
+            # one) would otherwise permanently misdiagnose this as count_mismatch below,
+            # never retry the failed cleanup again, and leave the still-dirty shard
+            # undeletable forever (edge case #51a follow-up). Stay verified and retry cleanup
+            # on whatever sources are still visible.
+            log("  scan %s: target has %d rows, sources currently sum to only %d "
+                "(cleanup already landed on some sources) — still verified, retrying cleanup "
+                "on the rest" % (scan_id, pre, src_total))
+            verified.add(scan_id)
+            if kind == "matches":
+                _cleanup_verified_scan_rows(client, srcs, scan_id, log)
+            plans.append({"scan_id": scan_id, "ok": True, "reason": "verified",
+                          "source_total": src_total, "target_count": pre,
+                          "deletable": sorted(srcs)})
+            continue                                          # <-- PATH A2: partial-cleanup re-verify
         if pre not in (0, src_total):
             log("  scan %s: target exists with %d rows, expected %d — NOT touching, reports mismatch"
                 % (scan_id, pre, src_total))
@@ -393,7 +554,9 @@ def run_consolidation(client, kind, ver="2", quiet_secs=DEFAULT_QUIET_SECS,
         log("  scan %s: wrote %d, target now %d, sources %d -> %s"
             % (scan_id, written, tcount, src_total, "VERIFIED" if plan["ok"] else plan["reason"]))
         if plan["ok"]:
-            verified.add(scan_id)
+            verified.add(scan_id)                             # <-- PATH B: fresh write verified
+            if kind == "matches":
+                _cleanup_verified_scan_rows(client, srcs, scan_id, log)
         plans.append(plan)
 
     # Deletion pass: a shard is safe to delete only when EVERY scan it contains is verified.
@@ -411,6 +574,106 @@ def run_consolidation(client, kind, ver="2", quiet_secs=DEFAULT_QUIET_SECS,
             log("  deleting %d fully-consolidated shard(s), %d at a time" % (len(to_delete), DELETE_CONCURRENCY))
             _delete_many(client, to_delete, log)
     return plans
+
+
+def check_consolidation_status(client, kinds=("matches", "scans"), vers=KNOWN_MATCHES_SCHEMA_VERSIONS,
+                               quiet_secs=DEFAULT_QUIET_SECS, row_ceiling=DEFAULT_ROW_CEILING,
+                               abandoned_after_secs=DEFAULT_ABANDONED_SECS,
+                               only_scan_ids=None, now_ms=None, action_state_for=None,
+                               log=lambda *a: None):
+    """Read-only readiness check: never writes or deletes (drives run_consolidation with
+    dry_run=True for every kind/version, whose write/delete passes never execute in that
+    mode). Safe to call repeatedly, including from inside a wait/retry poll loop.
+
+    Covers every known schema VERSION by default (not just the latest) — a tenant mid-rollout
+    of a new scanner version has both old- and new-schema shards live at once, and both need
+    consolidating; run_consolidation itself only ever looks at one version per call (see its
+    docstring), so this is the layer that fans out across versions.
+
+    A scan counts as ELIGIBLE only if every kind's shards agree it's ready — a scan whose
+    scans-lifecycle shard is done but whose matches shard is still draining is still
+    in-progress, not eligible, since each kind computes its own gate independently.
+
+    blocked_reasons maps each blocked scan_id to plan_consolidation's own reason string
+    (e.g. "row_ceiling_exceeded" vs "count_mismatch") — collapsing every non-deferred failure
+    into one opaque "blocked" bucket makes a permanently-stuck oversized scan
+    indistinguishable from a genuine data-integrity concern; this is the one place that
+    distinction survives to be surfaced by a caller (see YaraConsolidateStatus.py)."""
+    eligible, deferred, blocked = set(), set(), set()
+    blocked_reasons = {}
+    for ver in vers:
+        for kind in kinds:
+            for p in run_consolidation(client, kind, ver=ver, quiet_secs=quiet_secs,
+                                       row_ceiling=row_ceiling, dry_run=True, log=log,
+                                       now_ms=now_ms, action_state_for=action_state_for,
+                                       only_scan_ids=only_scan_ids,
+                                       abandoned_after_secs=abandoned_after_secs):
+                sid = p["scan_id"]
+                if p.get("ok") is None and p.get("reason") == "dry_run":
+                    eligible.add(sid)
+                elif p.get("reason") in ("host_not_terminal", "within_quiet_period"):
+                    deferred.add(sid)
+                else:
+                    blocked.add(sid)
+                    blocked_reasons[sid] = p.get("reason")
+    eligible -= deferred | blocked
+    return {"any_in_progress": bool(deferred), "eligible_count": len(eligible),
+            "eligible_scan_ids": sorted(eligible), "pending_scan_ids": sorted(deferred),
+            "blocked_count": len(blocked), "blocked_scan_ids": sorted(blocked),
+            "blocked_reasons": blocked_reasons}
+
+
+def consolidate_all(client, kinds=("matches", "scans"), vers=KNOWN_MATCHES_SCHEMA_VERSIONS, dry_run=False,
+                    only_scan_ids=None, quiet_secs=DEFAULT_QUIET_SECS,
+                    row_ceiling=DEFAULT_ROW_CEILING, abandoned_after_secs=DEFAULT_ABANDONED_SECS,
+                    now_ms=None, action_state_for=None, log=print):
+    """Drive run_consolidation across kinds AND schema versions, returning a structured
+    summary instead of printing and discarding it — the same call
+    xdr_data_management._run_consolidate already makes, extracted so both the CLI and an
+    XSOAR automation can share it. See check_consolidation_status for why every known version
+    is covered by default, not just the latest.
+
+    Unlike check_consolidation_status, this does NOT cross-kind-dedupe: a scan_id can
+    legitimately appear in both consolidated_scan_ids (its scans-lifecycle shard, tiny,
+    finished first) and deferred_scan_ids (its matches shard, still draining) in the same
+    call — each kind's target dataset is independent, so partial-by-kind completion is a
+    real, safe state, not an error to hide.
+
+    Write passes (dry_run=False) take a best-effort overlap guard first (see
+    acquire_consolidation_lock) — if another run appears to already hold it, this returns
+    immediately with lock_held_by_other_run=True and nothing touched. Dry runs never write or
+    delete, so they skip the lock entirely and can run concurrently with anything."""
+    if not dry_run and not acquire_consolidation_lock(client, log=log, now_ms=now_ms):
+        return {"consolidated_count": 0, "consolidated_scan_ids": [],
+                "deferred_count": 0, "deferred_scan_ids": [],
+                "failed_count": 0, "failed_scan_ids": [], "failed_reasons": {},
+                "lock_held_by_other_run": True}
+    try:
+        consolidated, deferred, failed = set(), set(), set()
+        failed_reasons = {}
+        for ver in vers:
+            for kind in kinds:
+                for p in run_consolidation(client, kind, ver=ver, quiet_secs=quiet_secs,
+                                           row_ceiling=row_ceiling, dry_run=dry_run, log=log,
+                                           now_ms=now_ms, action_state_for=action_state_for,
+                                           only_scan_ids=only_scan_ids,
+                                           abandoned_after_secs=abandoned_after_secs):
+                    sid = p["scan_id"]
+                    if p.get("ok"):
+                        consolidated.add(sid)
+                    elif p.get("reason") in ("host_not_terminal", "within_quiet_period"):
+                        deferred.add(sid)
+                    else:
+                        failed.add(sid)
+                        failed_reasons[sid] = p.get("reason")
+    finally:
+        if not dry_run:
+            release_consolidation_lock(client, log=log)
+    return {"consolidated_count": len(consolidated), "consolidated_scan_ids": sorted(consolidated),
+            "deferred_count": len(deferred), "deferred_scan_ids": sorted(deferred),
+            "lock_held_by_other_run": False,
+            "failed_count": len(failed), "failed_scan_ids": sorted(failed),
+            "failed_reasons": failed_reasons}
 
 
 def _delete_many(client, names, log, concurrency=None):

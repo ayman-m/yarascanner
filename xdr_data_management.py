@@ -22,12 +22,13 @@ Usage:
     python3 xdr_data_management.py --delete-legacy --yes
 """
 
-__version__ = "2.1.0"   # released with xdr_yara_scanner 2.1.0; see repo releases
+__version__ = "2.1.1"   # see repo CHANGELOG.md for what changed since 2.1.0
 import argparse
 import datetime
 import os
 import re
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from xdr_action_center import XDRActionCenter  # noqa: E402
@@ -131,6 +132,79 @@ def select_rotated_for_deletion(current_names, older_than_months, now_yyyymm):
     return candidates, skipped
 
 
+def filter_recently_written(client, candidates, min_quiet_secs, now_ms, log=print):
+    """Drop any candidate whose newest row is younger than min_quiet_secs. Returns
+    (survivors, skip_reasons).
+
+    select_rotated_for_deletion's month-label age check has a real gap: the instant the
+    calendar rolls to a new month, EVERY prior month's shard looks arbitrarily old regardless
+    of actual elapsed wall-clock time since its last write - a scan running late on the last
+    day of a month, or pure clock/timezone skew between the scanning endpoint and the machine
+    running this prune, can make a shard a scan is STILL WRITING TO look like fair game. This
+    asks the question that actually matters - has this shard stopped receiving writes
+    recently - instead of inferring liveness from a calendar label. min_quiet_secs defaults
+    generously (24h) since the goal is proving no active writer at all, not just outlasting
+    the scanner's own upload-drain window."""
+    survivors, skipped = [], []
+    for name in candidates:
+        try:
+            rows = client.xql("dataset = %s | comp max(event_timestamp_ms) as newest" % name, limit=5) or []
+            newest = rows[0].get("newest") if rows else None
+            newest = int(newest) if newest is not None else None
+        except Exception as e:
+            skipped.append("%s: could not check recency (%s) - skipping to be safe" % (name, e))
+            continue
+        if newest is not None and (now_ms - newest) < min_quiet_secs * 1000:
+            skipped.append("%s: newest row is only %.1fh old - a scan may still be writing "
+                           "to it, skipping despite month age" % (name, (now_ms - newest) / 3_600_000.0))
+            continue
+        survivors.append(name)
+    return survivors, skipped
+
+
+def filter_unconsolidated(client, candidates, log=print):
+    """Drop any candidate that still holds a scan_id xdr_consolidate.py has not yet fully
+    verified into a per-scan target. Returns (survivors, skip_reasons).
+
+    A row_ceiling_exceeded (or otherwise permanently stuck) scan blocks xdr_consolidate.py's
+    OWN deletion pass forever (a shard is only deleted once every scan_id it holds is
+    verified) - but this prune tool is a completely separate code path with no knowledge of
+    that. Left unchecked, it would eventually delete that shard by month age alone, destroying
+    the one and only copy of a scan's data that was never successfully consolidated."""
+    import xdr_consolidate as C
+    survivors, skipped = [], []
+    for name in candidates:
+        info = parse_dataset_name(name)
+        if info is None:
+            survivors.append(name)  # not a YARA dataset name; not this function's job to gate
+            continue
+        try:
+            rows = client.xql("dataset = %s | comp count() as n by scan_id" % name, limit=10000) or []
+        except Exception as e:
+            skipped.append("%s: could not check consolidation state (%s) - skipping to be safe" % (name, e))
+            continue
+        stuck = []
+        for r in rows:
+            sid, n = r.get("scan_id"), int(r.get("n") or 0)
+            if not sid or n <= 0:
+                continue
+            target = C.target_name(info["kind"], str(info["version"]), sid)
+            try:
+                tcount_rows = client.xql("dataset = %s | comp count() as n" % target, limit=5) or []
+                tcount = int(tcount_rows[0].get("n", 0)) if tcount_rows else 0
+            except Exception:
+                tcount = -1  # target doesn't exist or errored - definitely not verified
+            if tcount != n:
+                stuck.append(sid)
+        if stuck:
+            skipped.append("%s: still holds unconsolidated scan(s) %s (row_ceiling_exceeded, "
+                           "count_mismatch, or simply never run) - skipping, would lose data"
+                           % (name, ", ".join(stuck[:5])))
+            continue
+        survivors.append(name)
+    return survivors, skipped
+
+
 def select_legacy_for_deletion(legacy_names):
     """Legacy = older/unversioned schema, already classified by the toolkit.
 
@@ -192,8 +266,11 @@ def render_report(current, legacy, newer, now_yyyymm):
 
 
 def _run_consolidate(client, args):
-    """Drive xdr_consolidate.run_consolidation for both kinds. Verify-before-delete and the
-    finished-scan gate live in that module; this just wires the CLI flags to it."""
+    """Drive xdr_consolidate.run_consolidation for both kinds, across every known schema
+    version. Verify-before-delete and the finished-scan gate live in that module; this just
+    wires the CLI flags to it. Every version is covered by default (not just the latest) so a
+    tenant mid-rollout of a new scanner version — old- and new-schema shards both live — gets
+    both consolidated in one pass; run_consolidation itself only handles one version per call."""
     import xdr_consolidate as C
     kwargs = {"dry_run": not args.yes}
     if args.quiet_secs is not None:
@@ -205,24 +282,37 @@ def _run_consolidate(client, args):
     if args.scan_id:
         kwargs["only_scan_ids"] = args.scan_id
 
+    # Write passes take the same overlap guard consolidate_all uses, in case a scheduled Job
+    # is running concurrently (its queue-handling setting is the primary safeguard; this is
+    # defense in depth for when that's missing or fails — see acquire_consolidation_lock).
+    if args.yes and not C.acquire_consolidation_lock(client, log=print):
+        print("\nAnother consolidation run appears to already be in progress — skipping "
+              "this pass entirely rather than risk a concurrent write collision.")
+        return 1
+
     total_ok = total_would = total_deferred = total_fail = 0
-    for kind in ("scans", "matches"):
-        print("\n=== consolidate %s ===" % kind)
-        try:
-            plans = C.run_consolidation(client, kind, **kwargs)
-        except Exception as e:
-            print("  error: %s" % e, file=sys.stderr)
-            total_fail += 1
-            continue
-        for p in plans:
-            if p.get("ok"):
-                total_ok += 1
-            elif p.get("ok") is None:
-                total_would += 1   # dry-run: this scan WOULD consolidate
-            elif p.get("reason") in ("host_not_terminal", "within_quiet_period"):
-                total_deferred += 1
-            else:
-                total_fail += 1
+    try:
+        for ver in C.KNOWN_MATCHES_SCHEMA_VERSIONS:
+            for kind in ("matches", "scans"):
+                print("\n=== consolidate %s (schema v%s) ===" % (kind, ver))
+                try:
+                    plans = C.run_consolidation(client, kind, ver=ver, **kwargs)
+                except Exception as e:
+                    print("  error: %s" % e, file=sys.stderr)
+                    total_fail += 1
+                    continue
+                for p in plans:
+                    if p.get("ok"):
+                        total_ok += 1
+                    elif p.get("ok") is None:
+                        total_would += 1   # dry-run: this scan WOULD consolidate
+                    elif p.get("reason") in ("host_not_terminal", "within_quiet_period"):
+                        total_deferred += 1
+                    else:
+                        total_fail += 1
+    finally:
+        if args.yes:
+            C.release_consolidation_lock(client, log=print)
     if args.yes:
         print("\nconsolidation summary: %d consolidated, %d deferred (scan still active), %d failed"
               % (total_ok, total_deferred, total_fail))
@@ -243,6 +333,12 @@ def main():
                     help="delete rotated datasets older than N months (no default)")
     ap.add_argument("--delete-legacy", action="store_true",
                     help="delete datasets on an older/unversioned schema")
+    ap.add_argument("--min-quiet-hours", type=float, default=24.0,
+                    help="older-than-months: never delete a shard whose newest row is younger "
+                         "than this many hours, regardless of its month label - protects "
+                         "against a scan still writing near a month boundary, or clock/"
+                         "timezone skew between the scanning endpoint and this machine "
+                         "(default 24)")
     ap.add_argument("--force", action="store_true",
                     help="delete_dataset force=true, for datasets with dependencies")
     ap.add_argument("--yes", action="store_true",
@@ -287,8 +383,20 @@ def main():
     targets, skipped = [], []
     if args.older_than_months is not None:
         t, s = select_rotated_for_deletion(current, args.older_than_months, now_yyyymm)
-        targets += t
         skipped += s
+        # Two more safety rails, both requiring live calls so they run only against
+        # candidates that already survived the (free) month-label check above:
+        # - a shard may look old by calendar label but still be receiving writes (a scan
+        #   running late across a month boundary, or clock/timezone skew) - see
+        #   filter_recently_written's docstring;
+        # - a shard may be old AND quiet but still hold a scan xdr_consolidate.py has never
+        #   been able to fully verify (e.g. row_ceiling_exceeded) - deleting it here would be
+        #   the only copy of that scan's data, permanently. See filter_unconsolidated.
+        t, s2 = filter_recently_written(client, t, args.min_quiet_hours * 3600, int(time.time() * 1000))
+        skipped += s2
+        t, s3 = filter_unconsolidated(client, t)
+        skipped += s3
+        targets += t
     if args.delete_legacy:
         targets += select_legacy_for_deletion(legacy)
 

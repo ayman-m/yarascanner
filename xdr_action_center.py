@@ -333,10 +333,40 @@ class XDRActionCenter:
                 if status != "SUCCESS":
                     raise RuntimeError(f"XQL {status}: {json.dumps(reply)[:400]}")
                 results = reply.get("results", {})
-                rows = results.get("data", results) if isinstance(results, dict) else results
-                return rows if isinstance(rows, list) else []
+                if isinstance(results, dict) and "data" in results:
+                    rows = results["data"]
+                    return rows if isinstance(rows, list) else []
+                if isinstance(results, dict) and results.get("stream_id"):
+                    # Above ~1000 rows the platform doesn't inline the results — it hands
+                    # back a stream_id and the caller must fetch it via a second endpoint.
+                    # get_query_results' own "limit" only controls INLINE responses; past
+                    # that threshold it is silently ignored and "data" never appears, which
+                    # previously made every large pull look like zero rows (measured live:
+                    # a 2448-row scan's matches vanished at the exact 1000-row boundary —
+                    # requesting MORE rows, not fewer, was what broke it).
+                    return self._xql_stream(qid, results["stream_id"])
+                return results if isinstance(results, list) else []
             time.sleep(poll_secs)
         raise RuntimeError("XQL timed out")
+
+    def _xql_stream(self, query_id, stream_id):
+        """Fetch results the platform streamed instead of inlining (see xql() above).
+
+        The response body is newline-delimited JSON (one row object per line), not a
+        single JSON document, so requests' r.json() fails and call() falls back to
+        {"_raw": r.text} — that raw text is what we parse here."""
+        st, data = self.call("/public_api/v1/xql/get_query_results_stream/",
+                             {"query_id": query_id, "stream_id": stream_id,
+                              "is_gzip_compressed": False}, timeout=180)
+        raw = data.get("_raw") if isinstance(data, dict) else None
+        if raw is None:
+            return data if isinstance(data, list) else []
+        rows = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+        return rows
 
     # ---- datasets ----
     def get_datasets(self):

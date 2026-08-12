@@ -1,0 +1,426 @@
+id: YARA_Dataset_Consolidation
+version: -1
+name: YARA Dataset Consolidation
+description: 'Merges each finished YARA scan''s per-host lookup dataset shards into one dataset per
+
+  scan, safely handling scans still in progress. Meant to be scheduled twice daily as a
+
+  Job (Queue Handling: "Don''t trigger a new job instance" - overlapping runs are not
+
+  needed since the underlying merge is idempotent and safe to resume, but skipping
+
+  avoids doubling tenant load for no benefit).
+
+
+  Flow: check readiness (YaraConsolidateStatus, read-only) -> if nothing is eligible but
+
+  something is still running, wait via a bounded poll (GenericPolling) and recheck once
+
+  -> if anything is eligible, apply the merge (YaraConsolidateApply) -> if anything
+
+  failed, flag it for attention. If nothing is eligible and nothing is in progress after
+
+  the recheck, the run ends cleanly - the next scheduled trigger picks up whatever has
+
+  since finished. No state persists between runs; both status and apply re-derive
+
+  eligibility from tenant state each call.
+
+
+  NOTE ON VERIFICATION: the condition operators (isExists on the eligible/pending
+
+  scan_id lists) and the GenericPolling sub-playbook''s `dt` filter are the two pieces of
+
+  this playbook with no local precedent in this repo to copy from - they are believed
+
+  correct from the platform''s own documented GenericPolling/condition-task schema but
+
+  have not yet been exercised against a live run. Verify both on first use.
+
+
+  CAVEAT ON DELETION SAFETY: before deleting a per-host shard, the merge verifies the
+
+  per-scan target''s row count equals the shard''s row count - that is row-count parity,
+
+  not a content comparison, so a corrupted write with a matching count would still pass.
+
+  The platform has no undelete or dataset versioning, so a bad delete cannot be recovered
+
+  after the fact. Treat this playbook''s deletions as one-way; use YaraConsolidateStatus''
+
+  dry-run output to check what a run WOULD do before raising row_ceiling or lowering
+
+  abandoned_after_hours on a live schedule.'
+starttaskid: '0'
+tasks:
+  '0':
+    id: '0'
+    taskid: 7d3e0c30-0000-0000-0000-000000000000
+    type: start
+    task:
+      id: 7d3e0c30-0000-0000-0000-000000000000
+      version: -1
+      name: ''
+      iscommand: false
+      brand: ''
+    nexttasks:
+      '#none#':
+      - '1'
+    separatecontext: false
+    continueonerrortype: ''
+    view: '{"position": {"x": 450, "y": 50}}'
+    note: false
+    timertriggers: []
+    ignoreworker: false
+  '1':
+    id: '1'
+    taskid: 7d3e0c30-0000-0000-0000-000000000001
+    type: regular
+    task:
+      id: 7d3e0c30-0000-0000-0000-000000000001
+      version: -1
+      name: Check consolidation status
+      description: Read-only readiness check - which scans are eligible now, which are still in progress.
+      script: YaraConsolidateStatus
+      type: regular
+      iscommand: false
+      brand: ''
+    scriptarguments:
+      scan_id:
+        simple: ${inputs.scan_id}
+      row_ceiling:
+        simple: ${inputs.row_ceiling}
+      abandoned_after_hours:
+        simple: ${inputs.abandoned_after_hours}
+    nexttasks:
+      '#none#':
+      - '2'
+    separatecontext: false
+    continueonerrortype: ''
+    view: '{"position": {"x": 450, "y": 195}}'
+    note: false
+    timertriggers: []
+    ignoreworker: false
+  '2':
+    id: '2'
+    taskid: 7d3e0c30-0000-0000-0000-000000000002
+    type: condition
+    task:
+      id: 7d3e0c30-0000-0000-0000-000000000002
+      version: -1
+      name: Anything ready, or still running?
+      type: condition
+      iscommand: false
+      brand: ''
+    conditions:
+    - label: ready
+      condition:
+      - - operator: isExists
+          left:
+            value:
+              simple: Yara.ConsolidateStatus.eligible_scan_ids
+            iscontext: true
+    - label: waiting
+      condition:
+      - - operator: isExists
+          left:
+            value:
+              simple: Yara.ConsolidateStatus.pending_scan_ids
+            iscontext: true
+    nexttasks:
+      ready:
+      - '6'
+      waiting:
+      - '3'
+      '#default#':
+      - '9'
+    separatecontext: false
+    continueonerrortype: ''
+    view: '{"position": {"x": 450, "y": 340}}'
+    note: false
+    timertriggers: []
+    ignoreworker: false
+    skipunavailable: false
+    quietmode: 0
+    isoversize: false
+    isautoswitchedtoquietmode: false
+  '3':
+    id: '3'
+    taskid: 7d3e0c30-0000-0000-0000-000000000003
+    type: playbook
+    task:
+      id: 7d3e0c30-0000-0000-0000-000000000003
+      name: GenericPolling
+      playbookName: GenericPolling
+      type: playbook
+      iscommand: false
+      brand: ''
+    scriptarguments:
+      Ids:
+        complex:
+          root: Yara.ConsolidateStatus.pending_scan_ids
+      PollingCommandName:
+        simple: YaraConsolidateStatus
+      PollingCommandArgName:
+        simple: scan_id
+      Interval:
+        simple: ${inputs.poll_interval_minutes}
+      Timeout:
+        simple: ${inputs.poll_timeout_minutes}
+      dt:
+        simple: Yara.ConsolidateStatus.pending_scan_ids
+    nexttasks:
+      '#none#':
+      - '4'
+    separatecontext: true
+    continueonerrortype: ''
+    view: '{"position": {"x": 450, "y": 485}}'
+    note: false
+    timertriggers: []
+    ignoreworker: false
+    loop:
+      iscommand: false
+      exitCondition: ''
+      wait: 1
+  '4':
+    id: '4'
+    taskid: 7d3e0c30-0000-0000-0000-000000000004
+    type: regular
+    task:
+      id: 7d3e0c30-0000-0000-0000-000000000004
+      version: -1
+      name: Recheck consolidation status
+      description: One recheck after the poll resolves or times out - see if anything became eligible while waiting.
+      script: YaraConsolidateStatus
+      type: regular
+      iscommand: false
+      brand: ''
+    scriptarguments:
+      scan_id:
+        simple: ${inputs.scan_id}
+      row_ceiling:
+        simple: ${inputs.row_ceiling}
+      abandoned_after_hours:
+        simple: ${inputs.abandoned_after_hours}
+    nexttasks:
+      '#none#':
+      - '5'
+    separatecontext: false
+    continueonerrortype: ''
+    view: '{"position": {"x": 450, "y": 630}}'
+    note: false
+    timertriggers: []
+    ignoreworker: false
+  '5':
+    id: '5'
+    taskid: 7d3e0c30-0000-0000-0000-000000000005
+    type: condition
+    task:
+      id: 7d3e0c30-0000-0000-0000-000000000005
+      version: -1
+      name: Anything ready after waiting?
+      type: condition
+      iscommand: false
+      brand: ''
+    conditions:
+    - label: ready
+      condition:
+      - - operator: isExists
+          left:
+            value:
+              simple: Yara.ConsolidateStatus.eligible_scan_ids
+            iscontext: true
+    nexttasks:
+      ready:
+      - '6'
+      '#default#':
+      - '9'
+    separatecontext: false
+    continueonerrortype: ''
+    view: '{"position": {"x": 450, "y": 775}}'
+    note: false
+    timertriggers: []
+    ignoreworker: false
+    skipunavailable: false
+    quietmode: 0
+    isoversize: false
+    isautoswitchedtoquietmode: false
+  '6':
+    id: '6'
+    taskid: 7d3e0c30-0000-0000-0000-000000000006
+    type: regular
+    task:
+      id: 7d3e0c30-0000-0000-0000-000000000006
+      version: -1
+      name: Apply consolidation
+      description: Actually merge the eligible scans' shards into per-scan datasets and delete the fully-verified sources.
+      script: YaraConsolidateApply
+      type: regular
+      iscommand: false
+      brand: ''
+    scriptarguments:
+      scan_id:
+        complex:
+          root: Yara.ConsolidateStatus.eligible_scan_ids
+      row_ceiling:
+        simple: ${inputs.row_ceiling}
+      abandoned_after_hours:
+        simple: ${inputs.abandoned_after_hours}
+    nexttasks:
+      '#none#':
+      - '7'
+    separatecontext: false
+    continueonerrortype: ''
+    view: '{"position": {"x": 450, "y": 920}}'
+    note: false
+    timertriggers: []
+    ignoreworker: false
+  '7':
+    id: '7'
+    taskid: 7d3e0c30-0000-0000-0000-000000000007
+    type: condition
+    task:
+      id: 7d3e0c30-0000-0000-0000-000000000007
+      version: -1
+      name: Anything failed?
+      type: condition
+      iscommand: false
+      brand: ''
+    conditions:
+    - label: 'yes'
+      condition:
+      - - operator: isExists
+          left:
+            value:
+              simple: Yara.ConsolidateApply.failed_scan_ids
+            iscontext: true
+    nexttasks:
+      'yes':
+      - '8'
+      '#default#':
+      - '10'
+    separatecontext: false
+    continueonerrortype: ''
+    view: '{"position": {"x": 450, "y": 1065}}'
+    note: false
+    timertriggers: []
+    ignoreworker: false
+    skipunavailable: false
+    quietmode: 0
+    isoversize: false
+    isautoswitchedtoquietmode: false
+  '8':
+    id: '8'
+    taskid: 7d3e0c30-0000-0000-0000-000000000008
+    type: regular
+    task:
+      id: 7d3e0c30-0000-0000-0000-000000000008
+      version: -1
+      name: Flag failures for attention
+      description: Placeholder - wire this to a real notification (Slack/email/incident) once one is chosen. Today it only writes a flag to context so the failure is at least visible via the Job's own run history rather than silently repeating forever. This task is also never reached at all when task 1/4/6 errors outright (return_error halts the whole run before here) - for that case, and for a persistent/queryable history this task's own context flag does not provide, see the yara_scanner_consolidation_runs dataset and the "Consolidation Run Health" widget, written by YaraConsolidateApply on every pass including a crash.
+      script: SetAndHandleEmpty
+      type: regular
+      iscommand: false
+      brand: ''
+    scriptarguments:
+      key:
+        simple: yara_consolidate_needs_attention
+      value:
+        complex:
+          root: Yara.ConsolidateApply.failed_scan_ids
+      append:
+        simple: 'false'
+    nexttasks:
+      '#none#':
+      - '10'
+    separatecontext: false
+    continueonerrortype: ''
+    view: '{"position": {"x": 250, "y": 1210}}'
+    note: false
+    timertriggers: []
+    ignoreworker: false
+  '9':
+    id: '9'
+    taskid: 7d3e0c30-0000-0000-0000-000000000009
+    type: title
+    task:
+      id: 7d3e0c30-0000-0000-0000-000000000009
+      version: -1
+      name: Nothing to do this cycle
+      type: title
+      iscommand: false
+      brand: ''
+    nexttasks:
+      '#none#':
+      - '10'
+    separatecontext: false
+    continueonerrortype: ''
+    view: '{"position": {"x": 650, "y": 1210}}'
+    note: false
+    timertriggers: []
+    ignoreworker: false
+  '10':
+    id: '10'
+    taskid: 7d3e0c30-0000-0000-0000-00000000000a
+    type: title
+    task:
+      id: 7d3e0c30-0000-0000-0000-00000000000a
+      version: -1
+      name: Done
+      type: title
+      iscommand: false
+      brand: ''
+    separatecontext: false
+    continueonerrortype: ''
+    view: '{"position": {"x": 450, "y": 1355}}'
+    note: false
+    timertriggers: []
+    ignoreworker: false
+inputs:
+- key: scan_id
+  value:
+    simple: ''
+  required: false
+  description: Restrict this run to these scan_id(s) (comma-separated). Leave empty for all finished scans across the tenant.
+  playbookInputQuery: null
+- key: poll_interval_minutes
+  value:
+    simple: '30'
+  required: false
+  description: Minutes between rechecks while waiting on in-progress scans.
+  playbookInputQuery: null
+- key: poll_timeout_minutes
+  value:
+    simple: '240'
+  required: false
+  description: Total minutes to wait for in-progress scans before giving up on this cycle and letting the next scheduled run pick it up. This is THIS RUN's patience budget, separate from CONFIG_CONSOLIDATE_OBSOLETE_AFTER (days-scale, in the script) which governs when a truly-stuck scan is merged anyway to preserve its findings.
+  playbookInputQuery: null
+- key: row_ceiling
+  value:
+    simple: ''
+  required: false
+  description: Override the script's default per-scan row ceiling (2,000,000) above which a scan is refused rather than half-built. Leave empty to use the script default. Raise this for a tenant whose scans legitimately produce more matches than the default ceiling allows, instead of resorting to manual ad-hoc invocation.
+  playbookInputQuery: null
+- key: abandoned_after_hours
+  value:
+    simple: ''
+  required: false
+  description: Override the script's default hours (24h) a non-terminal scan must be silent before it's treated as abandoned and consolidated anyway to preserve its partial findings. Leave empty to use the script default.
+  playbookInputQuery: null
+outputs:
+- contextPath: Yara.ConsolidateStatus.eligible_count
+  description: Number of scans found eligible on the last status check.
+  type: Number
+- contextPath: Yara.ConsolidateApply.consolidated_count
+  description: Number of scans actually merged this run.
+  type: Number
+- contextPath: Yara.ConsolidateApply.failed_count
+  description: Number of scans that failed to merge and need attention.
+  type: Number
+- contextPath: Yara.ConsolidateApply.failed_reasons
+  description: Map of failed scan_id to the specific reason it failed (e.g. row_ceiling_exceeded, count_mismatch).
+  type: Unknown
+fromversion: 6.5.0
+tests:
+- No tests (auto-formatted)
+view: "{\n  \"linkLabelsPosition\": {},\n  \"paper\": {\n    \"dimensions\": {\n      \"height\": 1500,\n      \"width\": 800,\n      \"x\": 50,\n      \"y\": 50\n    }\n  }\n}"

@@ -221,3 +221,6 @@ xdr_ca_bundle.pem
 
 # Generated document exports — markdown is the source of truth
 *.docx
+
+# macOS
+.DS_Store
