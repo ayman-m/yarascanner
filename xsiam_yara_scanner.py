@@ -2555,7 +2555,13 @@ class ScanConfig:
         self.scan_queue_size = max(
             2, int(os.getenv("YARA_QUEUE_SIZE", str(self.max_workers * 2)) or (self.max_workers * 2))
         )
-        self.log_interval = int(os.getenv("YARA_PROGRESS_LOG_SECS", "120") or 120)
+        # Clamped to >=1s (same shape as scan_queue_size's max(2, ...) above): this value is
+        # the wait() interval of the progress-heartbeat thread, and "0" is a plausible thing
+        # for an operator to set trying to disable progress logging. threading.Event.wait(0)
+        # (and any negative) returns immediately, which would turn the heartbeat into a
+        # busy-spin that re-takes lock_counts continuously and floods the unbounded webhook
+        # queue. To actually disable progress logging, set a large interval.
+        self.log_interval = max(1, int(os.getenv("YARA_PROGRESS_LOG_SECS", "120") or 120))
         self.enable_performance_monitoring = ENABLE_PERF_MONITOR
         self.enable_resource_monitoring = ENABLE_RESOURCE_MONITOR
         self.enable_fd_monitoring = ENABLE_FD_MONITOR
@@ -5101,7 +5107,6 @@ rule test {{
         )
         self._progress_heartbeat_thread.start()
 
-        last_comprehensive_stats = time.time()
         total_files_found = 0
         files_per_target = {}
 
