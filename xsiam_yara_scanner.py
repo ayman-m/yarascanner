@@ -2555,13 +2555,19 @@ class ScanConfig:
         self.scan_queue_size = max(
             2, int(os.getenv("YARA_QUEUE_SIZE", str(self.max_workers * 2)) or (self.max_workers * 2))
         )
-        # Clamped to >=1s (same shape as scan_queue_size's max(2, ...) above): this value is
-        # the wait() interval of the progress-heartbeat thread, and "0" is a plausible thing
-        # for an operator to set trying to disable progress logging. threading.Event.wait(0)
-        # (and any negative) returns immediately, which would turn the heartbeat into a
-        # busy-spin that re-takes lock_counts continuously and floods the unbounded webhook
-        # queue. To actually disable progress logging, set a large interval.
-        self.log_interval = max(1, int(os.getenv("YARA_PROGRESS_LOG_SECS", "120") or 120))
+        # Default 30s, not 120s: this is the progress-heartbeat's sampling interval, and at
+        # 120s a scan whose active phase is shorter than that emits NO progress telemetry at
+        # all (the "Capacity vs Backpressure"/"Scan Rate" widgets stay empty). Measured on a
+        # 15,589-file Windows scan: the active phase is well under 120s, so 120 produced zero
+        # samples where 30 produces a usable series. Long fleet scans are unaffected - they
+        # simply get proportionally more samples.
+        #
+        # Clamped to >=1s (same shape as scan_queue_size's max(2, ...) above): "0" is a
+        # plausible thing for an operator to set trying to disable progress logging, and
+        # threading.Event.wait(0) (or any negative) returns immediately, which would turn the
+        # heartbeat into a busy-spin that re-takes lock_counts continuously and floods the
+        # unbounded webhook queue. To actually disable progress logging, set a large interval.
+        self.log_interval = max(1, int(os.getenv("YARA_PROGRESS_LOG_SECS", "30") or 30))
         self.enable_performance_monitoring = ENABLE_PERF_MONITOR
         self.enable_resource_monitoring = ENABLE_RESOURCE_MONITOR
         self.enable_fd_monitoring = ENABLE_FD_MONITOR

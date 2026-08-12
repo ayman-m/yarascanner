@@ -406,7 +406,7 @@ Center execution form or pre-set on the endpoint:
 | `YARA_MAX_MB` | 64 | Skip files larger than N MB |
 | `YARA_THREADS` | 2 | Worker count (capped at 2 by the light profile) |
 | `YARA_QUEUE_SIZE` | 4 | Internal scan queue depth |
-| `YARA_PROGRESS_LOG_SECS` | 120 | Seconds between `statistics` events |
+| `YARA_PROGRESS_LOG_SECS` | 30 | Seconds between `statistics` progress events. Clamped to a 1s minimum — setting `0` does **not** disable progress logging; use a large value instead. |
 | `YARA_ENABLE_PERF_MONITOR` | false | Enable per-worker `performance` events |
 | `YARA_ENABLE_RESOURCE_MONITOR` | false | Enable `system_resource_snapshot` events |
 | `YARA_ENABLE_FD_MONITOR` | false | Watch file-descriptor count (Linux/macOS) |
