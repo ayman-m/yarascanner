@@ -239,6 +239,12 @@ SCANS_HEARTBEAT_SECS = float(os.environ.get("YARA_HEARTBEAT_SECS", "600") or 600
 LOG_KEEP_SCANS = int(os.environ.get("YARA_LOG_KEEP", "10") or 10)
 CANCEL_POLL_SECS = float(os.environ.get("YARA_CANCEL_POLL_SECS", "5") or 5)        # cancel-flag watcher cadence
 CANCEL_DRAIN_DEADLINE_SECS = float(os.environ.get("YARA_CANCEL_DEADLINE_SECS", "30") or 30)  # graceful cancel budget
+# Cadence for the independent heartbeat thread (#8, distinct from #21): _maybe_heartbeat()
+# was previously called ONLY from the directory-walker loop, so a walker parked in
+# _enqueue_scan_path's backpressure retry loop (a large directory on a throttled host) also
+# stalled the "scans" dataset heartbeat for as long as it was blocked. This poll interval only
+# needs to be comfortably below SCANS_HEARTBEAT_SECS; it does not itself gate emission.
+HEARTBEAT_THREAD_POLL_SECS = float(os.environ.get("YARA_HEARTBEAT_POLL_SECS", "30") or 30)
 CANCEL_STALE_TOLERANCE_SECS = 2.0  # mtime slack when judging a cancel flag stale (coarse-FS safety)
 # Governor telemetry heartbeat: emit at least this often even when nothing changes, so a
 # healthy scan still leaves a time series proving the CPU promise held.
@@ -4999,6 +5005,7 @@ class YaraScanner:
         self.cancel_flag_path = os.path.join(getattr(config, "control_dir", config.scanner_dir), "cancel.flag")
         self.running_marker_path = os.path.join(getattr(config, "control_dir", config.scanner_dir), "running.json")
         self.cancel_watcher_thread = None
+        self.heartbeat_thread = None
         # Earliest baseline (construction time) used to distinguish a genuinely stale
         # cancel flag from one delivered during the pre-scan compile phase. Never reset.
         self._process_started_at = time.time()
@@ -5006,6 +5013,11 @@ class YaraScanner:
         self._last_heartbeat = 0.0
         self._scans_row_lock = threading.Lock()
         self._cancel_lock = threading.Lock()
+        # Guards the check-and-set on _last_heartbeat: _maybe_heartbeat() is now called from
+        # BOTH the directory-walker loop and the independent heartbeat thread below, so the
+        # gate must be atomic or two overlapping callers could both pass it and emit a
+        # duplicate 'running' row.
+        self._heartbeat_lock = threading.Lock()
 
         # Prime psutil's system-CPU sampler: the first cpu_percent(None) call always
         # returns 0.0, which would let the first throttle window through blind (P3).
@@ -5172,12 +5184,43 @@ class YaraScanner:
             self.log_manager.log_error(f"Failed to emit scan-lifecycle row: {e}")
 
     def _maybe_heartbeat(self):
-        """Emit a periodic 'running' lifecycle row + refresh the liveness marker."""
-        now = time.time()
-        if now - self._last_heartbeat >= SCANS_HEARTBEAT_SECS:
+        """Emit a periodic 'running' lifecycle row + refresh the liveness marker.
+
+        Called from both the directory-walker loop and the independent heartbeat thread
+        (_heartbeat_worker) - the check-and-set on _last_heartbeat is done under a lock so
+        two overlapping callers can't both pass the gate and emit a duplicate row."""
+        with self._heartbeat_lock:
+            now = time.time()
+            if now - self._last_heartbeat < SCANS_HEARTBEAT_SECS:
+                return
             self._last_heartbeat = now
-            self._write_running_marker("running")
-            self._emit_scan_row("running", "heartbeat")
+        self._write_running_marker("running")
+        self._emit_scan_row("running", "heartbeat")
+
+    def _start_heartbeat_thread(self):
+        """Start a dedicated background thread that keeps the dataset heartbeat flowing on a
+        fixed cadence, independent of the directory-walker's progress (#8).
+
+        Before this, _maybe_heartbeat() was called ONLY once per directory finished by the
+        walker loop. _enqueue_scan_path() blocks (retrying every queue_backoff_secs) when the
+        scan queue is saturated rather than dropping files, so a large single directory on a
+        heavily-throttled host can leave the walker parked there - and therefore skip
+        _maybe_heartbeat() entirely - for stretches well past the quiet period the
+        consolidation tool waits out before treating a scan as finished/abandoned. This thread
+        keeps the heartbeat landing on schedule even while the walker itself is legitimately
+        blocked."""
+        self.heartbeat_thread = threading.Thread(
+            target=self._heartbeat_worker, name="HeartbeatWorker", daemon=True
+        )
+        self.heartbeat_thread.start()
+
+    def _heartbeat_worker(self):
+        while self.scan_active:
+            try:
+                self._maybe_heartbeat()
+            except Exception as e:
+                self.log_manager.log_error(f"Heartbeat worker error: {e}")
+            time.sleep(HEARTBEAT_THREAD_POLL_SECS)
 
 
     def _clean_rule_content(self, rule_lines, rule_name):
@@ -6516,6 +6559,8 @@ rule test {{
         self._last_heartbeat = start_time  # first heartbeat waits a full interval
         # Start watching for an operator cancel flag and announce the scan started.
         self._start_cancellation_watcher()
+        # Independent of walker progress (#8) - see _start_heartbeat_thread's docstring.
+        self._start_heartbeat_thread()
         self._emit_scan_row("initiated", "scan initiated")
 
         self.resource_monitor = None
