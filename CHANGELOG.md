@@ -1,7 +1,8 @@
 # Release Notes
 
-Every released version of `xdr_yara_scanner.py` and its companion scripts. Each entry
-records what changed and **why**, so you can decide whether a release is worth taking.
+Every released version of `xdr_yara_scanner.py`, `xsiam_yara_scanner.py`, and their
+companion scripts. Each entry records what changed and **why**, so you can decide whether
+a release is worth taking.
 
 The guides in `docs/xdr/` and `docs/xsiam/` describe the **current** version only. Anything about how a
 behaviour used to work, or the testing behind a change, lives here.
@@ -11,6 +12,171 @@ the `VERSION` line at the top of `yara_processing_<run_id>.log`.
 
 Versioning is semantic: **MAJOR** breaks something, **MINOR** adds capability, **PATCH**
 fixes without changing behaviour you rely on.
+
+---
+
+## xsiam_yara_scanner.py v3.0.0 — 2026-08-12
+
+**Breaking.** First versioned release of the XSIAM edition since v2.0.0 (2026-08-03) — this
+edition had never had a changelog entry before. Redesigns the `yara_match` webhook event's
+grain, fixes several dashboard widgets that were silently empty, and tunes shutdown
+behaviour. Everything below was found and fixed in the course of investigating one customer
+report of an undercounted dashboard, then verified independently by a second, adversarial
+code-review pass after the first round of live testing.
+
+### Changed — one `yara_match` event per (rule, file) finding, not per matched-string offset
+
+The original design queued one webhook event per matched STRING OFFSET. One loosely-written
+rule matching one large file (a growing Windows event log, in the case that surfaced this)
+can produce tens of thousands of offsets, and each one became its own HTTP POST — measured
+live on the sandbox tenant: 36,213 upload items backlogged in one scan's delivery queue, the
+large majority from one rule matching one file. `xdr_yara_scanner.py`'s companion lookup
+dataset had the identical bug (also one row per offset) and is fixed in the same commit —
+this is not a case of porting an already-proven fix from one edition to the other; both
+editions had the same design flaw and both are corrected together here.
+
+`add_match()` now folds every offset for a given (rule, file) into **one** event, adding:
+- `match_count` — the TRUE total offsets matched for that finding, never sampled or capped.
+- `truncated` — `true` when the samples below hold fewer entries than `match_count`.
+- `offsets` / `strings` — JSON arrays, a sample of up to `MAX_MATCH_SAMPLES_PER_FINDING`
+  (default 50, override via `YARA_MAX_MATCH_SAMPLES`) offsets and their matched strings,
+  aligned 1:1.
+- `match_ids` — JSON object of TRUE, uncapped counts per YARA string identifier (e.g.
+  `{"$ps": 20649, "$enc": 55}`) — exact, but keyed by the rule's internal identifier, not the
+  literal matched text.
+- `match_scope` — `"rule"` or `"string"`, distinguishing a condition-only match from one with
+  actual string hits.
+- `file_name` / `rule_id` — aliases of the existing `filename`/`rule` fields, added so the
+  dashboard widgets below can query stable, self-explanatory column names.
+
+**Removed:** the old `match` field (one specific string identifier per row) no longer exists
+in the event payload — it only ever meant something at the old per-offset grain. Any ad-hoc
+query built directly against the raw `match` field (rather than through the shipped
+dashboards) will need to move to `match_ids` instead.
+
+**Requires updating the XSIAM parsing rule** to extract these fields — now at
+[`parsing_rules/xsiam/parsing_rule.xql`](parsing_rules/xsiam/parsing_rule.xql) (moved out of
+`docs/xsiam/`, see below). This is a manual console step; there is no parsing-rule API.
+Updated the 5 affected dashboard widgets and `dashboards/xsiam/YARA Matches.json` to
+`sum(to_integer(match_count))` instead of `count()`, and to explode the sampled `strings`
+array where a per-string breakdown is needed.
+
+**Live-verified against the sandbox tenant on 2026-08-12, after the parsing rule was
+updated**, including the pathological case reproducing naturally rather than being
+re-staged: a fresh scan of the same event-log directory that originally surfaced the bug
+landed exactly 3 dataset rows for 3 findings, two of them genuinely truncated (20,759 and
+13,013 true offsets each) with `match_ids` summing EXACTLY to `match_count` in every case —
+the hardest correctness bar for this design, since the per-string counts are uncapped while
+the offset/string samples are not. All 5 widget queries then ran live against that data with
+correct numbers (Hot Hosts: 33,784 = 12 + 13,013 + 20,759, matching the sum of the 3
+findings exactly).
+
+**Caveat:** parsing rules are not retroactively applied to already-ingested raw logs, so any
+`yara_match` row ingested before you update the tenant's parsing rule permanently shows `null`
+for these fields. Widgets will show gaps for old hosts/data until fresh scans run under the
+new rule — this is an XSIAM platform behaviour, not something this fix can work around.
+
+### Fixed — three dashboard widgets that were silently empty
+
+Found and fixed alongside the grain-split work above, all three because the widget's filter
+referenced a column the scanner never actually populated at that level:
+
+- **"Capacity vs Backpressure"** filters on a top-level `active_workers` column;
+  `log_scan_progress()` only ever nested it under `metrics.active_workers`. Now also emitted
+  at the top level.
+- **CPU/memory widgets** filter on top-level `proc_cpu_percent`, `proc_memory_mb`,
+  `sys_cpu_percent`, `sys_memory_used_percent`; `SystemResourceMonitor` only nested these
+  under `resource_data['process']`/`['system']`. Now also flattened to the top level.
+- **Resource monitoring stopped after file discovery, not after scanning finished.**
+  `_perform_enhanced_cleanup()` stopped `resource_monitor`/`stats_manager` as soon as file
+  discovery completed — a different, earlier moment than when the worker threads actually
+  finish matching everything still queued, which on a large scan can be minutes apart. Moved
+  both `stop_monitoring()` calls to fire after the worker-thread join loop instead, so
+  resource telemetry now covers the scan's real duration. Same fix ported to
+  `xdr_yara_scanner.py` (same bug, same root cause, XDR explicitly authorized).
+
+### Fixed — critical lifecycle events could take minutes to actually deliver
+
+The delivery queue backlogs during a heavy scan, and "Target scan completed"/"Worker thread
+startup completed" were previously queued behind that same backlog like any other telemetry
+log — measured live: a 12s scan's own completion event took ~246s to actually land. Added
+`LogManager._log_critical()`: an immediate synchronous send attempt for these two dashboard-
+critical, once-per-scan(-target) signals, falling back to the normal async queue only if the
+direct send fails. Verified live: 246s → 1s.
+
+### Changed — shutdown drain budget scales with backlog instead of a flat timeout
+
+Ported XDR's proportional drain-budget design (`DRAIN_MIN_SECS`/`DRAIN_PER_ITEM_SECS`/
+`DRAIN_MAX_SECS`, env-overridable) to all 4 of this edition's independent drain sites
+(`LogManager.stop_logging` + 3 uploader classes) — a flat timeout was either too short for a
+heavy backlog (events dropped, not delayed) or wastefully long for a light one. Tuned down
+from an initial, too-generous `DRAIN_MAX_SECS=300` after a live 4-host concurrent test showed
+3 of 4 hosts hit Action Center `TIMEOUT` (each of the 4 drain sites approaching 300s
+sequentially exceeded the snippet's own timeout) — final values (15 / 0.3 / 60) re-verified
+live with all 4 hosts completing cleanly.
+
+### Fixed — placeholder-credential abort check was a tautology
+
+`main()`'s abort guard compared `API_ENDPOINT`/`API_KEY` against `DEFAULT_API_ENDPOINT`/
+`DEFAULT_API_KEY` after both had already been reset TO those same defaults a few lines
+earlier — always true either way, so a scanner shipped with un-edited placeholder
+credentials never aborted and instead failed every single upload silently. Added fixed
+sentinel literals to compare against instead.
+
+### Fixed — second-round hardening (independent adversarial code review)
+
+An exhaustive, independently-verified review pass over this release's diff surfaced more
+real issues, all fixed here:
+
+- `_log_critical()`'s synchronous send never updated `upload_stats['successful_uploads'/
+  'failed_uploads']` in any outcome, undercounting the final accounting, and swallowed a
+  non-2xx response or a send exception with no logged error before silently falling back to
+  the queue — including the case where the fallback queue itself wasn't available (thread not
+  alive, or the queue put failing), which previously dropped the log with zero trace at all.
+  Every outcome now updates stats and logs something before the method returns.
+- The same method could double-deliver a critical event on an ambiguous outcome (e.g. a read
+  timeout after the collector already processed the request) — no idempotency key exists to
+  dedupe this, so rather than pretend to solve it, the ambiguous case is now logged explicitly
+  instead of disappearing silently, consistent with this scanner's existing "honest books over
+  exact-once delivery" philosophy elsewhere.
+- `MAX_MATCH_SAMPLES_PER_FINDING` and the 3 `DRAIN_*` env-var overrides were parsed with bare
+  `int()`/`float()` at module import time — a deployer typo (e.g. `YARA_DRAIN_MAX_SECS=60s`)
+  crashed the entire scanner before `main()` ever ran, with zero telemetry. Added `_env_number()`:
+  falls back to the default and logs a warning on a malformed value instead of crashing.
+- `dashboards/xsiam/YARA Matches.json`'s `widgets_data[]` catalog copies of the 5 grain-
+  affected widgets were never patched — only the `dashboards_data[].layout[]` copies were,
+  earlier in this same release. Anyone editing/reusing a widget from the widget library (not
+  just viewing the dashboard) would have silently gotten the old, wrong query. Patched to
+  match.
+
+### Known gap (not fixed here)
+
+`widgets/xsiam/Matches Over Time.xql`'s "by Severity" breakdown can never show more than one
+series: `add_match()` hardcodes `level="INFO"` on every `yara_match` event and never surfaces
+the rule's actual `threat_level` as a queryable column. Pre-existing, not introduced by this
+release — left as a follow-up since fixing it changes `level` semantics for every log type,
+not just matches.
+
+### Also available, not yet wired into a widget
+
+`add_match()` also emits `string_match_count`, `threat_level`, `dateOfScan`, `file_sha256`,
+and `file_creation_time` into every `yara_match` event, but the parsing rule doesn't promote
+any of them to a bare column and no shipped widget queries them. They're reachable today via
+`json_extract_scalar(data, "$.file_sha256")` etc. for custom queries; promoting them to real
+columns is a natural follow-up if you build on top of this dashboard.
+
+### Upgrading
+
+1. Update the tenant's XSIAM parsing rule from
+   [`parsing_rules/xsiam/parsing_rule.xql`](parsing_rules/xsiam/parsing_rule.xql) (console
+   step, no API).
+2. Re-import or re-add the 5 affected widgets/`YARA Matches.json` dashboard if you've
+   customized them locally.
+3. If you have any custom query referencing the old `match` field directly, move it to
+   `match_ids`.
+4. Expect a gap for historical data — old rows won't retroactively gain the new fields.
+
+No other config or dataset changes required.
 
 ---
 
