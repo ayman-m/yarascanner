@@ -1,0 +1,77 @@
+args:
+- name: scan_id
+  description: Restrict the check to these scan_id(s) (comma-separated). Omit for
+    all finished scans.
+  required: false
+  isArray: true
+  default: false
+  secret: false
+- name: quiet_secs
+  description: Override the default settle window (900s) a completed scan's newest
+    row must be older than before it's considered safe.
+  required: false
+  isArray: false
+  default: false
+  secret: false
+- name: row_ceiling
+  description: Override the default per-scan row ceiling (2,000,000) above which a
+    scan is refused rather than half-built.
+  required: false
+  isArray: false
+  default: false
+  secret: false
+- name: abandoned_after_hours
+  description: Override the default hours (from CONFIG_CONSOLIDATE_OBSOLETE_AFTER,
+    24h default in code) a non-terminal scan must be silent before it's treated as
+    abandoned and consolidated anyway to preserve its partial findings.
+  required: false
+  isArray: false
+  default: false
+  secret: false
+comment: >-
+  Read-only readiness check for the YARA per-scan dataset merge. Never writes or
+  deletes anything — safe to call repeatedly from inside a wait/retry poll loop.
+  Reports which scans are eligible to consolidate now, which are still in progress
+  (a real scan running, or a just-finished scan still inside its settle window), and
+  which are blocked (row ceiling exceeded, or an existing target with a mismatched
+  row count needing manual attention). A scan only counts as eligible if BOTH the
+  scans-lifecycle and matches shards agree it's ready.
+commonfields:
+  id: YaraConsolidateStatus
+  version: -1
+enabled: true
+name: YaraConsolidateStatus
+outputs:
+- contextPath: Yara.ConsolidateStatus.any_in_progress
+  description: True if at least one scan is still running or settling.
+  type: Boolean
+- contextPath: Yara.ConsolidateStatus.eligible_count
+  description: Number of scans ready to consolidate now.
+  type: Number
+- contextPath: Yara.ConsolidateStatus.eligible_scan_ids
+  description: scan_id(s) ready to consolidate now.
+  type: String
+- contextPath: Yara.ConsolidateStatus.pending_scan_ids
+  description: scan_id(s) still in progress (running, or settling).
+  type: String
+- contextPath: Yara.ConsolidateStatus.blocked_count
+  description: Number of scans blocked (row ceiling or count mismatch).
+  type: Number
+- contextPath: Yara.ConsolidateStatus.blocked_scan_ids
+  description: scan_id(s) blocked and needing attention.
+  type: String
+- contextPath: Yara.ConsolidateStatus.blocked_reasons
+  description: Map of blocked scan_id to the specific reason it's blocked (e.g.
+    row_ceiling_exceeded, count_mismatch).
+  type: Unknown
+script: '-'
+system: false
+tags: []
+timeout: 900
+type: python
+subtype: python3
+dockerimage: demisto/python3:3.11.10.116949
+fromversion: 6.5.0
+marketplaces:
+- xsoar
+- marketplacev2

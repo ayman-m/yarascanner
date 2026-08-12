@@ -1,0 +1,74 @@
+args:
+- name: scan_id
+  description: Restrict the merge to these scan_id(s) (comma-separated) — typically
+    the eligible_scan_ids output from YaraConsolidateStatus. Omit to re-derive
+    eligibility and consolidate everything ready.
+  required: false
+  isArray: true
+  default: false
+  secret: false
+- name: quiet_secs
+  description: Override the default settle window (900s).
+  required: false
+  isArray: false
+  default: false
+  secret: false
+- name: row_ceiling
+  description: Override the default per-scan row ceiling (2,000,000).
+  required: false
+  isArray: false
+  default: false
+  secret: false
+- name: abandoned_after_hours
+  description: Override the default abandoned-scan cutoff in hours.
+  required: false
+  isArray: false
+  default: false
+  secret: false
+comment: >-
+  Performs the actual YARA per-scan dataset merge: creates a per-scan target
+  dataset, writes its rows, and deletes the source shard only once every scan the
+  shard holds has verified. A scan that flips from eligible to still-active between
+  the status check and this call is safely deferred here, not treated as an error —
+  the playbook should log deferred_scan_ids, not alarm on them. Only failed_count > 0
+  needs operator attention.
+commonfields:
+  id: YaraConsolidateApply
+  version: -1
+enabled: true
+name: YaraConsolidateApply
+outputs:
+- contextPath: Yara.ConsolidateApply.consolidated_count
+  description: Number of scans successfully merged this run.
+  type: Number
+- contextPath: Yara.ConsolidateApply.consolidated_scan_ids
+  description: scan_id(s) successfully merged this run.
+  type: String
+- contextPath: Yara.ConsolidateApply.deferred_count
+  description: Number of scans that became active between the status check and this
+    call — safe, not an error.
+  type: Number
+- contextPath: Yara.ConsolidateApply.deferred_scan_ids
+  description: scan_id(s) deferred this run.
+  type: String
+- contextPath: Yara.ConsolidateApply.failed_count
+  description: Number of scans that failed to merge and need operator attention.
+  type: Number
+- contextPath: Yara.ConsolidateApply.failed_scan_ids
+  description: scan_id(s) that failed this run.
+  type: String
+- contextPath: Yara.ConsolidateApply.failed_reasons
+  description: Map of failed scan_id to the specific reason it failed (e.g.
+    row_ceiling_exceeded, count_mismatch).
+  type: Unknown
+script: '-'
+system: false
+tags: []
+timeout: 900
+type: python
+subtype: python3
+dockerimage: demisto/python3:3.11.10.116949
+fromversion: 6.5.0
+marketplaces:
+- xsoar
+- marketplacev2

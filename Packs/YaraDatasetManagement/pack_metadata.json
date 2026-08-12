@@ -1,0 +1,14 @@
+{
+  "name": "YARA Dataset Management",
+  "description": "Automations and a playbook that merge finished YARA scan datasets and prune old ones on a schedule, safely handling scans still in progress.",
+  "support": "community",
+  "currentVersion": "1.0.0",
+  "author": "Ayman Mahmoud",
+  "url": "",
+  "email": "",
+  "categories": ["Utilities"],
+  "tags": [],
+  "useCases": [],
+  "keywords": ["yara", "xql", "dataset"],
+  "marketplaces": ["xsoar", "marketplacev2"]
+}
