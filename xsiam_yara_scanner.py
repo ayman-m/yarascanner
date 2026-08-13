@@ -104,7 +104,8 @@ MAX_MATCH_SAMPLES_PER_FINDING = _env_number("YARA_MAX_MATCH_SAMPLES", 50, cast=i
 # rows from one rule against one .evtx log; measured here: 36,213 in one match-upload backlog),
 # because the original design queued ONE upload item PER MATCHED STRING OFFSET. Fold all offsets
 # for a given (rule, file) into ONE upload with a capped sample - full per-offset detail still
-# goes to self.results (local, unbounded); only the network representation is capped.
+# is streamed to the local results file as it is produced; only the network representation
+# is capped. Neither is buffered in memory.
 BASE_BACKOFF_SECS = 1.0              # initial backoff
 MAX_BACKOFF_SECS = 30.0              # backoff ceiling
 CIRCUIT_FAILURE_THRESHOLD = 5        # open after N consecutive failures
@@ -3000,7 +3001,18 @@ class ResultsUploader:
     
     def __init__(self, config):
         self.config = config
-        self.results = []
+        # Per-offset detail is STREAMED to results_file as it is produced, not buffered.
+        # It used to accumulate in a list and only be written at scan end, which made peak
+        # memory scale with total matched offsets rather than with the scan: measured on a
+        # large Windows endpoint, 1,048,035 offset hits across 17,509 findings held ~15 GB
+        # RSS and still climbing. The list only ever existed to be serialized to this file,
+        # so writing each entry immediately is both O(1) memory and crash-safe - a killed
+        # scan (e.g. the console's Cancel button) now keeps everything written so far
+        # instead of losing all of it with the process.
+        self._results_count = 0
+        self._results_fh = None
+        self._results_lock = threading.Lock()
+        self._results_write_failed = False
         self.hostname = config.hostname
         self.os_info = config.os_info
         self.ip_address = config.ip_addresses[0] if config.ip_addresses else "Unknown"
@@ -3216,7 +3228,7 @@ class ResultsUploader:
 
         Grain split (ported from the XDR edition): the UPLOAD gets ONE ITEM PER (rule, file)
         finding, with every matched offset folded into that one item as a capped sample, rather
-        than emitted as its own upload. The full per-offset detail still goes to self.results
+        than emitted as its own upload. The full per-offset detail is streamed to results_file
         (local, unbounded) - only the network representation is aggregated+sampled.
         """
         raw_matches = list(match_data or [])
@@ -3254,7 +3266,7 @@ class ResultsUploader:
                 "file_sha256": file_sha256,
                 "file_creation_time": file_creation_time,
             }
-            self.results.append(result)
+            self._write_result_line(result)
             self.upload_stats['total_matches'] += 1
             match_count += 1
 
@@ -3322,29 +3334,63 @@ class ResultsUploader:
                 f"(1 upload item, {len(_offsets_sample)} of {match_count} sampled)"
             )
 
+    def _write_result_line(self, result):
+        """Append one per-offset result to the JSONL results file immediately.
+
+        Called from every scan worker, so the handle and the write are lock-guarded. The
+        file is opened lazily on the first match, so a scan with no detections leaves no
+        empty artifact behind (matching the previous behaviour, which wrote nothing when
+        the list was empty).
+
+        A write failure is logged ONCE and then suppressed: a full or read-only disk must
+        not turn into one log line per matched offset, which on a storm scan is exactly the
+        flood this class already guards against elsewhere.
+        """
+        with self._results_lock:
+            if self._results_write_failed:
+                return
+            try:
+                if self._results_fh is None:
+                    self._results_fh = open(self.results_file, "w", encoding="utf-8")
+                self._results_fh.write(json.dumps(result, ensure_ascii=False) + "\n")
+                self._results_count += 1
+            except Exception as e:
+                self._results_write_failed = True
+                if self.log_manager:
+                    self.log_manager.log_error(
+                        f"Error writing local results to {self.results_file}: {e} "
+                        f"(further write errors suppressed; {self._results_count} entries written)"
+                    )
+
     def save_results(self):
-        """Save results to JSON file."""
+        """Flush and close the streamed results file.
+
+        Entries are written as they are produced (see _write_result_line), so this is now a
+        flush/close rather than a bulk serialize - it exists to keep the call site and the
+        'results saved' accounting unchanged.
+        """
+        with self._results_lock:
+            count = self._results_count
+            try:
+                if self._results_fh is not None:
+                    self._results_fh.flush()
+                    try:
+                        os.fsync(self._results_fh.fileno())
+                    except Exception:
+                        pass
+                    self._results_fh.close()
+                    self._results_fh = None
+            except Exception as e:
+                if self.log_manager:
+                    self.log_manager.log_error(f"Error closing results file: {e}")
+                return False
+
         if self.log_manager:
-            self.log_manager.log_upload(f"Attempting to save {len(self.results)} results to: {self.results_file}")
-        
-        if not self.results:
-            if self.log_manager:
+            if count:
+                self.log_manager.log_upload(f"Successfully saved {count} results to: {self.results_file}")
+            else:
                 self.log_manager.log_upload("No results to save")
-            return True
-
-        try:
-            with open(self.results_file, "w", encoding="utf-8") as f:
-                for result in self.results:
-                    f.write(json.dumps(result, ensure_ascii=False) + "\n")
-
-            if self.log_manager:
-                self.log_manager.log_upload(f"Successfully saved {len(self.results)} results to: {self.results_file}")
-            return True
-            
-        except Exception as e:
-            if self.log_manager:
-                self.log_manager.log_error(f"Error saving results to JSON: {e}")
-            return False
+        return True
     
     def upload_results(self):
         """Finalize upload process with timeout protection."""
