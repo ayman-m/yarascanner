@@ -38,11 +38,26 @@ PREFIX = "yara_scanner"
 NAME_RE = re.compile(
     r"^%s_(?P<kind>matches|scans)_v(?P<version>\d+)(?:_(?P<rest>.+))?$" % re.escape(PREFIX)
 )
-# A trailing 6-digit group is the rotation month. A host segment that is ITSELF exactly six
-# digits is indistinguishable from a month - we resolve it as a month, because the worst
-# outcome of that reading is declining to delete something that looks recent, whereas
-# reading it as a host could delete a whole host's history in one call.
-MONTH_RE = re.compile(r"^(?:(?P<host>.*?)_)?(?P<month>\d{6})$")
+# A trailing group that is a PLAUSIBLE YYYYMM (20xx, month 01-12) is the rotation month. A
+# host segment that is itself exactly that shape is indistinguishable from a month - we
+# resolve it as a month, because the worst outcome of that reading is declining to delete
+# something that looks recent, whereas reading it as a host could delete a whole host's
+# history in one call.
+#
+# The year/month RANGE is load-bearing, not cosmetic. A bare \d{6} makes any six trailing
+# digits a month, and two of those readings are actively dangerous rather than conservative:
+# "110501" parses as year 1105 -> an age of ~11,000 months, i.e. older than every retention
+# window, so the ambiguity resolves towards DELETING; and "143025" (a HHMMSS timestamp tail)
+# raises ValueError out of months_between, crashing the read-only report as well as the
+# prune. Requiring 20xx + 01-12 makes every implausible group fall back to "this is part of
+# the host name", which reads as unrotated and is therefore never a deletion candidate.
+MONTH_RE = re.compile(r"^(?:(?P<host>.*?)_)?(?P<month>20\d{2}(?:0[1-9]|1[0-2]))$")
+
+# --min-quiet-hours' default, as a module constant rather than an argparse literal: the XSOAR
+# pack hand-ports this module, and its drift gate can only compare module-level statements.
+# Deliberately generous - the goal is proving no active writer at all, not just outlasting the
+# scanner's own upload-drain window.
+DEFAULT_MIN_QUIET_HOURS = 24.0
 
 
 def parse_dataset_name(name):
@@ -50,21 +65,33 @@ def parse_dataset_name(name):
 
     Returning None is safety rail 3: anything outside the naming contract can never be a
     deletion candidate, so a bug here cannot reach unrelated tenant data.
+
+    `scan_target` marks a CONSOLIDATED per-scan target (yara_scanner_<kind>_v<N>_scan_<slug>,
+    the output of xdr_consolidate.py) using the same discriminator xdr_consolidate.parse_shard
+    already applies in the other direction. Such a dataset is not a rotation shard: it has no
+    month by design, it is immutable once verified, and after consolidation deleted the source
+    shards it is the ONLY copy of that scan. Marking it explicitly keeps a slug that happens to
+    end in six month-shaped digits from being read as an ancient rotation month, and keeps
+    consolidation's own output from being reported as "not rotated - will grow without bound".
     """
     m = NAME_RE.match(name or "")
     if not m:
         return None
     rest = m.group("rest")
-    host, month = None, None
+    host, month, scan_target = None, None, False
     if rest:
-        mm = MONTH_RE.match(rest)
-        if mm:
-            host = mm.group("host") or None
-            month = mm.group("month")
+        if rest == "scan" or rest.startswith("scan_"):
+            host, scan_target = rest, True
         else:
-            host = rest
+            mm = MONTH_RE.match(rest)
+            if mm:
+                host = mm.group("host") or None
+                month = mm.group("month")
+            else:
+                host = rest
     return {"name": name, "kind": m.group("kind"),
-            "version": int(m.group("version")), "host": host, "month": month}
+            "version": int(m.group("version")), "host": host, "month": month,
+            "scan_target": scan_target}
 
 
 def months_between(older_yyyymm, newer_yyyymm):
@@ -106,6 +133,11 @@ def select_rotated_for_deletion(current_names, older_than_months, now_yyyymm):
         info = parse_dataset_name(name)
         if info is None:
             skipped.append("%s: not a YARA dataset name" % name)
+            continue
+        if info["scan_target"]:
+            skipped.append("%s: per-scan consolidated target - consolidation OUTPUT, not a "
+                           "rotation shard, and after the source shards were deleted it is "
+                           "the only copy of that scan" % name)
             continue
         if not info["month"]:
             if has_rotated_sibling(name, current_names):
@@ -205,13 +237,61 @@ def filter_unconsolidated(client, candidates, log=print):
     return survivors, skipped
 
 
-def select_legacy_for_deletion(legacy_names):
-    """Legacy = older/unversioned schema, already classified by the toolkit.
+def select_legacy_for_deletion(legacy_names, newer_names=(), now_yyyymm=None):
+    """Legacy = older/unversioned schema, already classified by the toolkit. Returns
+    (candidates, skip_reasons) - the same shape as select_rotated_for_deletion, because the
+    same name-derived rails apply here.
 
     The toolkit's 'newer' bucket is deliberately NOT accepted by this function: a host
     running a stale YARA_LOOKUP_SCHEMA_VER must never delete a future schema's data.
+
+    "Legacy" is only ever as trustworthy as the assumed current schema version, and that
+    assumption is a single free-text setting. Set it one version too HIGH - a typo, or a
+    version bumped in automation ahead of the fleet rollout - and every live, actively-written
+    dataset reclassifies as legacy. So the classification alone is not allowed to authorise a
+    delete; these rails apply to legacy exactly as they do to the rotated path:
+
+      * if ANY newer-schema dataset exists, the assumed version is provably stale, so the
+        whole blanket legacy deletion is refused rather than trusted (the keep-guard
+        xdr_action_center.py's prune-datasets already carried; this brings the two into line)
+      * an UNSUFFIXED dataset holds ALL pre-rotation history for that host - same rail, same
+        categorically bigger blast radius, whatever schema it is on
+      * a per-scan consolidated target is consolidation OUTPUT and frequently the only
+        surviving copy of a scan
+      * the CURRENT month, and a FUTURE-dated month, are never candidates
+
+    Callers must still run the survivors through filter_recently_written and
+    filter_unconsolidated. Those two are the only rails that can see an endpoint STILL
+    WRITING to a dataset whose name says it is ancient, which is exactly the state a
+    mid-rollout fleet is in - and consolidation only handles KNOWN_MATCHES_SCHEMA_VERSIONS,
+    so an un-consolidated legacy shard is always a scan's only copy.
     """
-    return list(legacy_names or [])
+    if newer_names:
+        return [], ["refusing blanket legacy deletion: %d dataset(s) are on a NEWER schema "
+                    "version (%s) - the assumed current version is stale, so this 'legacy' "
+                    "classification cannot be trusted"
+                    % (len(newer_names), ", ".join(sorted(newer_names)[:5]))]
+    candidates, skipped = [], []
+    for name in legacy_names or []:
+        info = parse_dataset_name(name)
+        if info is not None and info["scan_target"]:
+            skipped.append("%s: per-scan consolidated target - consolidation OUTPUT, not a "
+                           "legacy leftover" % name)
+            continue
+        if info is not None and not info["month"]:
+            skipped.append("%s: unsuffixed - holds ALL pre-rotation history for that host, "
+                           "so it is never a blanket candidate; delete it by name if you "
+                           "really want the space" % name)
+            continue
+        if info is not None and now_yyyymm:
+            if info["month"] == now_yyyymm:
+                skipped.append("%s: current month - a scan may be writing to it" % name)
+                continue
+            if months_between(info["month"], now_yyyymm) < 0:
+                skipped.append("%s: dated in the future (clock skew?)" % name)
+                continue
+        candidates.append(name)
+    return candidates, skipped
 
 
 def render_report(current, legacy, newer, now_yyyymm):
@@ -220,13 +300,16 @@ def render_report(current, legacy, newer, now_yyyymm):
     lines = ["YARA lookup datasets (schema v%s current, now %s)" % (schema, now_yyyymm), ""]
     lines.append("%-52s %-8s %-14s %6s" % ("dataset", "kind", "host", "age"))
     lines.append("-" * 84)
-    unrotated, abandoned = [], []
+    unrotated, abandoned, consolidated = [], [], []
     for name in current:
         info = parse_dataset_name(name)
         if info is None:
             lines.append("%-52s %s" % (name[:52], "(unrecognised - never a candidate)"))
             continue
-        if info["month"]:
+        if info["scan_target"]:
+            age = "scan"
+            consolidated.append(name)
+        elif info["month"]:
             age = "%dmo" % months_between(info["month"], now_yyyymm)
         else:
             age = "frozen" if has_rotated_sibling(name, current) else "n/a"
@@ -242,6 +325,14 @@ def render_report(current, legacy, newer, now_yyyymm):
         lines += ["", "NEWER schema - never deleted by this tool. Your "
                       "YARA_LOOKUP_SCHEMA_VER may be stale:"]
         lines += ["  " + n for n in newer]
+    if consolidated:
+        lines += [
+            "",
+            "%d dataset(s) are per-scan CONSOLIDATED TARGETS (…_scan_<id>). They are"
+            % len(consolidated),
+            "      consolidation OUTPUT: unrotated by design, finished, not growing, and",
+            "      often a scan's only surviving copy. Never a cleanup candidate.",
+        ]
     if abandoned:
         lines += [
             "",
@@ -333,8 +424,8 @@ def main():
                     help="delete rotated datasets older than N months (no default)")
     ap.add_argument("--delete-legacy", action="store_true",
                     help="delete datasets on an older/unversioned schema")
-    ap.add_argument("--min-quiet-hours", type=float, default=24.0,
-                    help="older-than-months: never delete a shard whose newest row is younger "
+    ap.add_argument("--min-quiet-hours", type=float, default=DEFAULT_MIN_QUIET_HOURS,
+                    help="never delete a shard whose newest row is younger "
                          "than this many hours, regardless of its month label - protects "
                          "against a scan still writing near a month boundary, or clock/"
                          "timezone skew between the scanning endpoint and this machine "
@@ -398,7 +489,17 @@ def main():
         skipped += s3
         targets += t
     if args.delete_legacy:
-        targets += select_legacy_for_deletion(legacy)
+        # The legacy path gets the SAME rails, not a weaker set. "Legacy" is a derived
+        # classification that depends entirely on YARA_LOOKUP_SCHEMA_VER being right; set it
+        # one version too high and every live, actively-written dataset lands in this bucket.
+        # The two live-query rails are the only ones that can tell that apart from the name.
+        t, s = select_legacy_for_deletion(legacy, newer, now_yyyymm)
+        skipped += s
+        t, s2 = filter_recently_written(client, t, args.min_quiet_hours * 3600, int(time.time() * 1000))
+        skipped += s2
+        t, s3 = filter_unconsolidated(client, t)
+        skipped += s3
+        targets += t
 
     for s in skipped:
         print("  skip  %s" % s)

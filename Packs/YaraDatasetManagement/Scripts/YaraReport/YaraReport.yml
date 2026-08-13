@@ -1,0 +1,90 @@
+args:
+- name: schema_version
+  description: The scanner's current lookup schema version (YARA_LOOKUP_SCHEMA_VER
+    on the endpoints; "2" if unset). Must be a whole number — a non-numeric value is
+    rejected outright. Datasets on a HIGHER version are reported under "newer schema"
+    and are never pruned by YaraCleanup — if this is stale, everything lands in that
+    bucket.
+  required: false
+  isArray: false
+  default: false
+  secret: false
+comment: >-
+  Read-only inventory of every yara_scanner_* lookup dataset: kind, host and age in
+  months, plus the legacy and newer-schema buckets. Never writes or deletes anything
+  and issues a single API call — safe to run any time, including from a poll loop or
+  alongside a consolidation pass. Flags the two conditions that need opposite advice:
+  "frozen" (unsuffixed but rotated siblings exist — a pre-rotation leftover, not
+  growing) and "not rotated" (unsuffixed with no rotated siblings — rotation is
+  genuinely off for that deployment and the dataset will grow without bound until it
+  goes write-dead). Per-scan consolidated targets are unsuffixed too but are
+  consolidation OUTPUT, so they get their own "consolidated" state and are counted in
+  neither bucket.
+commonfields:
+  id: YaraReport
+  version: -1
+enabled: true
+name: YaraReport
+outputs:
+- contextPath: Yara.Report.now_yyyymm
+  description: The YYYYMM ages in this report were measured against.
+  type: String
+- contextPath: Yara.Report.schema_version
+  description: The schema version treated as current for this report.
+  type: String
+- contextPath: Yara.Report.report
+  description: The rendered fixed-width inventory table, as shown in the War Room.
+  type: String
+- contextPath: Yara.Report.datasets
+  description: Per-dataset rows — name, kind, host, month, age_months, and state
+    (rotated / frozen / not_rotated / consolidated / unrecognised).
+  type: Unknown
+- contextPath: Yara.Report.current_count
+  description: Number of datasets on the current schema version.
+  type: Number
+- contextPath: Yara.Report.frozen
+  description: Unsuffixed datasets that have rotated siblings — pre-rotation
+    leftovers, frozen rather than growing.
+  type: String
+- contextPath: Yara.Report.frozen_count
+  description: Number of frozen pre-rotation datasets.
+  type: Number
+- contextPath: Yara.Report.not_rotated
+  description: Unsuffixed datasets with no rotated siblings — rotation is off and
+    these grow without bound.
+  type: String
+- contextPath: Yara.Report.not_rotated_count
+  description: Number of datasets that are not rotated.
+  type: Number
+- contextPath: Yara.Report.consolidated
+  description: Per-scan consolidated targets (…_scan_<id>) — consolidation output,
+    unrotated by design and never a cleanup candidate.
+  type: String
+- contextPath: Yara.Report.consolidated_count
+  description: Number of per-scan consolidated targets.
+  type: Number
+- contextPath: Yara.Report.legacy
+  description: Datasets on an older/unversioned schema (deletable by YaraCleanup with
+    delete_legacy=true).
+  type: String
+- contextPath: Yara.Report.legacy_count
+  description: Number of legacy-schema datasets.
+  type: Number
+- contextPath: Yara.Report.newer
+  description: Datasets on a HIGHER schema version than schema_version — never
+    deleted by this pack.
+  type: String
+- contextPath: Yara.Report.newer_count
+  description: Number of newer-schema datasets.
+  type: Number
+script: '-'
+system: false
+tags: []
+timeout: 900
+type: python
+subtype: python3
+dockerimage: demisto/python3:3.11.10.116949
+fromversion: 6.5.0
+marketplaces:
+- xsoar
+- marketplacev2

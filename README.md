@@ -143,7 +143,7 @@ python3 xdr_data_management.py --report                      # inventory (defaul
 python3 xdr_data_management.py --older-than-months 6 --yes   # drop months older than 6
 ```
 
-Dry run unless `--yes`. Never deletes the current month, a future-dated month, an unsuffixed dataset, a newer schema version, or anything outside the `yara_scanner_*` naming contract. **No scan depends on it having run** — if it never runs, datasets grow but every scan still succeeds.
+Dry run unless `--yes`. Never deletes the current month, a future-dated month, an unsuffixed dataset, a newer schema version, a per-scan consolidated target, or anything outside the `yara_scanner_*` naming contract. The same rails apply to `--delete-legacy`, which is additionally refused outright while any newer-schema dataset exists — "legacy" is derived from `YARA_LOOKUP_SCHEMA_VER`, so a version set one too high would reclassify the live tenant as legacy. **No scan depends on it having run** — if it never runs, datasets grow but every scan still succeeds.
 
 Two more gates run before any `--older-than-months` deletion, both checked live against the
 tenant and both "skip to be safe" on error: a dataset whose *newest row* is younger than
@@ -386,12 +386,18 @@ dataset = yara_scanner_matches*
 plus scheduling guidance for recurring scan Jobs. See `playbooks/README.md` for the required
 3-input script upload.
 
-### Dataset consolidation automation (`Packs/YaraDatasetManagement/`)
+### Dataset consolidation & maintenance automation (`Packs/YaraDatasetManagement/`)
 
 An XSOAR pack — playbook + automations — that runs `xdr_consolidate.py`'s per-scan
 consolidation (§2 above) as a **twice-daily scheduled Job** instead of a manual CLI
-invocation. Deployment, credentials, troubleshooting (including the pack-specific HTTP 401
-symptom), and the `yara_scanner_consolidation_runs` health dataset/widget:
+invocation, plus two standalone automations covering `xdr_data_management.py`'s side of §2:
+`YaraReport` (read-only dataset inventory — the `--report` path) and `YaraCleanup` (retention
+pruning — the `--older-than-months` / `--delete-legacy` path). **`YaraCleanup` deletes whole
+datasets and is a dry run unless you pass `execute=true`**; it carries the same seven safety
+rails as the CLI and, unlike the CLI, takes the consolidation lock before deleting.
+Deployment, credentials, per-automation arguments, troubleshooting (including the
+pack-specific HTTP 401 symptom), and the `yara_scanner_consolidation_runs` /
+`yara_scanner_cleanup_runs` record datasets:
 [Packs/YaraDatasetManagement/README.md](Packs/YaraDatasetManagement/README.md).
 
 ### API toolkit (`xdr_action_center.py`)
@@ -511,7 +517,7 @@ Everything is split by edition — **XDR** and **XSIAM** never share a folder.
 ├── dashboards/{xdr,xsiam}/        # importable dashboards, per edition
 ├── widgets/{xdr,xsiam}/           # per-widget XQL, per edition
 ├── playbooks/                     # Runner / Canceller — work on both editions
-├── Packs/YaraDatasetManagement/   # XSOAR pack: consolidation as a scheduled Job (§7)
+├── Packs/YaraDatasetManagement/   # XSOAR pack: consolidation Job + report/cleanup automations (§7)
 ├── images/                        # dashboard screenshots
 └── tests/                         # XDR: rule generator, corpus seeder, scan matrix, unit tests
 ```

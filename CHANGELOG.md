@@ -15,14 +15,189 @@ fixes without changing behaviour you rely on.
 
 ---
 
+## YARA Dataset Management pack v1.1.0 — 2026-08-12
+
+The pack now ships all four automations its own shared-library header always claimed it did.
+`YaraConsolidateCommon.py`'s first paragraph has said since v1.0.0 that "the four thin
+automations (`YaraConsolidateStatus`, `YaraConsolidateApply`, `YaraReport`, `YaraCleanup`)
+import from this module" — the last two did not exist. Both are added here, as verbatim
+ports of `xdr_data_management.py`'s report and retention-pruning logic, in the same
+hand-kept-copy style the consolidation logic was ported in (XSOAR automations cannot import
+arbitrary repo files at runtime, so the pack carries its own copy and a test gate keeps the
+two honest). Nothing about the consolidation playbook, its schedule, or its behaviour
+changes; neither new automation is a task in it.
+
+Suite is **217 tests, all passing** (was 125) — 83 in the new
+`tests/test_pack_data_management.py` and 9 added to `tests/test_data_management.py` for the
+canonical-side changes below.
+
+### Added — `YaraReport`: read-only dataset inventory in the console
+
+Wraps the CLI's `--report`. Lists every `yara_scanner_*` lookup dataset with kind, host and
+age in whole months, and splits out the legacy, newer-schema and per-scan-consolidated
+buckets. It makes exactly one API call (the dataset listing), writes nothing and deletes
+nothing, so it is safe to run at any time — from a poll loop, or alongside a running
+consolidation or cleanup pass. Outputs to `Yara.Report.*`, with the rendered fixed-width
+table in a code fence so the War Room does not reflow its columns.
+
+It preserves the one distinction `render_report` already drew and a raw dataset listing
+cannot: an unsuffixed dataset with rotated siblings is **frozen** (a pre-rotation leftover —
+rotation is on, writes moved to the dated names, nothing to do), while an unsuffixed dataset
+with *no* rotated siblings is **not rotated** (rotation is genuinely off for that deployment
+and the dataset grows without bound). Same shape in a listing, opposite advice.
+
+### Added — `YaraCleanup`: retention pruning, dry run by default
+
+Wraps the CLI's `--older-than-months` / `--delete-legacy` deletion path. **This automation
+deletes whole lookup datasets and the platform has no undelete**, so the properties that
+make it hard to run by accident are the feature, not the pruning:
+
+* **Dry run by default.** The CLI's `--yes` is inverted into an `execute` argument that
+  defaults to false: a bare invocation reports what it *would* delete and deletes nothing.
+  Only an explicit affirmative enables deletion — an unrecognised value raises and is
+  reported as a rejected argument rather than being guessed in either direction, and the
+  readable output opens with `DRY RUN — nothing was deleted.` or `EXECUTED — N dataset(s)
+  deleted` so the mode is never ambiguous in Job history.
+* **No implicit retention window.** `older_than_months` keeps the CLI's deliberate lack of a
+  default. With neither it nor `delete_legacy`, the run selects nothing, deletes nothing,
+  says so, and returns before making a single API call.
+* **All seven rails, on both selection paths.** Never the current month, never a
+  future-dated month, never an unsuffixed dataset, never a newer schema version, never a
+  name outside the `yara_scanner_*` contract, never a dataset written to within
+  `min_quiet_hours`, never a dataset still holding a scan consolidation has not verified
+  into a per-scan target. Rails 6 and 7 are live XQL and both **keep** the dataset on query
+  error, matching the skip-to-be-safe posture of every other rail.
+* **Takes the consolidation lock before deleting, in a `try`/`finally`, exactly as
+  `consolidate_all` does** — same `yara_scanner_consolidation_lock` marker. Pruning and
+  consolidation mutate the same shards and rails 6/7 are point-in-time checks, so a
+  consolidation pass starting between the checks and the deletes would race them. A held
+  lock means this pass deletes nothing and reports `lock_held_by_other_run`, mirroring how
+  `YaraConsolidateApply` surfaces it. **A dry run never takes the lock** — it mutates
+  nothing and must stay safe to run concurrently with anything.
+* **Every skipped candidate's reason reaches the operator**, uncapped, in both the War Room
+  entry and `Yara.Cleanup.skipped` — including the buckets that were never candidates at all
+  (newer-schema always; legacy when `delete_legacy` is off). A dataset silently not deleted
+  is indistinguishable from a bug, and "0 selected, 0 skipped" must never be how the tenant
+  reports "rail 4 vetoed everything".
+* **`min_quiet_hours` cannot be used to switch rail 6 off.** `0` does not relax the rail, it
+  disables it — `filter_recently_written`'s `(now − newest) < 0` is false even for a row
+  written a second ago. The CLI is typed by a human who can see what they typed; an XSOAR
+  argument is one field on a scheduled Job, so anything below a 1h floor
+  (`MIN_ALLOWED_QUIET_HOURS`, pack-only) is raised to the floor and the run says so.
+* **A stricter lock-takeover posture than consolidation's.** A wrong takeover during a merge
+  costs a redundant merge; during a prune it deletes data mid-copy. So on this path an
+  existing marker whose row cannot be read counts as **held** rather than stale (that is
+  precisely the `add_data` create-lag window right after another run took it), staleness is
+  judged on a 6h window (`PRUNE_LOCK_STALE_SECS`) instead of consolidation's 2h, and any
+  takeover that does happen is reported in `Yara.Cleanup.lock_taken_over` and called out in
+  the War Room entry rather than passing for an ordinary uncontended pass.
+
+### Added — `yara_scanner_cleanup_runs`, deliberately separate from the consolidation record
+
+Neither new automation writes to `yara_scanner_consolidation_runs`. That dataset's schema
+and status vocabulary (`consolidated_count`, `failed_scan_ids`,
+`success`/`partial_failure`/`crashed`) describe a *consolidation* pass, and the
+`Consolidation Run Health` widget reads "a row in the last ~24h" as proof the twice-daily
+merge Job is alive — a report or prune row would both skew its counts and satisfy that
+liveness check, masking a dead merge Job. `record_consolidation_run()` was read and judged a
+bad fit rather than forced.
+
+`YaraReport` therefore records nothing at all (writing nothing is the point of it), and each
+**executed** prune writes one row to its own `yara_scanner_cleanup_runs` dataset instead:
+mode, schema version, window, `delete_legacy`, `min_quiet_hours`, the selected/deleted/
+failed/skipped counts, the deleted names, every skip reason, and `lock_taken_over`. The
+write is best-effort — a failure to record is logged and never changes the run's outcome.
+A War Room entry and XSOAR investigation context are per-run and not queryable across runs,
+so without this row there is no way to answer "which datasets did we prune last month, and
+why were the rest kept" for the one action in this pack that cannot be undone. No widget
+ships for it; `Packs/YaraDatasetManagement/README.md` carries the XQL to read it directly.
+
+### Fixed — `xdr_data_management.py`: `--delete-legacy` now takes the same rails as the age path
+
+`select_legacy_for_deletion()` previously returned `list(legacy_names)` unchanged — the
+"legacy" bucket went straight to deletion with none of the name-derived rails the
+`--older-than-months` path applies, and without the two live-query gates. But "legacy" is
+not observed, it is *derived* from `YARA_LOOKUP_SCHEMA_VER`: set that one version too high —
+a typo, or automation bumping it ahead of the fleet rollout — and every live,
+actively-written dataset on the tenant reclassifies as legacy. The classification alone is
+no longer allowed to authorise a delete. `--delete-legacy` is now **refused outright while
+any newer-schema dataset exists** (that proves the assumed version is stale — the keep-guard
+`xdr_action_center.py prune-datasets` already carried, now shared), unsuffixed datasets and
+per-scan consolidated targets are never blanket candidates, the current and future-month
+rails apply, and `main()` runs the survivors through `filter_recently_written` and
+`filter_unconsolidated` just as it does the rotated path. The signature gained
+`newer_names`/`now_yyyymm` and the return became `(candidates, skip_reasons)` to match
+`select_rotated_for_deletion`'s shape.
+
+### Fixed — `MONTH_RE`'s bare `\d{6}` resolved two ambiguities the wrong way
+
+The rotation-month regex was `^(?:(?P<host>.*?)_)?(?P<month>\d{6})$`, so *any* six trailing
+digits read as a month. The comment above it claimed the ambiguous reading was the
+conservative one; for two real shapes it was the opposite. A host segment like `110501`
+parsed as year 1105 — an age of roughly 11,000 months, older than every retention window, so
+the ambiguity resolved towards **deleting**. A trailing `HHMMSS` timestamp such as `143025`
+raised `ValueError` out of `months_between`, crashing the read-only `--report` as well as the
+prune. The pattern now requires a plausible `YYYYMM` (`20\d{2}` plus month `01`–`12`), so
+every implausible group falls back to "this is part of the host name" — which reads as
+unrotated and is therefore never a deletion candidate.
+
+### Fixed — a per-scan consolidated target could be read as an ancient rotation shard
+
+`parse_dataset_name()` now marks `yara_scanner_<kind>_v<N>_scan_<slug>` as `scan_target`,
+using the same discriminator `xdr_consolidate.parse_shard` already applies from the other
+side. Such a dataset is not a rotation shard: it has no month by design, it is immutable once
+verified, and once consolidation deleted the source shards it is the **only** copy of that
+scan. Marking it explicitly keeps a scan slug that happens to end in six month-shaped digits
+from being aged like a rotation month, keeps consolidation's own output out of `--report`'s
+"not rotated — will grow without bound" advice (it is finished, not leaking), and makes it a
+permanent non-candidate on both deletion paths.
+
+### Fixed — `acquire_consolidation_lock` gained two knobs for irreversible callers
+
+`xdr_consolidate.py` (and the pack's copy) take `unreadable_is_held` and `on_takeover`.
+The first treats an existing lock dataset whose row cannot be read as **held** instead of
+stale — that state is not exotic, it is the window right after another run created the
+marker, since `add_lookup_data` tolerates up to ~60s of create-lag with its retries, so the
+dataset exists before its row does. The second reports a takeover to the caller so it can say
+"I proceeded while another run's marker was in place" instead of logging an ordinary pass.
+Consolidation's defaults are unchanged (`unreadable_is_held=False`, no callback): its cost of
+a wrong takeover is a redundant merge, and parking the pipeline forever on an unreadable row
+would be the worse failure. `YaraCleanup` sets both.
+
+### Fixed — `YaraConsolidateApply` surfaces lock events in its War Room entry
+
+Lock events exist only in the library's log stream, never in the structured result:
+`acquire_consolidation_lock`'s "stale or unreadable — taking over" (which precedes
+force-deleting another run's marker) and `release_consolidation_lock`'s "could not release"
+(which parks every following pass until the marker goes stale). Both were invisible to
+anyone reading Job history. `YaraConsolidateApply.py` now appends a `lock events:` block to
+its readable output, as `YaraCleanup` does.
+
+### Docs
+
+`Packs/YaraDatasetManagement/README.md` gains a `YaraReport` section, a rewritten
+`YaraCleanup` section opening with an unmissable statement that it deletes whole datasets and
+that **the platform has no undelete**, a full argument table for each automation, the seven
+rails as a numbered table, the recommended report → dry-run → `execute=true` sequence, five
+new Troubleshooting rows (nothing-requested, stale-LOW `schema_version`, rail 6/7 skips, held
+lock, lock takeover), and a `yara_scanner_cleanup_runs` subsection under Monitoring with the
+XQL to query it. It also states that neither new automation is a task in the consolidation
+playbook and that scheduling `YaraCleanup` with `execute=true` is a standing authorisation.
+The root `README.md` §2 records that the rails now cover `--delete-legacy`, and §7 and the
+repository-layout tree name both new automations. Pack version `1.0.0` → `1.1.0`
+(`pack_metadata.json` does not enumerate content items, so nothing else in it changed).
+
+---
+
 ## Tier 3 edge-case fixes — 2026-08-12
 
-Nine confirmed Tier-3 gaps fixed in this pass, found through systematic edge-case review of
+Ten confirmed Tier-3 gaps fixed in this pass, found through systematic edge-case review of
 the consolidation pipeline's operator-facing failure modes (API key rotation, playbook
 failure visibility, Action Center's full terminal-state vocabulary, heartbeat liveness under
-throttling) — not through a live incident. A tenth item on the same confirmed list turned out,
-on closer inspection while writing this entry, to still be open in the working tree; it's
-recorded below as a known gap rather than claimed fixed.
+throttling, endpoint clock skew in the consolidation time gates) — not through a live incident.
+The tenth, edge case #6, was recorded as still-open in an earlier draft of this entry and is
+now fixed; its section below is the authoritative account, including what it deliberately
+leaves open.
 
 ### Fixed — `xdr_consolidate.py` v2.6.0: two more Action Center states recognized as terminal (edge case #2)
 
@@ -128,32 +303,98 @@ tries to attach it to a scheduled Job and can't find it. New
 monitoring); the top-level `README.md` §7 now links to it and the repo layout tree lists the
 pack.
 
-### Known gap (not fixed here) — endpoint clock skew in the quiet-period/abandoned-scan gates (edge case #6)
+### Fixed — `xdr_consolidate.py` v2.7.0: the time gates no longer trust the endpoint's clock (edge case #6)
 
-On the same confirmed list as the fixes above, but **not actually fixed** in the working
-tree — recorded here rather than silently claimed done. `newest_row_age_ok()`
-(`xdr_consolidate.py:226`) and `_gate_scan()`'s abandoned-scan check (`:705`, comparing
-`age_ms >= abandoned_after_secs * 1000`) still measure elapsed time as `now_ms` (this
-process's own clock) minus `newest_ms`, which comes from `_scan_stats()` /
-`_stats_from_rows()` (`:340`, `:383`) reading each row's `event_timestamp_ms` — an
-endpoint-stamped, uncorrected wall-clock value — with zero skew tolerance in either direction.
-A skew-immune, server-assigned `_insert_time` column already exists on every row (referenced
-only in `_coerce_row`'s docstring, `:360`, as something the write-back projection *drops*) but
-is never read for gate timing. A sufficiently clock-skewed endpoint can therefore make
-`within_quiet_period`/abandoned-cutoff judgments early or late in a way this tool cannot
-currently detect or correct for. Remains a follow-up; no fix proposed here.
+Recorded in an earlier draft of this section as a known gap; now closed. Both time gates —
+the quiet period (`newest_row_age_ok`) and the abandoned-scan cutoff (`_gate_scan`) — measured
+a scan's age as `now_ms` (server-side) minus `event_timestamp_ms`, which is stamped **on the
+endpoint**. At fleet scale a wrong endpoint clock is routine, and one direction loses data: a
+clock running *behind* makes a live scan's rows look hours or days old, so the cutoff sweeps
+the scan as abandoned and the quiet period waves it through — and this tool then consolidates
+and **deletes the shard the scanner is still uploading into**.
+
+New `_newest_ms()` measures against the later of `event_timestamp_ms` and `_insert_time`, the
+platform's own server-side ingest stamp, which stays ~"now" for as long as a scan is actually
+uploading no matter what the endpoint's clock says. `_scan_stats()` gets it from
+`max(_insert_time)` riding along in the existing `comp ... by scan_id` stage (measured working
+on the live tenant); `_stats_from_rows()` reads it as a system column off the rows it already
+pulled. New `_as_ms()` coerces whatever shape XQL returns a stamp in (int, float, numeric or
+exponent string, ISO-8601) and degrades to "no signal" rather than raising — the same
+type-fidelity problem `_coerce_row` exists for.
+
+**Why `max()` and not simply replacing one stamp with the other:** `_insert_time` is a
+freshness signal *only on a source shard*. Consolidation reads a shard's rows and re-writes
+them into the per-scan target, which resets `_insert_time` while `event_timestamp_ms` keeps
+the original scan time — measured on a real target, the gap was ~**31 days**, against 3.2s /
+3.7s / 5.2s / 5.4s / 66.8s (ordinary upload latency) on real shards. Both stats helpers are
+therefore fed source shards only, which `parse_shard` enforces structurally by refusing to
+recognise a `…_scan_<id>` target as a shard.
+
+Two guards keep the correction from creating a worse failure than the one it fixes, since a
+value that is too *new* is unbounded rather than merely inconvenient (`now_ms - newest` goes
+negative, so the quiet period can never be satisfied **and** the abandoned cutoff can never
+fire — the scan is stuck and its shard undeletable forever):
+
+- an endpoint stamp more than `SKEW_TOLERANCE_MS` (5 min) ahead of the ingest stamp is
+  discarded, not maxed in — a row cannot be authored after the platform received it, so that
+  is a clock running ahead, and the trustworthy stamp is used instead;
+- a server stamp implausibly far in the future of `now_ms` (the tell for a unit mismatch, e.g.
+  microseconds) is dropped in favour of the endpoint stamp, so an unexpected platform
+  representation degrades to pre-fix behaviour instead of stalling every scan on the tenant.
+
+`_gate_scan` also gains a **backstop** (`DEFAULT_SKEW_BACKSTOP_SECS`, 7 days) measured on the
+endpoint stamp alone, which nothing but the endpoint itself can re-arm. The cutoff's whole
+purpose is to guarantee nothing blocks cleanup forever, and `_insert_time` only means "when
+this row was ingested" as long as nothing rewrites the shard — this tool's own
+`_cleanup_verified_scan_rows` rewrites shards that may still hold other scans' rows. Whether
+the platform implements that removal as a rewrite (which would re-stamp the survivors) is
+**not verified** — settling it needs a destructive `remove_lookup_data` against a real shard —
+so the backstop makes the answer not matter: past a week of endpoint silence, a non-terminal
+scan is abandoned and the quiet period is satisfied regardless. The trade is explicit: skew
+protection is given back only for a clock wrong by more than a week, which is far rarer than
+one wrong by hours.
+
+Mirrored verbatim into
+`Packs/YaraDatasetManagement/Scripts/YaraConsolidateCommon/YaraConsolidateCommon.py` — that
+copy, not `xdr_consolidate.py`, is what the scheduled `YaraConsolidateApply` Job actually runs,
+so a fix landing only in the standalone module would leave the data-loss window fully open in
+production. New `test_pack_copy_gate_logic_matches_xdr_consolidate` now compares the two files'
+whole ported core statement-by-statement (docstrings and comments stripped), so the copies
+cannot silently drift again. As with every pack change, it only takes effect once the pack is
+re-delivered (console Import or pack-zip install) — editing the repo file changes nothing on
+the tenant.
+
+Also in this change: `build_terminal_map`'s `newest_ms` goes through the same skew-proof path
+(and through `_as_ms`, so a non-numeric stamp no longer raises `ValueError` and aborts a whole
+pass), so the value sitting next to `terminal` cannot silently reintroduce this bug if a future
+caller reaches for it; `_scan_stats`/`_stats_from_rows` log when a shard returns no usable
+`_insert_time`, so a silently-inactive protection is visible in the run log; and the fake
+client's aggregation in `tests/test_consolidation.py` now derives its response from the query
+text instead of hardcoded output keys — previously, reverting the query to its pre-fix form or
+renaming the alias disabled the fix completely with the suite still green.
+
+**Residual, deliberately open:** an endpoint whose clock runs *ahead* on a platform that
+returns no usable `_insert_time` still defers indefinitely, because there is then no
+trustworthy stamp to correct against (clamping to `now_ms` would reset the age to zero every
+pass and livelock the same way). `_gate_scan` logs that case distinctly so it is diagnosable
+rather than silently permanent.
 
 ### Upgrading
 
-**Mostly drop-in.** `xdr_consolidate.py` v2.6.0's `TERMINAL_ACTION` change only widens what
-already counts as terminal — no config or dataset changes. `xdr_yara_scanner.py`'s heartbeat
-thread is internal; the new `YARA_HEARTBEAT_POLL_SECS` env var (default 30s) is optional. The
-`Packs/YaraDatasetManagement` changes (`record_consolidation_run`, the new
-`yara_scanner_consolidation_runs` dataset, the new widget, `CoreApiClient`'s fail-fast 401)
+**Mostly drop-in.** `xdr_consolidate.py` ships from this pass as **v2.7.0**. Its
+`TERMINAL_ACTION` change only widens what already counts as terminal — no config or dataset
+changes. The edge-case-#6 gate change is also
+drop-in but is a **behavioural** change to when a scan is consolidated: a scan whose endpoint
+clock is wrong now waits longer (and, in the ahead direction, is no longer stuck forever),
+which is why the module version moves to 2.7.0 — a tenant can tell a skew-protected
+consolidator from an unprotected one by that number. `xdr_yara_scanner.py`'s heartbeat thread
+is internal; the new `YARA_HEARTBEAT_POLL_SECS` env var (default 30s) is optional. The
+`Packs/YaraDatasetManagement` changes (the mirrored gate fix, `record_consolidation_run`, the
+new `yara_scanner_consolidation_runs` dataset, the new widget, `CoreApiClient`'s fail-fast 401)
 only take effect once the pack is re-delivered via console Import or pack-zip install (see its
 README's Deployment section) — editing the repo files alone changes nothing on the tenant.
 
-Verified with the full suite: **102/102** passing (`python3 -m pytest tests/ -q`).
+Verified with the full suite: **125/125** passing (`python3 -m pytest tests/ -q`).
 
 ---
 

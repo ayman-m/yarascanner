@@ -63,6 +63,17 @@ def main():
                                for sid in result["failed_scan_ids"][:10])
             lines.append("{} scan(s) FAILED — needs attention: {}".format(result["failed_count"], detail))
 
+    # Lock events exist ONLY in the library's log stream, never in the structured result:
+    # acquire_consolidation_lock's "stale or unreadable — taking over" (which precedes
+    # force-deleting another run's marker) and release_consolidation_lock's "could not
+    # release" (which parks every following pass until the marker goes stale). Both are
+    # otherwise invisible to the operator.
+    lock_log = [m for m in log_lines if "lock" in m.lower()]
+    if lock_log:
+        lines.append("")
+        lines.append("lock events:")
+        lines += ["  {}".format(m) for m in lock_log]
+
     # Same context-accumulation risk as YaraConsolidateStatus (see its comment) - clear
     # before writing so consolidated/deferred/failed lists never carry stale entries from
     # a prior call to the same investigation.

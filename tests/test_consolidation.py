@@ -6,7 +6,9 @@ create_lookup_dataset, add_lookup_data, delete_dataset, action_status). Here tha
 is a deterministic fake, so gate logic and verify-before-delete are tested exhaustively
 without a tenant. Live behaviour is validated separately against the real API.
 """
+import ast
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -113,6 +115,25 @@ def test_terminal_map_from_scans_shards():
     assert tmap[("S1", "hostB_bb0002")]["terminal"] is False  # still running
 
 
+def test_terminal_map_newest_ms_is_skew_proof_and_never_raises():
+    # newest_ms sits in the same entry as `terminal`, so it is the obvious value for a future
+    # caller to reach for as a freshness signal. It must therefore be computed the same
+    # skew-proof way the gates are (edge case #6), not from the bare endpoint stamp — and a
+    # non-numeric stamp must degrade to "no signal" rather than raise ValueError and abort the
+    # whole consolidation pass.
+    scans_rows = {
+        "yara_scanner_scans_v2_hostA_aa0001": [
+            {"scan_id": "S1", "status": "running", "event_timestamp_ms": 100,
+             "_insert_time": 900},                        # endpoint clock behind
+            {"scan_id": "S2", "status": "running", "event_timestamp_ms": "n/a"},
+        ],
+    }
+    tmap = build_terminal_map(scans_rows)
+    assert tmap[("S1", "hostA_aa0001")]["newest_ms"] == 900   # server stamp wins
+    assert tmap[("S2", "hostA_aa0001")]["newest_ms"] is None  # unreadable -> no signal
+    assert tmap[("S2", "hostA_aa0001")]["status"] == "running"
+
+
 def test_terminal_map_action_center_rescues_stuck_running():
     # console-cancelled host: lifecycle stuck at running, but Action Center says ABORTED.
     scans_rows = {
@@ -211,22 +232,61 @@ class FakeClient:
         self.ds[name] = [r for r in self.ds[name] if not matches(r)]
         return {"deleted": before - len(self.ds[name])}
 
+    # `comp count() as n, max(<col>) as <alias>[, ...] by scan_id` — parsed out of the query
+    # text rather than assumed, so the fake can only return a column production ACTUALLY asked
+    # for, under the alias it was actually asked for. Hardcoding the output keys here made the
+    # whole skew fix untestable: reverting the query to the pre-fix form, or renaming the
+    # alias, left the suite green while the fix was 100% disabled in production.
+    _AGG_MAX_RE = re.compile(
+        r"max\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)\s+as\s+([A-Za-z_][A-Za-z0-9_]*)")
+    _AGG_COUNT_RE = re.compile(r"count\(\s*\)\s+as\s+([A-Za-z_][A-Za-z0-9_]*)")
+
     def xql(self, query, limit=1000):
         name = query.split("dataset = ", 1)[1].split(" ", 1)[0].strip()
         rows = self.ds.get(name, [])
         if "by scan_id" in query:   # _scan_stats aggregation
+            # The two "newest" signals the live tenant can supply, each returned ONLY if the
+            # query asked for it:
+            #   max(event_timestamp_ms) — stamped ON THE ENDPOINT, so it moves with (and lies
+            #                             with) that endpoint's system clock.
+            #   max(_insert_time)       — the platform's own server-side ingest stamp, immune
+            #                             to endpoint clock skew.
+            # A seeded row without _insert_time contributes nothing, so the alias comes back
+            # None — how a platform/dataset that does not surface the column degrades.
+            wants = self._AGG_MAX_RE.findall(query)
+            count_alias = self._AGG_COUNT_RE.findall(query)
             agg = {}
             for r in rows:
                 sid = r.get("scan_id")
-                n, newest = agg.get(sid, (0, 0))
-                agg[sid] = (n + 1, max(newest, int(r.get("event_timestamp_ms") or 0)))
-            return [{"scan_id": s, "n": n, "newest": nw} for s, (n, nw) in agg.items()]
+                cur = agg.setdefault(sid, {"n": 0, "max": {}})
+                cur["n"] += 1
+                for col, alias in wants:
+                    v = r.get(col)
+                    if v is None:
+                        continue
+                    v = int(float(v))
+                    prev = cur["max"].get(alias)
+                    cur["max"][alias] = v if prev is None else max(prev, v)
+            out = []
+            for sid, cur in agg.items():
+                row = {"scan_id": sid}
+                for alias in count_alias:
+                    row[alias] = cur["n"]
+                for _col, alias in wants:
+                    row[alias] = cur["max"].get(alias)
+                out.append(row)
+            return out
         if "comp count()" in query:
             return [{"n": len(rows)}]
         def readback(r):
-            # Mirror XQL read-back: add a system column, and return numbers as strings
-            # (offset comes back as text) so coercion is exercised.
-            out = dict(r, _insert_time=1)
+            # Mirror XQL read-back: system columns come back on every row, and numbers come
+            # back as strings (offset comes back as text live) so coercion is exercised. A row
+            # seeded with its own _insert_time keeps it — that is the server-side ingest stamp
+            # the skew-proof "newest" calculation leans on — and it is stringified like every
+            # other number, since that is the one type behaviour this repo has live evidence of.
+            out = dict(r)
+            out.setdefault("_insert_time", 1)
+            out["_insert_time"] = str(out["_insert_time"])
             if "offset" in out:
                 out["offset"] = str(out["offset"])
             return out
@@ -323,6 +383,335 @@ def test_orchestration_recent_nonterminal_still_defers():
     assert plans[0]["reason"] == "host_not_terminal"
     assert "yara_scanner_matches_v2_scan_s9" not in fc.ds
     assert "yara_scanner_matches_v2_hostz_ee0009" in fc.ds   # shard preserved
+
+
+# ------------------------------------------- endpoint clock skew (edge case #6)
+# event_timestamp_ms is stamped ON THE ENDPOINT, so an endpoint whose system clock runs
+# BEHIND writes rows that look older than they are. Both time gates (quiet period, abandoned
+# cutoff) measured age from that stamp alone, so such a host's LIVE scan could be declared
+# abandoned/settled and have its shard consolidated + deleted out from under it. The fix
+# takes max(event_timestamp_ms, _insert_time) with implausible values discarded first;
+# _insert_time is server-stamped at ingest, so it stays ~"now" while the scan is uploading.
+#
+# These tests were checked against deliberate mutations of the implementation — each of the
+# following was introduced and confirmed to make this block FAIL, so the block discriminates
+# the fix from its absence rather than merely co-existing with it:
+#   _newest_ms returning the endpoint stamp alone (fix neutralised)  -> 8 failures
+#   _newest_ms as a bare max() with no plausibility guards           -> 3 failures
+#   the comp stage reverted to its pre-fix, event_timestamp_ms-only form -> 9 failures
+#   the srv_newest alias renamed in the query only                   -> 9 failures
+#   _gate_scan's `settled` backstop removed                          -> 1 failure
+#   _as_ms trimmed to a single int() attempt                         -> 1 failure
+def _skewed(rows, srv_ms):
+    """Rows as an endpoint with a behind-running clock wrote them: the caller already set a
+    stale event_timestamp_ms; srv_ms is when the platform ACTUALLY ingested them."""
+    return [dict(r, _insert_time=srv_ms) for r in rows]
+
+
+def test_as_ms_accepts_every_shape_xql_returns_and_never_raises():
+    # _as_ms is the single choke point for every stamp the gates read. XQL read-back is known
+    # (live, see _coerce_row) to hand numbers back as strings and as floats, so trimming this
+    # to a bare int() would silently drop the server stamp — disabling the skew fix with a
+    # green suite. Anything unreadable must degrade to None, never raise: a stamp this can't
+    # parse must not abort a whole consolidation pass.
+    assert C._as_ms(1799999995000) == 1799999995000
+    assert C._as_ms(1799999995000.0) == 1799999995000
+    assert C._as_ms("1799999995000") == 1799999995000
+    assert C._as_ms("1799999995000.0") == 1799999995000
+    assert C._as_ms("1.8e12") == 1800000000000
+    assert C._as_ms("2026-08-10T09:46:56.000Z") == 1786355216000   # ISO form, if it ever comes
+    assert C._as_ms("2026-08-10T09:46:56") == 1786355216000        # naive -> read as UTC
+    assert C._as_ms(None) is None
+    assert C._as_ms("") is None
+    assert C._as_ms("n/a") is None
+    assert C._as_ms(True) is None       # a bool is an int in Python; as a stamp it is garbage
+
+
+def test_scan_stats_query_actually_asks_the_tenant_for_insert_time():
+    # The alias/column pair the fix depends on. Reverting the query to the pre-fix form or
+    # renaming the alias disables the protection completely in production, so pin the request
+    # itself, not just what a fake chooses to answer with.
+    seen = []
+
+    class QuerySpy(FakeClient):
+        def xql(self, query, limit=1000):
+            seen.append(query)
+            return super().xql(query, limit=limit)
+
+    fc = QuerySpy()
+    _seed(fc, "yara_scanner_matches_v2_hostk_ab0011", _m("S1", "hostk", 1))
+    C._scan_stats(fc, "yara_scanner_matches_v2_hostk_ab0011")
+    assert any("max(_insert_time) as srv_newest" in q and "by scan_id" in q for q in seen), seen
+
+
+def test_scan_stats_prefers_server_insert_time_when_endpoint_clock_is_behind():
+    fc = FakeClient()
+    stale, fresh = RNOW - 48 * 3600 * 1000, RNOW - 5000
+    _seed(fc, "yara_scanner_matches_v2_hostk_ab0011",
+          _skewed(_m("S1", "hostk", 4, ts=stale), fresh))
+    st = C._scan_stats(fc, "yara_scanner_matches_v2_hostk_ab0011")["S1"]
+    assert st.count == 4
+    assert st.newest == fresh       # the server-side stamp wins — the rows are seconds old
+    assert st.ep_newest == stale    # the endpoint stamp is kept separately for the backstop
+
+
+def test_scan_stats_keeps_endpoint_stamp_when_it_is_the_newer_of_the_two():
+    # Endpoint stamp AHEAD of ingest but within SKEW_TOLERANCE_MS: that is ordinary
+    # clock jitter, not a wrong clock, so max() keeps it (only ever delays consolidation).
+    fc = FakeClient()
+    ingested = RNOW - 5000
+    ahead = ingested + 60_000        # 1 minute — inside the 5-minute tolerance
+    _seed(fc, "yara_scanner_matches_v2_hostk_ab0011",
+          _skewed(_m("S1", "hostk", 2, ts=ahead), ingested))
+    assert C._scan_stats(fc, "yara_scanner_matches_v2_hostk_ab0011",
+                         now_ms=RNOW)["S1"].newest == ahead
+
+
+def test_scan_stats_discards_endpoint_stamp_far_ahead_of_the_ingest_stamp():
+    # Clock AHEAD by an hour. A row cannot be authored after the platform ingested it, so the
+    # endpoint stamp is discarded rather than maxed in. Keeping it would make now_ms - newest
+    # NEGATIVE forever: quiet period never satisfied, abandoned cutoff never reached, shard
+    # never deletable — the stuck-forever failure the cutoff exists to prevent.
+    fc = FakeClient()
+    ahead, ingested = RNOW + 3600 * 1000, RNOW - 5000
+    _seed(fc, "yara_scanner_matches_v2_hostk_ab0011",
+          _skewed(_m("S1", "hostk", 2, ts=ahead), ingested))
+    assert C._scan_stats(fc, "yara_scanner_matches_v2_hostk_ab0011",
+                         now_ms=RNOW)["S1"].newest == ingested
+
+
+def test_scan_stats_discards_a_server_stamp_in_an_implausible_unit():
+    # If a platform ever returned _insert_time in microseconds, a bare max() would adopt a
+    # value ~57,000 years ahead and stall EVERY scan on the tenant forever. A stamp far in the
+    # future of this run's own clock is dropped in favour of the endpoint's, i.e. it degrades
+    # to pre-fix behaviour instead of to a fleet-wide deadlock.
+    fc = FakeClient()
+    ts = RNOW - 7000
+    _seed(fc, "yara_scanner_matches_v2_hostk_ab0011",
+          _skewed(_m("S1", "hostk", 2, ts=ts), RNOW * 1000))   # microseconds by mistake
+    assert C._scan_stats(fc, "yara_scanner_matches_v2_hostk_ab0011",
+                         now_ms=RNOW)["S1"].newest == ts
+
+
+def test_scan_stats_falls_back_to_event_timestamp_without_insert_time():
+    # No _insert_time at all (older platform / column absent) -> exactly today's behaviour.
+    fc = FakeClient()
+    ts = RNOW - 7000
+    _seed(fc, "yara_scanner_matches_v2_hostk_ab0011", _m("S1", "hostk", 3, ts=ts))
+    assert C._scan_stats(fc, "yara_scanner_matches_v2_hostk_ab0011")["S1"] == (3, ts, ts)
+
+
+def test_scan_stats_logs_when_the_skew_protection_is_inactive():
+    # A silently-inactive protection is the worst outcome of the two failure shapes here, so
+    # a shard that returns no usable _insert_time must say so in the run log.
+    fc = FakeClient()
+    _seed(fc, "yara_scanner_matches_v2_hostk_ab0011", _m("S1", "hostk", 2, ts=RNOW - 7000))
+    lines = []
+    C._scan_stats(fc, "yara_scanner_matches_v2_hostk_ab0011", log=lines.append)
+    assert any("INACTIVE" in ln and "_insert_time" in ln for ln in lines), lines
+    # and the healthy case must NOT cry wolf
+    fc2 = FakeClient()
+    _seed(fc2, "yara_scanner_matches_v2_hostk_ab0011",
+          _skewed(_m("S1", "hostk", 2, ts=RNOW - 7000), RNOW - 5000))
+    quiet = []
+    C._scan_stats(fc2, "yara_scanner_matches_v2_hostk_ab0011", log=quiet.append)
+    assert not any("INACTIVE" in ln for ln in quiet), quiet
+
+
+def test_stats_from_rows_prefers_server_insert_time_when_endpoint_clock_is_behind():
+    stale, fresh = RNOW - 48 * 3600 * 1000, RNOW - 5000
+    rows = _skewed(_s("S1", "hostk", "running", ts=stale), fresh)
+    assert C._stats_from_rows(rows)["S1"] == (1, fresh, stale)
+    # the same rows as XQL read-back actually returns them — numbers stringified
+    as_text = [{k: (str(v) if k in ("event_timestamp_ms", "_insert_time") else v)
+                for k, v in r.items()} for r in rows]
+    assert C._stats_from_rows(as_text)["S1"] == (1, fresh, stale)
+
+
+def test_stats_from_rows_falls_back_to_event_timestamp_without_insert_time():
+    ts = RNOW - 7000
+    rows = _s("S1", "hostk", "running", ts=ts)
+    assert C._stats_from_rows(rows)["S1"] == (1, ts, ts)
+    # a present-but-null _insert_time must degrade the same way, not crash or win
+    rows_null = [dict(r, _insert_time=None) for r in rows]
+    assert C._stats_from_rows(rows_null)["S1"] == (1, ts, ts)
+    # an unreadable one likewise — degrade to the endpoint stamp, never raise
+    rows_junk = [dict(r, _insert_time="n/a") for r in rows]
+    assert C._stats_from_rows(rows_junk)["S1"] == (1, ts, ts)
+
+
+def test_orchestration_clock_behind_endpoint_is_not_swept_as_abandoned():
+    # THE data-loss case: a live scan on a host whose clock is 48h behind. Its rows LOOK
+    # older than the 24h abandoned cutoff, but the platform ingested them seconds ago.
+    fc = FakeClient()
+    stale, fresh = RNOW - 48 * 3600 * 1000, RNOW - 5000
+    shard = "yara_scanner_matches_v2_hostskew_dd0004"
+    _seed(fc, shard, _skewed(_m("S7", "hostskew", 9, ts=stale), fresh))
+    _seed(fc, "yara_scanner_scans_v2_hostskew_dd0004",
+          _skewed(_s("S7", "hostskew", "running", ts=stale), fresh))
+    plans = C.run_consolidation(fc, "matches", quiet_secs=900, dry_run=False, now_ms=RNOW,
+                                abandoned_after_secs=24 * 3600, log=lambda *a: None)
+    assert plans[0]["reason"] == "host_not_terminal"
+    assert "yara_scanner_matches_v2_scan_s7" not in fc.ds   # nothing written
+    assert len(fc.ds[shard]) == 9                           # shard and its rows survive
+
+
+def test_orchestration_clock_behind_endpoint_still_blocked_by_quiet_period():
+    # Same skew, but the host DID report terminal, so the abandoned cutoff is not what is
+    # protecting it — the quiet period is. Its uploader may still be draining, so a stale
+    # event_timestamp_ms must not let the shard be consolidated + deleted early.
+    fc = FakeClient()
+    stale, fresh = RNOW - 48 * 3600 * 1000, RNOW - 5000
+    shard = "yara_scanner_matches_v2_hostskew_dd0004"
+    _seed(fc, shard, _skewed(_m("S7", "hostskew", 9, ts=stale), fresh))
+    _seed(fc, "yara_scanner_scans_v2_hostskew_dd0004",
+          _skewed(_s("S7", "hostskew", "completed", ts=stale), fresh))
+    plans = C.run_consolidation(fc, "matches", quiet_secs=900, dry_run=False, now_ms=RNOW,
+                                abandoned_after_secs=24 * 3600, log=lambda *a: None)
+    assert plans[0]["reason"] == "within_quiet_period"
+    assert "yara_scanner_matches_v2_scan_s7" not in fc.ds
+    assert len(fc.ds[shard]) == 9
+
+
+def test_orchestration_genuinely_stale_scan_is_still_abandoned_and_consolidated():
+    # The over-correction guard: when BOTH stamps are old (a real orphan — nothing has been
+    # ingested for 48h either), the gates must still fire exactly as before. The fix must not
+    # amount to "never sweep anything".
+    fc = FakeClient()
+    stale = RNOW - 48 * 3600 * 1000
+    shard = "yara_scanner_matches_v2_hostold_dd0005"
+    _seed(fc, shard, _skewed(_m("S8", "hostold", 6, ts=stale), stale))
+    _seed(fc, "yara_scanner_scans_v2_hostold_dd0005",
+          _skewed(_s("S8", "hostold", "running", ts=stale), stale))
+    plans = C.run_consolidation(fc, "matches", quiet_secs=900, dry_run=False, now_ms=RNOW,
+                                abandoned_after_secs=24 * 3600, log=lambda *a: None)
+    assert plans[0]["ok"] is True
+    assert len(fc.ds["yara_scanner_matches_v2_scan_s8"]) == 6   # findings preserved
+    assert shard not in fc.ds                                   # shard now deletable
+
+
+def test_orchestration_scans_kind_clock_behind_endpoint_is_not_swept_as_abandoned():
+    # Same protection on the scans-kind path, which reads already-pulled rows
+    # (_stats_from_rows) instead of the aggregation (_scan_stats).
+    fc = FakeClient()
+    stale, fresh = RNOW - 48 * 3600 * 1000, RNOW - 5000
+    shard = "yara_scanner_scans_v2_hostskew_dd0004"
+    _seed(fc, shard, _skewed(_s("S7", "hostskew", "running", ts=stale), fresh))
+    plans = C.run_consolidation(fc, "scans", quiet_secs=900, dry_run=False, now_ms=RNOW,
+                                abandoned_after_secs=24 * 3600, log=lambda *a: None)
+    assert plans[0]["reason"] == "host_not_terminal"
+    assert "yara_scanner_scans_v2_scan_s7" not in fc.ds
+    assert len(fc.ds[shard]) == 1
+
+
+def test_orchestration_scans_kind_genuinely_stale_is_still_abandoned():
+    fc = FakeClient()
+    stale = RNOW - 48 * 3600 * 1000
+    shard = "yara_scanner_scans_v2_hostold_dd0005"
+    _seed(fc, shard, _skewed(_s("S8", "hostold", "running", ts=stale), stale))
+    plans = C.run_consolidation(fc, "scans", quiet_secs=900, dry_run=False, now_ms=RNOW,
+                                abandoned_after_secs=24 * 3600, log=lambda *a: None)
+    assert plans[0]["ok"] is True
+    assert len(fc.ds["yara_scanner_scans_v2_scan_s8"]) == 1
+    assert shard not in fc.ds
+
+
+def test_orchestration_clock_ahead_endpoint_does_not_stall_forever():
+    # The OTHER skew direction, and the one a bare max() would make permanent: an endpoint
+    # whose clock reads a year into the future. now_ms - event_timestamp_ms is negative, so
+    # the quiet period could never be satisfied and the abandoned cutoff could never fire —
+    # the scan would be un-consolidatable and its shard un-deletable for as long as the tenant
+    # exists. The ingest stamp is trustworthy by construction, so it governs instead.
+    fc = FakeClient()
+    ahead, ingested = RNOW + 365 * 24 * 3600 * 1000, RNOW - 10 * 24 * 3600 * 1000
+    shard = "yara_scanner_matches_v2_hostfuture_dd0006"
+    _seed(fc, shard, _skewed(_m("S6", "hostfuture", 4, ts=ahead), ingested))
+    _seed(fc, "yara_scanner_scans_v2_hostfuture_dd0006",
+          _skewed(_s("S6", "hostfuture", "completed", ts=ahead), ingested))
+    plans = C.run_consolidation(fc, "matches", quiet_secs=900, dry_run=False, now_ms=RNOW,
+                                abandoned_after_secs=24 * 3600, log=lambda *a: None)
+    assert plans[0]["ok"] is True
+    assert len(fc.ds["yara_scanner_matches_v2_scan_s6"]) == 4
+    assert shard not in fc.ds
+
+
+def test_orchestration_backstop_stops_a_sibling_cleanup_deferring_the_cutoff_forever():
+    # The abandoned cutoff's whole job is to guarantee nothing blocks cleanup forever, and it
+    # now measures against max(event_timestamp_ms, _insert_time). _insert_time is only "when
+    # the endpoint's row was ingested" as long as nothing rewrites the shard — but this tool
+    # rewrites shards itself (row-level cleanup of a sibling scan). If the platform implements
+    # that as a rewrite, an orphan's server stamp is re-armed every pass and its age never
+    # reaches the cutoff. Past the backstop the ENDPOINT stamp alone (which nothing but the
+    # endpoint can re-arm) is enough to call it abandoned.
+    fc = FakeClient()
+    ep_old = RNOW - 8 * 24 * 3600 * 1000        # endpoint wrote nothing for 8 days
+    srv_bumped = RNOW - 1000                    # ...but a sibling's cleanup re-stamped it 1s ago
+    shard = "yara_scanner_matches_v2_hostzombie_dd0007"
+    _seed(fc, shard, _skewed(_m("S5", "hostzombie", 3, ts=ep_old), srv_bumped))
+    _seed(fc, "yara_scanner_scans_v2_hostzombie_dd0007",
+          _skewed(_s("S5", "hostzombie", "running", ts=ep_old), srv_bumped))
+    plans = C.run_consolidation(fc, "matches", quiet_secs=900, dry_run=False, now_ms=RNOW,
+                                abandoned_after_secs=24 * 3600, log=lambda *a: None)
+    assert plans[0]["ok"] is True
+    assert len(fc.ds["yara_scanner_matches_v2_scan_s5"]) == 3   # findings preserved
+    assert shard not in fc.ds                                   # and the shard stops being a zombie
+
+
+def test_orchestration_backstop_does_not_fire_within_a_plausible_skew():
+    # The backstop must not undo the fix it backs up: a clock 3 days behind is well inside the
+    # skew range this protects against, so a live scan on such a host must still be deferred.
+    fc = FakeClient()
+    ep_old, srv_fresh = RNOW - 3 * 24 * 3600 * 1000, RNOW - 5000
+    shard = "yara_scanner_matches_v2_hostslow_dd0008"
+    _seed(fc, shard, _skewed(_m("S4", "hostslow", 3, ts=ep_old), srv_fresh))
+    _seed(fc, "yara_scanner_scans_v2_hostslow_dd0008",
+          _skewed(_s("S4", "hostslow", "running", ts=ep_old), srv_fresh))
+    plans = C.run_consolidation(fc, "matches", quiet_secs=900, dry_run=False, now_ms=RNOW,
+                                abandoned_after_secs=24 * 3600, log=lambda *a: None)
+    assert plans[0]["reason"] == "host_not_terminal"
+    assert "yara_scanner_matches_v2_scan_s4" not in fc.ds
+    assert len(fc.ds[shard]) == 3
+
+
+def test_orchestration_scan_spanning_a_healthy_and_a_skewed_host_defers_entirely():
+    # Multi-host blast radius: a scan spanning a cleanly-finished host and one whose clock is
+    # 48h behind and is still running. _gate_scan walks EVERY source, so the whole scan must
+    # defer — and crucially the healthy host's shard must not be deleted either, since its
+    # rows are only safe to drop once the scan's target holds every host's rows.
+    fc = FakeClient()
+    stale, fresh = RNOW - 48 * 3600 * 1000, RNOW - 5000
+    old = RNOW - 6 * 3600 * 1000
+    healthy = "yara_scanner_matches_v2_hostgood_aa0021"
+    skewed = "yara_scanner_matches_v2_hostbad_bb0022"
+    _seed(fc, healthy, _skewed(_m("S3", "hostgood", 5, ts=old), old))
+    _seed(fc, skewed, _skewed(_m("S3", "hostbad", 4, ts=stale), fresh))
+    _seed(fc, "yara_scanner_scans_v2_hostgood_aa0021",
+          _skewed(_s("S3", "hostgood", "completed", ts=old), old))
+    _seed(fc, "yara_scanner_scans_v2_hostbad_bb0022",
+          _skewed(_s("S3", "hostbad", "running", ts=stale), fresh))
+    plans = C.run_consolidation(fc, "matches", quiet_secs=900, dry_run=False, now_ms=RNOW,
+                                abandoned_after_secs=24 * 3600, log=lambda *a: None)
+    assert plans[0]["reason"] == "host_not_terminal"
+    assert "yara_scanner_matches_v2_scan_s3" not in fc.ds
+    assert len(fc.ds[healthy]) == 5 and len(fc.ds[skewed]) == 4
+
+
+def test_orchestration_scan_with_no_readable_stamps_at_all_still_defers():
+    # The degenerate case: neither stamp is readable on any row, so newest is None. None is
+    # "no signal", NOT "settled" — a non-terminal scan must still defer rather than be swept.
+    fc = FakeClient()
+    shard = "yara_scanner_matches_v2_hostnots_cc0033"
+    rows = [{k: v for k, v in r.items() if k != "event_timestamp_ms"}
+            for r in _m("S2", "hostnots", 3)]
+    _seed(fc, shard, rows)
+    _seed(fc, "yara_scanner_scans_v2_hostnots_cc0033",
+          [{k: v for k, v in r.items() if k != "event_timestamp_ms"}
+           for r in _s("S2", "hostnots", "running")])
+    plans = C.run_consolidation(fc, "matches", quiet_secs=900, dry_run=False, now_ms=RNOW,
+                                abandoned_after_secs=24 * 3600, log=lambda *a: None)
+    assert plans[0]["reason"] == "host_not_terminal"
+    assert "yara_scanner_matches_v2_scan_s2" not in fc.ds
+    assert len(fc.ds[shard]) == 3
 
 
 def test_orchestration_idempotent_second_run_no_duplicates():
@@ -862,6 +1251,94 @@ def test_partial_cleanup_failure_does_not_cause_permanent_count_mismatch():
     assert shard_b not in fc.ds, (
         "shard_b must not be a permanent zombie -- once every scan sharing it is verified, "
         "it must still become whole-deletable")
+
+
+# ---------------- pack copy must not drift from this module (edge case #6 follow-up) -------
+# Packs/YaraDatasetManagement/.../YaraConsolidateCommon.py hand-carries a copy of this core
+# logic (it must be self-contained to run as an XSOAR automation), and that copy — not
+# xdr_consolidate.py — is what the scheduled Job actually runs on the tenant. It cannot be
+# imported here (it does `import demistomock` / `from CommonServerPython import *`), so compare
+# the two files' gate logic structurally instead: same signature, same statements, ignoring
+# comments and docstrings. Edge case #6 shipped fixed in one copy and unfixed in the other
+# precisely because nothing checked this.
+_PACK_COMMON = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "Packs", "YaraDatasetManagement", "Scripts", "YaraConsolidateCommon",
+    "YaraConsolidateCommon.py")
+_XDR_CONSOLIDATE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "xdr_consolidate.py")
+
+# The whole ported core: every gate helper (these decide whether a live scan's shard gets
+# deleted) plus the orchestration around them, which the pack's header calls a verbatim port.
+_SHARED_GATE_FUNCS = (
+    "_as_ms", "_newest_ms", "_max_ms", "newest_row_age_ok", "_scan_stats",
+    "_warn_if_no_server_stamp", "_stats_from_rows", "_gate_scan", "build_terminal_map",
+    "shard_is_terminal", "plan_consolidation", "parse_shard", "target_name", "_coerce_row",
+    "_cleanup_verified_scan_rows", "_rows_of", "_rows_for_scan", "_added", "_count",
+    "_delete_many", "_list_yara_datasets", "matches_schema_for", "_read_lock",
+    "acquire_consolidation_lock", "release_consolidation_lock",
+    "run_consolidation", "check_consolidation_status", "consolidate_all")
+_SHARED_CONSTS = ("SKEW_TOLERANCE_MS", "DEFAULT_SKEW_BACKSTOP_SECS", "DEFAULT_QUIET_SECS",
+                  "DEFAULT_ABANDONED_SECS", "TERMINAL_LIFECYCLE", "TERMINAL_ACTION",
+                  "_PREFIX", "_SHARD_RE", "MATCHES_SCHEMA", "MATCHES_SCHEMA_V3",
+                  "SCANS_SCHEMA", "_MATCHES_SCHEMAS_BY_VER", "KNOWN_MATCHES_SCHEMA_VERSIONS",
+                  "_WRITE_BATCH", "DELETE_CONCURRENCY", "DEFAULT_ROW_CEILING",
+                  "_LOCK_DATASET", "_LOCK_SCHEMA", "DEFAULT_LOCK_STALE_SECS")
+
+
+def _logic_index(path):
+    """{name: normalised source} for the shared functions and constants in a file, with
+    docstrings and comments stripped so only executable logic is compared."""
+    with open(path) as fh:
+        tree = ast.parse(fh.read())
+    out = {}
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in _SHARED_GATE_FUNCS:
+            body = list(node.body)
+            if (body and isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                body = body[1:]      # drop the docstring; wording may differ between copies
+            out[node.name] = "def %s(%s):\n%s" % (
+                node.name, ast.unparse(node.args),
+                "\n".join(ast.unparse(s) for s in body))
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1 \
+                and isinstance(node.targets[0], ast.Name) \
+                and node.targets[0].id in _SHARED_CONSTS:
+            out[node.targets[0].id] = ast.unparse(node)
+    return out
+
+
+def test_pack_copy_gate_logic_matches_xdr_consolidate():
+    mine = _logic_index(_XDR_CONSOLIDATE)
+    pack = _logic_index(_PACK_COMMON)
+    missing = sorted(set(_SHARED_GATE_FUNCS + _SHARED_CONSTS) - set(mine))
+    assert not missing, "test is stale — not found in xdr_consolidate.py: %s" % missing
+    for name in sorted(mine):
+        assert name in pack, (
+            "%s is missing from the pack copy (%s) — the scheduled Job runs THAT file, so a "
+            "fix that lands only in xdr_consolidate.py does nothing on the tenant"
+            % (name, _PACK_COMMON))
+        assert pack[name] == mine[name], (
+            "%s has drifted between xdr_consolidate.py and the pack copy:\n--- xdr_consolidate\n%s"
+            "\n--- pack\n%s" % (name, mine[name], pack[name]))
+
+
+def test_pack_copy_uses_the_same_scan_stat_shape():
+    # _ScanStat's field ORDER is load-bearing in both copies (run_consolidation unpacks it by
+    # attribute, _gate_scan's backstop reads ep_newest), and it is a call, not a def, so the
+    # comparison above does not cover it.
+    def _scanstat_src(path):
+        with open(path) as fh:
+            tree = ast.parse(fh.read())
+        for node in tree.body:
+            if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id == "_ScanStat"):
+                return ast.unparse(node)
+        return None
+    assert _scanstat_src(_XDR_CONSOLIDATE) is not None
+    assert _scanstat_src(_PACK_COMMON) == _scanstat_src(_XDR_CONSOLIDATE)
 
 
 if __name__ == "__main__":

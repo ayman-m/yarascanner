@@ -1,6 +1,6 @@
 # Known Limitations — XDR scanner & dataset consolidation
 
-*Applies to scanner **v3.0.1** / `xdr_consolidate.py` **v2.6.0**. History of changes:
+*Applies to scanner **v3.0.1** / `xdr_consolidate.py` **v2.7.0**. History of changes:
 [release notes](../../../CHANGELOG.md).*
 
 A residual-risk ledger for the lower-priority edge cases surfaced during this project's
@@ -50,6 +50,32 @@ future investigation doesn't have to rediscover the same ground.
 
 - **Quiet period (900s default) shorter than a scan's actual worst-case drain.** Tunable via
   `--quiet-secs`/`quiet_secs`; *accepted risk* for the default value, not a design gap.
+- **Endpoint clock running *ahead*, on a platform returning no usable `_insert_time`.** The
+  dangerous direction (clock behind, live scan swept as abandoned) is fixed — see edge case #6
+  in CHANGELOG.md — by measuring age against `max(event_timestamp_ms, _insert_time)` and
+  discarding an endpoint stamp that is ahead of its own ingest stamp. With no server stamp to
+  correct against, a future-dated endpoint stamp still defers that scan until real time catches
+  up. *Accepted risk*: there is no trustworthy signal left in that case (clamping to `now_ms`
+  resets the age to zero every pass, which livelocks the same way), and `_gate_scan` logs it
+  distinctly so it is diagnosable rather than silently permanent.
+- **The 7-day skew backstop (`DEFAULT_SKEW_BACKSTOP_SECS`) trades protection for liveness.**
+  Past a week of endpoint silence, the endpoint stamp alone can settle both gates, so an
+  endpoint whose clock is wrong by *more than a week* loses the skew protection. *Accepted
+  risk*, and deliberate: it is what guarantees the abandoned cutoff cannot be deferred without
+  limit (see the next entry), and a clock wrong by a week is far rarer than one wrong by hours.
+- **Does `remove_lookup_data` re-stamp `_insert_time` on a shard's surviving rows?** *Needs
+  live verification* — settling it requires a destructive `remove_lookup_data` against a real
+  shard holding two scans. If it does (i.e. the platform implements removal as a rewrite), one
+  scan's row-level cleanup re-arms an unrelated sibling scan's freshness signal on the same
+  shard. The 7-day backstop above makes the answer non-load-bearing either way, which is why
+  it exists.
+- **`_insert_time`'s exact shape on a RAW row pull (`dataset = X`), as opposed to the
+  `max(_insert_time)` aggregation.** The aggregation form is live-verified to return a usable
+  number; the raw-row form (which `_stats_from_rows` uses for scans shards) is not. *Accepted
+  risk* — `_as_ms` parses int/float/numeric-string/exponent/ISO-8601 and degrades to "no
+  signal" otherwise, a stamp implausibly far in the future is discarded rather than adopted,
+  and `_scan_stats`/`_stats_from_rows` log when a shard yields no usable server stamp, so the
+  worst case is a logged reversion to pre-fix behaviour rather than a silent one.
 - **Schema version bump (v2→v3) mid-flight.** *Confirmed not a gap* — `run_consolidation`
   takes an explicit `ver` and only ever touches shards of that one version;
   `check_consolidation_status`/`consolidate_all` fan out across `KNOWN_MATCHES_SCHEMA_VERSIONS`
