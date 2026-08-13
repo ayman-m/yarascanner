@@ -3001,18 +3001,16 @@ class ResultsUploader:
     
     def __init__(self, config):
         self.config = config
-        # Per-offset detail is STREAMED to results_file as it is produced, not buffered.
-        # It used to accumulate in a list and only be written at scan end, which made peak
-        # memory scale with total matched offsets rather than with the scan: measured on a
-        # large Windows endpoint, 1,048,035 offset hits across 17,509 findings held ~15 GB
-        # RSS and still climbing. The list only ever existed to be serialized to this file,
-        # so writing each entry immediately is both O(1) memory and crash-safe - a killed
-        # scan (e.g. the console's Cancel button) now keeps everything written so far
-        # instead of losing all of it with the process.
-        self._results_count = 0
-        self._results_fh = None
-        self._results_lock = threading.Lock()
-        self._results_write_failed = False
+        # NOTE: this uploader deliberately keeps NO local copy of per-offset detail.
+        # It used to build one dict per matched offset and hold them all in memory for the
+        # whole scan (measured: 1,048,035 offsets -> ~15 GB RSS on one endpoint), to be
+        # serialized at the end by save_results(). That write never actually happened -
+        # save_results()'s only caller, upload_results(), is never invoked - so the data was
+        # accumulated and then discarded. Streaming it to disk was considered and rejected:
+        # _write_alerts() already records EVERY offset (String ID / Offset / Data, uncapped)
+        # to alert_dir/<rule>.txt, which the evidence ZIP bundles, so a second copy would
+        # duplicate an already-large artifact for no new information. The aggregated
+        # per-finding upload is unaffected.
         self.hostname = config.hostname
         self.os_info = config.os_info
         self.ip_address = config.ip_addresses[0] if config.ip_addresses else "Unknown"
@@ -3020,9 +3018,6 @@ class ResultsUploader:
         self.date_of_scan = datetime.datetime.now(datetime.timezone.utc).isoformat()
         self.log_manager = None
 
-        self.results_file = os.path.join(
-            self.config.evidence_dir, f"yara_matches_{self.hostname}_{self.config.run_id}.json"
-        )
         
         self.upload_queue = Queue()
         self.upload_thread = None
@@ -3228,7 +3223,8 @@ class ResultsUploader:
 
         Grain split (ported from the XDR edition): the UPLOAD gets ONE ITEM PER (rule, file)
         finding, with every matched offset folded into that one item as a capped sample, rather
-        than emitted as its own upload. The full per-offset detail is streamed to results_file
+        than emitted as its own upload. Per-offset detail is not retained here at all - the
+        alert files under alert_dir/ already record every offset
         (local, unbounded) - only the network representation is aggregated+sampled.
         """
         raw_matches = list(match_data or [])
@@ -3250,23 +3246,7 @@ class ResultsUploader:
             else:
                 string_data = _render_match_data(string_data)
 
-            result = {
-                "hostname": self.hostname,
-                "os_info": self.os_info,
-                "ipAddress": self.ip_address,
-                "dateOfScan": self.date_of_scan,
-                "filename": filename,
-                "rule": rule,
-                "threat_level": getattr(self.config, "alert_severity", "low"),
-                "string": string_data,
-                "offset": "" if offset is None else str(offset),
-                "match": "" if string_id is None else str(string_id),
-                "match_scope": "rule" if (string_id is None and offset is None) else "string",
-                "string_match_count": len(raw_matches),
-                "file_sha256": file_sha256,
-                "file_creation_time": file_creation_time,
-            }
-            self._write_result_line(result)
+
             self.upload_stats['total_matches'] += 1
             match_count += 1
 
@@ -3334,64 +3314,6 @@ class ResultsUploader:
                 f"(1 upload item, {len(_offsets_sample)} of {match_count} sampled)"
             )
 
-    def _write_result_line(self, result):
-        """Append one per-offset result to the JSONL results file immediately.
-
-        Called from every scan worker, so the handle and the write are lock-guarded. The
-        file is opened lazily on the first match, so a scan with no detections leaves no
-        empty artifact behind (matching the previous behaviour, which wrote nothing when
-        the list was empty).
-
-        A write failure is logged ONCE and then suppressed: a full or read-only disk must
-        not turn into one log line per matched offset, which on a storm scan is exactly the
-        flood this class already guards against elsewhere.
-        """
-        with self._results_lock:
-            if self._results_write_failed:
-                return
-            try:
-                if self._results_fh is None:
-                    self._results_fh = open(self.results_file, "w", encoding="utf-8")
-                self._results_fh.write(json.dumps(result, ensure_ascii=False) + "\n")
-                self._results_count += 1
-            except Exception as e:
-                self._results_write_failed = True
-                if self.log_manager:
-                    self.log_manager.log_error(
-                        f"Error writing local results to {self.results_file}: {e} "
-                        f"(further write errors suppressed; {self._results_count} entries written)"
-                    )
-
-    def save_results(self):
-        """Flush and close the streamed results file.
-
-        Entries are written as they are produced (see _write_result_line), so this is now a
-        flush/close rather than a bulk serialize - it exists to keep the call site and the
-        'results saved' accounting unchanged.
-        """
-        with self._results_lock:
-            count = self._results_count
-            try:
-                if self._results_fh is not None:
-                    self._results_fh.flush()
-                    try:
-                        os.fsync(self._results_fh.fileno())
-                    except Exception:
-                        pass
-                    self._results_fh.close()
-                    self._results_fh = None
-            except Exception as e:
-                if self.log_manager:
-                    self.log_manager.log_error(f"Error closing results file: {e}")
-                return False
-
-        if self.log_manager:
-            if count:
-                self.log_manager.log_upload(f"Successfully saved {count} results to: {self.results_file}")
-            else:
-                self.log_manager.log_upload("No results to save")
-        return True
-    
     def upload_results(self):
         """Finalize upload process with timeout protection."""
         if self.log_manager:
@@ -3443,7 +3365,6 @@ class ResultsUploader:
                 success_rate = (self.upload_stats['successful_uploads'] / self.upload_stats['total_matches']) * 100
                 self.log_manager.log_upload(f"Upload success rate: {success_rate:.1f}%")
         
-        self.save_results()
         
         if self.log_manager:
             if UPLOAD_RESULTS:
