@@ -2536,8 +2536,15 @@ class ScanConfig:
             raise
 
         yara_hash = hashlib.sha256(self.yara_rule.encode('utf-8')).hexdigest()
-        self.scan_id = f"yara_{yara_hash}"
-        self.error_logger.error_logger.info(f"Scan ID (YARA hash): {self.scan_id}")
+        # scan_id must be unique per scan RUN, not per ruleset. Derived from the rule hash
+        # alone (the previous "yara_<hash>" form), every host in a fleet running the same
+        # rules - and every re-run on one host - reported under one identical scan_id, so
+        # any consumer grouping by scan_id silently merged the whole fleet into a single
+        # scan. Ported from the XDR edition. The hash prefix is kept (12 chars) so the
+        # ruleset is still identifiable from the scan_id alone.
+        self.rule_hash = yara_hash
+        self.scan_id = f"{self.hostname}_{self.run_id}_yara_{yara_hash[:12]}"
+        self.error_logger.error_logger.info(f"Scan ID: {self.scan_id} (rule hash: {yara_hash[:12]}...)")
 
         self.cleanup_script = os.path.join(
             self.scanner_dir, "cleanup_script.bat" if is_windows else "cleanup_script.sh"
@@ -2601,10 +2608,36 @@ class ScanConfig:
             "/library/caches/",
             "/appdata/local/temp/",
             "/appdata/local/packages/",
-            "/appdata/local/google/chrome/user data/default/cache/",
-            "/appdata/local/microsoft/edge/user data/default/cache/",
-            "/mozilla/firefox/profiles/",
-            "/cache2/",
+        )
+        # The four browser cache/profile fragments that used to live above
+        # ("/appdata/local/google/chrome/user data/default/cache/",
+        #  "/appdata/local/microsoft/edge/user data/default/cache/",
+        #  "/mozilla/firefox/profiles/", "/cache2/") were REMOVED, not moved:
+        # browser caches and profile directories are common malware staging and
+        # persistence areas, and skipping them was a detection blind spot on every
+        # platform. Ported from the XDR edition.
+
+        # Always-scan carve-outs (checked BEFORE skip logic): on macOS the broad
+        # "/library/caches/" fragment above (and the mac skip dirs) would still bypass
+        # browser caches, so re-open them surgically here. Safari is best-effort under
+        # TCC / Full Disk Access.
+        self.force_scan_fragments = (
+            "/library/caches/google/chrome/",
+            "/library/caches/chromium/",
+            "/library/caches/microsoft edge/",
+            "/library/caches/firefox/",
+            "/library/caches/com.apple.safari/",
+        )
+        # Boundary skips the force-scan allowlist must never override. These keep the
+        # scanner on THIS host rather than reducing noise, so a browser cache found under
+        # one (e.g. a Time Machine disk at /Volumes/..., which holds one cache tree per
+        # backup snapshot) must still be skipped - otherwise the carve-out silently turns
+        # into an unbounded walk over mounted/removable/network media.
+        self.force_scan_never_under = (
+            "/volumes/",   # macOS mounted volumes (also in mac_skip_directory)
+            "/media/",     # Linux removable media
+            "/mnt/",       # Linux mounts
+            "/net/",       # autofs network mounts
         )
 
         self.evidence_zip = os.path.join(
@@ -3977,11 +4010,25 @@ class YaraScanner:
             logging.debug(f"Validation error for rule {rule_name}: {e}")
             return False
     
-    def _get_available_yara_modules(self):
-        """Detect which YARA modules are available."""
+    def _get_available_yara_modules(self, source_text=None):
+        """Detect which YARA modules are available on THIS agent's libyara build.
+
+        The candidate set is the standard probe list UNION every module actually
+        imported by the submitted rules. Probing only a hardcoded list meant any
+        module outside it was treated as unavailable no matter what libyara really
+        supported - so `_split_yara_rules` would strip a perfectly good preamble
+        import and the rule would then fail to compile with "undefined identifier".
+        Deriving the extra candidates from the source makes this correct for any
+        current or future libyara build. (The same hardcoded-list defect exists in
+        the XDR edition - see xdr_yara_scanner.py's _get_available_yara_modules.)
+        """
         test_modules = ['pe', 'elf', 'cuckoo', 'magic', 'hash', 'math', 'dotnet', 'time']
+        if source_text:
+            for module in sorted(self._extract_imported_modules(source_text)):
+                if module not in test_modules:
+                    test_modules.append(module)
         available = []
-        
+
         for module in test_modules:
             try:
                 test_rule = f'''import "{module}"
@@ -4047,7 +4094,7 @@ rule test {{
     def _compile_yara_rules(self, yara_rule_string):
         """Compile YARA rules with robust error handling."""
         error_logger = self.config.error_logger
-        available_modules = self._get_available_yara_modules()
+        available_modules = self._get_available_yara_modules(yara_rule_string)
         logging.info(f"Available YARA modules: {', '.join(available_modules)}")
         error_logger.error_logger.info(f"Available YARA modules: {', '.join(available_modules)}")
         
@@ -4599,6 +4646,24 @@ rule test {{
             return True
         if any(portable_path.endswith(ext) for ext in self.config.skip_extensions):
             return True
+        # Force-scan allowlist: browser caches/profiles are scanned even though a broader
+        # CATEGORY skip (e.g. "/library/caches/") would exclude them. Filename/extension
+        # skips above still apply (no point scanning a .iso).
+        #
+        # Two subtleties, both found in review:
+        #  - Match against portable_path + "/" so DIRECTORY paths match too. This function
+        #    is called on os.walk's `root` (a directory, normpath-stripped of its trailing
+        #    separator) before any file in it is considered; without the appended slash,
+        #    "/library/caches/firefox" fails to match the "/library/caches/firefox/"
+        #    fragment while still matching the broad "/library/caches/" skip - so the whole
+        #    directory was pruned and no file inside ever reached this allowlist.
+        #  - It must NOT override BOUNDARY skips (mounted volumes, network shares). Those
+        #    exist to keep the scanner on this host, not to reduce noise; a Time Machine
+        #    disk under /Volumes/ holds a browser cache per backup snapshot.
+        _probe = portable_path + "/"
+        if not any(b in _probe for b in getattr(self.config, "force_scan_never_under", ())):
+            if any(fragment in _probe for fragment in getattr(self.config, "force_scan_fragments", ())):
+                return False
         if any(fragment in portable_path for fragment in self.config.skip_path_fragments):
             return True
 
@@ -4806,17 +4871,34 @@ rule test {{
             scan_rate = self.files_scanned / elapsed if elapsed > 0 else 0
             
             try:
-                process = psutil.Process()
+                # Reuse ONE long-lived, primed handle: psutil's first cpu_percent() call on
+                # a given Process object always returns 0.0, so building a fresh
+                # psutil.Process() each tick reported 0.0% CPU forever. (Same reasoning as
+                # the XDR edition's _governor_proc priming.) Latent before the progress
+                # heartbeat existed - this path used to almost never run - but it now fires
+                # every log_interval for the whole scan, so the zeros would be the norm.
+                process = getattr(self, "_progress_proc", None)
+                if process is None:
+                    process = psutil.Process()
+                    process.cpu_percent(interval=None)   # prime; discard the 0.0
+                    self._progress_proc = process
                 cpu_percent = process.cpu_percent()
                 memory_info = process.memory_info()
                 memory_mb = memory_info.rss / 1024 / 1024
-                
-                io_counters = process.io_counters()
-                disk_io_mb = (io_counters.read_bytes + io_counters.write_bytes) / 1024 / 1024
-                
+
+                # io_counters() does not exist on macOS (psutil raises AttributeError).
+                # Unguarded it aborted this whole block, zeroing memory/network too - which
+                # do work there - and logged an error every tick.
+                disk_io_mb = 0
+                try:
+                    io_counters = process.io_counters()
+                    disk_io_mb = (io_counters.read_bytes + io_counters.write_bytes) / 1024 / 1024
+                except (AttributeError, NotImplementedError, psutil.AccessDenied):
+                    pass
+
                 net_counters = psutil.net_io_counters()
                 network_mb = (net_counters.bytes_sent + net_counters.bytes_recv) / 1024 / 1024
-                
+
                 self.log_manager.log_system_resources(cpu_percent, memory_mb, disk_io_mb, network_mb)
                 
             except ImportError:
@@ -5682,9 +5764,41 @@ def main(yarafile=None, scan_folder=None, alert_severity="low"):
         except Exception:
             upload_errors = " | Upload errors: unknown"
 
+        # Surface MATCH-channel loss on the result line itself. upload_errors above only
+        # reflects the telemetry uploader, so a scan that found everything and delivered
+        # none of its findings still read as a clean success. Both counters are real loss
+        # but are named misleadingly differently: 'undelivered' items were never attempted
+        # (the drain window expired), 'failed_uploads' were attempted and rejected.
+        # Ported from the XDR edition's _delivery_shortfall().
+        #
+        # The denominator is deliberately ok+failed+undelivered, NOT total_matches:
+        # total_matches counts OFFSETS (incremented per matched string instance), while
+        # these three count UPLOAD ITEMS - one per (rule, file) finding since the
+        # grain-split change. Mixing the two understates loss by the average
+        # offsets-per-finding factor, which on a noisy rule is a factor of thousands.
+        #
+        # Read after _perform_enhanced_cleanup has called results_uploader.stop(wait=True),
+        # so these are the settled values; a worker that overran its join could in principle
+        # still move them, which would only ever under-report, never invent loss.
+        shortfall = ""
+        try:
+            ru = getattr(scanner, "results_uploader", None)
+            s = ru.get_upload_stats() if ru else {}
+            ok = int(s.get("successful_uploads", 0) or 0)
+            failed = int(s.get("failed_uploads", 0) or 0)
+            undelivered = int(s.get("undelivered", 0) or 0)
+            lost = failed + undelivered
+            if lost > 0:
+                queued = ok + lost
+                shortfall = (f" | WARNING: {lost} of {queued} finding upload(s) NOT delivered "
+                             f"(failed={failed}, undelivered={undelivered}) - "
+                             f"local logs hold the complete record")
+        except Exception:
+            pass
+
         summary = (f"Scan completed: {scanner.files_scanned} files scanned | "
                 f"{error_logger.failed_rules_count} rules failed compilation | "
-                f"{scanner.total_detections} matches found{upload_errors}")
+                f"{scanner.total_detections} matches found{upload_errors}{shortfall}")
         return summary
         
     except Exception as e:
