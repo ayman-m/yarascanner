@@ -184,6 +184,42 @@ ENABLE_RESOURCE_MONITOR = _env_bool("YARA_ENABLE_RESOURCE_MONITOR", False)  # CP
 ENABLE_PERF_MONITOR = _env_bool("YARA_ENABLE_PERF_MONITOR", False)
 ENABLE_FD_MONITOR = _env_bool("YARA_ENABLE_FD_MONITOR", False)
 
+# ---------------------------------------------------------------------------
+# Upload batching (matches, telemetry, and logs all use these)
+# ---------------------------------------------------------------------------
+# The HTTP Collector accepts many events in ONE request as NDJSON - one JSON object
+# per line, Content-Type: text/plain. Without batching each event cost its own POST,
+# and a storm scan simply could not finish delivering: measured on a live endpoint,
+# 23,223 findings at ~756 ms per POST would need ~4.9 HOURS, so the scan ended with
+# 22,621 of them (97%) never sent. Batched at 500 the same run is ~47 requests, well
+# inside the normal shutdown drain.
+#
+# Measured on the tenant, all delivered with zero loss:
+#     10 events / 3.8 KB  -> 621 ms       1000 events / 391 KB -> 1075 ms
+#    100 events /  38 KB  -> 685 ms       2000 events / 784 KB -> 1347 ms
+#    500 events / 194 KB  -> 943 ms
+# Latency is dominated by the round trip, not the payload, so larger batches are
+# nearly free. 500 is the default rather than the 2000 ceiling that was probed:
+# it keeps a request near 200 KB and leaves headroom for findings carrying unusually
+# large matched strings.
+#
+# WARNING - do NOT switch this to a JSON array ([{...},{...}]). The collector answers
+# HTTP 200 {"error":"false"} for an array and then silently discards every event in
+# it (verified twice against the tenant). NDJSON is the only multi-event format that
+# actually lands, and the failure mode for getting it wrong is invisible data loss.
+# Batching is opportunistic, NOT timer-based: a worker blocks for the first event, then
+# takes whatever is already queued behind it, up to these caps, and sends immediately. The
+# batch size therefore self-adjusts to real load - a busy scan fills 500-event requests,
+# and a scan with 3 matches sends a batch of 3 with no added latency. There is deliberately
+# no "linger" timer: waiting to fill a batch would delay delivery on quiet scans to buy
+# batching they do not need.
+UPLOAD_BATCH_MAX_EVENTS = _env_number("YARA_UPLOAD_BATCH_MAX_EVENTS", 500, cast=int)
+UPLOAD_BATCH_MAX_BYTES = _env_number("YARA_UPLOAD_BATCH_MAX_BYTES", 4 * 1024 * 1024, cast=int)
+
+# Clamp: a batch of 0 would spin without ever sending.
+UPLOAD_BATCH_MAX_EVENTS = max(1, UPLOAD_BATCH_MAX_EVENTS)
+UPLOAD_BATCH_MAX_BYTES = max(64 * 1024, UPLOAD_BATCH_MAX_BYTES)
+
 YARA_RULE = r""""""
 
 
@@ -585,6 +621,57 @@ def _exp_backoff_delay(attempt_index):
     if raw > MAX_BACKOFF_SECS:
         raw = MAX_BACKOFF_SECS
     return raw * random.uniform(0.5, 1.0)
+
+
+def _collect_batch(queue_obj, first_item, max_events=None, max_bytes=None):
+    """Drain up to a batch's worth of already-queued items, starting from first_item.
+
+    Non-blocking after the first item: whatever is sitting in the queue right now is
+    taken, up to the event/byte cap. It never waits for the queue to fill, so a quiet
+    scan still delivers promptly - the caller already blocked to get first_item.
+
+    Returns (items, saw_sentinel). saw_sentinel is True if the None shutdown marker was
+    pulled, so the caller can send this final batch and then exit.
+    """
+    max_events = max_events or UPLOAD_BATCH_MAX_EVENTS
+    max_bytes = max_bytes or UPLOAD_BATCH_MAX_BYTES
+    items = [first_item]
+    approx = 0
+    saw_sentinel = False
+    while len(items) < max_events and approx < max_bytes:
+        try:
+            nxt = queue_obj.get_nowait()
+        except Empty:
+            break
+        if nxt is None:
+            saw_sentinel = True
+            break
+        items.append(nxt)
+        try:
+            approx += len(json.dumps(nxt.to_dict(), ensure_ascii=False))
+        except Exception:
+            approx += 1024
+    return items, saw_sentinel
+
+
+def _ndjson_body(items):
+    """Serialize StandardLogEntry items as NDJSON - one JSON object per line.
+
+    This is the ONLY multi-event format the HTTP Collector actually ingests. A JSON
+    array is answered with HTTP 200 {"error":"false"} and then silently discarded, so
+    getting this wrong loses data with no error anywhere. Verified against the tenant.
+    """
+    return "\n".join(json.dumps(i.to_dict(), ensure_ascii=False) for i in items)
+
+
+def _post_ndjson(endpoint, api_key, items, timeout=None):
+    """POST a batch of events as NDJSON. Returns the requests Response."""
+    return requests.post(
+        url=endpoint,
+        headers={"Authorization": api_key, "Content-Type": "text/plain"},
+        data=_ndjson_body(items).encode("utf-8"),
+        timeout=timeout or DEFAULT_TIMEOUT_SECS,
+    )
 
 
 def _get_webhook_endpoint(api_endpoint: str) -> str:
@@ -1894,8 +1981,15 @@ class LogManager:
                 if standard_log is None:
                     break
 
-                self._upload_standard_log(standard_log)
-                self.webhook_queue.task_done()
+                # Batch log events too - on a storm scan this queue carries the bulk of
+                # the per-file/system chatter, and one POST per line was the same
+                # round-trip-bound bottleneck the match channel hit.
+                batch, saw_sentinel = _collect_batch(self.webhook_queue, standard_log)
+                self._upload_standard_batch(batch)
+                for _ in batch:
+                    self.webhook_queue.task_done()
+                if saw_sentinel:
+                    break
 
             except Empty:
                 if not self.webhook_active:
@@ -1909,34 +2003,24 @@ class LogManager:
                 self.log_error(err_msg)
                 continue
 
-    def _upload_standard_log(self, standard_log: StandardLogEntry):
-        """Upload standardized log entry to webhook."""
+    def _upload_standard_batch(self, items):
+        """Upload a batch of log entries as NDJSON. Per-event accounting on failure."""
+        if not items:
+            return
+        n = len(items)
         try:
-            headers = {
-                "Authorization": API_KEY,
-                "Content-Type": "application/json"
-            }
-
-            response = requests.post(
-                url=_get_webhook_endpoint(API_ENDPOINT),
-                headers=headers,
-                json=standard_log.to_dict(),
-                timeout=10,
-            )
-
+            response = _post_ndjson(_get_webhook_endpoint(API_ENDPOINT), API_KEY, items, timeout=10)
             if 200 <= response.status_code < 300:
-                self.upload_stats['successful_uploads'] += 1
+                self.upload_stats['successful_uploads'] += n
             else:
-                self.upload_stats['failed_uploads'] += 1
+                self.upload_stats['failed_uploads'] += n
                 self.loggers[LogType.UPLOAD].error(
-                    f"Webhook upload failed (HTTP {response.status_code}): {response.text}"
+                    f"Webhook batch upload failed (HTTP {response.status_code}, {n} event(s)): "
+                    f"{response.text[:200]}"
                 )
-
         except Exception as e:
-            self.upload_stats['failed_uploads'] += 1
-            self.loggers[LogType.UPLOAD].error(
-                f"Webhook upload error for {standard_log.type}: {e}"
-            )
+            self.upload_stats['failed_uploads'] += n
+            self.loggers[LogType.UPLOAD].error(f"Webhook batch upload error ({n} event(s)): {e}")
 
     def _log_with_webhook(self, log_type, message, level="INFO", data=None):
         """Log message to file and optionally upload to webhook."""
@@ -3086,8 +3170,16 @@ class ResultsUploader:
                 if standard_log is None:
                     break
 
-                self._upload_standard_result(standard_log)
-                self.upload_queue.task_done()
+                # Take everything already queued behind this item and send it as ONE
+                # NDJSON request. One POST per finding could not keep up with a storm
+                # scan: 23,223 findings x ~756 ms is ~4.9 hours, so 97% were still
+                # queued when the drain expired and were counted undelivered.
+                batch, saw_sentinel = _collect_batch(self.upload_queue, standard_log)
+                self._upload_batch(batch)
+                for _ in batch:
+                    self.upload_queue.task_done()
+                if saw_sentinel:
+                    break
 
             except Empty:
                 if self.stop_upload_thread:
@@ -3103,58 +3195,62 @@ class ResultsUploader:
         if self.log_manager:
             self.log_manager.log_upload("Upload worker thread stopped")
 
-    def _upload_standard_result(self, standard_log: StandardLogEntry):
-        """Upload YARA match with bounded retries."""
-        headers = {
-            "Authorization": API_KEY,
-            "Content-Type": "application/json"
-        }
-        payload = standard_log.to_dict()
+    def _upload_batch(self, items):
+        """Upload a batch of match events as NDJSON, with bounded retries.
+
+        Accounting is per EVENT, not per request: a failed batch counts all of its
+        events as failed. Counting a rejected 500-event request as a single failure
+        would under-report loss by the batch size, which is exactly the kind of
+        dishonest bookkeeping the delivery-shortfall reporting exists to prevent.
+        """
+        if not items:
+            return True
         endpoint = _get_webhook_endpoint(API_ENDPOINT)
+        n = len(items)
 
         attempt = 0
         while attempt < MAX_RETRIES_PER_ITEM:
             attempt += 1
             try:
-                resp = requests.post(
-                    url=endpoint,
-                    headers=headers,
-                    json=payload,
-                    timeout=DEFAULT_TIMEOUT_SECS,
-                )
+                resp = _post_ndjson(endpoint, API_KEY, items)
                 if 200 <= resp.status_code < 300:
-                    self.upload_stats['successful_uploads'] += 1
+                    self.upload_stats['successful_uploads'] += n
                     self._throttled_log("upload_ok",
-                                        f"YARA match upload successful (HTTP {resp.status_code})", level="upload")
+                                        f"YARA match batch uploaded: {n} event(s) (HTTP {resp.status_code})",
+                                        level="upload")
                     return True
 
                 if resp.status_code in (408, 429, 500, 502, 503, 504):
                     delay = _exp_backoff_delay(attempt)
                     self._throttled_log("upload_retry",
-                                        f"Upload failed (HTTP {resp.status_code}). Retrying in {delay:.1f}s "
-                                        f"(attempt {attempt}/{MAX_RETRIES_PER_ITEM}).", level="upload")
+                                        f"Batch upload failed (HTTP {resp.status_code}). Retrying in {delay:.1f}s "
+                                        f"(attempt {attempt}/{MAX_RETRIES_PER_ITEM}, {n} event(s)).",
+                                        level="upload")
                     time.sleep(delay)
                     continue
 
-                self.upload_stats['failed_uploads'] += 1
+                self.upload_stats['failed_uploads'] += n
                 self._throttled_log("upload_err",
-                                    f"YARA match upload failed (HTTP {resp.status_code}): {resp.text[:200]}")
+                                    f"YARA match batch failed (HTTP {resp.status_code}, {n} event(s)): "
+                                    f"{resp.text[:200]}")
                 return False
 
             except (requests.Timeout, requests.ConnectionError) as e:
                 delay = _exp_backoff_delay(attempt)
                 self._throttled_log("upload_neterr",
-                                    f"Network error uploading result: {str(e)[:160]}. Retrying in {delay:.1f}s "
-                                    f"(attempt {attempt}/{MAX_RETRIES_PER_ITEM}).", level="upload")
+                                    f"Batch upload network error ({type(e).__name__}). Retrying in {delay:.1f}s "
+                                    f"(attempt {attempt}/{MAX_RETRIES_PER_ITEM}, {n} event(s)).",
+                                    level="upload")
                 time.sleep(delay)
-
             except Exception as e:
-                self.upload_stats['failed_uploads'] += 1
-                self._throttled_log("upload_err", f"YARA match upload unexpected error: {e}")
+                self.upload_stats['failed_uploads'] += n
+                self._throttled_log("upload_err",
+                                    f"YARA match batch error ({type(e).__name__}: {e}, {n} event(s))")
                 return False
 
-        self.upload_stats['failed_uploads'] += 1
-        self._throttled_log("upload_err", "Max retries reached for payload. Abandoning.")
+        self.upload_stats['failed_uploads'] += n
+        self._throttled_log("upload_err",
+                            f"YARA match batch exhausted retries ({n} event(s) not delivered)")
         return False
 
     def stop(self, wait=True):
@@ -3515,8 +3611,16 @@ class WebhookUploader:
                     self.upload_queue.task_done()
                     break
 
-                self._process_standard_upload(standard_log)
-                self.upload_queue.task_done()
+                # Batch telemetry the same way as matches. Resource snapshots, worker
+                # performance rows and scan-progress events are individually small but
+                # numerous on a long scan, and each one used to cost a full round trip.
+                batch, saw_sentinel = _collect_batch(self.upload_queue, standard_log)
+                self._process_standard_batch(batch)
+                for _ in batch:
+                    self.upload_queue.task_done()
+                if saw_sentinel:
+                    self.upload_queue.task_done()
+                    break
 
             except Empty:
                 if self.stop_upload_thread:
@@ -3527,67 +3631,56 @@ class WebhookUploader:
 
         self.log_manager.log_upload("Webhook upload worker thread stopped")
 
-    def _process_standard_upload(self, standard_log: StandardLogEntry):
-        """Process and upload standardized log entry with retries + circuit breaker."""
-        try:
-            data_type = standard_log.type
-            self.upload_stats[data_type]['total'] += 1
+    def _process_standard_batch(self, items):
+        """Upload a batch of telemetry events as NDJSON, with retries + circuit breaker.
 
-            headers = {
-                "Authorization": API_KEY,
-                "Content-Type": "application/json"
-            }
+        Per-type accounting is preserved: a mixed batch credits each event against its
+        own type, and a failed batch counts every event in it as failed rather than one.
+        """
+        if not items:
+            return
+        by_type = defaultdict(int)
+        for it in items:
+            t = getattr(it, "type", "unknown")
+            by_type[t] += 1
+            self.upload_stats[t]['total'] += 1
 
-            if not self._circuit.allow():
+        # Circuit open: put the whole batch back and let it settle.
+        if not self._circuit.allow():
+            for it in items:
                 try:
-                    self.upload_queue.put(standard_log, timeout=1.0)
+                    self.upload_queue.put(it, timeout=1.0)
                 except Exception:
                     pass
-                time.sleep(2.0)
-                return
+            time.sleep(2.0)
+            return
 
-            attempt = 0
-            sent_ok = False
-            while attempt < MAX_RETRIES_PER_ITEM:
-                attempt += 1
-                try:
-                    response = requests.post(
-                        url=_get_webhook_endpoint(API_ENDPOINT),
-                        headers=headers,
-                        json=standard_log.to_dict(),
-                        timeout=DEFAULT_TIMEOUT_SECS
-                    )
-
-                    if 200 <= response.status_code < 300:
-                        sent_ok = True
-                        self._circuit.on_success()
-                        break
-
-                    if response.status_code in (408, 429, 500, 502, 503, 504):
-                        delay = _exp_backoff_delay(attempt)
-                        time.sleep(delay)
-                        continue
-
-                    self._circuit.on_failure()
+        endpoint = _get_webhook_endpoint(API_ENDPOINT)
+        attempt = 0
+        sent_ok = False
+        while attempt < MAX_RETRIES_PER_ITEM:
+            attempt += 1
+            try:
+                response = _post_ndjson(endpoint, API_KEY, items)
+                if 200 <= response.status_code < 300:
+                    sent_ok = True
+                    self._circuit.on_success()
                     break
+                if response.status_code in (408, 429, 500, 502, 503, 504):
+                    time.sleep(_exp_backoff_delay(attempt))
+                    continue
+                self._circuit.on_failure()
+                break
+            except (requests.Timeout, requests.ConnectionError):
+                time.sleep(_exp_backoff_delay(attempt))
+            except Exception as e:
+                self._circuit.on_failure()
+                self.log_manager.log_error(f"Webhook unexpected error for batch: {str(e)}")
+                break
 
-                except (requests.Timeout, requests.ConnectionError):
-                    delay = _exp_backoff_delay(attempt)
-                    time.sleep(delay)
-                except Exception as e:
-                    self._circuit.on_failure()
-                    self.log_manager.log_error(f"Webhook unexpected error for {data_type}: {str(e)}")
-                    break
-
-            if sent_ok:
-                self.upload_stats[data_type]['successful'] += 1
-            else:
-                self.upload_stats[data_type]['failed'] += 1
-
-        except Exception as e:
-            data_type = standard_log.type if hasattr(standard_log, 'type') else 'unknown'
-            self.upload_stats[data_type]['failed'] += 1
-            self.log_manager.log_error(f"Webhook upload error for {data_type}: {str(e)}")
+        key = 'successful' if sent_ok else 'failed'
+        for t, n in by_type.items():
+            self.upload_stats[t][key] += n
 
     def _queue_standard_upload(self, standard_log: StandardLogEntry, priority=False):
         """Queue standardized log entry for upload."""
