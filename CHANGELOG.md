@@ -15,6 +15,142 @@ fixes without changing behaviour you rely on.
 
 ---
 
+## xsiam_yara_scanner.py v4.1.0 — 2026-08-13
+
+Delivery and footprint release. Fixes a case where **97% of a scan's findings never
+reached the tenant**, removes a multi-gigabyte memory cost on match-heavy endpoints, and
+cuts total ingested rows by roughly a third. Every number below was measured on a live
+Windows endpoint (26,312 files, 22,918 findings, 2,653,417 matched offsets), not estimated.
+
+### Fixed — findings were being lost in bulk on match-heavy scans
+
+Each event was sent as its own HTTP request. At ~756 ms per round trip, a scan producing
+23,223 findings needed **~4.9 hours** of serial requests but finished in 455 seconds, so
+**22,621 findings (97%) were still queued when the shutdown drain expired and were dropped.**
+
+All three channels — matches, telemetry/monitoring, and logs — now send many events per
+request. On the same endpoint and ruleset:
+
+| | Before | After |
+|---|---|---|
+| Findings delivered | 602 (2.6%) | **22,918 (100%)** |
+| Undelivered | 22,621 | **0** |
+| Scan duration | 161.7 s | **63.1 s** |
+| Scan rate | 162.7 files/s | **417.2 files/s** |
+
+The scan itself got 2.6× faster as a side effect: the upload thread had been contending
+heavily with the scan workers.
+
+Batching is **opportunistic, not timer-based** — a worker takes whatever is already queued
+behind the first event and sends immediately. Batch size self-adjusts to load: 500 under a
+storm, 3 on a scan with 3 matches, with no added latency either way. Tunable at the top of
+the script via `UPLOAD_BATCH_MAX_EVENTS` (default 500) and `UPLOAD_BATCH_MAX_BYTES`
+(default 4 MB).
+
+> **If you modify the upload code:** the collector accepts NDJSON (one JSON object per
+> line). It *also* accepts a JSON array — answering `HTTP 200 {"error":"false"}` — and then
+> **silently discards every event in it.** Verified twice against a live tenant: array 0/5
+> landed, NDJSON 5/5. Using the array form would report 100% success while delivering
+> nothing.
+
+### Changed — one alert event per matched file instead of two
+
+Two alert events fired for the same file: `"YARA detection event: N rules triggered in
+<file>"` and `"YARA matches found in <file>"`. Their payloads overlapped almost entirely
+(path, SHA256, creation time, rule list). Measured on the storm scan, alerts were **47,460
+of 72,484 ingested rows (65%)** at 2.07 events per finding — the single largest consumer of
+ingestion, mostly duplication.
+
+They are now **one** event carrying the union of both payloads, plus rule and string-hit
+counts in the message. Expected effect on that scan: ~47,460 alert rows → ~22,918, cutting
+total ingestion roughly a third.
+
+**Check any ad-hoc query matching `"YARA detection event"`** — that message no longer
+exists. No shipped widget, dashboard, or parsing-rule field used either event, so nothing
+in the packaged content breaks, and `rules_triggered` is retained as an alias of
+`rules_matched` so queries on either field name still resolve.
+
+### Fixed — multi-gigabyte memory growth on match-heavy endpoints
+
+A record was built for every matched *offset* and held in memory for the whole scan.
+Measured: **1,048,035 offsets held ~15 GB RSS and was still climbing.** That endpoint had
+160 GB and survived; a normal 8–16 GB endpoint would have been driven into swap by the same
+ruleset.
+
+Those records were never written anywhere — the function that would have serialized them is
+unreachable, so the data was accumulated and then discarded. They are no longer built at
+all. The per-offset detail was already recorded, uncapped, in `alert/<rule>.txt` (String ID
+/ Offset / Data), which the evidence ZIP bundles, so **nothing is lost.**
+
+Re-measured on the same endpoint with **2.5× more offsets** (2,653,415): peak RSS **224 MB**.
+
+### Also in this release
+
+- **11 new dashboard widgets**, each live-validated against a tenant: scanner memory growth,
+  host load vs scanner CPU share, scan ETA, disk headroom, thread count, disk I/O, agent
+  fleet inventory, rule-only vs string matches, truncated findings, detection density, and
+  rule compilation health. Of the 84 fields the parsing rule extracts, only 24 were
+  previously visualized.
+- **Removed the Cache Hit-Rate widget.** Scan caching is a roadmap feature that is hardcoded
+  off, so the scanner has never emitted a cache event — the widget could not populate.
+- **Documented why the CPU/memory widgets are blank during a running scan** (Deployment
+  Guide §12.1): they average samples between a per-host start marker and `Target scan
+  completed:`, so a scan with no end marker yet contributes nothing.
+
+### Upgrading
+
+**Re-upload the script and re-import both dashboards.** The parsing rule is unchanged since
+v4.0.0 — nothing to re-apply on the tenant. Expect noticeably lower ingested row counts and
+complete delivery on match-heavy scans.
+
+---
+
+## xdr_yara_scanner.py v3.2.0 — 2026-08-13
+
+Ports the delivery-agnostic fixes from the XSIAM edition. XDR's own alert/dataset machinery
+is untouched.
+
+### Fixed — the same multi-gigabyte memory growth
+
+XDR had this defect in identical form: a record per matched offset, buffered for the whole
+scan, serialized by a function that is never called. Removed outright, for the same reason —
+`alert_dir/<rule>.txt` already records every offset. See the XSIAM v4.1.0 entry above for
+the measurements.
+
+### Fixed — rules were silently dropped for mentioning a module name
+
+Module availability was decided by matching `\b<module>\.` against raw rule text, guarded by
+a set of imports computed over the **whole ruleset**. So a single `import "cuckoo"` anywhere
+in a pack opened the gate for every other rule in the file — exactly the case the guard
+existed for. Demonstrated against the old code: a rule hunting the literal string
+`"cuckoo.conf"`, and a rule merely mentioning it in a comment, were both **skipped without
+ever being compiled** — silent detection loss.
+
+Classification now happens only after yara itself raises `undefined identifier "<module>"`
+for a module imported in the source and absent from the agent. A rule that merely mentions a
+module name compiles and runs normally.
+
+> `docs/xdr/topics/Rule_Compatibility.md` stated that a rule containing `"cuckoo.conf"` is
+> not wrongly dropped. That was **not true** before this release.
+
+### Fixed — skipped rules were invisible, and cancelled runs under-reported
+
+- `skipped_rules_count` was set but never read by anything operator-facing, so a pack whose
+  rules mostly could not run still reported "0 rules failed compilation". Now on the
+  `SCAN_RESULT` line and in `scan_summary_<run_id>.json`.
+- An all-skipped ruleset reported a compilation failure; it now reports an agent capability
+  limit, so the operator is not sent hunting for a syntax error that does not exist.
+- The cancel path returned early and **bypassed the delivery-shortfall check entirely** — the
+  one outcome where partial results matter most was the one that never reported lost
+  findings.
+
+### Upgrading
+
+**Drop-in.** Expect one extra rule compile per host on the first scan after upgrading (the
+module-probe fix changes the rule-cache key).
+
+---
+
 ## xsiam_yara_scanner.py v4.0.0 — 2026-08-13
 
 **Breaking.** Adds operator-driven scan cancellation — which this edition simply did not

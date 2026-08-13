@@ -11,7 +11,7 @@ Features:
 - Circuit breaker for upload resilience
 - System resource monitoring
 
-    VERSION : 4.0.0
+    VERSION : 4.1.0
     RELEASED: 2026-08-13
     SOURCE  : https://github.com/ayman-m/yarascanner
     NOTES   : https://github.com/ayman-m/yarascanner/blob/main/CHANGELOG.md
@@ -19,7 +19,7 @@ Features:
 Report the version with any support request.
 """
 
-__version__ = "4.0.0"
+__version__ = "4.1.0"
 __release_date__ = "2026-08-13"
 
 # Standard library imports
