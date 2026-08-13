@@ -2923,7 +2923,14 @@ class ScanConfig:
         self.scan_queue_size = max(
             2, int(os.getenv("YARA_QUEUE_SIZE", str(self.max_workers * 2)) or (self.max_workers * 2))
         )
-        self.log_interval = int(os.getenv("YARA_PROGRESS_LOG_SECS", "120") or 120)
+        # Default 30s, not 120s: this is the progress-heartbeat's sampling interval, and at
+        # 120s a scan whose active phase is shorter than that emits NO progress telemetry at
+        # all. Clamped to >=1s because this value is a threading.Event.wait() interval -
+        # wait(0) (or any negative) returns immediately, which would turn the heartbeat into
+        # a busy-spin that re-takes lock_counts continuously and floods the upload queue.
+        # "0" is a plausible thing for an operator to set trying to disable progress logging;
+        # to actually disable it, set a large interval. Ported from the XSIAM edition.
+        self.log_interval = max(1, int(os.getenv("YARA_PROGRESS_LOG_SECS", "30") or 30))
         self.enable_performance_monitoring = str(
             os.getenv("YARA_ENABLE_PERF_MONITOR", "false")
         ).strip().lower() in ("1", "true", "yes", "on")
@@ -5267,11 +5274,24 @@ class YaraScanner:
             logging.debug(f"Validation error for rule {rule_name}: {e}")
             return False
     
-    def _get_available_yara_modules(self):
-        """Detect which YARA modules are available."""
+    def _get_available_yara_modules(self, source_text=None):
+        """Detect which YARA modules are available on THIS agent's libyara build.
+
+        The candidate set is the standard probe list UNION every module actually
+        imported by the submitted rules. Probing only a hardcoded list meant any
+        module outside it was treated as unavailable no matter what libyara really
+        supported - so `_split_yara_rules` would strip a perfectly good preamble
+        import and the rule would then fail to compile with "undefined identifier".
+        Deriving the extra candidates from the source makes this correct for any
+        current or future libyara build.
+        """
         test_modules = ['pe', 'elf', 'cuckoo', 'magic', 'hash', 'math', 'dotnet', 'time']
+        if source_text:
+            for module in sorted(self._extract_imported_modules(source_text)):
+                if module not in test_modules:
+                    test_modules.append(module)
         available = []
-        
+
         for module in test_modules:
             try:
                 test_rule = f'''import "{module}"
@@ -5463,7 +5483,7 @@ rule test {{
         cache_path = None
         if RULE_CACHE_ENABLED:
             try:
-                available_modules = self._get_available_yara_modules()
+                available_modules = self._get_available_yara_modules(yara_rule_string)
                 key = self._rule_cache_key(yara_rule_string, available_modules)
                 cache_path = os.path.join(self._rule_cache_dir(), "rules_%s.yarac" % key[:40])
                 if os.path.exists(cache_path):
@@ -5503,7 +5523,7 @@ rule test {{
     def _compile_yara_rules(self, yara_rule_string):
         """Compile YARA rules with robust error handling."""
         error_logger = self.config.error_logger
-        available_modules = self._get_available_yara_modules()
+        available_modules = self._get_available_yara_modules(yara_rule_string)
         logging.info(f"Available YARA modules: {', '.join(available_modules)}")
         error_logger.error_logger.info(f"Available YARA modules: {', '.join(available_modules)}")
         
@@ -6325,17 +6345,34 @@ rule test {{
             scan_rate = self.files_scanned / elapsed if elapsed > 0 else 0
             
             try:
-                process = psutil.Process()
+                # Reuse ONE long-lived, primed handle: psutil's first cpu_percent() call on
+                # a given Process object always returns 0.0, so building a fresh
+                # psutil.Process() each tick reported 0.0% CPU forever - the same reason
+                # __init__ primes self._governor_proc. Latent before the progress heartbeat
+                # existed (this path used to almost never run), but it now fires every
+                # log_interval for the whole scan, so the zeros would be the norm.
+                process = getattr(self, "_governor_proc", None) or getattr(self, "_progress_proc", None)
+                if process is None:
+                    process = psutil.Process()
+                    process.cpu_percent(interval=None)   # prime; discard the 0.0
+                    self._progress_proc = process
                 cpu_percent = process.cpu_percent()
                 memory_info = process.memory_info()
                 memory_mb = memory_info.rss / 1024 / 1024
-                
-                io_counters = process.io_counters()
-                disk_io_mb = (io_counters.read_bytes + io_counters.write_bytes) / 1024 / 1024
-                
+
+                # io_counters() does not exist on macOS (psutil raises AttributeError).
+                # Unguarded it aborted this whole block, zeroing memory/network too - which
+                # do work there - and logged an error every tick.
+                disk_io_mb = 0
+                try:
+                    io_counters = process.io_counters()
+                    disk_io_mb = (io_counters.read_bytes + io_counters.write_bytes) / 1024 / 1024
+                except (AttributeError, NotImplementedError, psutil.AccessDenied):
+                    pass
+
                 net_counters = psutil.net_io_counters()
                 network_mb = (net_counters.bytes_sent + net_counters.bytes_recv) / 1024 / 1024
-                
+
                 self.log_manager.log_system_resources(cpu_percent, memory_mb, disk_io_mb, network_mb)
                 
             except ImportError:
@@ -6465,6 +6502,24 @@ rule test {{
                 cache_stats
             )
         
+    def _progress_heartbeat(self):
+        """Periodic _log_progress() call spanning the WHOLE scan, not just file discovery.
+
+        Progress logging used to be an inline check in the discovery os.walk loop, which
+        almost never runs long enough on its own to cross log_interval - file enumeration
+        is fast; matching file content in the worker threads is what actually takes
+        minutes, and that happens after discovery ends. Ported from the XSIAM edition,
+        where this was confirmed live: zero "Scan Progress"/"Cache Performance" events had
+        ever been recorded, on any host, under the inline-only approach.
+        """
+        while not self._progress_heartbeat_stop.wait(self.config.log_interval):
+            if not self.scan_active:
+                break
+            try:
+                self._log_progress()
+            except Exception as e:
+                self.log_manager.log_error(f"Progress heartbeat error: {e}")
+
     def _perform_enhanced_cleanup(self, start_time, total_files_found, files_per_target):
         """Enhanced cleanup with aggressive timeouts."""
         self.log_manager.log_system("=== ENHANCED CLEANUP AND FINALIZATION ===")
@@ -6518,6 +6573,14 @@ rule test {{
         self.log_manager.log_performance(
             f"Worker cleanup: {successful_joins} stopped, {failed_joins} timed out in {worker_join_time:.1f}s"
         )
+
+        # Stopped here, AFTER the join above, for the same reason as resource/stats
+        # monitoring below - the heartbeat needs to keep firing for as long as workers
+        # are actually still draining scan_queue, not just until file discovery ends.
+        if getattr(self, '_progress_heartbeat_stop', None) is not None:
+            self._progress_heartbeat_stop.set()
+            if getattr(self, '_progress_heartbeat_thread', None) is not None:
+                self._progress_heartbeat_thread.join(timeout=2)
 
         try:
             if getattr(self, 'resource_monitor', None) is not None:
@@ -6613,8 +6676,12 @@ rule test {{
             {'worker_startup_time_seconds': worker_startup_time, 'workers_started': len(self.scan_threads)}
         )
 
-        last_log = time.time()
-        last_comprehensive_stats = time.time()
+        self._progress_heartbeat_stop = threading.Event()
+        self._progress_heartbeat_thread = threading.Thread(
+            target=self._progress_heartbeat, name="ProgressHeartbeat", daemon=True
+        )
+        self._progress_heartbeat_thread.start()
+
         total_files_found = 0
         files_per_target = {}
 
@@ -6673,10 +6740,6 @@ rule test {{
                             if not self._enqueue_scan_path(path):
                                 break
                                 
-                        current_time = time.time()
-                        if current_time - last_log >= self.config.log_interval:
-                            self._log_progress()
-                            last_log = current_time
                         self._maybe_heartbeat()
 
                     target_scan_time = time.time() - target_start_time

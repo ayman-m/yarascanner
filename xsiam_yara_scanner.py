@@ -127,6 +127,28 @@ THREAD_CLEANUP_TIMEOUT = 60          # Maximum time to wait for thread cleanup
 # everything still queued, strictly worse than the flat-timeout bug this was meant to fix. Kept
 # low enough that even all four sites maxing out at once (4 * 60s = 240s) stays well inside a
 # normal script timeout.
+# Cooperative cancellation. The console's own Cancel button hard-kills the payload process
+# mid-scan (no flush, no summary, no terminal event), so an operator who wants a scan to stop
+# WITHOUT losing what it already found needs this path instead: a flag file the running scan
+# polls for. Ported from the XDR edition.
+# Captured at MODULE IMPORT - as close to real process start as this file can observe, and
+# critically BEFORE ScanConfig setup and rule compilation. The stale-flag check compares a
+# cancel flag's mtime against this; anchoring it to YaraScanner.__init__ instead (which runs
+# AFTER _compile_yara_rules) would judge any cancel delivered during a long compile as "stale
+# from a previous run" and silently delete it - the exact failure the staleness logic exists
+# to avoid.
+_PROCESS_STARTED_AT = time.time()
+
+# Floored: this is a poll interval, and _env_number only validates that the override parses
+# as a number. A negative value would make time.sleep() raise (killing the watcher thread
+# outright, leaving cancellation silently dead while running.json still advertises a live,
+# cancellable scan); 0 would turn the watcher into a busy-spin on a scanner whose whole
+# design goal is low host impact.
+CANCEL_POLL_SECS = max(0.5, _env_number("YARA_CANCEL_POLL_SECS", 5))   # cancel-flag watcher cadence
+CANCEL_STALE_TOLERANCE_SECS = 2.0  # mtime slack when judging a cancel flag stale (coarse-FS safety)
+RUNNING_MARKER_REFRESH_SECS = 30.0  # how often a live scan refreshes running.json
+RUNNING_MARKER_STALE_SECS = 180.0   # marker older than this => scan presumed dead
+
 DRAIN_MIN_SECS = _env_number("YARA_DRAIN_MIN_SECS", 15)              # floor - matches prior fast-path behavior
 DRAIN_PER_ITEM_SECS = _env_number("YARA_DRAIN_PER_ITEM_SECS", 0.3)   # rough per-POST budget incl. occasional retry
 DRAIN_MAX_SECS = _env_number("YARA_DRAIN_MAX_SECS", 60)              # per-site ceiling (there are 4 sites - see above)
@@ -567,6 +589,66 @@ def _exp_backoff_delay(attempt_index):
 def _get_webhook_endpoint(api_endpoint: str) -> str:
     """Return the configured webhook endpoint, normalized for requests."""
     return (api_endpoint or "").strip()
+
+
+def _default_scanner_dir():
+    """Platform default scanner working directory (must match ScanConfig's choice)."""
+    override = os.environ.get("YARA_SCANNER_DIR")
+    if override and override.strip():
+        return override.strip()
+    if platform.system() == "Windows":
+        return "C:\\yara_scanner"
+    if platform.system() == "Darwin":
+        return "/usr/local/yara_scanner"
+    return "/opt/yara_scanner"
+
+
+def _handle_cancel_request():
+    """mode=cancel: drop a cooperative cancel flag for a running scan on this endpoint.
+
+    Deliberately lightweight - does NOT initialize the logging/scan machinery, compile
+    rules, or touch the collector. Writes <scanner_dir>/control/cancel.flag and reports
+    whether a scan appears alive via the running.json marker an active scan refreshes.
+
+    This is the supported alternative to the console's Cancel button, which hard-kills the
+    payload process: findings already queued are lost, no summary is written, and the scan
+    simply vanishes. A cooperative cancel unwinds the scan, drains what it has, and writes
+    its scan_summary_<run_id>.json.
+    """
+    scanner_dir = _default_scanner_dir()
+    control_dir = os.path.join(scanner_dir, "control")
+    try:
+        os.makedirs(control_dir, exist_ok=True)
+    except Exception as e:
+        return f"Cancel failed: cannot create control dir {control_dir}: {e}"
+
+    flag_path = os.path.join(control_dir, "cancel.flag")
+    running_path = os.path.join(control_dir, "running.json")
+
+    running = False
+    running_info = {}
+    try:
+        if os.path.exists(running_path):
+            with open(running_path, "r", encoding="utf-8") as f:
+                running_info = json.load(f) or {}
+            updated = float(running_info.get("updated_at", 0))
+            running = (time.time() - updated) < RUNNING_MARKER_STALE_SECS
+    except Exception:
+        running = False
+
+    try:
+        with open(flag_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "requested_at_ms": int(time.time() * 1000),
+                "source": "action_center",
+            }, f)
+    except Exception as e:
+        return f"Cancel failed: cannot write {flag_path}: {e}"
+
+    return (
+        f"Cancel signal delivered ({flag_path}) | scanner running: "
+        f"{'yes' if running else 'no'} | scan_id={running_info.get('scan_id', 'n/a')}"
+    )
 
 
 def _parse_bool_arg(value, arg_name="argument"):
@@ -1112,6 +1194,11 @@ class ErrorLogger:
         self.has_errors = False
         self.failed_rules_count = 0
         self.valid_rules_count = 0
+        # Rules the agent's libyara cannot run (module unavailable) rather than rules that
+        # are broken. Counted separately so the operator-visible result can say so: without
+        # it, reclassifying these out of failed_rules_count makes them vanish entirely and
+        # a pack where most rules never ran reads as a clean "0 rules failed compilation".
+        self.skipped_rules_count = 0
     
     def _setup_error_logger(self):
         """Setup dedicated error logger."""
@@ -2096,6 +2183,49 @@ class LogManager:
         
         self.log_system(message, summary_data)
 
+    def write_scan_summary(self, summary: dict):
+        """Write a single machine-readable scan summary JSON for this run.
+
+        The six per-category text logs are for humans; this one file is for tools - an
+        Action Center follow-up, the test skill, or the customer's own automation reads one
+        JSON instead of grepping six logs. Written atomically (tmp + os.replace) so a
+        reader never sees a half-written file, and the temp is cleaned up on failure.
+
+        This matters most in the case this edition is least protected against: the console's
+        Cancel button hard-kills the payload mid-scan, so nothing is flushed to the collector
+        and this local file is the only surviving evidence of what the run had done.
+        Ported from the XDR edition; XDR-specific fields (lookup datasets, CPU governor,
+        posture) are dropped and the webhook delivery books take their place.
+        """
+        path = os.path.join(self.config.logs_dir, f"scan_summary_{self.config.run_id}.json")
+        record = {
+            "schema": "yara_scan_summary/v1",
+            "edition": "xsiam",
+            "run_id": self.config.run_id,
+            "scan_id": self.scan_id,
+            "rule_hash": getattr(self.config, "rule_hash", ""),
+            "hostname": self.hostname,
+            "os_info": self.os_info,
+            "ip_address": self.ip_address,
+            "scanner_version": __version__,
+        }
+        record.update(summary or {})
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(record, f, default=str, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+            self.log_system(f"Scan summary written: {os.path.basename(path)}")
+        except Exception as e:
+            # Don't leave a half-written temp behind (e.g. disk full mid-dump).
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+            self.log_error(f"Failed to write scan summary JSON: {e}")
+        return path
+
     def stop_logging(self):
         """Stop all logging activities."""
         if self._stopped:
@@ -2492,8 +2622,14 @@ class ScanConfig:
             self.scanner_dir = "/opt/yara_scanner"
 
         self.logs_dir = os.path.join(self.scanner_dir, "logs")
+        # Cooperative-cancellation control files (cancel.flag / running.json) live here.
+        self.control_dir = os.path.join(self.scanner_dir, "control")
         os.makedirs(self.scanner_dir, exist_ok=True)
         os.makedirs(self.logs_dir, exist_ok=True)
+        try:
+            os.makedirs(self.control_dir, exist_ok=True)
+        except Exception:
+            pass
 
         is_windows = platform.system() == "Windows"
         self.alert_dir = os.path.join(self.scanner_dir, "alert")
@@ -2536,8 +2672,15 @@ class ScanConfig:
             raise
 
         yara_hash = hashlib.sha256(self.yara_rule.encode('utf-8')).hexdigest()
-        self.scan_id = f"yara_{yara_hash}"
-        self.error_logger.error_logger.info(f"Scan ID (YARA hash): {self.scan_id}")
+        # scan_id must be unique per scan RUN, not per ruleset. Derived from the rule hash
+        # alone (the previous "yara_<hash>" form), every host in a fleet running the same
+        # rules - and every re-run on one host - reported under one identical scan_id, so
+        # any consumer grouping by scan_id silently merged the whole fleet into a single
+        # scan. Ported from the XDR edition. The hash prefix is kept (12 chars) so the
+        # ruleset is still identifiable from the scan_id alone.
+        self.rule_hash = yara_hash
+        self.scan_id = f"{self.hostname}_{self.run_id}_yara_{yara_hash[:12]}"
+        self.error_logger.error_logger.info(f"Scan ID: {self.scan_id} (rule hash: {yara_hash[:12]}...)")
 
         self.cleanup_script = os.path.join(
             self.scanner_dir, "cleanup_script.bat" if is_windows else "cleanup_script.sh"
@@ -2601,10 +2744,36 @@ class ScanConfig:
             "/library/caches/",
             "/appdata/local/temp/",
             "/appdata/local/packages/",
-            "/appdata/local/google/chrome/user data/default/cache/",
-            "/appdata/local/microsoft/edge/user data/default/cache/",
-            "/mozilla/firefox/profiles/",
-            "/cache2/",
+        )
+        # The four browser cache/profile fragments that used to live above
+        # ("/appdata/local/google/chrome/user data/default/cache/",
+        #  "/appdata/local/microsoft/edge/user data/default/cache/",
+        #  "/mozilla/firefox/profiles/", "/cache2/") were REMOVED, not moved:
+        # browser caches and profile directories are common malware staging and
+        # persistence areas, and skipping them was a detection blind spot on every
+        # platform. Ported from the XDR edition.
+
+        # Always-scan carve-outs (checked BEFORE skip logic): on macOS the broad
+        # "/library/caches/" fragment above (and the mac skip dirs) would still bypass
+        # browser caches, so re-open them surgically here. Safari is best-effort under
+        # TCC / Full Disk Access.
+        self.force_scan_fragments = (
+            "/library/caches/google/chrome/",
+            "/library/caches/chromium/",
+            "/library/caches/microsoft edge/",
+            "/library/caches/firefox/",
+            "/library/caches/com.apple.safari/",
+        )
+        # Boundary skips the force-scan allowlist must never override. These keep the
+        # scanner on THIS host rather than reducing noise, so a browser cache found under
+        # one (e.g. a Time Machine disk at /Volumes/..., which holds one cache tree per
+        # backup snapshot) must still be skipped - otherwise the carve-out silently turns
+        # into an unbounded walk over mounted/removable/network media.
+        self.force_scan_never_under = (
+            "/volumes/",   # macOS mounted volumes (also in mac_skip_directory)
+            "/media/",     # Linux removable media
+            "/mnt/",       # Linux mounts
+            "/net/",       # autofs network mounts
         )
 
         self.evidence_zip = os.path.join(
@@ -3649,8 +3818,13 @@ class CleanupManager:
         self.config = config
 
     def _extract_run_id_from_log_name(self, filename):
-        """Extract scan run_id from standardized log filename."""
-        match = re.search(r'_(\d{8}_\d{6}_\d{6})\.log$', filename)
+        """Extract scan run_id from a standardized per-run artefact filename.
+
+        Matches .log, plus scan_summary_<run_id>.json and its .json.tmp orphans - anchoring
+        on `\\.log$` alone meant summaries were never retention-managed and accumulated on
+        the endpoint indefinitely.
+        """
+        match = re.search(r'_(\d{8}_\d{6}_\d{6})\.(?:log|json|json\.tmp)$', filename)
         return match.group(1) if match else None
 
     def _prune_old_scan_logs(self, keep_scans=2):
@@ -3661,7 +3835,12 @@ class CleanupManager:
 
         run_logs = defaultdict(list)
         for name in os.listdir(logs_dir):
-            if not name.endswith(".log"):
+            # Also retain-manage scan_summary_<run_id>.json, not just *.log. It is written
+            # once per run into this same directory, so matching only ".log" left every
+            # summary ever produced on the endpoint forever - the opposite of what a
+            # retention policy is for. Orphaned ".json.tmp" files (a summary write that died
+            # mid-dump, e.g. disk full) are swept on the same pass.
+            if not (name.endswith(".log") or name.endswith(".json") or name.endswith(".json.tmp")):
                 continue
             run_id = self._extract_run_id_from_log_name(name)
             if not run_id:
@@ -3882,8 +4061,23 @@ class YaraScanner:
 
         self.log_manager = log_manager if log_manager else LogManager(config)
         self.stats_manager = stats_manager if stats_manager else StatisticsManager(config, self.log_manager)
+
+        # Liveness marker BEFORE rule compilation. Compiling a large ruleset can take a
+        # minute or more, and until the marker exists `cancel` reports "scanner running: no"
+        # about a scan that is very much alive - which pushes the operator to the console's
+        # Cancel button, the destructive hard-kill this whole feature exists to replace.
+        # Only the paths/counters the marker writer touches are needed this early.
+        _control = getattr(config, "control_dir", config.scanner_dir)
+        self.cancel_flag_path = os.path.join(_control, "cancel.flag")
+        self.running_marker_path = os.path.join(_control, "running.json")
+        self.files_scanned = 0
+        self.total_detections = 0
+        self.scan_start_time = time.time()
+        self._last_marker_refresh = 0.0
+        self._write_running_marker("compiling")
+
         self.rules = self._compile_yara_rules(config.yara_rule)
-        
+
         self.files_scanned = 0
         self.files_skipped = 0
         self.skip_reasons = defaultdict(int)
@@ -3909,6 +4103,18 @@ class YaraScanner:
         self.lock_failures = threading.Lock()
         self.scan_targets = []
         self.scan_start_time = time.time()
+
+        # Cooperative cancellation state. (cancel_flag_path/running_marker_path are set
+        # earlier, before rule compilation, so the liveness marker exists during it.)
+        self.cancel_requested = False
+        self.cancel_source = ""
+        self._cancel_lock = threading.Lock()
+        self.cancel_watcher_thread = None
+        # Module-import time, NOT time.time() here: this object is constructed AFTER rule
+        # compilation, so a self-timestamp would make the staleness check discard a cancel
+        # delivered while a large ruleset was still compiling.
+        self._process_started_at = _PROCESS_STARTED_AT
+        self._last_marker_refresh = 0.0
         
         self.scanned_real_paths = set()
         self.junction_skip_count = 0
@@ -3977,11 +4183,25 @@ class YaraScanner:
             logging.debug(f"Validation error for rule {rule_name}: {e}")
             return False
     
-    def _get_available_yara_modules(self):
-        """Detect which YARA modules are available."""
+    def _get_available_yara_modules(self, source_text=None):
+        """Detect which YARA modules are available on THIS agent's libyara build.
+
+        The candidate set is the standard probe list UNION every module actually
+        imported by the submitted rules. Probing only a hardcoded list meant any
+        module outside it was treated as unavailable no matter what libyara really
+        supported - so `_split_yara_rules` would strip a perfectly good preamble
+        import and the rule would then fail to compile with "undefined identifier".
+        Deriving the extra candidates from the source makes this correct for any
+        current or future libyara build. (The same hardcoded-list defect exists in
+        the XDR edition - see xdr_yara_scanner.py's _get_available_yara_modules.)
+        """
         test_modules = ['pe', 'elf', 'cuckoo', 'magic', 'hash', 'math', 'dotnet', 'time']
+        if source_text:
+            for module in sorted(self._extract_imported_modules(source_text)):
+                if module not in test_modules:
+                    test_modules.append(module)
         available = []
-        
+
         for module in test_modules:
             try:
                 test_rule = f'''import "{module}"
@@ -4002,8 +4222,35 @@ rule test {{
             if module_name not in available_modules:
                 logging.debug(f"Rule uses unavailable module: {module_name}")
                 return True, module_name
-        
+
         return False, None
+
+    def _module_missing_from_compile_error(self, error, source_imported_modules, available_modules):
+        """Return the module name if a compile error is really "this agent lacks a module".
+
+        A rule that inherits `import "cuckoo"` from a shared PREAMBLE (the normal, idiomatic
+        YARA layout) has that import stripped by _split_yara_rules when the module is not
+        available on this agent's libyara build. The rule body still references
+        `cuckoo.something`, so yara.compile raises `undefined identifier "cuckoo"` and the
+        rule would be booked as a COMPILE FAILURE - inflating the failed count, writing a
+        bogus failed_rule_*.yar artifact, and making a healthy scan look broken. The check
+        above cannot catch this: it only inspects the rule's own text, and after splitting
+        there is no import line left there to find.
+
+        Classifying on the actual compile error is deliberate. The XDR edition instead
+        gates on a per-module usage REGEX, which over-skips: a rule hunting for the literal
+        string "cuckoo.conf" contains `cuckoo.` and would be silently dropped. Requiring
+        BOTH that yara itself reported the identifier undefined AND that the name was
+        imported somewhere in the original source AND that it is genuinely unavailable
+        cannot mis-handle a literal string.
+        """
+        if not source_imported_modules:
+            return None
+        text = str(error)
+        for module_name in re.findall(r'undefined identifier "(\w+)"', text):
+            if module_name in source_imported_modules and module_name not in available_modules:
+                return module_name
+        return None
 
     def _extract_imported_modules(self, source_text):
         """Extract imported YARA module names from a source block."""
@@ -4047,7 +4294,7 @@ rule test {{
     def _compile_yara_rules(self, yara_rule_string):
         """Compile YARA rules with robust error handling."""
         error_logger = self.config.error_logger
-        available_modules = self._get_available_yara_modules()
+        available_modules = self._get_available_yara_modules(yara_rule_string)
         logging.info(f"Available YARA modules: {', '.join(available_modules)}")
         error_logger.error_logger.info(f"Available YARA modules: {', '.join(available_modules)}")
         
@@ -4084,6 +4331,10 @@ rule test {{
         compilation_errors = []
         skipped_count = 0
         preamble_imports = self._extract_imported_modules(preamble)
+        # Imports from the RAW source, before _split_yara_rules stripped the unavailable
+        # ones out of the preamble. Needed to tell "this agent lacks the module" apart from
+        # a genuine syntax error when a split rule fails to compile.
+        source_imported_modules = self._extract_imported_modules(yara_rule_string)
         logging.info(f"Starting compilation of {len(individual_rules)} YARA rules...")
 
         for i, rule_content in enumerate(individual_rules, 1):
@@ -4134,9 +4385,36 @@ rule test {{
                     logging.info(f"✓ Compiled {i}/{len(individual_rules)} rules ({error_logger.valid_rules_count} valid, {error_logger.failed_rules_count} failed, {skipped_count} skipped)")
 
             except Exception as e:
+                # Not a compile failure: the rule needs a module this agent's libyara
+                # does not have, inherited from a preamble import that was stripped.
+                _missing = self._module_missing_from_compile_error(
+                    e, source_imported_modules, available_modules
+                )
+                if _missing:
+                    skipped_count += 1
+                    if skipped_count <= 10:
+                        msg = (f"Skipping rule '{display_name}': needs unavailable module "
+                               f"'{_missing}' (inherited from a file-level import)")
+                        logging.warning(msg)
+                        error_logger.error_logger.warning(msg)
+                    try:
+                        skipped_rule_path = os.path.join(
+                            self.config.failed_rules_dir,
+                            f"skipped_rule_{display_name}_{_missing}.yar"
+                        )
+                        with open(skipped_rule_path, "w", encoding="utf-8") as f:
+                            f.write(f"// SKIPPED RULE - Module '{_missing}' not available on this agent\n")
+                            f.write(f"// (import inherited from the file-level preamble)\n")
+                            f.write(f"// Date: {datetime.datetime.now().isoformat()}\n")
+                            f.write("// " + "="*50 + "\n\n")
+                            f.write(rule_content)
+                    except Exception:
+                        pass
+                    continue
+
                 compilation_errors.append(f"Rule {display_name}: {str(e)}")
                 error_logger.log_rule_compilation_error(display_name, rule_content, e)
-                
+
                 if error_logger.failed_rules_count <= 10:
                     logging.warning(f"Failed rule {display_name}: {str(e)[:100]}")
                 
@@ -4159,12 +4437,28 @@ rule test {{
         error_logger.log_compilation_summary()
         
         logging.info(f"Compilation complete: {error_logger.valid_rules_count} valid, {error_logger.failed_rules_count} failed, {skipped_count} skipped")
-        
+
+        # Publish on the error_logger so main() can surface it on the SCAN_RESULT line and
+        # in scan_summary_<run_id>.json - local logs alone are not an operator-visible
+        # channel for an Action Center run.
+        error_logger.skipped_rules_count = skipped_count
         if skipped_count > 0:
             error_logger.error_logger.info(f"Skipped {skipped_count} rules due to unavailable modules")
 
         if not valid_sources:
-            error_msg = f"No valid YARA rules could be compiled out of {len(individual_rules)} rules."
+            # Distinguish "your rules are broken" from "this agent's libyara cannot run
+            # them". Both end the scan, but they need completely different responses, and
+            # reporting an all-skipped pack as a compilation failure sends the operator
+            # hunting for a syntax error that does not exist.
+            if skipped_count and not error_logger.failed_rules_count:
+                error_msg = (
+                    f"No rules could run on this endpoint: all {skipped_count} rule(s) need "
+                    f"YARA modules this agent's libyara build does not provide "
+                    f"(available: {', '.join(available_modules) or 'none'}). "
+                    f"This is an agent capability limit, not a rule syntax error."
+                )
+            else:
+                error_msg = f"No valid YARA rules could be compiled out of {len(individual_rules)} rules."
             error_logger.has_errors = True
             error_logger.error_logger.error(f"FINAL_COMPILATION_ERROR: {error_msg}")
             sys.stderr.write(f"CRITICAL: YARA rule compilation failed: {error_msg}\n")
@@ -4599,6 +4893,24 @@ rule test {{
             return True
         if any(portable_path.endswith(ext) for ext in self.config.skip_extensions):
             return True
+        # Force-scan allowlist: browser caches/profiles are scanned even though a broader
+        # CATEGORY skip (e.g. "/library/caches/") would exclude them. Filename/extension
+        # skips above still apply (no point scanning a .iso).
+        #
+        # Two subtleties, both found in review:
+        #  - Match against portable_path + "/" so DIRECTORY paths match too. This function
+        #    is called on os.walk's `root` (a directory, normpath-stripped of its trailing
+        #    separator) before any file in it is considered; without the appended slash,
+        #    "/library/caches/firefox" fails to match the "/library/caches/firefox/"
+        #    fragment while still matching the broad "/library/caches/" skip - so the whole
+        #    directory was pruned and no file inside ever reached this allowlist.
+        #  - It must NOT override BOUNDARY skips (mounted volumes, network shares). Those
+        #    exist to keep the scanner on this host, not to reduce noise; a Time Machine
+        #    disk under /Volumes/ holds a browser cache per backup snapshot.
+        _probe = portable_path + "/"
+        if not any(b in _probe for b in getattr(self.config, "force_scan_never_under", ())):
+            if any(fragment in _probe for fragment in getattr(self.config, "force_scan_fragments", ())):
+                return False
         if any(fragment in portable_path for fragment in self.config.skip_path_fragments):
             return True
 
@@ -4806,17 +5118,34 @@ rule test {{
             scan_rate = self.files_scanned / elapsed if elapsed > 0 else 0
             
             try:
-                process = psutil.Process()
+                # Reuse ONE long-lived, primed handle: psutil's first cpu_percent() call on
+                # a given Process object always returns 0.0, so building a fresh
+                # psutil.Process() each tick reported 0.0% CPU forever. (Same reasoning as
+                # the XDR edition's _governor_proc priming.) Latent before the progress
+                # heartbeat existed - this path used to almost never run - but it now fires
+                # every log_interval for the whole scan, so the zeros would be the norm.
+                process = getattr(self, "_progress_proc", None)
+                if process is None:
+                    process = psutil.Process()
+                    process.cpu_percent(interval=None)   # prime; discard the 0.0
+                    self._progress_proc = process
                 cpu_percent = process.cpu_percent()
                 memory_info = process.memory_info()
                 memory_mb = memory_info.rss / 1024 / 1024
-                
-                io_counters = process.io_counters()
-                disk_io_mb = (io_counters.read_bytes + io_counters.write_bytes) / 1024 / 1024
-                
+
+                # io_counters() does not exist on macOS (psutil raises AttributeError).
+                # Unguarded it aborted this whole block, zeroing memory/network too - which
+                # do work there - and logged an error every tick.
+                disk_io_mb = 0
+                try:
+                    io_counters = process.io_counters()
+                    disk_io_mb = (io_counters.read_bytes + io_counters.write_bytes) / 1024 / 1024
+                except (AttributeError, NotImplementedError, psutil.AccessDenied):
+                    pass
+
                 net_counters = psutil.net_io_counters()
                 network_mb = (net_counters.bytes_sent + net_counters.bytes_recv) / 1024 / 1024
-                
+
                 self.log_manager.log_system_resources(cpu_percent, memory_mb, disk_io_mb, network_mb)
                 
             except ImportError:
@@ -4946,6 +5275,167 @@ rule test {{
                 cache_stats
             )
         
+    def _request_cancel(self, source, log=True):
+        """Cooperatively request cancellation. Idempotent (first source wins) and safe from
+        any thread: clearing scan_active is what unwinds the producer walk and the workers."""
+        with self._cancel_lock:
+            if self.cancel_requested:
+                return
+            self.cancel_requested = True
+            self.cancel_source = source
+            self.scan_active = False
+        if log:
+            try:
+                self.log_manager.log_system(f"Cancellation requested (source={source})")
+            except Exception:
+                pass
+
+    def _start_cancellation_watcher(self):
+        """Remove a genuinely stale cancel flag, write the running marker, start polling.
+
+        "Stale" = written before this process even started (mtime < process start, minus a
+        small tolerance for coarse filesystem mtime resolution). A cancel delivered DURING
+        the pre-scan rule-compilation phase has a NEWER mtime and is deliberately preserved,
+        so the watcher honours it as soon as it starts - the naive "delete any pre-existing
+        flag at startup" version silently loses a cancel issued while a large ruleset is
+        still compiling, which is a real window.
+        """
+        try:
+            if os.path.exists(self.cancel_flag_path):
+                mtime = os.path.getmtime(self.cancel_flag_path)
+                if mtime < (self._process_started_at - CANCEL_STALE_TOLERANCE_SECS):
+                    os.remove(self.cancel_flag_path)
+                    self.log_manager.log_system("Removed stale cancel flag from a previous run")
+        except Exception as e:
+            self.log_manager.log_system(f"Could not evaluate pre-existing cancel flag: {e}")
+
+        self._write_running_marker("running")
+        self.cancel_watcher_thread = threading.Thread(
+            target=self._cancellation_watcher, name="CancelWatcher", daemon=True
+        )
+        self.cancel_watcher_thread.start()
+
+    def _cancellation_watcher(self):
+        """Poll for an operator cancel flag written by a `mode=cancel` invocation."""
+        while self.scan_active and not self.cancel_requested:
+            try:
+                if os.path.exists(self.cancel_flag_path):
+                    source = "action_center"
+                    try:
+                        with open(self.cancel_flag_path, "r", encoding="utf-8") as f:
+                            source = (json.load(f) or {}).get("source", source)
+                    except Exception:
+                        pass
+                    self._request_cancel(source)
+                    break
+                # Inside the try: an exception here (e.g. a bad poll interval) would kill
+                # this thread outright, and nothing joins or health-checks it - cancellation
+                # would be silently dead for the whole scan while running.json kept
+                # advertising a live, cancellable scan.
+                time.sleep(CANCEL_POLL_SECS)
+            except Exception as e:
+                self.log_manager.log_error(f"Cancel watcher error: {e}")
+                time.sleep(1.0)
+
+    def _write_running_marker(self, status):
+        """Refresh the liveness marker that `mode=cancel` reports against.
+
+        Written atomically (temp + os.replace) so a cross-process cancel reader never sees
+        a half-written or empty file.
+        """
+        try:
+            tmp = self.running_marker_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({
+                    "scan_id": self.config.scan_id,
+                    "run_id": getattr(self.config, "run_id", ""),
+                    "pid": os.getpid(),
+                    "hostname": self.config.hostname,
+                    "started_at": self.scan_start_time,
+                    "updated_at": time.time(),
+                    "status": status,
+                    "files_scanned": self.files_scanned,
+                    "detections": self.total_detections,
+                }, f)
+            os.replace(tmp, self.running_marker_path)
+            self._last_marker_refresh = time.time()
+        except Exception:
+            pass
+
+    def _maybe_refresh_running_marker(self):
+        """Refresh running.json on a cadence so `cancel` can tell a live scan from a dead
+        one. Cheap enough to call from the producer loop; rate-limited here, not by callers."""
+        if (time.time() - self._last_marker_refresh) >= RUNNING_MARKER_REFRESH_SECS:
+            self._write_running_marker("running")
+
+    def _remove_running_marker(self):
+        try:
+            if os.path.exists(self.running_marker_path):
+                os.remove(self.running_marker_path)
+        except Exception:
+            pass
+
+    def _clear_cancel_flag(self):
+        """Consume the flag once acted on, so it can't cancel the NEXT scan too."""
+        try:
+            if os.path.exists(self.cancel_flag_path):
+                os.remove(self.cancel_flag_path)
+        except Exception:
+            pass
+
+    def _walk_cancellable(self, target):
+        """os.walk replacement whose cancellation latency is bounded by ONE scandir call.
+
+        os.walk yields only after its internal recursion produces the next directory, so
+        `scan_active` can go unobserved for an unbounded interval - measured in the XDR
+        edition on C:\\ : workers stopped 4.45s after a cancel but the process took a further
+        50s to exit because the walk was still inside the generator, which also left
+        running.json stale so `cancel` reported "scanner running: no" during a live scan.
+
+        Driving the traversal with an explicit stack puts the check under our control: it
+        runs before every directory and between entries, so a cancel is honoured within a
+        single scandir.
+
+        Contract matches os.walk(topdown=True): yields (dirpath, dirnames, filenames), and
+        the caller may prune `dirnames` in place to skip subtrees - the stack is extended
+        after the yield, so pruning is respected. Symlinked directories are listed in
+        dirnames but not recursed into, matching followlinks=False.
+        """
+        stack = [target]
+        while stack:
+            if not self.scan_active:
+                return
+            current = stack.pop()
+            dirnames, filenames, symlinked = [], [], set()
+            try:
+                with os.scandir(current) as it:
+                    for entry in it:
+                        if not self.scan_active:
+                            return
+                        try:
+                            if entry.is_dir():
+                                dirnames.append(entry.name)
+                                if entry.is_symlink():
+                                    symlinked.add(entry.name)
+                            else:
+                                filenames.append(entry.name)
+                        except OSError:
+                            # Unreadable entry: classify as a file so the normal per-file
+                            # error path reports it rather than silently dropping it.
+                            filenames.append(entry.name)
+            except (PermissionError, FileNotFoundError, NotADirectoryError):
+                continue
+            except OSError:
+                continue
+
+            yield current, dirnames, filenames
+
+            # Extended AFTER the yield so caller-side pruning of dirnames is respected.
+            for name in reversed(dirnames):
+                if name in symlinked:
+                    continue
+                stack.append(os.path.join(current, name))
+
     def _progress_heartbeat(self):
         """Periodic _log_progress() call spanning the WHOLE scan (discovery + the time
         workers spend draining scan_queue afterward), not just file discovery. The old
@@ -4962,6 +5452,17 @@ rule test {{
                 self._log_progress()
             except Exception as e:
                 self.log_manager.log_error(f"Progress heartbeat error: {e}")
+            # Refresh the liveness marker from this TIMED thread rather than relying only on
+            # the per-directory call in the discovery loop. That loop's inner
+            # _enqueue_scan_path blocks while the scan queue is saturated, so one huge
+            # directory can hold it well past RUNNING_MARKER_STALE_SECS - during which
+            # `cancel` would report "scanner running: no" about a scan that is very much
+            # alive, pushing the operator toward the console hard-kill this feature exists
+            # to replace. Self-rate-limited, so calling it every tick is cheap.
+            try:
+                self._maybe_refresh_running_marker()
+            except Exception:
+                pass
 
     def _perform_enhanced_cleanup(self, start_time, total_files_found, files_per_target):
         """Enhanced cleanup with aggressive timeouts."""
@@ -5025,6 +5526,12 @@ rule test {{
             self._progress_heartbeat_stop.set()
             if getattr(self, '_progress_heartbeat_thread', None) is not None:
                 self._progress_heartbeat_thread.join(timeout=2)
+
+        # Consume the cancel flag (so it cannot also cancel the NEXT scan) and drop the
+        # liveness marker (so `mode=cancel` correctly reports no scan running).
+        if getattr(self, "cancel_requested", False):
+            self._clear_cancel_flag()
+        self._remove_running_marker()
 
         try:
             if getattr(self, 'resource_monitor', None) is not None:
@@ -5113,6 +5620,8 @@ rule test {{
         )
         self._progress_heartbeat_thread.start()
 
+        self._start_cancellation_watcher()
+
         total_files_found = 0
         files_per_target = {}
 
@@ -5134,10 +5643,12 @@ rule test {{
                         {'target_index': target_idx + 1, 'target_path': target}
                     )
                     
-                    for root, dirs, files in os.walk(target):
+                    for root, dirs, files in self._walk_cancellable(target):
                         if not self.scan_active:
                             break
-                            
+
+                        self._maybe_refresh_running_marker()
+
                         if self._is_special_file(root):
                             continue
                         
@@ -5323,6 +5834,17 @@ def upload_final_comprehensive_report(scanner, total_scan_time):
         if hasattr(scanner, 'log_manager'):
             scanner.log_manager.log_error(f"Error generating comprehensive final report: {e}")
         logging.error(f"Error uploading final comprehensive report: {e}")
+
+
+def cancel():
+    """Action Center entry point - cancel a running scan on this endpoint (NO inputs).
+
+    Kept as a separate zero-input entry point rather than a `mode` parameter on main():
+    Action Center's "Run by entry point" derives a script's input list from the function
+    signature, so adding a parameter to main() would change its 3-input contract and make
+    every existing run_script call fail parameter validation.
+    """
+    return _handle_cancel_request()
 
 
 def main(yarafile=None, scan_folder=None, alert_severity="low"):
@@ -5620,22 +6142,37 @@ def main(yarafile=None, scan_folder=None, alert_severity="low"):
             }
         }
         
+        # Telemetry must agree with the returned result and the summary JSON. Reporting
+        # "completed successfully" for a run the operator cancelled makes the dashboard
+        # contradict the Action Center output, and hides that the counts are partial.
+        _was_cancelled = getattr(scanner, "cancel_requested", False)
+        _elapsed_txt = datetime.timedelta(seconds=int(scan_total_time))
+        _completion_msg = (
+            f"Scan cancelled by operator after {_elapsed_txt} (partial results)"
+            if _was_cancelled else
+            f"Scan completed successfully in {_elapsed_txt}"
+        )
+        comprehensive_final_stats['outcome'] = "cancelled" if _was_cancelled else "completed"
+        if _was_cancelled:
+            comprehensive_final_stats['cancel_source'] = getattr(scanner, "cancel_source", "")
+
         standard_log = create_standard_log(
             log_type='scan_completion_summary',
             hostname=config.hostname,
             os_info=config.os_info,
             ip_address=config.ip_addresses[0] if config.ip_addresses else "Unknown",
             scan_id=config.scan_id,
-            message=f"Scan completed successfully in {datetime.timedelta(seconds=int(scan_total_time))}",
+            message=_completion_msg,
             level="INFO",
             data=comprehensive_final_stats
         )
         webhook_uploader._queue_standard_upload(standard_log, priority=True)
-        
+
         upload_final_comprehensive_report(scanner, scan_total_time)
-        
+
         log_manager.log_statistics(
-            f"SCAN COMPLETED SUCCESSFULLY in {datetime.timedelta(seconds=int(scan_total_time))}",
+            (f"SCAN CANCELLED BY OPERATOR after {_elapsed_txt}" if _was_cancelled
+             else f"SCAN COMPLETED SUCCESSFULLY in {_elapsed_txt}"),
             comprehensive_final_stats
         )
         
@@ -5682,9 +6219,54 @@ def main(yarafile=None, scan_folder=None, alert_severity="low"):
         except Exception:
             upload_errors = " | Upload errors: unknown"
 
-        summary = (f"Scan completed: {scanner.files_scanned} files scanned | "
-                f"{error_logger.failed_rules_count} rules failed compilation | "
-                f"{scanner.total_detections} matches found{upload_errors}")
+        # Surface MATCH-channel loss on the result line itself. upload_errors above only
+        # reflects the telemetry uploader, so a scan that found everything and delivered
+        # none of its findings still read as a clean success. Both counters are real loss
+        # but are named misleadingly differently: 'undelivered' items were never attempted
+        # (the drain window expired), 'failed_uploads' were attempted and rejected.
+        # Ported from the XDR edition's _delivery_shortfall().
+        #
+        # The denominator is deliberately ok+failed+undelivered, NOT total_matches:
+        # total_matches counts OFFSETS (incremented per matched string instance), while
+        # these three count UPLOAD ITEMS - one per (rule, file) finding since the
+        # grain-split change. Mixing the two understates loss by the average
+        # offsets-per-finding factor, which on a noisy rule is a factor of thousands.
+        #
+        # Read after _perform_enhanced_cleanup has called results_uploader.stop(wait=True),
+        # so these are the settled values; a worker that overran its join could in principle
+        # still move them, which would only ever under-report, never invent loss.
+        shortfall = ""
+        try:
+            ru = getattr(scanner, "results_uploader", None)
+            s = ru.get_upload_stats() if ru else {}
+            ok = int(s.get("successful_uploads", 0) or 0)
+            failed = int(s.get("failed_uploads", 0) or 0)
+            undelivered = int(s.get("undelivered", 0) or 0)
+            lost = failed + undelivered
+            if lost > 0:
+                queued = ok + lost
+                shortfall = (f" | WARNING: {lost} of {queued} finding upload(s) NOT delivered "
+                             f"(failed={failed}, undelivered={undelivered}) - "
+                             f"local logs hold the complete record")
+        except Exception:
+            pass
+
+        # A cancelled scan must not report "Scan completed" - it stopped early by request,
+        # so its file/match counts are a partial view of the target and reading them as a
+        # clean full result is wrong. (Caught in testing: a cancel that truncated a scan at
+        # 1,669 of 4,000 files still returned "Scan completed".)
+        if getattr(scanner, "cancel_requested", False):
+            _verb = f"Scan cancelled (source={getattr(scanner, 'cancel_source', 'unknown')})"
+        else:
+            _verb = "Scan completed"
+        # Skipped rules are NOT failures (the agent's libyara lacks the module they need),
+        # but they did not run either - so they must be visible here. Otherwise a pack whose
+        # rules were mostly skipped reports "0 rules failed compilation" and reads clean.
+        _skipped = getattr(error_logger, "skipped_rules_count", 0) or 0
+        _skipped_txt = f" | {_skipped} rules skipped (module unavailable)" if _skipped else ""
+        summary = (f"{_verb}: {scanner.files_scanned} files scanned | "
+                f"{error_logger.failed_rules_count} rules failed compilation{_skipped_txt} | "
+                f"{scanner.total_detections} matches found{upload_errors}{shortfall}")
         return summary
         
     except Exception as e:
@@ -5748,7 +6330,18 @@ def main(yarafile=None, scan_folder=None, alert_severity="low"):
         failed_rules = config.error_logger.failed_rules_count if config and hasattr(config, 'error_logger') else 0
         files_scanned = scanner.files_scanned if 'scanner' in locals() else 0
         matches = scanner.total_detections if 'scanner' in locals() else 0
-        
+
+        # A crash reaching here IS a failed scan - record it so the finally-block's
+        # scan_summary derives outcome="failed" instead of defaulting to "completed".
+        # Without this the JSON contradicts the SCAN_RESULT line, and any tool trusting
+        # the summary reads a crashed run as a clean one. (XDR does the same.)
+        if 'scanner' in locals() and scanner is not None:
+            try:
+                scanner.scan_failed = True
+                scanner.failure_reasons.append(f"Critical scanner error: {type(e).__name__}")
+            except Exception:
+                pass
+
         error_summary = (f"Scan failed: {files_scanned} files scanned | "
                         f"{failed_rules} rules failed compilation | "
                         f"{matches} matches found | Critical error occurred")
@@ -5763,6 +6356,59 @@ def main(yarafile=None, scan_folder=None, alert_severity="low"):
                 scanner.results_uploader.stop(wait=True)
             if webhook_uploader:
                 webhook_uploader.stop_uploader()
+
+            # Machine-readable per-run summary, written AFTER the uploaders drain so the
+            # delivery counts are final, and BEFORE stop_logging() so its own "summary
+            # written" line still reaches the logs. NOTE: `scanner` is not pre-initialized
+            # in this edition, so the locals() guard is the correct check here (unlike the
+            # XDR edition, which sets scanner = None up front).
+            if log_manager and config is not None and 'scanner' in locals() and scanner is not None:
+                try:
+                    if getattr(scanner, "cancel_requested", False):
+                        _outcome = "cancelled"
+                    elif getattr(scanner, "scan_failed", False):
+                        _outcome = "failed"
+                    else:
+                        _outcome = "completed"
+                    _dur = (scan_total_time if 'scan_total_time' in locals()
+                            else (time.time() - scan_start_time) if 'scan_start_time' in locals()
+                            else None)
+                    _el = getattr(config, "error_logger", None)
+                    _det = getattr(scanner, "detection_counts", {}) or {}
+                    _ru = getattr(scanner, "results_uploader", None)
+                    _match_books = _ru.get_upload_stats() if _ru else {}
+                    _wh = {}
+                    try:
+                        if webhook_uploader:
+                            _wh = (webhook_uploader.get_upload_statistics() or {}).get("summary", {}) or {}
+                    except Exception:
+                        pass
+                    log_manager.write_scan_summary({
+                        "outcome": _outcome,
+                        "failure_reasons": list(getattr(scanner, "failure_reasons", []) or []),
+                        "scan_folder": getattr(config, "scan_folder", None),
+                        "scan_targets": list(getattr(scanner, "scan_targets", []) or []),
+                        "duration_secs": round(_dur, 2) if _dur is not None else None,
+                        "files_scanned": getattr(scanner, "files_scanned", None),
+                        "files_skipped": getattr(scanner, "files_skipped", None),
+                        "matches": getattr(scanner, "total_detections", None),
+                        "unique_rules_triggered": len(_det),
+                        "failed_rules": getattr(_el, "failed_rules_count", None),
+                        "valid_rules": getattr(_el, "valid_rules_count", None),
+                        "skipped_rules": getattr(_el, "skipped_rules_count", 0),
+                        "scan_rate_fps": (round(getattr(scanner, "files_scanned", 0) / _dur, 2)
+                                          if _dur and _dur > 0 else 0),
+                        # Delivery books. match_delivery is the findings channel (one item
+                        # per rule/file finding); telemetry_delivery is everything else.
+                        "match_delivery": _match_books,
+                        "telemetry_delivery": _wh,
+                    })
+                except Exception as _summary_err:
+                    try:
+                        log_manager.log_error(f"Scan summary write failed: {_summary_err}")
+                    except Exception:
+                        pass
+
             if log_manager:
                 log_manager.stop_logging()
         except Exception as cleanup_error:
@@ -5785,14 +6431,34 @@ if __name__ == "__main__":
         if len(sys.argv) > 3:
             alert_severity_arg = _parse_alert_severity(sys.argv[3], "alert_severity")
 
-        result = main(
-            yarafile_arg,
-            scan_folder_arg,
-            alert_severity_arg,
-        )
+        # `cancel` as argv[1] delivers a cooperative cancel to a running scan instead of
+        # starting one - the CLI counterpart of the zero-input cancel() entry point.
+        if (yarafile_arg or "").strip().lower() == "cancel":
+            result = cancel()
+        else:
+            result = main(
+                yarafile_arg,
+                scan_folder_arg,
+                alert_severity_arg,
+            )
 
         result_text = str(result or "")
-        is_success = bool(result_text) and not result_text.lower().startswith("scan failed")
+        # Print it. Previously main()'s return value was computed, used for the exit code,
+        # and then thrown away - so a direct run (customer validation, scheduled task, CI)
+        # exited silently having reported nothing at all. The only path that ever printed
+        # was the Action Center snippet footer. Use the same "SCAN_RESULT: " prefix as that
+        # footer so downstream parsing is identical on both paths.
+        print("SCAN_RESULT: " + result_text)
+        sys.stdout.flush()
+        # "SCAN ABORTED" (placeholder credentials, nothing scanned or ingested) must not
+        # exit 0 - it previously did, because only the "scan failed" prefix was checked.
+        # "Cancel failed" covers the cancel entry point's own error return.
+        _rt = result_text.lower()
+        is_success = bool(result_text) and not (
+            _rt.startswith("scan failed")
+            or _rt.startswith("scan aborted")
+            or _rt.startswith("cancel failed")
+        )
         sys.exit(0 if is_success else 1)
 
     except Exception as e:
