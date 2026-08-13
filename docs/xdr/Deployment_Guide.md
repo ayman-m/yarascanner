@@ -199,12 +199,27 @@ re-upload. These are the deployment-wide behaviour knobs (no per-run input neede
 | `CONFIG_LOOKUP_SHARD` | `endpoint`/`none`/`<label>` | `endpoint` | Dataset sharding (§11) |
 | `CONFIG_ALERT_MAX_PER_SCAN` | int | `500` | Max per-finding alerts per scan; beyond → one rollup per rule. **Constant only** |
 | `CONFIG_LOOKUP_ROTATION` | `monthly`/`none` | `monthly` | Monthly dataset rotation (§11). **Constant only** |
+| `CONFIG_HOST_CLEANUP` | `off`/`on_delivery`/`always` | `off` | Remove this run's working files from the endpoint at end of run. **Constant only** |
+| `CONFIG_HOST_CLEANUP_KEEP` | `nothing`/`summary`/`evidence` | `summary` | What to keep when cleanup runs. **Constant only** |
 | `CONFIG_OPTIONS` | `key=value,key=value` | `""` | Rarely-needed extra overrides applied every run |
 
 **Upgrading from an earlier build.** The old `throttle_mode` runtime option is still
 accepted and translated (`off` → `cpu_guarantee=none`; `script` or `os` →
 `cpu_guarantee=headroom`), so existing scheduled jobs and playbooks keep running unchanged.
 Unknown keys still fail loudly.
+
+**Host cleanup.** Off by default — nothing about existing deployments changes unless you
+turn it on. The scanner already trims its footprint *across repeat scans* (the previous
+run's alerts/evidence are cleared at the start of the next one, logs keep the last 10
+scans), but does nothing at the *end* of a run — so a host scanned once and never again
+keeps its full working directory forever. `on_delivery` removes it only once this run's
+findings are confirmed delivered (an empty `delivery_shortfall`); it refuses if neither
+`CONFIG_CREATE_ALERTS` nor `CONFIG_WRITE_DATASET` is enabled, since with no delivery
+channel there is nothing to verify and the local copy would be the only copy. `always`
+skips that check entirely. `CONFIG_HOST_CLEANUP_KEEP` controls what survives: `summary`
+(recommended) keeps the tiny machine-readable `scan_summary_<run_id>.json`; `evidence`
+also keeps the evidence ZIP; `nothing` removes everything. The rule-compilation cache is
+never touched — it is shared across runs, not this run's data.
 
 **Per-run overrides.** A per-run `options` string (`key=value,key=value`) beats the constant
 for the ten runtime keys: `create_alerts`, `write_dataset`, `collect_files`, `cpu_guarantee`,

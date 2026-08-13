@@ -113,13 +113,15 @@ DEFAULT_XDR_API_URL = "replace_with_xdr_standard_api_url"
 # OVERRIDES the matching constant below, so per-run overrides remain possible
 # without editing the script. Leave a value as-is to use it fleet-wide.
 #
-# This applies to the ten keys in _VALID_OPTION_KEYS only. CONFIG_LOOKUP_ROTATION
-# and CONFIG_ALERT_MAX_PER_SCAN have NO options equivalent and can be changed only
-# here — passing them in an options string is rejected as an unknown key. Both are
-# deployment-wide by nature: rotation decides dataset naming (mixing rotated and
-# unrotated runs on one host splits its history across two datasets), and the alert
-# cap protects a per-API-key ceiling that is shared across every concurrent scan,
-# so a single run is the wrong scope to raise it from.
+# This applies to the ten keys in _VALID_OPTION_KEYS only. CONFIG_LOOKUP_ROTATION,
+# CONFIG_ALERT_MAX_PER_SCAN, CONFIG_HOST_CLEANUP and CONFIG_HOST_CLEANUP_KEEP have NO
+# options equivalent and can be changed only here — passing them in an options string
+# is rejected as an unknown key. All four are deployment-wide by nature: rotation
+# decides dataset naming (mixing rotated and unrotated runs on one host splits its
+# history across two datasets), the alert cap protects a per-API-key ceiling that is
+# shared across every concurrent scan, and host cleanup deletes files on the endpoint
+# — none of these should be one accidental options-string typo away from a different
+# behaviour on a single run.
 # ============================================================================
 CONFIG_MODE = "scan"                    # "scan" (run a scan) or "cancel" (stop a running scan)
 CONFIG_CREATE_ALERTS = True             # push one XDR alert per YARA match (feeds incidents)
@@ -167,6 +169,29 @@ CONFIG_LOOKUP_ROWS_PER_FINDING_MAX = 50 # max dataset rows uploaded per (rule, f
 # forever. Dashboards need no change (they match yara_scanner_matches* wildcards); prune old months
 # with xdr_action_center.py prune-datasets. "none" = single unrotated dataset (legacy behaviour).
 CONFIG_LOOKUP_ROTATION = "monthly"      # "monthly" (recommended) | "none"
+# End-of-run host cleanup. The scanner already manages its footprint ACROSS repeat scans
+# (initial_cleanup clears the previous run's alert/evidence dirs, logs keep the last 10
+# scans) but does nothing at the END of a run. On a one-off fleet sweep the host is never
+# scanned again, so its full working directory - logs, evidence ZIP, alert files - sits on
+# disk forever. This is opt-in and off by default because it deletes files on the endpoint;
+# the wrong default here is a bigger risk than leaving today's behaviour in place.
+#   "off"         - unchanged behaviour (default). Nothing removed at end of run.
+#   "on_delivery" - remove only if this run's findings are confirmed delivered
+#                   (delivery_shortfall is empty). Keeps everything if delivery was
+#                   incomplete or if neither CONFIG_CREATE_ALERTS nor CONFIG_WRITE_DATASET
+#                   is enabled - with no delivery channel there is nothing to verify, and
+#                   the local copy is the only copy.
+#   "always"      - remove regardless of delivery. Only for hosts where the local copy is
+#                   not wanted even as a fallback.
+# CONFIG_HOST_CLEANUP_KEEP controls what survives the removal:
+#   "nothing"  - remove everything, including the summary JSON.
+#   "summary"  - keep only scan_summary_<run_id>.json (recommended default: tiny, and the
+#                machine-readable record of what this run did and found).
+#   "evidence" - keep the summary and the evidence ZIP, remove the rest.
+# rule_cache is NEVER touched by this - it is a cross-run performance cache, not this run's
+# data, and is already self-capped (RULE_CACHE_MAX_FILES).
+CONFIG_HOST_CLEANUP      = "off"        # "off" | "on_delivery" | "always"
+CONFIG_HOST_CLEANUP_KEEP = "summary"    # "nothing" | "summary" | "evidence"
 CONFIG_OPTIONS = ""                     # extra "key=value,key=value" overrides applied every run (rarely needed)
 # ============================================================================
 
@@ -1596,7 +1621,23 @@ class ErrorLogger:
             return logging.getLogger()
         
         return error_logger
-    
+
+    def close(self):
+        """Close the yara_processing FileHandler. Idempotent — safe to call more than once.
+
+        Never previously needed: nothing tried to delete this file while the process was
+        still alive, so an unclosed handler was harmless until host cleanup's end-of-run
+        removal made it not — Windows refuses to delete a file that is still open
+        (WinError 32), where POSIX does not, so this went unnoticed until measured on a
+        real Windows agent. Mirrors LogManager.stop_logging()'s handler-closing pattern.
+        """
+        for handler in self.error_logger.handlers[:]:
+            try:
+                handler.close()
+            except Exception:
+                pass
+            self.error_logger.removeHandler(handler)
+
     def _analyze_compilation_error(self, error_msg, rule_content, error_line_num):
         """Analyze compilation error and provide diagnostics."""
         analysis = {
@@ -4927,6 +4968,127 @@ WantedBy=multi-user.target
             logging.error(f"Error scheduling macOS cleanup: {e}")
 
 
+class HostCleanup:
+    """End-of-run removal of THIS run's on-host working files.
+
+    CleanupManager (above) only ever handles the alert/evidence dirs at the START of the
+    NEXT scan (initial_cleanup) or a background rename task. Neither removes anything at
+    the end of a run, so a host scanned once and never again keeps its full logs, evidence
+    ZIP and alert files indefinitely - the exact gap a one-off fleet sweep hits. This class
+    is the opt-in fix: it runs once, in the finally block of run(), after delivery has
+    fully drained, and only when the operator has explicitly turned it on.
+
+    Off by default. It deletes files on a customer endpoint, so the wrong default is a far
+    bigger risk than leaving today's behaviour in place.
+    """
+
+    VALID_MODES = ("off", "on_delivery", "always")
+    VALID_KEEP = ("nothing", "summary", "evidence")
+
+    def __init__(self, config, mode, keep):
+        self.config = config
+        self.mode = str(mode or "off").strip().lower()
+        self.keep = str(keep or "summary").strip().lower()
+
+    def should_run(self, shortfall, delivery_enabled):
+        """Decide whether to clean up. Returns (ok, reason) - reason is always populated
+        so the caller can log why, even on the affirmative path (used for should_run()==False
+        cases; the True case's reason is empty and callers should not need it)."""
+        if self.mode == "off":
+            return False, "host cleanup disabled (CONFIG_HOST_CLEANUP=off)"
+        if self.mode not in self.VALID_MODES:
+            return False, ("unknown CONFIG_HOST_CLEANUP value %r - treated as off "
+                           "(valid: %s)" % (self.mode, "/".join(self.VALID_MODES)))
+        if self.mode == "always":
+            return True, ""
+        # mode == "on_delivery" from here.
+        if not delivery_enabled:
+            # Both CONFIG_CREATE_ALERTS and CONFIG_WRITE_DATASET are off: there is no
+            # "delivery" for this gate to check, so an empty shortfall would mean "nothing
+            # was ever attempted", not "everything landed". Treating that as safe to delete
+            # would wipe the only copy of this scan's findings. Refuse unless the operator
+            # opts all the way out of the gate with CONFIG_HOST_CLEANUP=always.
+            return False, ("on_delivery has no delivery channel to verify (alerts and "
+                           "dataset writes are both off) - keeping the local copy")
+        if shortfall:
+            return False, "delivery incomplete (%s) - keeping local copy" % shortfall
+        return True, ""
+
+    def run(self, summary_path, log=lambda *_: None):
+        """Remove this run's artefacts per the KEEP tier. Returns (removed_paths, errors).
+
+        Never touches: a DIFFERENT run's logs/summary in the same logs_dir (that is
+        LOG_KEEP_SCANS' retained history), or rule_cache (a cross-run performance cache,
+        already self-capped by RULE_CACHE_MAX_FILES, and not this run's data at all).
+
+        Safety check: only proceeds if `summary_path` was actually and durably written -
+        the audit record that this run happened and what it found. A missing summary means
+        we cannot even attest the run completed, so cleanup is refused rather than deleting
+        blind. This mirrors the verify-before-delete principle used elsewhere (dataset
+        consolidation): confirm the thing you are relying on actually exists first.
+        """
+        removed, errors = [], []
+        if not (summary_path and os.path.isfile(summary_path)):
+            return removed, errors
+
+        def _rm_file(path):
+            if path and os.path.isfile(path):
+                try:
+                    os.remove(path)
+                    removed.append(path)
+                except OSError as e:
+                    errors.append("%s: %s" % (path, e))
+
+        def _rm_tree(path):
+            if path and os.path.isdir(path):
+                try:
+                    shutil.rmtree(path)
+                    removed.append(path)
+                except OSError as e:
+                    errors.append("%s: %s" % (path, e))
+
+        run_id = self.config.run_id
+        logs_dir = self.config.logs_dir
+        summary_name = os.path.basename(summary_path)
+
+        # This run's per-category logs, identified the SAME way log retention identifies
+        # them (CleanupManager._extract_run_id_from_log_name), so the two mechanisms can
+        # never disagree about which files belong to which run. The summary itself is
+        # handled separately below (kept or removed per KEEP), never blind-removed here.
+        cm = CleanupManager(self.config)
+        if os.path.isdir(logs_dir):
+            for name in os.listdir(logs_dir):
+                if name == summary_name:
+                    continue
+                if cm._extract_run_id_from_log_name(name) == run_id:
+                    _rm_file(os.path.join(logs_dir, name))
+
+        # alert_dir / evidence_dir / failed_rules_dir are NOT partitioned per run_id - the
+        # scanner already wipes them wholesale at the START of the next run
+        # (CleanupManager.initial_cleanup). This is that same wipe, one run early, which is
+        # the entire point: a one-off sweep never gets a "next run" to do it.
+        if self.keep != "evidence":
+            _rm_tree(self.config.evidence_dir)
+        _rm_tree(self.config.alert_dir)
+        _rm_tree(self.config.failed_rules_dir)
+
+        if self.keep == "nothing":
+            _rm_file(summary_path)
+
+        # Recreate what was wiped, empty - matches initial_cleanup's own invariant that
+        # these directories always exist, and keeps the scheduled rename task (which cd's
+        # into alert_dir) exiting cleanly rather than hitting a missing directory.
+        for path in (self.config.evidence_dir, self.config.alert_dir, self.config.failed_rules_dir):
+            try:
+                os.makedirs(path, exist_ok=True)
+            except OSError:
+                pass
+
+        for err in errors:
+            log("host cleanup could not remove %s" % err)
+        return removed, errors
+
+
 # ============================================================================
 # MAIN SCANNING ENGINE
 # ============================================================================
@@ -7411,7 +7573,11 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
                             else None)
                     _el = config.error_logger if hasattr(config, "error_logger") else None
                     _det = getattr(scanner, "detection_counts", {}) or {}
-                    log_manager.write_scan_summary({
+                    # Computed once and reused below for HostCleanup's gate, rather than
+                    # calling _delivery_shortfall a second time — the two must never see a
+                    # different answer to "did this run's findings actually land?".
+                    _shortfall = _delivery_shortfall(scanner, config)
+                    _summary_path = log_manager.write_scan_summary({
                         "outcome": _outcome,
                         "scan_folder": getattr(config, "scan_folder", None),
                         "duration_secs": round(_dur, 2) if _dur is not None else None,
@@ -7441,9 +7607,54 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
                         # "did this scan's results actually land?". Local summary file only:
                         # the lookup datasets have a fixed schema and silently skip rows
                         # carrying unknown fields, so this must never be added to a row.
-                        "delivery_shortfall": _delivery_shortfall(scanner, config),
+                        "delivery_shortfall": _shortfall,
                         "top_rules": sorted(_det.items(), key=lambda rc: rc[1], reverse=True)[:10],
                     })
+
+                    # End-of-run host cleanup — opt-in, off by default (see CUSTOMER CONFIG).
+                    # Scoped to outcome == "completed" only: a crash's delivery accounting
+                    # is not trustworthy, and a cooperative-cancel's partial run is exactly
+                    # the case an operator would want to inspect afterwards, not have wiped.
+                    # Isolated in its own try/except so a failure here can never mask this
+                    # run's actual result or escape main()'s finally block.
+                    #
+                    # log_manager.stop_logging() AND config.error_logger.close() are called
+                    # HERE, before cleanup, not left to the unconditional call further down.
+                    # Both hold per-category log files open via a persistent
+                    # logging.FileHandler for the whole run — LogManager for six of the
+                    # seven categories, and ErrorLogger (config.error_logger) separately for
+                    # yara_processing, which is NOT one of LogManager's own handlers. POSIX
+                    # allows unlinking a file that is still open (Linux tolerates the
+                    # ordering either way), but Windows refuses to delete one — os.remove()
+                    # fails with WinError 32 and HostCleanup silently records it as an error
+                    # rather than crashing the scan. Verified live, in two rounds: closing
+                    # only log_manager's handlers fixed six of the seven files; the seventh
+                    # (yara_processing) needed error_logger.close() too, since it was never
+                    # closed anywhere in the codebase before host cleanup existed — nothing
+                    # had previously tried to delete it while the process was still alive.
+                    # Host cleanup's OWN status/error messages therefore cannot go through
+                    # log_manager (its handlers are already closed) — the plain `logging`
+                    # module is used instead, the same convention CleanupManager already
+                    # uses for messages outside the per-run structured-log lifecycle.
+                    try:
+                        if _outcome == "completed":
+                            if log_manager:
+                                log_manager.stop_logging()
+                            if _el is not None and hasattr(_el, "close"):
+                                _el.close()
+                            _hc = HostCleanup(config, CONFIG_HOST_CLEANUP, CONFIG_HOST_CLEANUP_KEEP)
+                            _delivery_enabled = bool(getattr(config, "create_alerts", False)
+                                                     or getattr(config, "write_dataset", False))
+                            _ok, _reason = _hc.should_run(_shortfall, _delivery_enabled)
+                            if _ok:
+                                _removed, _errs = _hc.run(_summary_path, log=logging.warning)
+                                logging.info(
+                                    "Host cleanup removed %d path(s)%s"
+                                    % (len(_removed), (", %d error(s)" % len(_errs)) if _errs else ""))
+                            elif CONFIG_HOST_CLEANUP != "off":
+                                logging.info("Host cleanup skipped: %s" % _reason)
+                    except Exception as _hce:
+                        logging.warning(f"Host cleanup failed: {_hce}")
                 except Exception as _se:
                     log_manager.log_error(f"scan summary write failed: {_se}")
             if log_manager:
