@@ -3,10 +3,10 @@ YARA Scanner (XDR API Edition)
 ==================================
 Enterprise-grade file scanner with real-time threat detection and Cortex XDR API reporting.
 
-    VERSION : 3.0.1
-    RELEASED: 2026-08-12
+    VERSION : 3.1.0
+    RELEASED: 2026-08-13
     SOURCE  : https://github.com/ayman-m/yarascanner
-    NOTES   : https://github.com/ayman-m/yarascanner/releases/tag/v3.0.1
+    NOTES   : https://github.com/ayman-m/yarascanner/blob/main/CHANGELOG.md
 
 Capabilities in this version:
 - Multi-threaded YARA scanning of one or more paths, with per-run rule delivery
@@ -26,8 +26,8 @@ Report the version with any support request: behaviour differs between releases 
 the release notes above record what changed.
 """
 
-__version__ = "3.0.1"
-__release_date__ = "2026-08-12"
+__version__ = "3.1.0"
+__release_date__ = "2026-08-13"
 
 # Standard library imports
 import base64

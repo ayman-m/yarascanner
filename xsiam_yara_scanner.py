@@ -11,16 +11,16 @@ Features:
 - Circuit breaker for upload resilience
 - System resource monitoring
 
-    VERSION : 3.0.0
-    RELEASED: 2026-08-12
+    VERSION : 4.0.0
+    RELEASED: 2026-08-13
     SOURCE  : https://github.com/ayman-m/yarascanner
-    NOTES   : https://github.com/ayman-m/yarascanner/releases/tag/v3.0.0-xsiam
+    NOTES   : https://github.com/ayman-m/yarascanner/blob/main/CHANGELOG.md
 
 Report the version with any support request.
 """
 
-__version__ = "3.0.0"
-__release_date__ = "2026-08-12"
+__version__ = "4.0.0"
+__release_date__ = "2026-08-13"
 
 # Standard library imports
 import base64

@@ -15,6 +15,217 @@ fixes without changing behaviour you rely on.
 
 ---
 
+## xsiam_yara_scanner.py v4.0.0 — 2026-08-13
+
+**Breaking.** Adds operator-driven scan cancellation — which this edition simply did not
+have — plus a per-run machine-readable summary, a scan-coverage fix, and correct
+classification of rules the agent cannot run. The major bump is for four contract changes
+listed under *Breaking* below, not for the new features; if you parse this scanner's output
+or group on its `scan_id`, read that section before upgrading.
+
+### Added — cooperative cancellation (`cancel` entry point)
+
+Until now the only way to stop a running scan was the console's **Cancel** button, which
+hard-kills the payload process: queued findings are lost, no summary is written, and no
+terminal event is emitted. The scan simply vanishes.
+
+The scanner now exposes a second, **zero-input** Action Center entry point, `cancel`. It
+writes a flag file that the running scan polls for (default every 5s) and reports whether a
+scan is actually alive. The scan then unwinds cooperatively — workers stop, queues drain,
+telemetry flushes, and the run still writes its summary with `outcome: "cancelled"`.
+
+`cancel` is a separate entry point rather than a `mode` input on `main` deliberately: Action
+Center derives a script's input list from the function signature, so adding a parameter to
+`main` would change its 3-input contract and fail parameter validation on every existing
+`run_script` call. **`main`'s inputs are unchanged.**
+
+Supporting pieces: `_walk_cancellable` replaces `os.walk` for discovery so a cancel is
+honoured within a single directory read instead of an unbounded wait (traversal verified
+byte-identical to `os.walk`, including symlink handling and caller-side pruning); a
+`control/running.json` liveness marker, written before rule compilation starts so `cancel`
+does not report "scanner running: no" about a scan that is merely still compiling.
+
+Verified live: a cancel truncated a scan at 1,627 of 4,000 files, with the flag consumed and
+the marker removed.
+
+### Added — `logs/scan_summary_<run_id>.json`
+
+One machine-readable record per run — outcome, duration, file/match counts, rule stats,
+scanner version, and both delivery books — written atomically so a reader never sees a
+partial file. This matters most in the case this edition is least protected against: after a
+console hard-kill, nothing reaches the collector and this local file is the only surviving
+evidence of what the run had done.
+
+### Fixed — browser caches and profiles were never scanned (detection blind spot)
+
+Chrome, Edge and Firefox cache and profile directories were on the skip list on **every**
+platform, so a payload staged in one was invisible to this scanner. Those four skip entries
+are removed, and a small allowlist re-opens browser caches on macOS where a broader
+`/library/caches/` rule would still have excluded them. The allowlist deliberately does not
+override *boundary* skips — mounted volumes, removable and network media (`/Volumes/`,
+`/media/`, `/mnt/`, `/net/`) stay excluded, so a Time Machine disk's per-snapshot browser
+caches cannot turn the carve-out into an unbounded walk.
+
+**This widens what gets scanned.** Expect more files scanned, and potentially new detections,
+in user profile directories.
+
+### Fixed — rules needing an unavailable module counted as compilation failures
+
+A rule that inherits `import "cuckoo"` (or any module this agent's libyara lacks) from a
+shared file-level preamble had that import stripped, then failed to compile with `undefined
+identifier` and was booked as a **failed rule** — inflating the failure count and making a
+healthy scan look broken. This is the normal, idiomatic YARA layout, so it affected whole
+rule packs at once.
+
+Such rules are now reported as **skipped**, and skipped rules appear on the result line and in
+the summary JSON so they cannot silently vanish. Classification is based on the actual compile
+error, not on scanning rule text for module names — a rule hunting for the literal string
+`"cuckoo.conf"` still compiles and runs normally. If *every* rule is skipped, the error now
+says the agent lacks the required modules rather than reporting a compilation failure that
+sends you hunting for a syntax error that does not exist.
+
+Relatedly, module availability is no longer probed against a fixed list of eight names —
+whatever the submitted rules import is probed too, so a module this agent *does* support is
+no longer treated as missing.
+
+### Fixed — progress telemetry was effectively never emitted
+
+Progress logging was checked only inside the file-discovery loop, which almost never runs
+long enough to cross the interval; enumeration is fast, and the worker threads matching file
+content are what take minutes. Confirmed against the tenant: **zero** "Scan Progress" or
+"Cache Performance" events had ever been recorded, on any host. It now runs on a background
+heartbeat spanning the whole scan, and the default interval is **30s** (was 120s, which was
+longer than many scans' active phase). The value is clamped to a 1s minimum — setting `0`
+does not disable progress logging, it would have busy-spun; use a large value instead.
+
+Two long-standing metric bugs surfaced by that fix: CPU was reported as `0.0%` forever (a
+fresh psutil handle was created per sample, and psutil's first reading is always zero), and
+on macOS an unguarded `io_counters()` call zeroed memory and network too.
+
+### Fixed — other
+
+- Monitoring toggles (`ENABLE_RESOURCE_MONITOR`, `ENABLE_PERF_MONITOR`, `ENABLE_FD_MONITOR`)
+  are editable constants at the top of the file. They were previously environment variables
+  only, with no constant anywhere — and Action Center cannot set environment variables, so
+  they were unreachable in practice.
+- Direct CLI runs print their result. Previously `main`'s return value was computed, used for
+  the exit code, and discarded, so a direct invocation printed nothing at all.
+- A crashed scan records `outcome: "failed"` in the summary instead of `"completed"`.
+- Log retention covers the new summary JSONs and sweeps orphaned `.json.tmp` files; it
+  previously matched only `*.log`, so summaries would have accumulated indefinitely.
+
+### Breaking
+
+1. **`scan_id` format.** Was `yara_<sha256-of-rules>`; now
+   `<hostname>_<run_id>_yara_<hash12>`. The old form was identical across every host running
+   the same ruleset and across re-runs, so anything grouping by `scan_id` was silently
+   merging an entire fleet into one "scan". The new form is unique per run. **History
+   contains both shapes**, and queries grouped on `scan_id` will not error — they will just
+   group differently. No shipped widget or dashboard uses `scan_id`.
+2. **`SCAN_RESULT` line shape.** It can now begin `Scan cancelled (source=…)` instead of
+   `Scan completed`, gains a `| N rules skipped (module unavailable)` segment when relevant,
+   and gains a trailing delivery-shortfall warning when findings did not reach the collector.
+   Prefix and positional parsers need updating.
+3. **Exit codes.** `SCAN ABORTED` (placeholder credentials — nothing scanned or ingested) and
+   `Cancel failed` now exit **1**. `SCAN ABORTED` previously exited 0, reporting a total
+   failure as success.
+4. **Completion telemetry.** For a cancelled run the `scan_completion_summary` message is now
+   `Scan cancelled by operator…` rather than `Scan completed successfully in …`, and the event
+   carries a new `outcome` field. Saved queries keyed on the old message text will miss
+   cancelled runs.
+
+### Upgrading
+
+1. Re-upload the script to the Action Center script library, re-applying your collector
+   credentials (`DEFAULT_API_KEY` / `DEFAULT_API_ENDPOINT`) after download.
+2. Confirm the console lists **two** entry points: `main` (3 inputs) and `cancel` (0 inputs).
+3. Use the `cancel` entry point instead of the console Cancel button — the console button
+   still hard-kills and still loses findings.
+4. If you want CPU/memory dashboard data, set `ENABLE_RESOURCE_MONITOR = True` before
+   uploading. Note `ENABLE_PERF_MONITOR` writes to the endpoint's local log only and sends
+   nothing to the collector.
+5. Review the four Breaking items against any automation that parses this scanner's output.
+
+**The parsing rule and the XSIAM dashboards/widgets are unchanged in this release — there is
+nothing to re-apply on the tenant.**
+
+---
+
+## xdr_yara_scanner.py v3.1.0 — 2026-08-13
+
+Adds optional end-of-run host cleanup, and fixes progress telemetry that was effectively
+never emitted. Drop-in: every new behaviour is off by default.
+
+### Added — end-of-run host cleanup (`CONFIG_HOST_CLEANUP`, default `off`)
+
+A one-off fleet sweep previously left every scanned host's full working directory — logs,
+evidence ZIP, alert files — on disk forever; the scanner only ever trimmed its footprint
+across *repeat* scans, never at the end of a run.
+
+`CONFIG_HOST_CLEANUP` accepts `off` (default), `on_delivery`, or `always`, with
+`CONFIG_HOST_CLEANUP_KEEP` (`nothing` / `summary` (default) / `evidence`) controlling what
+survives. Because it deletes data, the gate is deliberately conservative:
+
+- Only runs when the scan's outcome is `completed` — a cancelled or failed run keeps
+  everything.
+- Only when the run's `scan_summary` was actually written (verify-before-delete).
+- `on_delivery` additionally requires the run's delivery accounting to show **nothing** lost,
+  and refuses outright when both alert and dataset delivery are disabled — "nothing was
+  attempted" must never be mistaken for "everything landed."
+- Never touches another run's retained logs, or `rule_cache` (a cross-run cache, not this
+  run's data).
+
+`always` bypasses the delivery check by design. That is the one setting that can remove a
+run's only local copy regardless of whether anything reached the tenant — choose it
+deliberately.
+
+**Caveat:** cleanup empties `failed_rules/` wholesale, which includes earlier runs'
+compilation diagnostics, not just this run's.
+
+Two Windows-only bugs were found and fixed during live validation: cleanup ran before the
+log-file handles were released, and Windows refuses to delete an open file (POSIX tolerates
+it, so it never surfaced on Linux). A seventh file owned by a separate logger had no `close()`
+method at all. Both are fixed by closing handles immediately before cleanup dispatches.
+
+### Fixed — progress telemetry, module probing, and metrics
+
+The same three fixes described in the XSIAM v4.0.0 entry above, ported to this edition:
+progress logging moved to a background heartbeat (it was checked only in the discovery loop
+and so effectively never fired); `log_interval` default 120s → 30s with a 1s clamp; module
+availability probed against what the rules actually import rather than a fixed list; and the
+psutil handle primed and reused so CPU is no longer reported as `0.0%` forever, with
+`io_counters()` guarded so macOS does not lose memory and network metrics too.
+
+Note the module-probe fix changes the rule-cache key, so the first scan on each host after
+upgrading recompiles rules once.
+
+Separately, the dataset heartbeat now runs on its own thread, so liveness no longer stalls
+when the directory walker is blocked on a saturated queue.
+
+### Upgrading
+
+**Drop-in** — `CONFIG_HOST_CLEANUP` defaults to `off`, so behaviour is unchanged until you
+opt in. Expect one extra rule compile per host on the first scan (cache-key change), and
+roughly 4× more local progress-log lines from the 30s interval.
+
+### Known issue — the bundled XDR dashboard is still on the pre-v3 match grain
+
+The standalone widget files under `widgets/xdr/` were rewritten for the v3.0.0 grain change
+(one dataset row per *finding* rather than per matched offset, with the true hit total in
+`match_count`). **The bundled `dashboards/xdr/YARA Scanner (Lookup).json` was not.** All 18 of
+its match-related queries still use the pre-v3 shape (`count()` over rows,
+`matched_length`), and none reference `match_count`.
+
+Consequence: importing that dashboard as-is produces hit counts that **undercount by orders
+of magnitude** on any rule with many string hits per file — the queries run and return data,
+they are simply wrong. This is the same defect corrected on the XSIAM side in v3.0.0.
+
+Until it is fixed, prefer the individual `.xql` files in `widgets/xdr/`, which are correct.
+Note also that `Matched-Length Size Buckets` was replaced by `Match Count Buckets` (the old
+`matched_length` column does not exist at the v3 grain).
+
+---
+
 ## YARA Dataset Management pack v1.1.0 — 2026-08-12
 
 The pack now ships all four automations its own shared-library header always claimed it did.
