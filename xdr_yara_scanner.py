@@ -3275,7 +3275,22 @@ class ResultsUploader:
     
     def __init__(self, config):
         self.config = config
-        self.results = []
+        # Per-offset detail is STREAMED to results_file as it is produced, not buffered.
+        # It used to accumulate in a list and only be written at scan end, which made peak
+        # memory scale with total matched offsets rather than with the scan. Measured on the
+        # sibling XSIAM edition, which had byte-for-byte this bug: 1,048,035 offset hits
+        # across 17,509 findings held ~15 GB RSS and was still climbing. That endpoint had
+        # 160 GB so it survived; a normal 8-16 GB endpoint would have been driven into swap
+        # or OOM by the same ruleset. Both editions already cap the UPLOAD representation
+        # (CONFIG_LOOKUP_ROWS_PER_FINDING_MAX here) - the local list was the uncapped half.
+        #
+        # The list only ever existed to be serialized to this file, so writing each entry
+        # immediately is both O(1) memory and crash-safe: a killed scan (console Cancel)
+        # now keeps everything written so far instead of losing all of it with the process.
+        self._results_count = 0
+        self._results_fh = None
+        self._results_lock = threading.Lock()
+        self._results_write_failed = False
         self.hostname = config.hostname
         self.os_info = config.os_info
         self.ip_address = config.ip_addresses[0] if config.ip_addresses else "Unknown"
@@ -3725,7 +3740,7 @@ class ResultsUploader:
         other findings in the same scan get a turn. Folding offsets into one row keeps that fixed
         per-file cost paid ONCE per finding instead of once per offset.
 
-        The full per-offset detail still goes to self.results (local, unbounded) — only the
+        The full per-offset detail is streamed to results_file as produced — only the
         NETWORK/dataset representation is aggregated+sampled here."""
         match_count = 0
         _first_offset = None
@@ -3757,7 +3772,7 @@ class ResultsUploader:
                 "file_sha256": file_sha256,
                 "file_creation_time": file_creation_time,
             }
-            self.results.append(result)
+            self._write_result_line(result)
             self.upload_stats['total_matches'] += 1
             match_count += 1
             _string_id_counts[string_id] = _string_id_counts.get(string_id, 0) + 1
@@ -3861,29 +3876,63 @@ class ResultsUploader:
         self._throttled_log("added_matches",
                             f"Added {match_count} matches for rule '{rule}' in file: {filename}", level="upload")
 
+    def _write_result_line(self, result):
+        """Append one per-offset result to the JSONL results file immediately.
+
+        Called from every scan worker, so the handle and the write are lock-guarded. The
+        file is opened lazily on the first match, so a scan with no detections leaves no
+        empty artifact behind (matching the previous behaviour, which wrote nothing when
+        the list was empty).
+
+        A write failure is logged ONCE and then suppressed: a full or read-only disk must
+        not turn into one log line per matched offset, which on a storm scan is exactly the
+        flood this class already guards against elsewhere.
+        """
+        with self._results_lock:
+            if self._results_write_failed:
+                return
+            try:
+                if self._results_fh is None:
+                    self._results_fh = open(self.results_file, "w", encoding="utf-8")
+                self._results_fh.write(json.dumps(result, ensure_ascii=False) + "\n")
+                self._results_count += 1
+            except Exception as e:
+                self._results_write_failed = True
+                if self.log_manager:
+                    self.log_manager.log_error(
+                        f"Error writing local results to {self.results_file}: {e} "
+                        f"(further write errors suppressed; {self._results_count} entries written)"
+                    )
+
     def save_results(self):
-        """Save results to JSON file."""
+        """Flush and close the streamed results file.
+
+        Entries are written as they are produced (see _write_result_line), so this is now a
+        flush/close rather than a bulk serialize - it exists to keep the call site and the
+        'results saved' accounting unchanged.
+        """
+        with self._results_lock:
+            count = self._results_count
+            try:
+                if self._results_fh is not None:
+                    self._results_fh.flush()
+                    try:
+                        os.fsync(self._results_fh.fileno())
+                    except Exception:
+                        pass
+                    self._results_fh.close()
+                    self._results_fh = None
+            except Exception as e:
+                if self.log_manager:
+                    self.log_manager.log_error(f"Error closing results file: {e}")
+                return False
+
         if self.log_manager:
-            self.log_manager.log_upload(f"Attempting to save {len(self.results)} results to: {self.results_file}")
-        
-        if not self.results:
-            if self.log_manager:
+            if count:
+                self.log_manager.log_upload(f"Successfully saved {count} results to: {self.results_file}")
+            else:
                 self.log_manager.log_upload("No results to save")
-            return True
-
-        try:
-            with open(self.results_file, "w", encoding="utf-8") as f:
-                for result in self.results:
-                    f.write(json.dumps(result, ensure_ascii=False) + "\n")
-
-            if self.log_manager:
-                self.log_manager.log_upload(f"Successfully saved {len(self.results)} results to: {self.results_file}")
-            return True
-            
-        except Exception as e:
-            if self.log_manager:
-                self.log_manager.log_error(f"Error saving results to JSON: {e}")
-            return False
+        return True
     
     def upload_results(self):
         """Finalize upload process with timeout protection."""
@@ -5495,18 +5544,43 @@ rule test {{
                     logging.debug(f"Rule imports unavailable module: {module_name}")
                     return True, module_name
 
-        # (2) usage of a module that the source imported but this agent lacks
-        if source_imported_modules:
-            for module_name, usage_pattern in MODULE_USAGE_PATTERNS.items():
-                if module_name in available_modules:
-                    continue
-                if module_name not in source_imported_modules:
-                    continue  # bare "<mod>." here is a literal string/comment, not a module ref
-                if re.search(usage_pattern, rule_content):
-                    logging.debug(f"Rule uses unavailable imported module via reference: {module_name}")
-                    return True, module_name
-
+        # Case (2) - a rule whose declaring preamble import was stripped - is NO LONGER
+        # detected here by matching a `<mod>.` usage regex against the rule text. That test
+        # could not tell a real module reference from the same characters appearing inside a
+        # string literal, a comment, or a meta value, and its `source_imported_modules` guard
+        # did not save it: that set is computed once over the WHOLE submitted ruleset, so a
+        # single `import "cuckoo"` anywhere in the pack opened the gate for every other rule
+        # in the file - exactly the situation case (2) exists for. A rule hunting the literal
+        # string "cuckoo.conf" was therefore dropped without ever being compiled, silently
+        # losing detection coverage.
+        #
+        # It is now classified from the ACTUAL compile error instead - see
+        # _module_missing_from_compile_error(), called from the compile loop's except branch.
+        # A rule that merely mentions a module name compiles cleanly, never raises, and so can
+        # never be reclassified. Ported from the XSIAM edition.
         return False, None
+
+    def _module_missing_from_compile_error(self, error, source_imported_modules, available_modules):
+        """Return the module name if a compile error is really "this agent lacks a module".
+
+        A rule that inherits `import "cuckoo"` from a shared preamble (the normal, idiomatic
+        YARA layout) has that import stripped by _split_yara_rules when the module is not
+        available here. The rule body still references `cuckoo.something`, so yara.compile
+        raises `undefined identifier "cuckoo"` and the rule would otherwise be booked as a
+        COMPILE FAILURE - inflating the failed count and making a healthy scan look broken.
+
+        Requiring all three of: yara itself reported the identifier undefined, the name was
+        imported somewhere in the original source, and the module is genuinely unavailable,
+        cannot mis-handle a literal string. It also needs no per-module usage table, so it
+        works for any module a future libyara build might add.
+        """
+        if not source_imported_modules:
+            return None
+        text = str(error)
+        for module_name in re.findall(r'undefined identifier "(\w+)"', text):
+            if module_name in source_imported_modules and module_name not in available_modules:
+                return module_name
+        return None
 
     def _extract_imported_modules(self, source_text):
         """Extract imported YARA module names from a source block."""
@@ -5777,9 +5851,36 @@ rule test {{
                     logging.info(f"✓ Compiled {i}/{len(individual_rules)} rules ({error_logger.valid_rules_count} valid, {error_logger.failed_rules_count} failed, {skipped_count} skipped)")
 
             except Exception as e:
+                # Not a compile failure: the rule needs a module this agent's libyara does
+                # not have, inherited from a preamble import that was stripped.
+                _missing = self._module_missing_from_compile_error(
+                    e, source_imported, available_modules
+                )
+                if _missing:
+                    skipped_count += 1
+                    if skipped_count <= 10:
+                        msg = (f"SKIP (module unavailable): rule '{display_name}' needs "
+                               f"'{_missing}' (inherited from a file-level import)")
+                        logging.warning(msg)
+                        error_logger.error_logger.warning(msg)
+                    try:
+                        skipped_rule_path = os.path.join(
+                            self.config.failed_rules_dir,
+                            f"skipped_rule_{display_name}_{_missing}.yar"
+                        )
+                        with open(skipped_rule_path, "w", encoding="utf-8") as f:
+                            f.write(f"// SKIPPED RULE - Module '{_missing}' not available on this agent\n")
+                            f.write(f"// (import inherited from the file-level preamble)\n")
+                            f.write(f"// Date: {datetime.datetime.now().isoformat()}\n")
+                            f.write("// " + "="*50 + "\n\n")
+                            f.write(rule_content)
+                    except Exception:
+                        pass
+                    continue
+
                 compilation_errors.append(f"Rule {display_name}: {str(e)}")
                 error_logger.log_rule_compilation_error(display_name, rule_content, e)
-                
+
                 if error_logger.failed_rules_count <= 10:
                     logging.warning(f"Failed rule {display_name}: {str(e)[:100]}")
                 
@@ -5808,7 +5909,19 @@ rule test {{
             error_logger.error_logger.info(f"Skipped {skipped_count} rules due to unavailable modules")
 
         if not valid_sources:
-            error_msg = f"No valid YARA rules could be compiled out of {len(individual_rules)} rules."
+            # Distinguish "your rules are broken" from "this agent's libyara cannot run
+            # them". Both end the scan, but they need completely different responses, and
+            # reporting an all-skipped pack as a compilation failure sends the operator
+            # hunting for a syntax error that does not exist.
+            if skipped_count and not error_logger.failed_rules_count:
+                error_msg = (
+                    f"No rules could run on this endpoint: all {skipped_count} rule(s) need "
+                    f"YARA modules this agent's libyara build does not provide "
+                    f"(available: {', '.join(available_modules) or 'none'}). "
+                    f"This is an agent capability limit, not a rule syntax error."
+                )
+            else:
+                error_msg = f"No valid YARA rules could be compiled out of {len(individual_rules)} rules."
             error_logger.has_errors = True
             error_logger.error_logger.error(f"FINAL_COMPILATION_ERROR: {error_msg}")
             sys.stderr.write(f"CRITICAL: YARA rule compilation failed: {error_msg}\n")
@@ -7398,10 +7511,21 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
         # Operator-initiated cancellation is a success outcome (not a failure).
         if scanner.cancel_requested:
             log_manager.log_system(f"Scan cancelled by operator (source={scanner.cancel_source})")
-            return (
+            _cancel_summary = (
                 f"Scan cancelled by operator: {scanner.files_scanned} files scanned | "
                 f"{scanner.total_detections} matches found | {config.posture}"
             )
+            # A cancelled scan can still have lost findings in transit, and this early
+            # return used to bypass the delivery-shortfall check entirely - so the one
+            # outcome where partial results matter most was also the one that never told
+            # the operator any of them failed to land. Uploaders are stopped by
+            # _perform_enhanced_cleanup before scan_system returns, so the counters are
+            # settled here exactly as they are on the completed path.
+            _cancel_shortfall = _delivery_shortfall(scanner, config)
+            if _cancel_shortfall:
+                _cancel_summary += " | " + _cancel_shortfall
+                log_manager.log_error("DELIVERY INCOMPLETE - " + _cancel_shortfall)
+            return _cancel_summary
 
         if scanner.scan_failed:
             failure_data = {
@@ -7478,8 +7602,13 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
                     
         log_manager.log_system("=== YARA SCANNER COMPLETED SUCCESSFULLY (STANDARDIZED) ===")
 
+        # Skipped rules are NOT failures (the agent's libyara lacks the module they need),
+        # but they did not run either - so they must be visible here. Otherwise a pack whose
+        # rules were mostly skipped reports "0 rules failed compilation" and reads clean.
+        _skipped = getattr(error_logger, "skipped_rules_count", 0) or 0
+        _skipped_txt = f" | {_skipped} rules skipped (module unavailable)" if _skipped else ""
         summary = (f"Scan completed: {scanner.files_scanned} files scanned | "
-                f"{error_logger.failed_rules_count} rules failed compilation | "
+                f"{error_logger.failed_rules_count} rules failed compilation{_skipped_txt} | "
                 f"{scanner.total_detections} matches found | "
                 f"cpu-slept {scanner.cpu_governor.slept_total:.0f}s | {config.posture}")
 
@@ -7587,6 +7716,7 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
                         "unique_rules_triggered": len(_det),
                         "failed_rules": getattr(_el, "failed_rules_count", None),
                         "valid_rules": getattr(_el, "valid_rules_count", None),
+                        "skipped_rules": getattr(_el, "skipped_rules_count", 0),
                         "scan_rate_fps": (round(getattr(scanner, "files_scanned", 0) / _dur, 2)
                                           if _dur and _dur > 0 else 0),
                         "total_paused_secs": round(
