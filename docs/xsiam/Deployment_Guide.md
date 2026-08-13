@@ -338,15 +338,52 @@ dataset = yara_scans_raw
 
 | File | Dashboard | Shows |
 |------|-----------|-------|
-| `dashboards/Yara Matches.json` | **Yara Matches** | Match counts, severity trend, top rules, top hosts, files |
-| `dashboards/Yara Scan Performance.json` | **Yara Scan Performance** | Initiated/completed scans, throughput, CPU/memory, errors |
+| `dashboards/xsiam/YARA Matches.json` | **Yara Matches** | Match counts, severity trend, top rules, top hosts, files |
+| `dashboards/xsiam/YARA Scan Performance.json` | **Yara Scan Performance** | Initiated/completed scans, throughput, CPU/memory, errors |
 
 1. **Dashboards & Reports → Dashboards Manager**.
 2. **⋮ menu → Import Dashboard** → select the JSON → **Import**. Repeat for the second.
 3. Open each — widgets self-populate from `dataset = yara_scans_raw`.
 
-Individual widget queries are in `widgets/*.xql` if you prefer to build custom
+Individual widget queries are in `widgets/xsiam/*.xql` if you prefer to build custom
 dashboards.
+
+## 12.1 The CPU / memory widgets need at least one **finished** scan
+
+> **Expect these four widgets to be blank while a scan is still running — that is correct
+> behaviour, not a broken dashboard or a missing parsing rule.**
+>
+> - Yara - Average System CPU Utilization
+> - Yara - Average Process CPU Utilization
+> - Yara - Average System Memory Utilization
+> - Yara - Average Memory Allocation
+
+Each of these averages resource samples taken *inside a completed scan window*. They pair a
+start marker (`Worker thread startup completed`) with the matching completion marker
+(`Target scan completed:`) per host, and then average only the `system_resource_snapshot`
+rows that fall between the two. A scan that has started but not finished has no end marker
+yet, so it contributes nothing and the widget renders **"Could not Visualize"**.
+
+Practical consequences:
+
+- On a first deployment, these stay blank until the **first endpoint finishes** — on a full
+  `C:\` scan that can be tens of minutes to hours.
+- With a long-running scan in flight, they show only *previously completed* runs, so the
+  numbers can look stale while a scan is clearly active.
+- If they are blank and no scan has ever completed on any endpoint, that is expected. Verify
+  with:
+  ```
+  dataset = yara_scans_raw | filter message contains "Target scan completed:" | comp count() as finished_scans by hostname
+  ```
+  Zero rows means nothing has finished yet — wait, or scan a small folder first to get one
+  completed window on the board.
+
+They also require resource sampling to be switched on (see §7): with
+`ENABLE_RESOURCE_MONITOR = False` no `system_resource_snapshot` rows are produced at all, and
+these four widgets stay blank no matter how many scans complete.
+
+The remaining widgets (matches, throughput, worker stats, scan counts) do **not** wait for a
+completed scan and populate while a scan is in progress.
 
 ---
 
