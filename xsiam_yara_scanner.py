@@ -11,16 +11,16 @@ Features:
 - Circuit breaker for upload resilience
 - System resource monitoring
 
-    VERSION : 4.1.0
-    RELEASED: 2026-08-13
+    VERSION : 4.2.0
+    RELEASED: 2026-08-14
     SOURCE  : https://github.com/ayman-m/yarascanner
     NOTES   : https://github.com/ayman-m/yarascanner/blob/main/CHANGELOG.md
 
 Report the version with any support request.
 """
 
-__version__ = "4.1.0"
-__release_date__ = "2026-08-13"
+__version__ = "4.2.0"
+__release_date__ = "2026-08-14"
 
 # Standard library imports
 import base64
@@ -219,6 +219,21 @@ UPLOAD_BATCH_MAX_BYTES = _env_number("YARA_UPLOAD_BATCH_MAX_BYTES", 4 * 1024 * 1
 # Clamp: a batch of 0 would spin without ever sending.
 UPLOAD_BATCH_MAX_EVENTS = max(1, UPLOAD_BATCH_MAX_EVENTS)
 UPLOAD_BATCH_MAX_BYTES = max(64 * 1024, UPLOAD_BATCH_MAX_BYTES)
+
+# --- Evidence packaging -----------------------------------------------------
+# Whether the evidence ZIP carries copies of the matched files themselves.
+#
+# OFF by default, matching xdr_yara_scanner's collect_files, which was defaulted off at
+# the customer's request. Copying is charged entirely to the SCANNED host's disk: every
+# matched file is read and written into a local archive, so a scan that matches broadly
+# writes gigabytes to the very machine the scan is meant not to disturb. A C:\Windows\System32
+# scan on the lab host produced a 2.8 GB archive this way.
+#
+# Turning it off does NOT lose the ability to investigate: file_mapping.txt (every path
+# plus its SHA256) and the per-rule alert texts are still packaged, so a responder can
+# locate and pull any matched file by path or hash on demand. What is dropped is only the
+# bulk pre-emptive copy of files that are, by definition, already on the host.
+COLLECT_MATCHED_FILES = _env_bool("YARA_COLLECT_MATCHED_FILES", False)
 
 YARA_RULE = r""""""
 
@@ -3853,15 +3868,42 @@ class EvidenceCollector:
                         mapping_file.write(f"{file_path} | {file_hash}\n")
 
     def _create_evidence_zip(self):
-        """Create ZIP file containing evidence."""
+        """Create ZIP file containing evidence.
+
+        Entries are content-addressed (`matched_files/<sha256>`), so several paths
+        holding identical bytes collapse to one blob. file_mapping.txt still records
+        every path -> hash pair, which is what makes the dedupe lossless.
+
+        Skipping already-packaged hashes is load-bearing, not an optimisation: zipfile
+        only *warns* on a repeated arcname and writes the member anyway, so without this
+        the archive carried one full copy per duplicate path while readers could still
+        only ever see the first. Duplicate files are routine under System32, and this is
+        what grew a single scan's archive to gigabytes on the scanned host.
+        """
+        copy_files = getattr(self.config, "collect_matched_files", COLLECT_MATCHED_FILES)
+        packaged_hashes = set()
+        duplicates_skipped = 0
         with zipfile.ZipFile(
             self.config.evidence_zip, "w", zipfile.ZIP_DEFLATED
         ) as zip_file:
-            for file_path, file_hash in self.file_hashes.items():
-                try:
-                    zip_file.write(file_path, f"matched_files/{file_hash}")
-                except Exception as e:
-                    logging.error(f"Error adding file to zip {file_path}: {e}")
+            if copy_files:
+                for file_path, file_hash in self.file_hashes.items():
+                    if file_hash in packaged_hashes:
+                        duplicates_skipped += 1
+                        continue
+                    try:
+                        zip_file.write(file_path, f"matched_files/{file_hash}")
+                        # Only mark packaged after a successful write - if this path
+                        # vanished mid-scan, another path with the same content still
+                        # deserves a try.
+                        packaged_hashes.add(file_hash)
+                    except Exception as e:
+                        logging.error(f"Error adding file to zip {file_path}: {e}")
+            else:
+                logging.info(
+                    "Evidence: COLLECT_MATCHED_FILES=false - packaging metadata only "
+                    "(paths + SHA256 + alert texts, no matched file copies)"
+                )
 
             for alert_file in os.listdir(self.config.alert_dir):
                 if alert_file.endswith(".txt"):
@@ -3869,6 +3911,12 @@ class EvidenceCollector:
                     zip_file.write(alert_path, f"alerts/{alert_file}")
 
             zip_file.write(self.config.file_mapping, "file_mapping.txt")
+
+        if duplicates_skipped:
+            logging.info(
+                f"Evidence ZIP: {len(packaged_hashes)} unique file(s) packaged, "
+                f"{duplicates_skipped} duplicate copy(ies) skipped"
+            )
 
 
 class CleanupManager:

@@ -15,6 +15,74 @@ fixes without changing behaviour you rely on.
 
 ---
 
+## xsiam_yara_scanner.py v4.2.0 — 2026-08-14
+
+Endpoint footprint release. A scan was writing **2.8 GB to the disk of the machine it was
+scanning**, unconditionally and with no way to turn it off. This release stops that by
+default and fixes a packaging bug found alongside it. Numbers below are measured on the
+same live Windows endpoint as v4.1.0 (26,312 files, 22,918 findings).
+
+> **Behaviour change:** the evidence ZIP no longer contains copies of matched files by
+> default. Nothing else about scanning, alerting, or delivery changes. See below for how
+> to restore the old behaviour and what you give up by leaving it off.
+
+### Changed — matched files are no longer copied into the evidence ZIP by default
+
+The evidence collector read every matched file and wrote it into a local archive. That
+work is charged entirely to the **scanned host**: on the lab endpoint it read **7,244 MB**
+of file data and left a **2,867 MB** ZIP behind, for a scan that ran 455 seconds. Because
+the archive is named per run and only cleared at the *start* of the next scan, a host
+scanned once keeps that 2.8 GB indefinitely.
+
+`xdr_yara_scanner.py` already defaults its equivalent `collect_files` option **off, at the
+customer's request**. XSIAM had no such option at all — the copy was unconditional. This
+release closes that gap.
+
+The new top-of-file knob mirrors the XDR default:
+
+```python
+COLLECT_MATCHED_FILES = _env_bool("YARA_COLLECT_MATCHED_FILES", False)
+```
+
+Set it to `True` (or export `YARA_COLLECT_MATCHED_FILES=true`) to restore pre-4.2.0
+behaviour.
+
+**What you still get with it off.** The ZIP keeps `file_mapping.txt` — every matched path
+with its SHA256 — and the per-rule alert texts with every offset. A responder can still
+identify exactly which files matched and fetch any of them on demand. What is dropped is
+only the bulk, up-front copy of files that are by definition already sitting on the host.
+
+### Fixed — duplicate files were stored multiple times in the evidence ZIP
+
+Archive entries are content-addressed (`matched_files/<sha256>`), but the writer iterated
+by *path*, so several paths holding identical bytes each wrote a full copy under the same
+entry name. `zipfile` only emits a warning for a repeated name and stores the member
+anyway, so the archive silently carried N copies while a reader could still only ever
+extract the first.
+
+Measured on the lab endpoint: 22,918 matched paths held **22,213 distinct files**, so
+**705 redundant copies** were being written — **506 MB**, or 7% of the bytes copied. The
+worst single case was `c_usb.inf_loc`, stored **34 times**.
+
+This only affects scans that opt back in via `COLLECT_MATCHED_FILES=true`, but it is fixed
+so that opting in is no longer needlessly expensive.
+
+### Known limitation — alert text files are still unbounded
+
+The per-rule `alert/<rule>.txt` files record every matched offset and are packaged into the
+ZIP regardless of this setting. On the lab endpoint's 2,653,415 offsets they came to
+**240 MB**. With file copying off they are now the largest thing in the archive. Bounding
+them is deferred to a later release; it needs a decision about which offsets to keep.
+
+### Tests
+
+`tests/test_evidence_collector.py` — 6 new tests covering dedupe by content, distinct
+content surviving, mapping completeness after dedupe, resilience to a file deleted
+mid-scan, metadata-only packaging when collection is off, and archive size staying
+independent of matched-file size. Suite total: 234 → 240.
+
+---
+
 ## xsiam_yara_scanner.py v4.1.0 — 2026-08-13
 
 Delivery and footprint release. Fixes a case where **97% of a scan's findings never
