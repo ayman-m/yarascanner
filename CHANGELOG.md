@@ -15,6 +15,104 @@ fixes without changing behaviour you rely on.
 
 ---
 
+## xsiam_yara_scanner.py v4.3.0 — 2026-08-14
+
+Two independent fixes, both found by measuring rather than reading: a scan blind spot in
+the skip list, and an alert artefact that spent nearly all its bytes on detail nobody uses.
+
+> **Behaviour change:** `alert/<rule>.txt` now samples offsets instead of listing every one,
+> and gains a per-string-ID census. Directories whose names merely *begin with* a skip
+> entry's name are now scanned, where before they were silently skipped.
+
+### Fixed — sibling directories sharing a skip entry's name prefix were unscannable
+
+The Windows skip check was `normalized_path.startswith(skip_folder)`, which treats the entry
+as a **string** prefix rather than a **path** prefix. So `c:\yara_scanner` also matched
+`c:\yara_scanner_backup\evil.dll`, and `c:\programdata\cyvera` matched
+`c:\programdata\cyverabackup\`. Any directory whose name merely began with a skip entry's
+became a permanent scan blind spot — one anyone able to create such a directory could hide in.
+
+Matching is now on whole path components: equal to the entry, or beneath it with a separator.
+Skip entries are additionally stripped of a trailing separator on every platform, because
+`os.path.normpath` only does that on Windows itself — the list previously had two different
+shapes depending on host OS. A drive root is guarded so `c:\` is not reduced to `c:`, which
+would prefix-match the entire drive.
+
+This came out of an adversarial audit of the self-skip (5 investigators, every finding
+attacked by 2 independent refuters). It was the highest-severity survivor, at 7 of 10
+refutations failed. The same audit **confirmed the baseline holds**: the scanner's own
+directory, evidence ZIP, alert texts and logs are still skipped on Windows, and a test now
+pins that so it cannot regress.
+
+### Changed — alert texts sample offsets and report per-string-ID counts in full
+
+The file rendered **every** matched offset at ~95 bytes each. On a live Windows endpoint one
+rule against `C:\Windows\System32` produced 2,433,386 offsets and a **220 MB** file on the
+scanned host — 98.6% of it from four Windows event logs, where a rule hunting PowerShell
+strings legitimately matches thousands of times inside a PowerShell log.
+
+Individual offsets are not what an analyst works from. Which host, which rule, **which string
+in that rule**, and which file are. So the file's byte budget is inverted:
+
+```
+Total string hits: 11087
+Hits per string ID: $enc=1143, $ps=9944
+================================================================================
+Matched Strings (showing 50 of 11087):
+...
+11037 further offset(s) omitted (YARA_MAX_ALERT_OFFSETS=50). Counts above are complete;
+re-run `yara -s` against this file for every offset.
+```
+
+The census is **uncapped** — it costs one line regardless of hit count, and the old format
+never summarised it at all. Offsets are sampled via:
+
+```python
+MAX_ALERT_OFFSETS_PER_FINDING = _env_number("YARA_MAX_ALERT_OFFSETS", 50, cast=int)
+```
+
+50 matches the tenant's existing `MAX_MATCH_SAMPLES_PER_FINDING`, so the local file and the
+`yara_match` row show the same sample. `0` restores the old behaviour.
+
+**Nothing is lost.** The matched file is never quarantined, moved or deleted, so
+`yara -s <rules> "<path>"` regenerates every offset on demand, and the tenant row already
+carries the exact uncapped `match_count` plus per-string-ID counts.
+
+Measured on the worst real finding (11,087 hits): **4,877 B, down from ~1,053,265 B**.
+Findings under the cap — 99.75% of them — are byte-identical apart from the new census. The
+cap is deliberately **not** applied to the alert event or the `yara_match` row.
+
+### Validated before building — the 220 MB was mostly a test artefact
+
+Worth recording, because it changed the scope of this release. The 220 MB figure came from a
+deliberately broad rule (`"Microsoft"` across System32). Re-running the same target with the
+**realistic 10-rule pack** produced:
+
+| | Synthetic rule | Realistic 10 rules |
+|---|---|---|
+| Matches | 21,622 | 82 |
+| Alert total | 220.29 MB | **3.30 MB** |
+| Evidence ZIP | 11.57 MB | **0.16 MB** |
+
+So there was no general footprint emergency. What *is* real is the shape: even in the
+realistic run, one rule put 3.2 MB into a single file from just **4** event logs. That skew
+is what the cap addresses, and it is why the cap is a bound on the pathological case rather
+than a change anyone with ordinary rules will notice.
+
+### Also verified this release
+
+`v4.2.0`'s dedupe was unit-tested only, because the validation scan ran with copying
+disabled. Exercised live against `System32\DriverStore\en-US`: **475 matched paths → 431 ZIP
+blobs = 431 distinct SHA256, 0 duplicate arcnames**, with the worst duplicate (34 copies)
+collapsed to one. Bytes saved there were only 0.011 MB — `.inf_loc` files are tiny — so the
+correctness is proven while the *savings* remain a function of duplicated file size.
+
+### Tests
+
+`tests/test_skip_predicate.py` (5) and `tests/test_alert_sampling.py` (6). Suite: 240 → 251.
+
+---
+
 ## xsiam_yara_scanner.py v4.2.0 — 2026-08-14
 
 Endpoint footprint release. A scan was writing **2.8 GB to the disk of the machine it was
@@ -130,8 +228,25 @@ of 72,484 ingested rows (65%)** at 2.07 events per finding — the single larges
 ingestion, mostly duplication.
 
 They are now **one** event carrying the union of both payloads, plus rule and string-hit
-counts in the message. Expected effect on that scan: ~47,460 alert rows → ~22,918, cutting
-total ingestion roughly a third.
+counts in the message.
+
+**Verified on the tenant** (2026-08-14, alongside the v4.2.0 validation scan), comparing the
+pre-merge run against a post-merge run of the same target and rule:
+
+| Rows by type | Pre-merge (v4.0.0) | Post-merge |
+|---|---|---|
+| `alert` | 45,837 — **2.00** per finding | 21,623 — **1.00** per finding |
+| `yara_match` | 22,918 — 1.00 per finding | 21,622 — 1.00 per finding |
+| all types | 69,124 | 43,602 |
+| **events per finding** | **3.02** | **2.02** |
+
+A **33.1% reduction** in total ingested rows, matching the projection above. Alert rows are
+now exactly one per finding.
+
+The remaining 2.02 comes from `alert` and `yara_match` still being emitted per finding. They
+serve different consumers — `yara_match` backs the dashboards and hunting queries, `alert`
+drives alerting — so they are deliberately not merged. Collapsing them is possible but would
+be a breaking change to both surfaces.
 
 **Check any ad-hoc query matching `"YARA detection event"`** — that message no longer
 exists. No shipped widget, dashboard, or parsing-rule field used either event, so nothing
