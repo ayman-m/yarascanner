@@ -2895,7 +2895,16 @@ class ScanConfig:
                 "C:\\yara_scanner\\*",
                 "C:\\*\\cyvera\\*"
             ]
-            self.win_skip_folder = [os.path.normpath(path.lower()) for path in self.win_skip_folder]
+            # Normalise to bare directory paths with NO trailing separator, on every
+            # platform. os.path.normpath only strips a trailing "\" when running on Windows
+            # itself, so the same list had two different shapes depending on host OS and the
+            # boundary check below would have had to handle both. The len<=3 guard keeps a
+            # drive root ("c:\") from being reduced to a bare drive letter ("c:"), which
+            # would then prefix-match the entire drive.
+            self.win_skip_folder = [
+                p if len(p) <= 3 else p.rstrip("\\")
+                for p in (os.path.normpath(path.lower()) for path in self.win_skip_folder)
+            ]
             self.win_skip_patterns = [pattern.lower() for pattern in self.win_skip_patterns]
             self.skip_paths = set(self.win_skip_folder)
 
@@ -5038,7 +5047,12 @@ rule test {{
                 return True
 
             for skip_folder in self.config.win_skip_folder:
-                if normalized_path.startswith(skip_folder):
+                # Match whole path COMPONENTS, not a raw string prefix. A bare startswith()
+                # also swallowed every sibling sharing the name: "c:\yara_scanner" matched
+                # "c:\yara_scanner_backup\evil.dll", so any directory whose name merely began
+                # with a skip entry's was permanently unscannable - a blind spot anyone able
+                # to create such a directory could hide in.
+                if normalized_path == skip_folder or normalized_path.startswith(skip_folder + "\\"):
                     return True
 
             path_without_drive = os.path.splitdrive(normalized_path)[1]
