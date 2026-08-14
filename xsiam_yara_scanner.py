@@ -235,6 +235,25 @@ UPLOAD_BATCH_MAX_BYTES = max(64 * 1024, UPLOAD_BATCH_MAX_BYTES)
 # bulk pre-emptive copy of files that are, by definition, already on the host.
 COLLECT_MATCHED_FILES = _env_bool("YARA_COLLECT_MATCHED_FILES", False)
 
+# How many matched offsets alert/<rule>.txt renders per (rule, file) finding.
+#
+# The file used to render EVERY offset at ~95 bytes each. Measured on a live Windows
+# endpoint, one rule against C:\Windows\System32 produced 2,433,386 offsets and a 220 MB
+# file on the SCANNED HOST - 98.6% of it from four Windows event logs, where a rule hunting
+# PowerShell strings legitimately matches thousands of times inside a PowerShell log.
+#
+# Individual offsets are not what an analyst works from: which host, which rule, which
+# string IN that rule, and which file are. So the per-string-ID census is written in full
+# and stays UNCAPPED - only the offsets themselves are sampled. That is the same deal
+# MAX_MATCH_SAMPLES_PER_FINDING already makes for the tenant, and 50 matches it so the
+# local file and the yara_match row show the same sample.
+#
+# The complete list is never lost: the matched file is still on the host (the scanner never
+# quarantines, moves or deletes), so `yara -s <rules> "<path>"` regenerates every offset.
+# 0 disables the cap and restores the old render-everything behaviour.
+MAX_ALERT_OFFSETS_PER_FINDING = _env_number("YARA_MAX_ALERT_OFFSETS", 50, cast=int)
+MAX_ALERT_OFFSETS_PER_FINDING = max(0, MAX_ALERT_OFFSETS_PER_FINDING)
+
 YARA_RULE = r""""""
 
 
@@ -5152,13 +5171,36 @@ rule test {{
                             f.write(f"File Creation Time: {file_creation_time}\n")
                         f.write("=" * 80 + "\n")
                         if strings:
-                            f.write("Matched Strings:\n")
+                            # Census first, and deliberately UNCAPPED: which string in the
+                            # rule fired and how many times is the detail an analyst works
+                            # from, and it costs one line no matter how many offsets there
+                            # are. The offsets below are sampled precisely so this can be
+                            # complete.
+                            id_counts = {}
+                            for (_o, _sid, _d) in strings:
+                                key = "$?" if _sid is None else str(_sid)
+                                id_counts[key] = id_counts.get(key, 0) + 1
+                            f.write(f"Total string hits: {len(strings)}\n")
+                            f.write("Hits per string ID: " + ", ".join(
+                                f"{k}={v}" for k, v in sorted(id_counts.items())) + "\n")
+                            f.write("=" * 80 + "\n")
+
+                            cap = MAX_ALERT_OFFSETS_PER_FINDING
+                            shown = strings if cap <= 0 else strings[:cap]
+                            f.write(
+                                f"Matched Strings (showing {len(shown)} of {len(strings)}):\n")
                             f.write("-" * 40 + "\n")
-                            for (off, sid, data) in strings:
+                            for (off, sid, data) in shown:
                                 string_repr = _render_match_data(data)
                                 f.write(f"String ID: {sid}\n")
                                 f.write(f"Offset: {off}\n")
                                 f.write(f"Data: {string_repr}\n")
+                                f.write("-" * 40 + "\n")
+                            if len(shown) < len(strings):
+                                f.write(
+                                    f"{len(strings) - len(shown)} further offset(s) omitted "
+                                    f"(YARA_MAX_ALERT_OFFSETS={cap}). Counts above are complete; "
+                                    f"re-run `yara -s` against this file for every offset.\n")
                                 f.write("-" * 40 + "\n")
                         elif condition_only_detail:
                             f.write("Condition Match Details:\n")
