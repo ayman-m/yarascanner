@@ -2905,15 +2905,33 @@ class ScanConfig:
                 "C:\\ProgramData\\Cyvera",
                 "C:\\ProgramData\\Microsoft Defender",
                 "C:\\Program Files\\Palo Alto Networks",
+                "C:\\Program Files (x86)\\Palo Alto Networks",
+                "C:\\Program Files\\Cyvera",
+                "C:\\Program Files (x86)\\Cyvera",
                 "C:\\yara_scanner\\",
                 "C:\\$Recycle.Bin",
                 "C:\\System Volume Information",
                 self.scanner_dir,
             ]
-            self.win_skip_patterns = [
-                "C:\\yara_scanner\\*",
-                "C:\\*\\cyvera\\*"
-            ]
+            # Cyvera (the Cortex/Traps agent) is covered above via its known install roots,
+            # not via a fragment match. An earlier version of this fix tried
+            # win_skip_fragments = ("/cyvera/",), an unanchored "anywhere in the path" check
+            # meant to replace the broken win_skip_patterns glob below - but that made ANY
+            # directory literally named "cyvera" a permanent scan blind spot, including
+            # world-writable locations no legitimate install ever uses: adversarial review
+            # demonstrated C:\Users\cyvera, C:\Users\Public\cyvera, C:\Temp\cyvera and even
+            # D:\cyvera (any drive, since the fragment carried no drive anchor) were all
+            # wrongly skipped. Anyone able to create such a directory - not just the vendor -
+            # would get a free evasion vector. Enumerating the real install roots instead
+            # keeps coverage bounded to admin-writable locations, matching the security model
+            # every other win_skip_folder entry already relies on.
+            #
+            # The matcher this replaced, win_skip_patterns, was a custom "C:\*\cyvera\*" glob
+            # confirmed by direct execution to never match ANY path: it split the drive
+            # letter off the pattern via string ops but compared against a path that had
+            # already had ITS drive letter stripped by os.path.splitdrive, so the literal
+            # "c:" component could never be found; separately, "*" was compared as a literal
+            # string, not a wildcard.
             # Normalise to bare directory paths with NO trailing separator, on every
             # platform. os.path.normpath only strips a trailing "\" when running on Windows
             # itself, so the same list had two different shapes depending on host OS and the
@@ -2924,7 +2942,6 @@ class ScanConfig:
                 p if len(p) <= 3 else p.rstrip("\\")
                 for p in (os.path.normpath(path.lower()) for path in self.win_skip_folder)
             ]
-            self.win_skip_patterns = [pattern.lower() for pattern in self.win_skip_patterns]
             self.skip_paths = set(self.win_skip_folder)
 
         elif platform.system() == "Linux":
@@ -2964,6 +2981,10 @@ class ScanConfig:
                 '/Applications/iMovie.app/Contents/',
                 os.path.normpath(self.scanner_dir).rstrip("/") + "/",
             ]
+            # Case-fold at construction, matching win_skip_folder's own .lower() - APFS is
+            # case-insensitive by default, and the matching code compares against
+            # portable_path, which is already case-folded for exactly this reason.
+            self.mac_skip_directory = [p.lower() for p in self.mac_skip_directory]
             self.skip_paths = set(self.mac_skip_directory)
         
         else:
@@ -5073,50 +5094,64 @@ rule test {{
                 # to create such a directory could hide in.
                 if normalized_path == skip_folder or normalized_path.startswith(skip_folder + "\\"):
                     return True
-
-            path_without_drive = os.path.splitdrive(normalized_path)[1]
-            for pattern in self.config.win_skip_patterns:
-                pattern_parts = (
-                    pattern.replace("**\\", "").replace("\\**", "").split("\\")
-                )
-                pattern_parts = [p.lower() for p in pattern_parts if p]
-
-                path_parts = path_without_drive.split("\\")
-                path_parts = [p.lower() for p in path_parts if p]
-
-                try:
-                    idx = 0
-                    for part in pattern_parts:
-                        while idx < len(path_parts):
-                            if path_parts[idx] == part:
-                                break
-                            idx += 1
-                        if idx >= len(path_parts):
-                            raise ValueError
-                        idx += 1
-                    return True
-                except ValueError:
-                    continue
             return False
-        
+
         elif platform.system() == "Linux":
-            return any(
-                normalized_path.startswith(skip_dir)
-                for skip_dir in self.config.lin_skip_directory
-            )
-        
+            # Filesystems on Linux are typically case-sensitive, so this stays on
+            # normalized_path (case-preserved), unlike the Darwin branch below.
+            for skip_dir in self.config.lin_skip_directory:
+                # skip_dir always carries a trailing "/" (see construction above). A plain
+                # startswith() never matches the BARE root os.walk yields for a directory
+                # itself (no trailing separator), only its contents - so the root of the
+                # scanner's own directory, e.g., was walked and enumerated even though
+                # everything inside it was correctly skipped.
+                if normalized_path == skip_dir.rstrip("/") or normalized_path.startswith(skip_dir):
+                    return True
+            return False
+
         elif platform.system() == "Darwin":
-            if any(normalized_path.startswith(skip_dir) for skip_dir in self.config.mac_skip_directory):
-                return True
-            
-            filename = os.path.basename(normalized_path)
+            # APFS is case-insensitive by default, so both sides must be case-folded here -
+            # portable_path already is (see its construction above); mac_skip_directory
+            # entries are lowercased at construction to match.
+            #
+            # Entries come in three shapes, and each needs different match semantics:
+            #   - starts with "/"    -> an ANCHOR: a real top-level path, meant to match
+            #     only there and beneath it (e.g. "/System/" must not match a user's own
+            #     "~/System/" directory - that would over-broaden a system-path skip into
+            #     matching anything sharing the name anywhere).
+            #   - contains ".app/"   -> a BUNDLE SUFFIX: e.g. ".app/Contents/Frameworks/"
+            #     is meant to match "Slack.app/Contents/Frameworks/" for ANY app name, so
+            #     the character immediately before ".app" is always that name's last letter,
+            #     never a path separator - unlike every other fragment below, this one is
+            #     deliberately checked WITHOUT requiring a leading "/".
+            #   - anything else, no leading "/" -> a FRAGMENT: meant to match this component
+            #     wherever it occurs (e.g. "node_modules/" under any project, at any depth) -
+            #     the same "anywhere in the path" semantics skip_path_fragments already uses.
+            #     A bare startswith() can never satisfy this: a relative string is never a
+            #     prefix of an absolute path, so 32 of these 58 entries matched nothing.
+            #     Also checked at the tail via endswith (minus the entry's own trailing "/"):
+            #     when the fragment's own directory is itself the os.walk root, the path has
+            #     no trailing separator to complete the bounded "/entry/" substring, exactly
+            #     the same bare-root gap already fixed for anchors above.
+            for skip_dir in self.config.mac_skip_directory:
+                if skip_dir.startswith("/"):
+                    if portable_path == skip_dir.rstrip("/") or portable_path.startswith(skip_dir):
+                        return True
+                elif ".app/" in skip_dir:
+                    if skip_dir in portable_path:
+                        return True
+                elif (("/" + skip_dir) in portable_path
+                      or portable_path.endswith("/" + skip_dir.rstrip("/"))):
+                    return True
+
+            filename = os.path.basename(portable_path)
             if filename.startswith('._'):
                 return True
-            if filename == '.DS_Store':
+            if filename == '.ds_store':
                 return True
-            
+
             return False
-        
+
         else:
             return False
 

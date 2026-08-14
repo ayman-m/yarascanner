@@ -106,6 +106,155 @@ def test_windows_custom_scanner_dir_is_skipped():
     assert skip("D:\\custom scan dir2\\other.dll") is False
 
 
+def test_windows_cyvera_anywhere_under_the_drive_is_skipped():
+    """Cyvera (the Cortex/Traps agent) must be skipped wherever it is installed on C:.
+
+    Regression: the old win_skip_patterns matcher ("C:\\*\\cyvera\\*") could never fire -
+    it split "c:" off the pattern via string ops, but compared against a path that had
+    already had its drive letter stripped by os.path.splitdrive, so "c:" could never be
+    found; and "*" was compared as a literal string, not a wildcard. Confirmed by direct
+    execution: the matcher returned False for every path tested, including the one
+    hardcoded skip entry (C:\\ProgramData\\Cyvera) it was meant to generalise.
+    """
+    cfg, skip = _predicate("Windows", "C:\\yara_scanner")
+    assert skip("C:\\ProgramData\\Cyvera\\log.txt") is True, "the hardcoded case must work"
+    assert skip("C:\\Program Files\\Cyvera\\agent.exe") is True, "install elsewhere on C: too"
+    assert skip("C:\\Program Files (x86)\\Cyvera\\agent.dll") is True
+
+
+def test_windows_cyvera_prefix_sibling_not_swallowed():
+    """The new cyvera check must not repeat the earlier prefix-over-match bug."""
+    cfg, skip = _predicate("Windows", "C:\\yara_scanner")
+    assert skip("C:\\Program Files\\CyveraBackup\\x.log") is False
+    assert skip("C:\\Program Files\\NotCyvera\\x.log") is False
+
+
+def test_windows_cyvera_coverage_is_not_a_universal_evasion_vector():
+    """Regression: an unscoped '/cyvera/' fragment (any path, any drive, any depth) turns
+    ANY directory literally named "cyvera" into a permanent blind spot - including ones an
+    unprivileged actor can create in a world-writable location. Caught by adversarial
+    review of the first fix: C:\\Users\\cyvera, C:\\Users\\Public\\cyvera and C:\\Temp\\cyvera
+    were all wrongly skipped, on every drive letter, not just C:. Coverage must stay
+    anchored to real, admin-only vendor install roots, matching the security model of every
+    other win_skip_folder entry - not "anywhere a directory happens to be named cyvera".
+    """
+    cfg, skip = _predicate("Windows", "C:\\yara_scanner")
+    assert skip("C:\\Users\\cyvera\\Documents\\resume.docx") is False, \
+        "a real user named cyvera is not the security agent"
+    assert skip("C:\\Users\\Public\\cyvera\\payload.exe") is False, \
+        "world-writable location must not become an evasion vector"
+    assert skip("C:\\Temp\\cyvera\\evil.dll") is False
+    assert skip("D:\\cyvera\\x") is False, "coverage is C: only, per the vendor's real install"
+
+
+# ------------------------------------------------------------------ Darwin app bundles
+def test_darwin_app_bundle_contents_are_skipped():
+    """Regression: '.app/Contents/Frameworks/' etc. are suffix-anchored to a bundle NAME
+    ("Slack.app/Contents/..."), so the character before ".app" is always the bundle name's
+    last letter, never a path separator. Requiring a leading "/" - correct for every other
+    relative entry - meant these three never matched, before OR after the first fix; only
+    the reason changed. Still uncaught by the first fix's 12 tests.
+    """
+    cfg, skip = _predicate("Darwin", "/usr/local/yara_scanner")
+    assert skip("/Applications/Slack.app/Contents/Frameworks/Electron Framework") is True
+    assert skip("/Applications/Docker.app/Contents/Resources/bin/docker") is True
+    assert skip("/Applications/MyApp.app/Contents/_CodeSignature/CodeResources") is True
+
+
+def test_windows_scanner_dir_still_skipped_after_pattern_removal():
+    """win_skip_patterns is retired entirely; win_skip_folder alone must still cover it."""
+    cfg, skip = _predicate("Windows", "C:\\yara_scanner")
+    assert skip("C:\\yara_scanner\\evidence\\e.zip") is True
+    assert skip("C:\\yara_scanner\\alert\\R.txt") is True
+
+
+# ------------------------------------------------------------------ Linux
+def test_linux_skips_own_directory_and_system_paths():
+    cfg, skip = _predicate("Linux", "/private/tmp/yst_lin/opt/yara_scanner")
+    assert skip("/opt/yara_scanner/evidence/e.zip") is True
+    assert skip("/sys/kernel/x") is True
+    assert skip("/proc/1/status") is True
+
+
+def test_linux_scanner_dir_bare_root_is_skipped():
+    """Regression: the root os.walk yields has NO trailing separator, but the skip entry
+    was built WITH one ("/opt/yara_scanner/"), so startswith() failed on the root itself.
+    """
+    cfg, skip = _predicate("Linux", "/private/tmp/yst_lin/opt/yara_scanner")
+    assert skip("/opt/yara_scanner") is True, "hardcoded entry's bare root"
+    assert skip("/private/tmp/yst_lin/opt/yara_scanner") is True, "YARA_SCANNER_DIR override's bare root"
+
+
+def test_linux_does_not_case_fold():
+    """Linux filesystems are typically case-sensitive; matching must stay case-exact.
+
+    This guards against the Darwin case-folding fix leaking into the Linux branch, which
+    would be wrong there - the fixes address different platforms' actual filesystem
+    semantics, not a shared behaviour.
+    """
+    cfg, skip = _predicate("Linux", "/private/tmp/yst_lin/opt/yara_scanner")
+    assert skip("/OPT/YARA_SCANNER/evidence/e.zip") is False
+
+
+# ------------------------------------------------------------------ Darwin
+def test_darwin_absolute_entries_skip_regardless_of_case():
+    """Regression: APFS is case-insensitive by default, but neither side was case-folded.
+
+    A scan target or intermediate path segment typed in different case than the hardcoded
+    entries silently defeated the skip on the real filesystem, where the two paths are the
+    same directory.
+    """
+    cfg, skip = _predicate("Darwin", "/usr/local/yara_scanner")
+    assert skip("/System/Library/x") is True
+    assert skip("/SYSTEM/Library/x") is True, "case-variant must still be skipped"
+    assert skip("/System/library/X.DYLIB") is True
+
+
+def test_darwin_relative_fragment_entries_match_anywhere_in_path():
+    """Regression: 32 of 58 mac_skip_directory entries have no leading '/' (e.g.
+    "node_modules/", "Library/Application Support/Slack/"), but the matcher did
+    normalized_path.startswith(entry) - a relative string can never be a prefix of an
+    absolute path, so these entries matched nothing, ever. They must match as a fragment
+    anywhere in the path instead, the same semantics skip_path_fragments already uses.
+    """
+    cfg, skip = _predicate("Darwin", "/usr/local/yara_scanner")
+    assert skip("/Users/bob/project/node_modules/pkg/evil.js") is True
+    assert skip("/Users/bob/Library/Application Support/Slack/storage/x") is True
+    assert skip("/Users/bob/dev/PycharmProjects/proj/.idea/x") is True
+    assert skip("/Users/bob/proj/build/out.o") is True
+
+
+def test_darwin_relative_fragment_has_component_boundaries():
+    """The fragment check must not match a bare substring occurrence mid-name."""
+    cfg, skip = _predicate("Darwin", "/usr/local/yara_scanner")
+    assert skip("/Users/bob/notnode_modules/x") is False
+    assert skip("/Users/bob/mybuild/x") is False
+
+
+def test_darwin_anchor_entries_stay_root_scoped_not_anywhere():
+    """Absolute entries like '/System/' must remain anchored at the real filesystem root -
+    they must NOT become 'anywhere' fragments, or a user directory that happens to share
+    the name (e.g. "~/System/") would be wrongly skipped.
+    """
+    cfg, skip = _predicate("Darwin", "/usr/local/yara_scanner")
+    assert skip("/Users/bob/System/notes.txt") is False
+
+
+def test_darwin_scanner_dir_bare_root_is_skipped():
+    cfg, skip = _predicate("Darwin", "/usr/local/yara_scanner")
+    assert skip("/usr/local/yara_scanner") is True
+
+
+def test_darwin_case_variant_scan_target_no_longer_defeats_skip():
+    """Reproduces the audit's exact live finding: a scan target typed in different case
+    than YARA_SCANNER_DIR previously bypassed the skip for every path under it, because
+    os.walk preserves the caller-supplied casing of the argument itself.
+    """
+    cfg, skip = _predicate("Darwin", "/usr/local/YARA_SCANNER")
+    assert skip("/usr/local/yara_scanner/evidence/e.zip") is True
+    assert skip("/usr/local/YARA_SCANNER/evidence/e.zip") is True
+
+
 if __name__ == "__main__":
     import subprocess
     raise SystemExit(subprocess.call([sys.executable, "-m", "pytest", __file__, "-v"]))
