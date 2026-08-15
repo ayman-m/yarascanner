@@ -48,8 +48,6 @@ from enum import Enum
 from queue import Queue, Empty, Full
 
 # Platform-specific imports
-if platform.system() == "Windows":
-    from ctypes import wintypes
 
 # Third-party imports
 import psutil
@@ -773,20 +771,6 @@ def _handle_cancel_request():
     )
 
 
-def _parse_bool_arg(value, arg_name="argument"):
-    """Parse strict boolean CLI/runtime argument from text."""
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return None
-
-    text = str(value).strip().lower()
-    if text in ("true", "1", "yes", "y", "on"):
-        return True
-    if text in ("false", "0", "no", "n", "off"):
-        return False
-
-    raise ValueError(f"Invalid {arg_name} '{value}'. Use true or false.")
 
 
 def _parse_alert_severity(value, arg_name="alert_severity"):
@@ -820,21 +804,6 @@ def _build_yara_match_externals(file_path):
     }
 
 
-def _serialize_matches(yara_matches):
-    """Convert YARA match objects to JSON-serializable format."""
-    serial = []
-    for m in yara_matches:
-        normalized_strings = _normalize_match_strings(getattr(m, "strings", []) or [])
-        serial.append({
-            "rule": getattr(m, "rule", None),
-            "tags": list(getattr(m, "tags", []) or []),
-            "meta": dict(getattr(m, "meta", {}) or {}),
-            "strings": [
-                (int(o), str(sid), data.hex() if isinstance(data, (bytes, bytearray)) else str(data))
-                for (o, sid, data) in normalized_strings
-            ]
-        })
-    return serial
 
 
 def _normalize_match_strings(raw_strings):
@@ -1037,9 +1006,6 @@ class StandardLogEntry:
             
         return result
     
-    def to_json(self):
-        """Convert to JSON string."""
-        return json.dumps(self.to_dict(), ensure_ascii=False, default=str)
 
 
 def create_standard_log(log_type, hostname, os_info, ip_address, scan_id, message=None, level="INFO", data=None):
@@ -1235,16 +1201,6 @@ class FileCacher:
                 return None
             return entry
 
-    def get_cache_stats(self):
-        """Get current cache statistics."""
-        with self.lock:
-            approx_bytes = len(self.memory_cache) * 400
-            return {
-                'memory_entries': len(self.memory_cache),
-                'disk_entries': len(self.disk_cache),
-                'memory_usage_mb': round(approx_bytes / (1024*1024), 1),
-                'dirty': self.dirty,
-            }
 
     def stop_cache(self):
         """Stop cache and persist final state."""
@@ -1569,9 +1525,6 @@ class ExceptionLogger:
         logger.error(traceback.format_exc())
         logger.error("=" * 60)
 
-    def get_exception_count(self):
-        """Get total number of exceptions logged."""
-        return self.exception_count
 
 
 class StatisticsManager:
@@ -2992,9 +2945,6 @@ class ScanConfig:
             self.mac_skip_directory = []
             self.skip_paths = set()
 
-        self.batch_size = 1000
-        self.performance_log_interval = 120
-        self.statistics_upload_interval = 60
 
         if self.scan_folder and self.scan_folder.lower() != "default":
             # scan_folder accepts a COMMA-SEPARATED list of locations so one run can cover
@@ -4323,22 +4273,6 @@ class YaraScanner:
             return None
         return content
 
-    def _is_valid_rule_structure(self, content, rule_name):
-        """Basic validation for YARA rule structure."""
-        try:
-            if not re.search(r'\bcondition\s*:', content, re.IGNORECASE):
-                logging.debug(f"Rule {rule_name} missing condition section")
-                return False
-            
-            if not re.match(r'^\s*(?:(?:private|global)\s+)*rule\s+\w+', content, re.IGNORECASE):
-                logging.debug(f"Rule {rule_name} missing rule declaration line")
-                return False
-            
-            return True
-            
-        except Exception as e:
-            logging.debug(f"Validation error for rule {rule_name}: {e}")
-            return False
     
     def _get_available_yara_modules(self, source_text=None):
         """Detect which YARA modules are available on THIS agent's libyara build.
@@ -4779,43 +4713,6 @@ rule test {{
                 }
             )
     
-    def _get_scanner_stats(self):
-        """Get comprehensive scanner statistics."""
-        with self.lock_counts:
-            base_stats = {
-                'files_scanned': self.files_scanned,
-                'files_skipped': self.files_skipped,
-                'total_detections': self.total_detections,
-                'last_scanned_file': self.last_scanned_file,
-                'targets': self.scan_targets,
-                'valid_rules_count': self.config.error_logger.valid_rules_count,
-                'failed_rules_count': self.config.error_logger.failed_rules_count,
-            }
-            
-            if hasattr(self, 'stats_manager'):
-                performance_data = self.stats_manager.get_current_stats_for_upload()
-                base_stats.update({
-                    'performance_metrics': performance_data.get('performance_metrics', {}),
-                    'cache_stats': performance_data.get('cache_stats', {}),
-                    'scan_estimates': performance_data.get('scan_estimates', {}),
-                    'worker_count': len(self.stats_manager.worker_stats),
-                    'performance_snapshots': len(self.stats_manager.performance_history)
-                })
-            
-            if getattr(self, 'resource_monitor', None) is not None:
-                resource_summary = self.resource_monitor.get_resource_summary()
-                base_stats.update({
-                    'resource_monitoring': resource_summary,
-                    'resource_alerts': len(self.resource_monitor.alert_history)
-                })
-            
-            if hasattr(self, 'webhook_uploader'):
-                upload_stats = self.webhook_uploader.get_upload_statistics()
-                base_stats.update({
-                    'webhook_stats': upload_stats
-                })
-            
-            return base_stats
 
     def _calculate_cache_hit_rate(self):
         """Calculate current cache hit rate."""
