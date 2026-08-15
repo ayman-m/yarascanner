@@ -45,14 +45,8 @@ filter type= "statistics" and message contains "Scan Progress"
   active_workers          = json_extract_scalar(data, "$.metrics.active_workers"),
   elapsed_seconds         = json_extract_scalar(data, "$.metrics.elapsed_seconds"),
   eta_seconds             = json_extract_scalar(data, "$.metrics.eta_seconds"),
-  cache_hit_rate          = json_extract_scalar(data, "$.metrics.cache_hit_rate"),
   junction_skips          = json_extract_scalar(data, "$.metrics.junction_skips"),
   unique_real_paths       = json_extract_scalar(data, "$.metrics.unique_real_paths");
-filter type= "statistics" and message contains "Cache Performance"
-| alter 
-  hit_rate_percent           = json_extract_scalar(data, "$.hit_rate_percent"),
-  total_requests           = json_extract_scalar(data, "$.total_requests"),
-  memory_usage_mb           = json_extract_scalar(data, "$.memory_usage_mb");
 filter type= "statistics" and message contains "Time Estimates"
 | alter 
   eta_seconds           = json_extract_scalar(data, "$.eta_seconds"),

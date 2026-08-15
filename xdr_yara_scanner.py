@@ -6480,8 +6480,8 @@ rule test {{
         almost never runs long enough on its own to cross log_interval - file enumeration
         is fast; matching file content in the worker threads is what actually takes
         minutes, and that happens after discovery ends. Ported from the XSIAM edition,
-        where this was confirmed live: zero "Scan Progress"/"Cache Performance" events had
-        ever been recorded, on any host, under the inline-only approach.
+        where this was confirmed live: zero "Scan Progress" events had ever been
+        recorded, on any host, under the inline-only approach.
         """
         while not self._progress_heartbeat_stop.wait(self.config.log_interval):
             if not self.scan_active:

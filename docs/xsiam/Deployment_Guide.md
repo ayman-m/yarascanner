@@ -57,7 +57,7 @@ by bounded queues — file walkers feed scan workers, scan workers feed an uploa
 |-----------|----------------|
 | `ScanConfig` | Single source of truth for rules, paths, thresholds, env-var tuning |
 | `YaraScanner` | Orchestrator — builds the work queue, spawns workers, drives the scan loop |
-| `FileHasher` / `FileCacher` | Hash-based dedup so the same file isn't rescanned within a run |
+| `FileHasher` | SHA256 for each matched file — identifies it in `file_mapping.txt` and collapses duplicate content to one blob in the evidence ZIP |
 | `LogManager` | Rotating local log files, one per category (scanner_*, errors_*, stats_*) |
 | `WebhookUploader` / `ResultsUploader` | Background upload threads with retry + backoff + circuit breaker |
 | `StatisticsManager` / `SystemResourceMonitor` | Periodic progress and resource telemetry |
