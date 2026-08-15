@@ -58,19 +58,33 @@ import yara
 # CONSTANTS
 # ============================================================================
 
-def _env_number(name, default, cast=float):
+def _env_number(name, default, cast=float, minimum=None):
     """Read a numeric tuning env var without letting a deployer typo (e.g. '60s',
-    'unlimited') crash the whole scanner at import time - fall back to default and warn."""
+    'unlimited') crash the whole scanner at import time - fall back to default and warn.
+
+    `minimum` additionally rejects values that PARSE but are unusable. Parsing is not
+    validation: YARA_MAX_MB=-1 is a perfectly good int that made max_file_bytes negative,
+    so every file failed the size check and the scan reported "completed" having scanned
+    nothing - a silent total loss of coverage whose only signal was a zero. Out-of-range
+    falls back to the default for the same reason unparseable does: the deployer meant
+    something, and the documented default is a safer guess than their broken value.
+    """
     raw = os.environ.get(name, "")
     if not raw:
         return cast(default)
     try:
-        return cast(raw)
+        value = cast(raw)
     except (TypeError, ValueError):
         logging.warning(
             "Ignoring invalid %s=%r (expected a number) - using default %r",
             name, raw, default)
         return cast(default)
+    if minimum is not None and value < minimum:
+        logging.warning(
+            "Ignoring out-of-range %s=%r (minimum %r) - using default %r",
+            name, raw, minimum, default)
+        return cast(default)
+    return value
 
 
 def _env_bool(name, default):
@@ -2579,15 +2593,18 @@ class ScanConfig:
         self.file_mapping = os.path.join(self.evidence_dir, "file_mapping.txt")
         self.output_log = os.path.join(self.logs_dir, f"scanner_{self.run_id}.log")
 
-        self.max_file_mb = int(os.getenv("YARA_MAX_MB", "64") or 64)
+        # minimum=0 because 0 legitimately means "no size cap"; a NEGATIVE value parsed
+        # fine and made max_file_bytes negative, so every file failed the size check and
+        # the scan reported success having scanned nothing.
+        self.max_file_mb = _env_number("YARA_MAX_MB", 64, cast=int, minimum=0)
         self.max_file_bytes = self.max_file_mb * 1024 * 1024 if self.max_file_mb else 0
 
         cpu_count = os.cpu_count() or 2
         default_workers = 1 if cpu_count <= 2 else 2
-        configured_workers = int(os.getenv("YARA_THREADS", str(default_workers)) or default_workers)
+        configured_workers = _env_number("YARA_THREADS", default_workers, cast=int, minimum=1)
         self.max_workers = max(1, min(2, configured_workers))
         self.scan_queue_size = max(
-            2, int(os.getenv("YARA_QUEUE_SIZE", str(self.max_workers * 2)) or (self.max_workers * 2))
+            2, _env_number("YARA_QUEUE_SIZE", self.max_workers * 2, cast=int, minimum=2)
         )
         # Default 30s, not 120s: this is the progress-heartbeat's sampling interval, and at
         # 120s a scan whose active phase is shorter than that emits NO progress telemetry at
@@ -2601,20 +2618,22 @@ class ScanConfig:
         # threading.Event.wait(0) (or any negative) returns immediately, which would turn the
         # heartbeat into a busy-spin that re-takes lock_counts continuously and floods the
         # unbounded webhook queue. To actually disable progress logging, set a large interval.
-        self.log_interval = max(1, int(os.getenv("YARA_PROGRESS_LOG_SECS", "30") or 30))
+        self.log_interval = max(1, _env_number("YARA_PROGRESS_LOG_SECS", 30, cast=int, minimum=1))
         self.enable_performance_monitoring = ENABLE_PERF_MONITOR
         self.enable_resource_monitoring = ENABLE_RESOURCE_MONITOR
         self.enable_fd_monitoring = ENABLE_FD_MONITOR
         self.track_real_paths = False
         self.light_throttle_enabled = True
-        self.throttle_check_interval_secs = float(os.getenv("YARA_LIGHT_THROTTLE_CHECK_SECS", "0.5") or 0.5)
-        self.high_cpu_threshold = float(os.getenv("YARA_LIGHT_HIGH_CPU", "80") or 80)
-        self.critical_cpu_threshold = float(os.getenv("YARA_LIGHT_CRITICAL_CPU", "90") or 90)
-        self.throttle_sleep_secs = float(os.getenv("YARA_LIGHT_SLEEP_SECS", "0.02") or 0.02)
-        self.critical_throttle_sleep_secs = float(
-            os.getenv("YARA_LIGHT_CRITICAL_SLEEP_SECS", "0.08") or 0.08
-        )
-        self.queue_backoff_secs = float(os.getenv("YARA_QUEUE_BACKOFF_SECS", "0.25") or 0.25)
+        # All four throttle knobs take minimum=0: a negative sleep makes Event.wait()
+        # return immediately, turning the throttle into the hot loop it exists to prevent.
+        self.throttle_check_interval_secs = _env_number(
+            "YARA_LIGHT_THROTTLE_CHECK_SECS", 0.5, minimum=0)
+        self.high_cpu_threshold = _env_number("YARA_LIGHT_HIGH_CPU", 80, minimum=0)
+        self.critical_cpu_threshold = _env_number("YARA_LIGHT_CRITICAL_CPU", 90, minimum=0)
+        self.throttle_sleep_secs = _env_number("YARA_LIGHT_SLEEP_SECS", 0.02, minimum=0)
+        self.critical_throttle_sleep_secs = _env_number(
+            "YARA_LIGHT_CRITICAL_SLEEP_SECS", 0.08, minimum=0)
+        self.queue_backoff_secs = _env_number("YARA_QUEUE_BACKOFF_SECS", 0.25, minimum=0)
         self.skip_extensions = {
             ".iso", ".img", ".dmg", ".vmdk", ".vhd", ".vhdx", ".qcow", ".qcow2", ".sparsebundle"
         }

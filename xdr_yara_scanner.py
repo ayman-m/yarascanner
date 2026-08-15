@@ -67,6 +67,40 @@ import yara
 # CONSTANTS
 # ============================================================================
 
+def _env_number(name, default, cast=float, minimum=None):
+    """Read a numeric tuning env var without letting a deployer typo crash the scanner.
+
+    Most of the knobs below are read at MODULE level, so an unguarded int('5s') raised
+    ValueError at import time - before ScanConfig, before LogManager, before anything
+    existed that could report why the action failed. The operator saw a dead action with
+    no local log and no telemetry.
+
+    `minimum` additionally rejects values that PARSE but are unusable, because parsing is
+    not validation: YARA_MAX_MB=-1 is a valid int that made max_file_bytes negative, so
+    every file failed the size check and the scan reported "completed" having scanned
+    nothing. Both failure modes fall back to the documented default and warn.
+
+    Ported from the XSIAM edition, which already had this helper but applied it only to
+    its module-level knobs.
+    """
+    raw = os.environ.get(name, "")
+    if not raw:
+        return cast(default)
+    try:
+        value = cast(raw)
+    except (TypeError, ValueError):
+        logging.warning(
+            "Ignoring invalid %s=%r (expected a number) - using default %r",
+            name, raw, default)
+        return cast(default)
+    if minimum is not None and value < minimum:
+        logging.warning(
+            "Ignoring out-of-range %s=%r (minimum %r) - using default %r",
+            name, raw, minimum, default)
+        return cast(default)
+    return value
+
+
 UPLOAD_RESULTS = True  # Match uploads to XDR
 UPLOAD_NON_MATCH_DATA = False  # Keep non-match logs on disk only
 DEFAULT_TIMEOUT_SECS = 20            # increased request timeout everywhere
@@ -76,21 +110,21 @@ MAX_RETRIES_PER_ITEM = 4             # per-batch retry cap (Insert Parsed Alerts
 # (a broad rule can produce tens of thousands of string matches, which one-POST-per-match cannot
 # deliver before the scan ends). Edit these to tune the batch amount, flush interval, and how long
 # to keep draining pending alerts when the scan finishes.
-ALERT_BATCH_SIZE = min(60, int(os.environ.get("YARA_ALERT_BATCH", "60") or 60))  # alerts per POST (XDR HARD CAP = 60; clamped)
-ALERT_FLUSH_SECS = float(os.environ.get("YARA_ALERT_FLUSH_SECS", "10") or 10)     # flush a partial batch after this idle
-ALERT_DRAIN_SECS = float(os.environ.get("YARA_ALERT_DRAIN_SECS", "60") or 60)     # MINIMUM end-of-scan drain window
-ALERT_DRAIN_MAX_SECS = float(os.environ.get("YARA_ALERT_DRAIN_MAX_SECS", "300") or 300)  # backlog-scaled drain cap
+ALERT_BATCH_SIZE = min(60, _env_number("YARA_ALERT_BATCH", 60, cast=int, minimum=1))  # alerts per POST (XDR HARD CAP = 60; clamped)
+ALERT_FLUSH_SECS = _env_number("YARA_ALERT_FLUSH_SECS", 10, minimum=0)     # flush a partial batch after this idle
+ALERT_DRAIN_SECS = _env_number("YARA_ALERT_DRAIN_SECS", 60, minimum=0)     # MINIMUM end-of-scan drain window
+ALERT_DRAIN_MAX_SECS = _env_number("YARA_ALERT_DRAIN_MAX_SECS", 300, minimum=0)  # backlog-scaled drain cap
 # Insert Parsed Alerts is RATE-LIMITED (~600 alerts/min; the API returns HTTP 500 "Exceeding the
 # rate limit" when tripped). Pace batches to stay under it: 60 alerts every >=7s ~= 510/min. Without
 # pacing, over-fast batches fail and their retries burn the upload window, starving the rest.
-ALERT_MIN_BATCH_INTERVAL = float(os.environ.get("YARA_ALERT_MIN_INTERVAL", "7") or 7)  # min secs between alert POSTs
+ALERT_MIN_BATCH_INTERVAL = _env_number("YARA_ALERT_MIN_INTERVAL", 7, minimum=0)  # min secs between alert POSTs
 # Requeue-on-rate-limit: when a batch exhausts its retries because it was RATE-LIMITED (not a real
 # error), put it back on the queue to try again once the per-minute window frees up — instead of
 # dropping it. Bounded by a global wall-clock budget so a permanently-saturated key (many concurrent
 # agents) can't loop forever; past the budget, or once the scan is stopping, batches drop as before.
 # This can't beat the shared server-side ceiling, only ride out transient saturation.
 ALERT_REQUEUE_ENABLED = (os.environ.get("YARA_ALERT_REQUEUE", "1").strip().lower() not in ("0", "false", "no", ""))
-ALERT_MAX_DELIVER_SECS = float(os.environ.get("YARA_ALERT_MAX_DELIVER_SECS", "900") or 900)  # global requeue budget
+ALERT_MAX_DELIVER_SECS = _env_number("YARA_ALERT_MAX_DELIVER_SECS", 900, minimum=0)  # global requeue budget
 BASE_BACKOFF_SECS = 1.0              # initial backoff
 MAX_BACKOFF_SECS = 30.0              # backoff ceiling
 CIRCUIT_FAILURE_THRESHOLD = 5        # open after N consecutive failures
@@ -205,16 +239,16 @@ CONFIG_OPTIONS = ""                     # extra "key=value,key=value" overrides 
 #   FEWER posts  -> big batches + deferred partial flush (each POST is one collision chance).
 #   DECORRELATE  -> small pre-write jitter spreads same-host writers.
 #   RECOVER      -> full-jitter retries mop up the remainder.
-LOOKUP_DATASET_BATCH_SIZE = int(os.environ.get("YARA_LOOKUP_BATCH", "500") or 500)  # rows per POST. 500 is a sweet spot: bigger (e.g. 1000) makes the add_data payload slow enough that the API GATEWAY returns 502/read-timeouts under concurrent fleet load, losing whole batches.
-LOOKUP_DATASET_FLUSH_SECS = float(os.environ.get("YARA_LOOKUP_FLUSH_SECS", "30") or 30)  # defer partials -> fewer POSTs
-LOOKUP_WRITE_JITTER_SECS = float(os.environ.get("YARA_LOOKUP_WRITE_JITTER", "2") or 2)   # light same-host spread
-LOOKUP_ADD_DATA_MAX_RETRIES = int(os.environ.get("YARA_LOOKUP_RETRIES", "6") or 6)
-LOOKUP_DRAIN_TIMEOUT = float(os.environ.get("YARA_LOOKUP_DRAIN_SECS", "150") or 150)  # MINIMUM final-flush budget (covers jitter+retries)
+LOOKUP_DATASET_BATCH_SIZE = _env_number("YARA_LOOKUP_BATCH", 500, cast=int, minimum=1)  # rows per POST. 500 is a sweet spot: bigger (e.g. 1000) makes the add_data payload slow enough that the API GATEWAY returns 502/read-timeouts under concurrent fleet load, losing whole batches.
+LOOKUP_DATASET_FLUSH_SECS = _env_number("YARA_LOOKUP_FLUSH_SECS", 30, minimum=0)  # defer partials -> fewer POSTs
+LOOKUP_WRITE_JITTER_SECS = _env_number("YARA_LOOKUP_WRITE_JITTER", 2, minimum=0)   # light same-host spread
+LOOKUP_ADD_DATA_MAX_RETRIES = _env_number("YARA_LOOKUP_RETRIES", 6, cast=int, minimum=0)
+LOOKUP_DRAIN_TIMEOUT = _env_number("YARA_LOOKUP_DRAIN_SECS", 150, minimum=0)  # MINIMUM final-flush budget (covers jitter+retries)
 # The final drain budget scales with the backlog (datasets are the record — give a storm scan's
 # 70-batch backlog the time the math requires, not a flat window) up to a hard cap so a dead API
 # can't hang shutdown. Roughly: per-batch worst case ~= jitter + merge + one retry.
-LOOKUP_DRAIN_MAX_SECS = float(os.environ.get("YARA_LOOKUP_DRAIN_MAX_SECS", "600") or 600)
-LOOKUP_DRAIN_PER_BATCH_SECS = float(os.environ.get("YARA_LOOKUP_DRAIN_PER_BATCH", "45") or 45)
+LOOKUP_DRAIN_MAX_SECS = _env_number("YARA_LOOKUP_DRAIN_MAX_SECS", 600, minimum=0)
+LOOKUP_DRAIN_PER_BATCH_SECS = _env_number("YARA_LOOKUP_DRAIN_PER_BATCH", 45, minimum=0)
 # add_data merges are slow server-side, and the merge time scales with the DATASET's total size,
 # not the payload (measured on-tenant with a 1-row POST: ~13s against a 15k-row dataset, ~31s
 # against a 77k-row one). A read timeout below the real merge time is catastrophic: every POST
@@ -223,12 +257,12 @@ LOOKUP_DRAIN_PER_BATCH_SECS = float(os.environ.get("YARA_LOOKUP_DRAIN_PER_BATCH"
 # (observed live: 500/36,106 rows landed). So: fail fast on CONNECT, stay patient on the read
 # (120s >> the largest merge a monthly-rotated dataset can grow into), and cap retries after a
 # READ timeout separately (see LOOKUP_TIMEOUT_MAX_ATTEMPTS) because the write may have succeeded.
-LOOKUP_POST_TIMEOUT = (5, float(os.environ.get("YARA_LOOKUP_READ_TIMEOUT", "120") or 120))
+LOOKUP_POST_TIMEOUT = (5, _env_number("YARA_LOOKUP_READ_TIMEOUT", 120, minimum=0))
 # Max POST attempts for a batch whose failures are READ timeouts. Unlike a connect failure (server
 # never saw the request; retry freely), a read timeout means the server was mid-merge when we hung
 # up — the rows often land anyway, so each blind retry risks duplicating the whole batch. 2 =
 # one retry, then stop and count the batch 'unconfirmed' (fate unknown) instead of looping.
-LOOKUP_TIMEOUT_MAX_ATTEMPTS = int(os.environ.get("YARA_LOOKUP_TIMEOUT_ATTEMPTS", "2") or 2)
+LOOKUP_TIMEOUT_MAX_ATTEMPTS = _env_number("YARA_LOOKUP_TIMEOUT_ATTEMPTS", 2, cast=int, minimum=1)
 # THE fix for the add_data concurrency limitation: shard the lookup datasets per-writer so the
 # server never sees two endpoints writing the SAME dataset at once (the only condition that
 # triggers the clone-table race). Each endpoint writes yara_scanner_matches_<shard> and
@@ -251,29 +285,29 @@ LOOKUP_SCHEMA_VERSION = os.environ.get("YARA_LOOKUP_SCHEMA_VER", "3").strip() or
 # cross-version bundle; any load failure falls back to a fresh compile.
 RULE_CACHE_ENABLED = (os.environ.get("YARA_RULE_CACHE", "1").strip().lower() not in ("0", "false", "no", ""))
 RULE_CACHE_FORMAT = os.environ.get("YARA_RULE_CACHE_FORMAT", "1").strip() or "1"  # bump when compile logic changes
-RULE_CACHE_MAX_FILES = int(os.environ.get("YARA_RULE_CACHE_MAX", "5") or 5)
-RULE_CACHE_MAX_BYTES = int(float(os.environ.get("YARA_RULE_CACHE_MAX_MB", "256") or 256) * 1024 * 1024)
+RULE_CACHE_MAX_FILES = _env_number("YARA_RULE_CACHE_MAX", 5, cast=int, minimum=0)
+RULE_CACHE_MAX_BYTES = int(_env_number("YARA_RULE_CACHE_MAX_MB", 256, minimum=0) * 1024 * 1024)
 _RULE_CACHE_LOCK = threading.Lock()
 # Fixed lookup-dataset base name (stable so dashboards can reference literally):
 #   <prefix>_matches -> one row per matched YARA string
 #   <prefix>_scans   -> scan-lifecycle rows (initiated/running/completed/cancelled/failed)
 LOOKUP_DATASET_PREFIX = "yara_scanner"
-SCANS_HEARTBEAT_SECS = float(os.environ.get("YARA_HEARTBEAT_SECS", "600") or 600)  # running-row cadence
+SCANS_HEARTBEAT_SECS = _env_number("YARA_HEARTBEAT_SECS", 600, minimum=0)  # running-row cadence
 # How many past scans' logs (+ their JSON summary) to keep on the endpoint. The old value (2)
 # wiped diagnostics too aggressively under frequent scans; keep more by default, configurable.
-LOG_KEEP_SCANS = int(os.environ.get("YARA_LOG_KEEP", "10") or 10)
-CANCEL_POLL_SECS = float(os.environ.get("YARA_CANCEL_POLL_SECS", "5") or 5)        # cancel-flag watcher cadence
-CANCEL_DRAIN_DEADLINE_SECS = float(os.environ.get("YARA_CANCEL_DEADLINE_SECS", "30") or 30)  # graceful cancel budget
+LOG_KEEP_SCANS = _env_number("YARA_LOG_KEEP", 10, cast=int, minimum=0)
+CANCEL_POLL_SECS = _env_number("YARA_CANCEL_POLL_SECS", 5, minimum=0)        # cancel-flag watcher cadence
+CANCEL_DRAIN_DEADLINE_SECS = _env_number("YARA_CANCEL_DEADLINE_SECS", 30, minimum=0)  # graceful cancel budget
 # Cadence for the independent heartbeat thread (#8, distinct from #21): _maybe_heartbeat()
 # was previously called ONLY from the directory-walker loop, so a walker parked in
 # _enqueue_scan_path's backpressure retry loop (a large directory on a throttled host) also
 # stalled the "scans" dataset heartbeat for as long as it was blocked. This poll interval only
 # needs to be comfortably below SCANS_HEARTBEAT_SECS; it does not itself gate emission.
-HEARTBEAT_THREAD_POLL_SECS = float(os.environ.get("YARA_HEARTBEAT_POLL_SECS", "30") or 30)
+HEARTBEAT_THREAD_POLL_SECS = _env_number("YARA_HEARTBEAT_POLL_SECS", 30, minimum=0)
 CANCEL_STALE_TOLERANCE_SECS = 2.0  # mtime slack when judging a cancel flag stale (coarse-FS safety)
 # Governor telemetry heartbeat: emit at least this often even when nothing changes, so a
 # healthy scan still leaves a time series proving the CPU promise held.
-GOVERNOR_HEARTBEAT_SECS = float(os.environ.get("YARA_GOVERNOR_HEARTBEAT_SECS", "30") or 30)
+GOVERNOR_HEARTBEAT_SECS = _env_number("YARA_GOVERNOR_HEARTBEAT_SECS", 30, minimum=0)
 
 XDR_API_KEY = DEFAULT_XDR_API_KEY
 XDR_API_ID = DEFAULT_XDR_API_ID
@@ -2758,7 +2792,10 @@ class ScanConfig:
         self.file_mapping = os.path.join(self.evidence_dir, "file_mapping.txt")
         self.output_log = os.path.join(self.logs_dir, f"scanner_{self.run_id}.log")
 
-        self.max_file_mb = int(os.getenv("YARA_MAX_MB", "64") or 64)
+        # minimum=0: 0 legitimately means "no size cap", but a NEGATIVE parsed fine and
+        # made max_file_bytes negative, so every file failed the size check and the scan
+        # reported success having scanned nothing.
+        self.max_file_mb = _env_number("YARA_MAX_MB", 64, cast=int, minimum=0)
         self.max_file_bytes = self.max_file_mb * 1024 * 1024 if self.max_file_mb else 0
 
         cpu_count = os.cpu_count() or 2
@@ -2768,10 +2805,10 @@ class ScanConfig:
         # More workers also helps at the SAME cpu budget, because scanning is disk-bound
         # as well as CPU-bound - more outstanding reads per CPU-second.
         _cfg_workers = self._opt_workers if self._opt_workers is not None else CONFIG_WORKERS
-        configured_workers = int(os.getenv("YARA_THREADS", str(_cfg_workers)) or _cfg_workers)
+        configured_workers = _env_number("YARA_THREADS", _cfg_workers, cast=int, minimum=1)
         self.max_workers = configured_workers if configured_workers > 0 else max(2, cpu_count // 2)
         self.scan_queue_size = max(
-            2, int(os.getenv("YARA_QUEUE_SIZE", str(self.max_workers * 2)) or (self.max_workers * 2))
+            2, _env_number("YARA_QUEUE_SIZE", self.max_workers * 2, cast=int, minimum=2)
         )
         # Default 30s, not 120s: this is the progress-heartbeat's sampling interval, and at
         # 120s a scan whose active phase is shorter than that emits NO progress telemetry at
@@ -2780,7 +2817,7 @@ class ScanConfig:
         # a busy-spin that re-takes lock_counts continuously and floods the upload queue.
         # "0" is a plausible thing for an operator to set trying to disable progress logging;
         # to actually disable it, set a large interval. Ported from the XSIAM edition.
-        self.log_interval = max(1, int(os.getenv("YARA_PROGRESS_LOG_SECS", "30") or 30))
+        self.log_interval = max(1, _env_number("YARA_PROGRESS_LOG_SECS", 30, cast=int, minimum=1))
         self.enable_performance_monitoring = str(
             os.getenv("YARA_ENABLE_PERF_MONITOR", "false")
         ).strip().lower() in ("1", "true", "yes", "on")
@@ -2798,7 +2835,7 @@ class ScanConfig:
         # nothing but psutil overhead.
         self.throttle_check_interval_secs = float(
             os.getenv("YARA_GOVERNOR_INTERVAL_SECS", "1.0") or 1.0)
-        self.queue_backoff_secs = float(os.getenv("YARA_QUEUE_BACKOFF_SECS", "0.25") or 0.25)
+        self.queue_backoff_secs = _env_number("YARA_QUEUE_BACKOFF_SECS", 0.25, minimum=0)
         self.skip_extensions = {
             ".iso", ".img", ".dmg", ".vmdk", ".vhd", ".vhdx", ".qcow", ".qcow2", ".sparsebundle"
         }
