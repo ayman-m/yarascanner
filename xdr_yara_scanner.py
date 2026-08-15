@@ -2931,6 +2931,9 @@ class ScanConfig:
                 '/Applications/iMovie.app/Contents/',
                 os.path.normpath(self.scanner_dir).rstrip("/") + "/",
             ]
+            # Case-fold at construction: APFS is case-insensitive by default and the
+            # matcher compares against portable_path, which is already case-folded.
+            self.mac_skip_directory = [p.lower() for p in self.mac_skip_directory]
             self.skip_paths = set(self.mac_skip_directory)
         
         else:
@@ -4956,6 +4959,11 @@ class YaraScanner:
         self.junction_skip_count = 0
         self.lock_real_paths = threading.Lock()
 
+        # Requested scan targets that the skip list excludes wholesale. Without this a
+        # target inside the skip list produced outcome="completed", 0 scanned, exit 0 -
+        # indistinguishable from an empty directory, so an operator scanning e.g.
+        # AppData\Local\Temp got a clean success and zero coverage.
+        self.excluded_targets = []
         self.worker_processing_times = defaultdict(list)
         self.cpu_governor = CpuGovernor(
             policy=getattr(config, "cpu_guarantee", "none"),
@@ -6217,21 +6225,51 @@ rule test {{
             return False
         
         elif platform.system() == "Linux":
-            return any(
-                normalized_path.startswith(skip_dir)
-                for skip_dir in self.config.lin_skip_directory
-            )
-        
+            # Linux filesystems are typically case-sensitive, so this stays on
+            # normalized_path (case-preserved), unlike the Darwin branch below.
+            for skip_dir in self.config.lin_skip_directory:
+                # skip_dir always carries a trailing "/", which a plain startswith() never
+                # matches against the BARE root os.walk yields for the directory itself -
+                # only its contents. So the scanner's own directory root was walked and
+                # enumerated even though everything inside it was correctly skipped.
+                if normalized_path == skip_dir.rstrip("/") or normalized_path.startswith(skip_dir):
+                    return True
+            return False
+
         elif platform.system() == "Darwin":
-            if any(normalized_path.startswith(skip_dir) for skip_dir in self.config.mac_skip_directory):
-                return True
-            
-            filename = os.path.basename(normalized_path)
+            # APFS is case-insensitive by default, so both sides must be case-folded -
+            # portable_path already is; mac_skip_directory is lowercased at construction.
+            #
+            # Entries come in three shapes needing different match semantics:
+            #   - starts with "/"  -> ANCHOR: a real top-level path, matching only there
+            #     and beneath it (so "/System/" never matches a user's own "~/System/").
+            #   - contains ".app/" -> BUNDLE SUFFIX: ".app/Contents/Frameworks/" must match
+            #     "Slack.app/Contents/..." for ANY app name, so the character before ".app"
+            #     is that name's last letter, never a separator - checked WITHOUT a leading
+            #     slash, unlike every other fragment.
+            #   - otherwise        -> FRAGMENT: matches wherever the component occurs, at
+            #     any depth. A bare startswith() can never satisfy this - a relative string
+            #     is never a prefix of an absolute path - so 32 of these 58 entries matched
+            #     nothing at all. Also checked at the tail, because when the fragment's own
+            #     directory IS the walk root the path has no trailing separator to close
+            #     the bounded "/entry/" substring.
+            for skip_dir in self.config.mac_skip_directory:
+                if skip_dir.startswith("/"):
+                    if portable_path == skip_dir.rstrip("/") or portable_path.startswith(skip_dir):
+                        return True
+                elif ".app/" in skip_dir:
+                    if skip_dir in portable_path:
+                        return True
+                elif (("/" + skip_dir) in portable_path
+                      or portable_path.endswith("/" + skip_dir.rstrip("/"))):
+                    return True
+
+            filename = os.path.basename(portable_path)
             if filename.startswith('._'):
                 return True
-            if filename == '.DS_Store':
+            if filename == '.ds_store':
                 return True
-            
+
             return False
         
         else:
@@ -6703,6 +6741,18 @@ rule test {{
                         f"Scanning target {target_idx + 1}/{len(targets)}: {target}",
                         {'target_index': target_idx + 1, 'target_path': target}
                     )
+
+                    # The operator asked for this path explicitly, but it matches the skip
+                    # list, so the walk below drops every directory in it and reports a
+                    # clean zero. Record it so the result line can say so - silently
+                    # returning 0 reads as "nothing here", not "policy excluded this".
+                    if self._is_special_file(target):
+                        self.excluded_targets.append(target)
+                        self.log_manager.log_error(
+                            f"Requested scan target is excluded by the skip list, so nothing "
+                            f"under it will be scanned: {target}",
+                            {'target_path': target, 'reason': 'skip_list'}
+                        )
                     
                     # _walk_cancellable, not os.walk: the flag is checked before every
                     # directory so a cancel is honoured within one scandir, instead of
@@ -6712,6 +6762,17 @@ rule test {{
                             break
                             
                         if self._is_special_file(root):
+                            # Count what this skip actually excluded. A bare `continue`
+                            # touched no counter, so an entire skipped subtree vanished
+                            # from the books: files_scanned + files_skipped could not be
+                            # reconciled against what is on disk, and skip_rate read 0%.
+                            # Subdirectories are not pruned, so each one arrives here as
+                            # its own root and contributes its own files - the whole
+                            # subtree is counted exactly once.
+                            if files:
+                                with self.lock_counts:
+                                    self.files_skipped += len(files)
+                                    self.skip_reasons["Skipped directory"] += len(files)
                             continue
                         
                         dirs[:] = [d for d in dirs if not _should_skip_junction(os.path.join(root, d))]
@@ -7320,10 +7381,21 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
         # rules were mostly skipped reports "0 rules failed compilation" and reads clean.
         _skipped = getattr(error_logger, "skipped_rules_count", 0) or 0
         _skipped_txt = f" | {_skipped} rules skipped (module unavailable)" if _skipped else ""
+        # A target the operator explicitly asked for but the skip list excludes wholesale
+        # must be named on the result line. Reporting only "0 files scanned" is
+        # indistinguishable from an empty directory, so a scan of e.g. AppData\Local\Temp
+        # read as a clean success with zero coverage.
+        _excluded = list(getattr(scanner, "excluded_targets", []) or [])
+        _excl_txt = ""
+        if _excluded:
+            _excl_txt = (f" | WARNING: {len(_excluded)} requested target(s) EXCLUDED by the "
+                         f"skip list, nothing under them was scanned: "
+                         + ", ".join(_excluded[:3])
+                         + (" ..." if len(_excluded) > 3 else ""))
         summary = (f"Scan completed: {scanner.files_scanned} files scanned | "
                 f"{error_logger.failed_rules_count} rules failed compilation{_skipped_txt} | "
                 f"{scanner.total_detections} matches found | "
-                f"cpu-slept {scanner.cpu_governor.slept_total:.0f}s | {config.posture}")
+                f"cpu-slept {scanner.cpu_governor.slept_total:.0f}s | {config.posture}{_excl_txt}")
 
         # A scan that found everything and delivered none of it must not read as a clean
         # success. 'undelivered' only counts items never ATTEMPTED (drain budget expired);
@@ -7422,6 +7494,7 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
                     _summary_path = log_manager.write_scan_summary({
                         "outcome": _outcome,
                         "scan_folder": getattr(config, "scan_folder", None),
+                        "excluded_targets": list(getattr(scanner, "excluded_targets", []) or []),
                         "duration_secs": round(_dur, 2) if _dur is not None else None,
                         "files_scanned": getattr(scanner, "files_scanned", None),
                         "files_skipped": getattr(scanner, "files_skipped", None),

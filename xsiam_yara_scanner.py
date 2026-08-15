@@ -4064,6 +4064,11 @@ class YaraScanner:
         self.junction_skip_count = 0
         self.lock_real_paths = threading.Lock()
 
+        # Requested scan targets that the skip list excludes wholesale. Without this a
+        # target inside the skip list produced outcome="completed", 0 scanned, exit 0 -
+        # indistinguishable from an empty directory, so an operator scanning e.g.
+        # AppData\Local\Temp got a clean success and zero coverage.
+        self.excluded_targets = []
         self.worker_processing_times = defaultdict(list)
         self.last_throttle_check = 0.0
         self.last_system_cpu = 0.0
@@ -5544,6 +5549,18 @@ rule test {{
                         f"Scanning target {target_idx + 1}/{len(targets)}: {target}",
                         {'target_index': target_idx + 1, 'target_path': target}
                     )
+
+                    # The operator asked for this path explicitly, but it matches the skip
+                    # list, so the walk below drops every directory in it and reports a
+                    # clean zero. Record it so the result line can say so - silently
+                    # returning 0 reads as "nothing here", not "policy excluded this".
+                    if self._is_special_file(target):
+                        self.excluded_targets.append(target)
+                        self.log_manager.log_error(
+                            f"Requested scan target is excluded by the skip list, so nothing "
+                            f"under it will be scanned: {target}",
+                            {'target_path': target, 'reason': 'skip_list'}
+                        )
                     
                     for root, dirs, files in self._walk_cancellable(target):
                         if not self.scan_active:
@@ -5552,6 +5569,17 @@ rule test {{
                         self._maybe_refresh_running_marker()
 
                         if self._is_special_file(root):
+                            # Count what this skip actually excluded. A bare `continue`
+                            # touched no counter, so an entire skipped subtree vanished
+                            # from the books: files_scanned + files_skipped could not be
+                            # reconciled against what is on disk, and skip_rate read 0%.
+                            # Subdirectories are not pruned, so each one arrives here as
+                            # its own root and contributes its own files - the whole
+                            # subtree is counted exactly once.
+                            if files:
+                                with self.lock_counts:
+                                    self.files_skipped += len(files)
+                                    self.skip_reasons["Skipped directory"] += len(files)
                             continue
                         
                         dirs[:] = [d for d in dirs if not _should_skip_junction(os.path.join(root, d))]
@@ -6153,9 +6181,20 @@ def main(yarafile=None, scan_folder=None, alert_severity="low"):
         # rules were mostly skipped reports "0 rules failed compilation" and reads clean.
         _skipped = getattr(error_logger, "skipped_rules_count", 0) or 0
         _skipped_txt = f" | {_skipped} rules skipped (module unavailable)" if _skipped else ""
+        # A target the operator explicitly asked for but the skip list excludes wholesale
+        # must be named on the result line. Reporting only "0 files scanned" is
+        # indistinguishable from an empty directory, so a scan of e.g. AppData\Local\Temp
+        # read as a clean success with zero coverage.
+        _excluded = list(getattr(scanner, "excluded_targets", []) or [])
+        _excl_txt = ""
+        if _excluded:
+            _excl_txt = (f" | WARNING: {len(_excluded)} requested target(s) EXCLUDED by the "
+                         f"skip list, nothing under them was scanned: "
+                         + ", ".join(_excluded[:3])
+                         + (" ..." if len(_excluded) > 3 else ""))
         summary = (f"{_verb}: {scanner.files_scanned} files scanned | "
                 f"{error_logger.failed_rules_count} rules failed compilation{_skipped_txt} | "
-                f"{scanner.total_detections} matches found{upload_errors}{shortfall}")
+                f"{scanner.total_detections} matches found{upload_errors}{shortfall}{_excl_txt}")
         return summary
         
     except Exception as e:
@@ -6277,6 +6316,7 @@ def main(yarafile=None, scan_folder=None, alert_severity="low"):
                         "failure_reasons": list(getattr(scanner, "failure_reasons", []) or []),
                         "scan_folder": getattr(config, "scan_folder", None),
                         "scan_targets": list(getattr(scanner, "scan_targets", []) or []),
+                        "excluded_targets": list(getattr(scanner, "excluded_targets", []) or []),
                         "duration_secs": round(_dur, 2) if _dur is not None else None,
                         "files_scanned": getattr(scanner, "files_scanned", None),
                         "files_skipped": getattr(scanner, "files_skipped", None),
