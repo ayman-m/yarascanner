@@ -1116,144 +1116,6 @@ class FileHasher:
 # ============================================================================
 
 # Roadmap Feature: Caching implementation (currently disabled/dormant)
-class FileCacher:
-    """Thread-safe hybrid cache (LRU in RAM + full on disk) for scan results."""
-
-    def __init__(self, cache_file_path):
-        self.cache_file = cache_file_path
-        self.max_memory_entries = self._calculate_cache_size()
-        self.memory_cache = OrderedDict()
-        self.disk_cache = {}
-        self.lock = threading.RLock()
-        self.dirty = False
-        self._stop_evt = threading.Event()
-        self.log_manager = None
-
-        self._load_cache()
-        self._save_thread = threading.Thread(target=self._periodic_save, daemon=True)
-        self._save_thread.start()
-
-    def _calculate_cache_size(self):
-        """Calculate cache size based on available RAM."""
-        try:
-            total_ram_gb = psutil.virtual_memory().total / (1024**3)
-            if total_ram_gb >= 32:
-                return 500_000
-            if total_ram_gb >= 16:
-                return 250_000
-            if total_ram_gb >= 8:
-                return 125_000
-            if total_ram_gb >= 4:
-                return 62_500
-            return 25_000
-        except Exception:
-            return 25_000
-
-    def _fast_signature(self, file_key, data_json_safe: dict) -> int:
-        """Generate fast CRC32 signature for cache integrity."""
-        content = f"{file_key}:{json.dumps(data_json_safe, sort_keys=True)}"
-        return zlib.crc32(content.encode()) & 0xFFFFFFFF
-
-    def put(self, file_key: str, scan_result: dict):
-        """Store scan result in cache."""
-        cache_entry = {
-            'matches': scan_result.get('matches', []),
-            'file_size': scan_result.get('file_size', 0),
-            'timestamp': scan_result.get('timestamp', time.time()),
-        }
-        cache_entry['sig'] = self._fast_signature(file_key, {
-            'matches': cache_entry['matches'],
-            'file_size': cache_entry['file_size'],
-            'timestamp': cache_entry['timestamp'],
-        })
-
-        with self.lock:
-            if file_key in self.memory_cache:
-                self.memory_cache.move_to_end(file_key)
-                self.memory_cache[file_key] = cache_entry
-            else:
-                if len(self.memory_cache) >= self.max_memory_entries:
-                    self.memory_cache.popitem(last=False)
-                self.memory_cache[file_key] = cache_entry
-
-            self.disk_cache[file_key] = cache_entry
-            self.dirty = True
-
-    def get(self, file_key: str):
-        """Retrieve scan result from cache with integrity check."""
-        with self.lock:
-            entry = self.memory_cache.get(file_key)
-            if entry is not None:
-                self.memory_cache.move_to_end(file_key)
-            else:
-                entry = self.disk_cache.get(file_key)
-                if entry is None:
-                    return None
-                self.memory_cache[file_key] = entry
-                if len(self.memory_cache) > self.max_memory_entries:
-                    self.memory_cache.popitem(last=False)
-
-            stored_sig = entry.get('sig', 0)
-            entry_copy = {k: v for k, v in entry.items() if k != 'sig'}
-            calc_sig = self._fast_signature(file_key, entry_copy)
-
-            if stored_sig != calc_sig:
-                return None
-            return entry
-
-
-    def stop_cache(self):
-        """Stop cache and persist final state."""
-        self._stop_evt.set()
-        try:
-            self._save_cache()
-        finally:
-            if getattr(self, "_save_thread", None):
-                self._save_thread.join(timeout=2.0)
-            if getattr(self, "log_manager", None):
-                try:
-                    self.log_manager.log_system("Cache stopped and saved")
-                except Exception:
-                    pass
-
-    def _load_cache(self):
-        """Load cache from disk."""
-        if not self.cache_file or not os.path.exists(self.cache_file):
-            return
-        try:
-            with open(self.cache_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                self.disk_cache = data
-        except Exception:
-            self.disk_cache = {}
-
-    def _save_cache(self):
-        """Save cache to disk atomically."""
-        with self.lock:
-            if not self.dirty:
-                return
-            tmp = self.cache_file + ".tmp"
-            os.makedirs(os.path.dirname(self.cache_file), exist_ok=True)
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self.disk_cache, f, ensure_ascii=False)
-            try:
-                os.replace(tmp, self.cache_file)
-            finally:
-                if os.path.exists(tmp):
-                    try: 
-                        os.remove(tmp)
-                    except Exception:
-                        pass
-            self.dirty = False
-
-    def _periodic_save(self):
-        """Background thread for periodic cache persistence."""
-        while not self._stop_evt.wait(60):
-            try:
-                self._save_cache()
-            except Exception:
-                pass
 
 
 # ============================================================================
@@ -1551,14 +1413,7 @@ class StatisticsManager:
             'errors': 0,
             'last_activity': 0
         })
-        
-        self.cache_stats = {
-            'hits': 0,
-            'misses': 0,
-            'evictions': 0,
-            'memory_usage_mb': 0
-        }
-        
+                
         self.scan_estimates = {
             'total_files_estimate': 0,
             'completion_estimate': None,
@@ -1763,23 +1618,6 @@ class StatisticsManager:
             if error_occurred:
                 stats['errors'] += 1
 
-    def update_cache_stats(self, hits=0, misses=0, evictions=0, memory_usage_mb=0):
-        """Update cache performance statistics."""
-        with self.lock_stats:
-            self.cache_stats['hits'] += hits
-            self.cache_stats['misses'] += misses
-            self.cache_stats['evictions'] += evictions
-            self.cache_stats['memory_usage_mb'] = memory_usage_mb
-
-        if (self.cache_stats['hits'] + self.cache_stats['misses']) % 100 == 0:
-            hit_rate = self.cache_stats['hits'] / (self.cache_stats['hits'] + self.cache_stats['misses']) * 100
-
-            if self.log_manager is not None:
-                self.log_manager.log_cache_performance(
-                    hit_rate,
-                    self.cache_stats['hits'] + self.cache_stats['misses'],
-                    self.cache_stats['memory_usage_mb']
-                )
 
     def calculate_time_estimates(self, total_files_processed, total_files_estimated, start_time):
         """Calculate scan completion time estimates."""
@@ -1832,7 +1670,6 @@ class StatisticsManager:
             self.stats_logger.info("COMPREHENSIVE STATISTICS SUMMARY")
             self.stats_logger.info("=" * 60)
             self.stats_logger.info(f"Performance Metrics: {json.dumps(perf_summary, indent=2)}")
-            self.stats_logger.info(f"Cache Statistics: {json.dumps(self.cache_stats, indent=2)}")
             self.stats_logger.info(f"Time Estimates: {json.dumps(self.scan_estimates, indent=2, default=str)}")
             self.stats_logger.info(f"Worker Summary: {json.dumps(worker_summary, indent=2)}")
             self.stats_logger.info("=" * 60)
@@ -1849,7 +1686,6 @@ class StatisticsManager:
                 'timestamp': time.time(),
                 'log_type': 'statistics',
                 'performance_metrics': self.performance_metrics.copy(),
-                'cache_stats': self.cache_stats.copy(),
                 'scan_estimates': self.scan_estimates.copy(),
                 'current_performance': current_snapshot.to_dict() if current_snapshot else None,
                 'worker_count': len(self.worker_stats),
@@ -2193,21 +2029,6 @@ class LogManager:
         
         self.log_performance(message, resource_data)
 
-    def log_cache_performance(self, hit_rate: float, total_requests: int, 
-                             memory_usage_mb: float):
-        """Log cache performance metrics."""
-        cache_data = {
-            'hit_rate_percent': hit_rate,
-            'total_requests': total_requests,
-            'memory_usage_mb': memory_usage_mb
-        }
-        
-        message = (
-            f"Cache Performance | Hit Rate: {hit_rate:.1f}% | "
-            f"Requests: {total_requests} | Memory: {memory_usage_mb:.1f}MB"
-        )
-        
-        self.log_statistics(message, cache_data)
 
     def log_time_estimates(self, eta_seconds, completion_time,
                           current_rate: float, files_remaining: int):
@@ -2678,8 +2499,6 @@ class ScanConfig:
     def __init__(self, yarafile, scan_folder=None, alert_severity="low"):
         self.hostname, self.ip_addresses, self.os_info = get_system_info()
         self.run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        # Roadmap Feature: Caching is disabled by default
-        self.use_cache = False
         self.light_profile = True
         parsed_alert_severity = _parse_alert_severity(alert_severity, "alert_severity")
         self.alert_severity = "low" if parsed_alert_severity is None else parsed_alert_severity
@@ -2726,7 +2545,7 @@ class ScanConfig:
         self.error_logger.error_logger.info(f"API Endpoint: {API_ENDPOINT}")
         self.error_logger.error_logger.info(f"Default alert severity: {self.alert_severity}")
         self.error_logger.error_logger.info(
-            "Light profile active: cache disabled, reduced workers, reduced monitoring, and lower-impact scan execution"
+            "Light profile active: reduced workers, reduced monitoring, and lower-impact scan execution"
         )
 
         
@@ -3595,7 +3414,6 @@ class WebhookUploader:
             'statistics': 60,
             'system_resource': 45,
             'worker_stats': 120,
-            'cache_stats': 90,
             'time_estimates': 60
         }
         
@@ -4227,13 +4045,6 @@ class YaraScanner:
         self.junction_skip_count = 0
         self.lock_real_paths = threading.Lock()
 
-        # Roadmap Feature: Initialize file cache if enabled
-        self.file_cache = None
-        if self.config.use_cache:
-            cache_file_path = os.path.join(self.config.scanner_dir, "scan_cache.json")
-            self.file_cache = FileCacher(cache_file_path)
-            self.file_cache.log_manager = self.log_manager
-
         self.worker_processing_times = defaultdict(list)
         self.last_throttle_check = 0.0
         self.last_system_cpu = 0.0
@@ -4245,7 +4056,6 @@ class YaraScanner:
             {
                 'max_workers': self.config.max_workers,
                 'max_file_mb': self.config.max_file_mb,
-                'cache_enabled': self.config.use_cache,
                 'valid_rules': self.config.error_logger.valid_rules_count,
                 'failed_rules': self.config.error_logger.failed_rules_count
             }
@@ -4714,13 +4524,6 @@ rule test {{
             )
     
 
-    def _calculate_cache_hit_rate(self):
-        """Calculate current cache hit rate."""
-        cache_stats = self.stats_manager.cache_stats
-        total_requests = cache_stats['hits'] + cache_stats['misses']
-        if total_requests > 0:
-            return (cache_stats['hits'] / total_requests) * 100
-        return 0
 
     def _maybe_throttle_scanning(self, force=False):
         """Apply a small pause when the machine is already under CPU pressure."""
@@ -5282,7 +5085,6 @@ rule test {{
                 'active_workers': active_workers,
                 'elapsed_seconds': elapsed,
                 'eta_seconds': eta_seconds,
-                'cache_hit_rate': self._calculate_cache_hit_rate(),
                 'junction_skips': self.junction_skip_count,
                 'unique_real_paths': len(self.scanned_real_paths)
             }
@@ -5299,14 +5101,6 @@ rule test {{
                     total_files_estimate - self.files_scanned
                 )
             
-            cache_stats = self.stats_manager.cache_stats
-            if cache_stats['hits'] + cache_stats['misses'] > 0:
-                hit_rate = (cache_stats['hits'] / (cache_stats['hits'] + cache_stats['misses'])) * 100
-                self.log_manager.log_cache_performance(
-                    hit_rate, cache_stats['hits'] + cache_stats['misses'],
-                    cache_stats['memory_usage_mb']
-                )
-
     def _log_final_results(self, total_time):
         """Log comprehensive final results."""
         final_metrics = {
@@ -5370,15 +5164,7 @@ rule test {{
             f"Worker performance summary: {len(worker_summary)} workers processed files",
             {'worker_details': worker_summary}
         )
-        
-        cache_stats = self.stats_manager.cache_stats
-        if cache_stats['hits'] + cache_stats['misses'] > 0:
-            final_hit_rate = (cache_stats['hits'] / (cache_stats['hits'] + cache_stats['misses'])) * 100
-            self.log_manager.log_statistics(
-                f"Final cache performance: {final_hit_rate:.1f}% hit rate",
-                cache_stats
-            )
-        
+                
     def _request_cancel(self, source, log=True):
         """Cooperatively request cancellation. Idempotent (first source wins) and safe from
         any thread: clearing scan_active is what unwinds the producer walk and the workers."""
@@ -5546,8 +5332,8 @@ rule test {{
         approach checked this only inline in the discovery os.walk loop, which almost
         never runs long enough on its own to cross log_interval - file enumeration is
         fast; matching file content in the worker threads is what actually takes minutes,
-        and that happens after discovery ends. Confirmed live: zero "Scan Progress"/
-        "Cache Performance" events were ever recorded under the old approach, on any host.
+        and that happens after discovery ends. Confirmed live: zero "Scan Progress" events
+        were ever recorded under the old approach, on any host.
         """
         while not self._progress_heartbeat_stop.wait(self.config.log_interval):
             if not self.scan_active:
@@ -5575,12 +5361,6 @@ rule test {{
 
         cleanup_start = time.time()
        
-        try:
-            if hasattr(self, 'file_cache') and self.file_cache:
-                self.file_cache.stop_cache()
-                self.log_manager.log_system("File cache stopped and saved")
-        except Exception as e:
-            self.log_manager.log_error(f"Error stopping file cache: {e}")
 
         # Resource/stats monitoring is stopped AFTER the worker-thread join below, not
         # here. File discovery finishing (which is where control reaches this point) is
@@ -5678,7 +5458,6 @@ rule test {{
                 'webhook_uploading': UPLOAD_RESULTS,
                 'worker_threads': self.config.max_workers,
                 'light_throttling': self.config.light_throttle_enabled,
-                'cache_enabled': self.config.use_cache
             }
         )
         
@@ -5884,16 +5663,7 @@ def upload_final_comprehensive_report(scanner, total_scan_time):
         if hasattr(scanner, 'stats_manager'):
             performance_data = scanner.stats_manager.get_current_stats_for_upload()
             final_report_data['performance_summary'] = performance_data
-            
-            cache_total = scanner.stats_manager.cache_stats['hits'] + scanner.stats_manager.cache_stats['misses']
-            if cache_total > 0:
-                final_report_data['cache_performance'] = {
-                    'hit_rate_percent': (scanner.stats_manager.cache_stats['hits'] / cache_total) * 100,
-                    'total_requests': cache_total,
-                    'evictions': scanner.stats_manager.cache_stats['evictions'],
-                    'memory_usage_mb': scanner.stats_manager.cache_stats['memory_usage_mb']
-                }
-        
+                    
         if getattr(scanner, 'resource_monitor', None) is not None:
             resource_summary = scanner.resource_monitor.get_resource_summary()
             final_report_data['resource_summary'] = resource_summary
@@ -6119,7 +5889,6 @@ def main(yarafile=None, scan_folder=None, alert_severity="low"):
             'max_workers': config.max_workers,
             'scan_queue_size': config.scan_queue_size,
             'max_file_mb': config.max_file_mb,
-            'cache_enabled': config.use_cache,
             'scanner_profile': 'light',
             'performance_monitoring_enabled': config.enable_performance_monitoring,
             'resource_monitoring_enabled': config.enable_resource_monitoring,
@@ -6168,9 +5937,6 @@ def main(yarafile=None, scan_folder=None, alert_severity="low"):
         scanner = YaraScanner(config, log_manager=log_manager, stats_manager=stats_manager)
         scanner.webhook_uploader = webhook_uploader
         scanner.status_uploader.webhook_uploader = webhook_uploader
-        if scanner.file_cache:
-            scanner.file_cache.log_manager = log_manager
-
         error_logger = config.error_logger
         stats_manager.start_monitoring()
         
