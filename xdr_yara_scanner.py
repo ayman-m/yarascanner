@@ -7336,6 +7336,24 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
                 'detections': scanner.total_detections,
             }
             log_manager.log_error("Scan stopped due to fatal failures", failure_data)
+
+            # A fatal failure still has evidence worth keeping and a story worth telling.
+            # This used to return immediately, skipping evidence collection entirely - so a
+            # scan that FOUND matches and then died produced no ZIP at all, even though the
+            # alert texts and file_mapping it would package are exactly what a responder
+            # needs from a partial run (verified: 1 match, alert text written, 0 zips). It
+            # also sent no terminal event, so a dashboard just saw the scan stop. Both are
+            # best-effort: a failing scan must still return its result line.
+            try:
+                scanner.status_uploader.set_status("failed")
+            except Exception as _e:
+                log_manager.log_error(f"Could not emit terminal status after failure: {_e}")
+            try:
+                scanner.evidence_collector.collect_evidence()
+                log_manager.log_system("Evidence collected from failed scan")
+            except Exception as _e:
+                log_manager.log_error(f"Evidence collection failed after fatal failure: {_e}")
+
             return (
                 f"Scan failed: {scanner.files_scanned} files scanned | "
                 f"{error_logger.failed_rules_count} rules failed compilation | "
@@ -7419,6 +7437,14 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
                          f"skip list, nothing under them was scanned: "
                          + ", ".join(_excluded[:3])
                          + (" ..." if len(_excluded) > 3 else ""))
+        # Terminal status - see the XSIAM edition for the rationale. Without it the last
+        # value emitted on a successful run was "finishing", indistinguishable from a scan
+        # hung mid-shutdown.
+        try:
+            scanner.status_uploader.set_status("completed")
+        except Exception as _e:
+            log_manager.log_error(f"Could not emit terminal scan status: {_e}")
+
         summary = (f"Scan completed: {scanner.files_scanned} files scanned | "
                 f"{error_logger.failed_rules_count} rules failed compilation{_skipped_txt} | "
                 f"{scanner.total_detections} matches found | "

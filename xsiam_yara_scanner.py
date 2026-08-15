@@ -3510,11 +3510,12 @@ class WebhookUploader:
             return
         by_type = defaultdict(int)
         for it in items:
-            t = getattr(it, "type", "unknown")
-            by_type[t] += 1
-            self.upload_stats[t]['total'] += 1
+            by_type[getattr(it, "type", "unknown")] += 1
 
-        # Circuit open: put the whole batch back and let it settle.
+        # Circuit open: put the whole batch back and let it settle. Counted BEFORE this
+        # check previously, so every re-queue cycle re-counted the same events - one event
+        # bouncing three times showed total=3, successful=0, failed=0, and an operator
+        # reading total=31/failed=6 concluded 25 landed when none had.
         if not self._circuit.allow():
             for it in items:
                 try:
@@ -3523,6 +3524,9 @@ class WebhookUploader:
                     pass
             time.sleep(2.0)
             return
+
+        for t, n in by_type.items():
+            self.upload_stats[t]['total'] += n
 
         endpoint = _get_webhook_endpoint(API_ENDPOINT)
         attempt = 0
@@ -3603,6 +3607,12 @@ class WebhookUploader:
             'total_uploads': 0,
             'successful_uploads': 0,
             'failed_uploads': 0,
+            # Items still queued when the drain window expired - never attempted, so
+            # neither successful nor failed. The count was computed at shutdown, written to
+            # the log and then discarded, so scan_summary's telemetry_delivery could not be
+            # balanced and a total delivery outage read as a clean run. The match channel
+            # has carried this counter for the same reason since the delivery-loss work.
+            'undelivered': 0,
             'success_rate_percent': 0
         }
         
@@ -3621,6 +3631,11 @@ class WebhookUploader:
                 'success_rate_percent': success_rate
             }
         
+        try:
+            total_stats['undelivered'] = self.upload_queue.qsize()
+        except Exception:
+            pass
+
         if total_stats['total_uploads'] > 0:
             total_stats['success_rate_percent'] = (total_stats['successful_uploads'] / total_stats['total_uploads']) * 100
         
@@ -6055,6 +6070,24 @@ def main(yarafile=None, scan_folder=None, alert_severity="low"):
                 'detections': scanner.total_detections,
             }
             log_manager.log_error("Scan stopped due to fatal failures", failure_data)
+
+            # A fatal failure still has evidence worth keeping and a story worth telling.
+            # This used to return immediately, skipping evidence collection entirely - so a
+            # scan that FOUND matches and then died produced no ZIP at all, even though the
+            # alert texts and file_mapping it would package are exactly what a responder
+            # needs from a partial run (verified: 1 match, alert text written, 0 zips). It
+            # also sent no terminal event, so a dashboard just saw the scan stop. Both are
+            # best-effort: a failing scan must still return its result line.
+            try:
+                scanner.status_uploader.set_status("failed")
+            except Exception as _e:
+                log_manager.log_error(f"Could not emit terminal status after failure: {_e}")
+            try:
+                scanner.evidence_collector.collect_evidence()
+                log_manager.log_system("Evidence collected from failed scan")
+            except Exception as _e:
+                log_manager.log_error(f"Evidence collection failed after fatal failure: {_e}")
+
             return (
                 f"Scan failed: {scanner.files_scanned} files scanned | "
                 f"{error_logger.failed_rules_count} rules failed compilation | "
@@ -6219,6 +6252,16 @@ def main(yarafile=None, scan_folder=None, alert_severity="low"):
                          f"skip list, nothing under them was scanned: "
                          + ", ".join(_excluded[:3])
                          + (" ..." if len(_excluded) > 3 else ""))
+        # Terminal status. The sequence previously ended at "finishing", so a dashboard
+        # could not tell a completed scan from one hung mid-shutdown - only the failure
+        # paths ("error"/"interrupted") ever reached a terminal value. Emitted here, after
+        # the summary and delivery books have settled, so the value reflects the real end
+        # state rather than an optimistic one.
+        try:
+            scanner.status_uploader.set_status("cancelled" if _was_cancelled else "completed")
+        except Exception as _e:
+            log_manager.log_error(f"Could not emit terminal scan status: {_e}")
+
         summary = (f"{_verb}: {scanner.files_scanned} files scanned | "
                 f"{error_logger.failed_rules_count} rules failed compilation{_skipped_txt} | "
                 f"{scanner.total_detections} matches found{upload_errors}{shortfall}{_excl_txt}")
