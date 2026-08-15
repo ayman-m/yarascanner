@@ -34,13 +34,24 @@ def _predicate(platform_name, scanner_dir, scan_folder=None):
     targets), but it has no bearing on the skip lists, which are built from scanner_dir
     plus hardcoded vendor paths. Any real directory works; the tests pass paths that only
     need to be *evaluated*, never opened.
+
+    os.makedirs is stubbed out for the duration of construction. ScanConfig eagerly creates
+    its working tree, and scanner_dir here is a foreign-platform path — so on a POSIX host
+    "C:\\yara_scanner" is not a drive reference but a perfectly legal single directory NAME
+    containing backslashes, and running these tests literally created 37 junk directories in
+    the repo root (invisible to git status: their contents are all *.log, which .gitignore
+    covers, and git does not track empty dirs). It also made /opt/yara_scanner raise
+    PermissionError, which is why these tests briefly used tmp-path substitutes instead of
+    the real platform defaults. Stubbing the call fixes both: nothing touches the
+    filesystem, and the REAL default paths can be asserted against.
     """
     patcher = mock.patch("platform.system", return_value=platform_name)
     patcher.start()
     try:
         os.environ["YARA_SCANNER_DIR"] = scanner_dir
         import xsiam_yara_scanner as m
-        cfg = m.ScanConfig(RULE_B64, scan_folder=scan_folder or os.path.dirname(__file__))
+        with mock.patch("os.makedirs"):
+            cfg = m.ScanConfig(RULE_B64, scan_folder=scan_folder or os.path.dirname(__file__))
 
         class _Scanner:
             pass
@@ -170,7 +181,7 @@ def test_windows_scanner_dir_still_skipped_after_pattern_removal():
 
 # ------------------------------------------------------------------ Linux
 def test_linux_skips_own_directory_and_system_paths():
-    cfg, skip = _predicate("Linux", "/private/tmp/yst_lin/opt/yara_scanner")
+    cfg, skip = _predicate("Linux", "/opt/yara_scanner")
     assert skip("/opt/yara_scanner/evidence/e.zip") is True
     assert skip("/sys/kernel/x") is True
     assert skip("/proc/1/status") is True
@@ -180,9 +191,9 @@ def test_linux_scanner_dir_bare_root_is_skipped():
     """Regression: the root os.walk yields has NO trailing separator, but the skip entry
     was built WITH one ("/opt/yara_scanner/"), so startswith() failed on the root itself.
     """
-    cfg, skip = _predicate("Linux", "/private/tmp/yst_lin/opt/yara_scanner")
+    cfg, skip = _predicate("Linux", "/opt/yara_scanner")
     assert skip("/opt/yara_scanner") is True, "hardcoded entry's bare root"
-    assert skip("/private/tmp/yst_lin/opt/yara_scanner") is True, "YARA_SCANNER_DIR override's bare root"
+    assert skip("/opt/yara_scanner/evidence") is True, "and its subdirectories"
 
 
 def test_linux_does_not_case_fold():
@@ -192,7 +203,7 @@ def test_linux_does_not_case_fold():
     would be wrong there - the fixes address different platforms' actual filesystem
     semantics, not a shared behaviour.
     """
-    cfg, skip = _predicate("Linux", "/private/tmp/yst_lin/opt/yara_scanner")
+    cfg, skip = _predicate("Linux", "/opt/yara_scanner")
     assert skip("/OPT/YARA_SCANNER/evidence/e.zip") is False
 
 
@@ -253,6 +264,31 @@ def test_darwin_case_variant_scan_target_no_longer_defeats_skip():
     cfg, skip = _predicate("Darwin", "/usr/local/YARA_SCANNER")
     assert skip("/usr/local/yara_scanner/evidence/e.zip") is True
     assert skip("/usr/local/YARA_SCANNER/evidence/e.zip") is True
+
+
+# ------------------------------------------------------------------ hygiene
+def test_building_configs_creates_no_directories():
+    """These tests must never write to the filesystem.
+
+    ScanConfig eagerly creates its working tree, and the foreign-platform scanner_dir
+    values used above are legal directory NAMES on a POSIX host — "C:\\yara_scanner" is one
+    directory whose name contains backslashes, not a drive reference. Before os.makedirs
+    was stubbed, running this file created 37 junk directories in the repo root, and
+    .gitignore's *.log rule plus git's not tracking empty dirs kept `git status` clean, so
+    nothing surfaced it. This asserts the stub is actually in effect rather than trusting it.
+    """
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    before = set(os.listdir(repo_root))
+
+    for plat, sdir in (("Windows", "C:\\yara_scanner"),
+                       ("Linux", "/opt/yara_scanner"),
+                       ("Darwin", "/usr/local/yara_scanner")):
+        _predicate(plat, sdir)
+
+    new = set(os.listdir(repo_root)) - before
+    assert not new, f"tests polluted the repo root with: {sorted(new)}"
+    assert not [e for e in os.listdir(repo_root) if "\\" in e], \
+        "a backslash-named directory was created in the repo root"
 
 
 if __name__ == "__main__":
