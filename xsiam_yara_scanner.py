@@ -278,10 +278,6 @@ YARA_RULE = r""""""
 # CLEANUP SCRIPTS
 # ============================================================================
 
-b64CleanupScriptWindows = (
-    "CkBlY2hvIG9mZgpjZCAvZCBjOlx4ZHItZGF0YVxhbGVydApyZW4gKi50eHQgKi5hbGVydAo="
-)
-b64CleanupScriptLinux = "IyEvYmluL2Jhc2gKY2QgL29wdC94ZHItZGF0YS9hbGVydApmb3IgZmlsZSBpbiAqLnR4dDsgZG8KICAgIG12ICIkZmlsZSIgIiR7ZmlsZSUudHh0fS5hbGVydCIKZG9uZQ=="
 
 
 
@@ -2755,7 +2751,6 @@ class ScanConfig:
                 p if len(p) <= 3 else p.rstrip("\\")
                 for p in (os.path.normpath(path.lower()) for path in self.win_skip_folder)
             ]
-            self.skip_paths = set(self.win_skip_folder)
 
         elif platform.system() == "Linux":
             self.lin_skip_directory = [
@@ -2763,7 +2758,6 @@ class ScanConfig:
                 "/var/run/", "/lost+found/", "/media/", "/opt/yara_scanner/",
                 os.path.normpath(self.scanner_dir).rstrip("/") + "/",
             ]
-            self.skip_paths = set(self.lin_skip_directory)
         
         elif platform.system() == "Darwin":
             self.mac_skip_directory = [
@@ -2798,12 +2792,10 @@ class ScanConfig:
             # case-insensitive by default, and the matching code compares against
             # portable_path, which is already case-folded for exactly this reason.
             self.mac_skip_directory = [p.lower() for p in self.mac_skip_directory]
-            self.skip_paths = set(self.mac_skip_directory)
         
         else:
             self.lin_skip_directory = []
             self.mac_skip_directory = []
-            self.skip_paths = set()
 
 
         if self.scan_folder and self.scan_folder.lower() != "default":
@@ -3964,10 +3956,35 @@ class CleanupManager:
             os.chmod(self.config.cleanup_script, 0o755)
 
     def _get_cleanup_script_content(self):
-        """Get platform-specific cleanup script."""
+        """Generate the cleanup script from the ACTUAL alert dir.
+
+        Fixes a path-drift bug: the embedded base64 scripts targeted c:\\xdr-data\\alert
+        and /opt/xdr-data/alert, paths this edition never creates, so the scheduled
+        .txt -> .alert rename renamed nothing. Verified failing on a live endpoint
+        (task ran, Last Result = 1) - meaning every scan with alerts created a SYSTEM
+        scheduled task that did nothing at all.
+
+        The errorlevel guard matters as much as the path: batch does NOT abort on a
+        failed cd, so without it a wildcard `ren *.txt *.alert` would run in whatever
+        directory the task happened to start in. Ported from the XDR edition, which
+        already carried both halves of this fix.
+        """
+        alert_dir = self.config.alert_dir
         if platform.system() == "Windows":
-            return base64.b64decode(b64CleanupScriptWindows).decode("utf-8")
-        return base64.b64decode(b64CleanupScriptLinux).decode("utf-8")
+            return (
+                "@echo off\r\n"
+                f'cd /d "{alert_dir}"\r\n'
+                "if errorlevel 1 exit /b 0\r\n"
+                "ren *.txt *.alert\r\n"
+            )
+        return (
+            "#!/bin/bash\n"
+            f'cd "{alert_dir}" || exit 0\n'
+            "for file in *.txt; do\n"
+            '    [ -e "$file" ] || continue\n'
+            '    mv "$file" "${file%.txt}.alert"\n'
+            "done\n"
+        )
 
     def _schedule_windows_cleanup(self):
         """Schedule cleanup task in Windows."""
