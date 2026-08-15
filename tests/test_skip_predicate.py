@@ -294,3 +294,19 @@ def test_building_configs_creates_no_directories():
 if __name__ == "__main__":
     import subprocess
     raise SystemExit(subprocess.call([sys.executable, "-m", "pytest", __file__, "-v"]))
+
+
+def test_windows_bare_directory_root_matches_a_path_fragment():
+    """Regression, caught only by re-verifying on real Windows.
+
+    skip_path_fragments entries are bounded on both sides ("/node_modules/"), but the bare
+    directory root os.walk yields has no trailing separator - so the directory that IS the
+    excluded component matched nothing, while every file inside it matched. The Darwin
+    branch masked this locally via its own relative-entry list, so it passed on macOS and
+    failed on the platform the fleet actually runs: an operator scanning ...\\node_modules
+    got 0 files scanned and no exclusion warning at all.
+    """
+    cfg, skip = _predicate("Windows", "C:\\yara_scanner")
+    assert skip("C:\\proj\\node_modules") is True, "the bare excluded directory itself"
+    assert skip("C:\\proj\\node_modules\\pkg\\x.js") is True, "and everything under it"
+    assert skip("C:\\proj\\notnode_modules") is False, "but not a prefix sibling"

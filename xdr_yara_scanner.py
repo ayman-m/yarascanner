@@ -6205,7 +6205,15 @@ rule test {{
         # them. Filename/extension skips above still apply (no point scanning a .iso).
         if any(fragment in portable_path for fragment in getattr(self.config, "force_scan_fragments", ())):
             return False
-        if any(fragment in portable_path for fragment in self.config.skip_path_fragments):
+        # Matched as a bounded "/fragment/" substring AND at the tail. os.walk yields a
+        # directory root with no trailing separator, so the directory that IS the excluded
+        # component (".../node_modules") closed no bounded form and matched nothing, while
+        # every file inside it matched. Caught only by re-verifying on real Windows: the
+        # Darwin branch masked it locally through its own relative-entry list, so an
+        # operator scanning ...\node_modules got 0 files and no exclusion warning on the
+        # one platform the fleet actually runs.
+        if any(fragment in portable_path or portable_path.endswith(fragment.rstrip("/"))
+               for fragment in self.config.skip_path_fragments):
             return True
 
         if platform.system() == "Windows":
