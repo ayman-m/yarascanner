@@ -1221,6 +1221,24 @@ class CpuGovernor:
         }
 
 
+def _scan_error_reason(exc):
+    """Bounded skip_reasons key for a per-file scan error.
+
+    skip_reasons is an AGGREGATE breakdown - its keys are labels, and the whole dict is
+    serialised into the final report and a statistics event. Returning str(exc) made every
+    errored file its own key, because both common error texts embed the absolute path
+    (yara.Error is 'could not open file "<path>"', OSError is '[Errno 2] ...: <path>').
+    On a full-system scan, where files vanish or lock between the access check and
+    rules.match routinely, that is unbounded growth shipped to the tenant - measured at
+    307,780 bytes for 5,000 errored files.
+
+    The exception TYPE is kept so genuinely different failures stay distinguishable, and
+    "error" stays in the label because the final report counts error reasons by that
+    substring. The specific message and path are not lost: scan_file logs them per file.
+    """
+    return f"Scan error ({type(exc).__name__})"
+
+
 def _render_match_data(data) -> str:
     """Render YARA-matched bytes as a printable string for human-readable output.
 
@@ -6146,7 +6164,7 @@ rule test {{
                 f"Error scanning file {file_path}: {str(e)}",
                 {'file_path': file_path, 'real_path': real_path, 'error': str(e)}
             )
-            return False, str(e)
+            return False, _scan_error_reason(e)
         finally:
             processing_time = time.time() - worker_start_time
             self.stats_manager.update_worker_stats(worker_id, processing_time, error_occurred)
@@ -7334,7 +7352,8 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
             'log_generation_stats': final_log_stats,
             'error_summary': {
                 'compilation_errors': error_logger.failed_rules_count,
-                'scan_errors': sum(1 for reason in scanner.skip_reasons.keys() if 'error' in reason.lower())
+                'scan_errors': sum(count for reason, count in scanner.skip_reasons.items()
+                                   if 'error' in reason.lower())
             }
         }
 

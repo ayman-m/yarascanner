@@ -1320,8 +1320,9 @@ findings gone.
 recreate attempt per batch so a genuinely broken create call can't loop forever.
 
 **Live-reproduced and fixed, not just code-traced.** Deliberately deleted a running scan's
-own lookup dataset mid-flight (twice — once via the abandoned-cutoff race on `xdragent2`,
-once by deleting the dataset directly on `xdr-agent` while tailing its log over SSH) and
+own lookup dataset mid-flight (twice — once via the abandoned-cutoff race on a Windows
+endpoint, once by deleting the dataset directly on a Linux endpoint while tailing its log
+over SSH) and
 confirmed both halves:
 
 - **Pre-fix:** the dataset never reappeared; the scanner kept running but its per-host
