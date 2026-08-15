@@ -110,7 +110,12 @@ UPLOAD_RESULTS = True  # Match and telemetry uploads to webhook
 UPLOAD_NON_MATCH_DATA = True  # Keep telemetry uploads enabled in webhook mode
 DEFAULT_TIMEOUT_SECS = 20            # increased request timeout everywhere
 MAX_RETRIES_PER_ITEM = 2             # hard cap to avoid infinite loops
-MAX_MATCH_SAMPLES_PER_FINDING = _env_number("YARA_MAX_MATCH_SAMPLES", 50, cast=int)
+# minimum=1, NOT 0. Its consumer is `if len(sample) < CAP`, so 0 silently disables
+# sampling entirely - the exact opposite of what 0 means on its twin
+# MAX_ALERT_OFFSETS_PER_FINDING below, where 0 means "no cap". Two knobs named alike,
+# defaulted alike, whose 0 does opposite things is a footgun; here 0 or negative falls
+# back to the default rather than quietly shipping findings with no offsets at all.
+MAX_MATCH_SAMPLES_PER_FINDING = _env_number("YARA_MAX_MATCH_SAMPLES", 50, cast=int, minimum=1)
 # ^ Ported from the XDR edition after it hit this live: one loosely-written rule matching one
 # large file can produce tens of thousands of string-offset instances (measured there: 33,118
 # rows from one rule against one .evtx log; measured here: 36,213 in one match-upload backlog),
@@ -2531,7 +2536,6 @@ class ScanConfig:
     def __init__(self, yarafile, scan_folder=None, alert_severity="low"):
         self.hostname, self.ip_addresses, self.os_info = get_system_info()
         self.run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        self.light_profile = True
         parsed_alert_severity = _parse_alert_severity(alert_severity, "alert_severity")
         self.alert_severity = "low" if parsed_alert_severity is None else parsed_alert_severity
         scanner_dir_override = os.environ.get("YARA_SCANNER_DIR")
@@ -3434,9 +3438,11 @@ class WebhookUploader:
 
         self.upload_queue = Queue()
         self.upload_thread = None
-        self.upload_active = True
+        # stop_upload_thread is the flag the worker loop actually reads. upload_active was
+        # a second copy set and flipped alongside it but never read anywhere - exactly the
+        # kind of thing that misleads someone debugging uploader shutdown. ResultsUploader,
+        # the parallel class, correctly carries only stop_upload_thread.
         self.stop_upload_thread = False
-        self.upload_logger = log_manager
         self._circuit = CircuitBreaker()
         
         self.upload_stats = defaultdict(lambda: {
@@ -3662,7 +3668,6 @@ class WebhookUploader:
                 while self.upload_queue.qsize() > 0 and (time.time() - start_wait) < max_wait_time:
                     time.sleep(0.2)
 
-            self.upload_active = False
             self.stop_upload_thread = True
             try:
                 self.upload_queue.put(None, timeout=0.2)
