@@ -1,6 +1,6 @@
 % YARA Scanner for Cortex XSIAM — Deployment Guide
 % Cortex XSIAM edition (`xsiam_yara_scanner.py`)
-% Version 2.1.0 · Released 2026-08-06
+% Version 4.3.0 · Released 2026-08-15
 
 ---
 
@@ -16,7 +16,7 @@ your tenant:
 
 | Type | Purpose |
 |------|---------|
-| `yara_match` | One record per YARA hit (file path, rule, offset, matched string) |
+| `yara_match` | One record per **(rule, file) finding** — not per hit. `match_count` carries the true, uncapped hit total; `offsets`/`strings` carry a sample of up to 50, with `truncated` set when there were more. Aggregate with `sum(to_integer(match_count))`, never `count()`. |
 | `performance` | Per-worker throughput (files processed, avg time, error rate) |
 | `statistics` | Periodic scan progress (queue size, scan rate, system metrics) |
 | `statistics_summary` | Phase boundaries (initialization, completion) with system info |
@@ -69,7 +69,7 @@ by bounded queues — file walkers feed scan workers, scan workers feed an uploa
 | Multi-threaded scanning | Producer/consumer with a bounded work queue |
 | Real-time streaming | Matches and telemetry POSTed to the collector as they occur |
 | Resilient delivery | Exponential backoff, timeout protection, circuit breaker, local JSON backups |
-| Evidence collection | Matched files + `file_mapping.txt` packaged into an evidence ZIP with SHA256 |
+| Evidence collection | `file_mapping.txt` (every matched path + SHA256) and the per-rule alert texts packaged into an evidence ZIP. Matched **file copies** are excluded by default since v4.2.0 — see `YARA_COLLECT_MATCHED_FILES` in §14 |
 | Graceful shutdown | Workers drain, in-flight uploads finish, evidence ZIP still produced |
 | Cross-platform | Single script — Windows, Linux, macOS; adapts paths and cleanup per OS |
 | Privilege-aware | Detects root / SYSTEM; warns on macOS without Full Disk Access |
@@ -89,7 +89,7 @@ This is the **light** variant, tuned for live production hosts:
 >
 > The XSIAM edition applies a **bounded sleep** when system CPU is above its high or
 > critical threshold, so a scan slows down on a busy host rather than stopping. Thresholds
-> and the maximum pause are configurable at the top of the script.
+> and the maximum pause are configurable via the `YARA_LIGHT_*` environment variables in §14.
 >
 > Because it reacts to **system-wide** CPU, it also yields to load it did not itself cause.
 > The sleep is bounded, so the effect is a slower scan, never a stalled one.
@@ -104,7 +104,7 @@ After a run, results live in three places:
 | Where | What | Retention |
 |-------|------|-----------|
 | XSIAM dataset `yara_scans_raw` | Streamed JSON events (matches, statistics, performance, snapshots, summaries) | XSIAM standard dataset retention |
-| Endpoint working directory | `logs/scanner_*.log`, `errors_*`, `statistics_*`, `failed_rules/`, evidence ZIP | Until the cleanup task runs, then `*.alert` |
+| Endpoint working directory | `logs/scanner_*.log`, `errors_*`, `statistics_*`, `failed_rules/`, `alert/<rule>.txt`, evidence ZIP | Until the cleanup task runs, then `*.alert` |
 | Action Center action result | One-line summary string returned by `main()` (file/rule/match counts) | Action Center default |
 
 ---
@@ -393,14 +393,16 @@ completed scan and populate while a scan is in progress.
 
 ```sql
 dataset = yara_scans_raw | filter type = "yara_match"
-| comp count() as hits by hostname | sort desc hits | limit 10
+| alter hits = to_integer(match_count)
+| comp sum(hits) as hits by hostname | sort desc hits | limit 10
 ```
 
 **Top rules across the fleet:**
 
 ```sql
 dataset = yara_scans_raw | filter type = "yara_match"
-| comp count() as hits, count_distinct(hostname) as hosts by rule_id
+| alter mc = to_integer(match_count)
+| comp sum(mc) as hits, count_distinct(hostname) as hosts by rule_id
 | sort desc hits | limit 25
 ```
 
@@ -435,11 +437,18 @@ dataset = yara_scans_raw | filter type = "yara_match"
 
 # 14. Operations & Tuning
 
-These environment variables are read by `ScanConfig` and can be set in the Action
-Center execution form or pre-set on the endpoint:
+These are read from the endpoint's environment. The Action Center execution form only
+carries the script's three declared inputs (rules, scan folder, severity) — it cannot set
+arbitrary variables — so set these on the endpoint beforehand, or edit the matching
+constant at the top of the script before uploading it, which is the usual route.
+
+An invalid value never kills a scan: a non-numeric or out-of-range setting is ignored with
+a warning and the documented default is used instead.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
+| `YARA_COLLECT_MATCHED_FILES` | false | Copy every matched file into the evidence ZIP. **Off since v4.2.0** — it wrote 2.8 GB to a scanned host in testing. With it off the ZIP still carries `file_mapping.txt` (every path + SHA256) and the per-rule alert texts, so matched files stay identifiable and fetchable on demand. |
+| `YARA_MAX_ALERT_OFFSETS` | 50 | Offsets rendered per finding in `alert/<rule>.txt`. **New in v4.3.0.** The per-string-ID hit census above them is never capped, so which string fired and how often survives in full; only the individual offsets are sampled. `0` disables the cap. |
 | `YARA_MAX_MB` | 64 | Skip files larger than N MB |
 | `YARA_THREADS` | 2 | Worker count (capped at 2 by the light profile) |
 | `YARA_QUEUE_SIZE` | 4 | Internal scan queue depth |

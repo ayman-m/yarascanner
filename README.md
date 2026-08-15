@@ -349,8 +349,9 @@ correlation rules over the ingested dataset.
   shutdown drain expires are counted, never silently dropped.
 - **Rule support:** the same engine features as XDR, plus detailed fallback summaries for
   condition-only matches.
-- **Dashboards:** `dashboards/Yara Matches.json` and `dashboards/Yara Scan Performance.json` (with
-  their editable XQL under `widgets/`).
+- **Dashboards:** `dashboards/xsiam/YARA Matches.json` and
+  `dashboards/xsiam/YARA Scan Performance.json` (with their editable XQL under
+  `widgets/xsiam/`).
 
 ---
 
@@ -358,11 +359,11 @@ correlation rules over the ingested dataset.
 
 | Dashboard | Edition | Contents |
 |---|---|---|
-| `dashboards/Yara XDR Scanner (Lookup).json` | XDR | **40 widgets** over the lookup datasets: detection KPIs, top rules/hosts/files, match timelines, scan throughput, cancellations/failures, alert-vs-dataset delivery health |
-| `dashboards/Yara Matches.json` | XSIAM | Threat-detection view over collector events |
-| `dashboards/Yara Scan Performance.json` | XSIAM | Scan operations: throughput, workers, cache, resources |
+| `dashboards/xdr/YARA Scanner (Lookup).json` | XDR | **40 widgets** over the lookup datasets: detection KPIs, top rules/hosts/files, match timelines, scan throughput, cancellations/failures, alert-vs-dataset delivery health |
+| `dashboards/xsiam/YARA Matches.json` | XSIAM | Threat-detection view over collector events |
+| `dashboards/xsiam/YARA Scan Performance.json` | XSIAM | Scan operations: throughput, workers, queue backpressure, resources |
 
-Import via **Dashboards → Import**. Every widget's XQL is in `widgets/` (XSIAM) and
+Import via **Dashboards → Import**. Every widget's XQL is in `widgets/xsiam/` (XSIAM) and
 `widgets/xdr/` (XDR) for customization. The XDR queries use wildcard dataset references, so
 they span all endpoint shards and months automatically.
 
