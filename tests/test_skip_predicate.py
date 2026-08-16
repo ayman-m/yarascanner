@@ -310,3 +310,34 @@ def test_windows_bare_directory_root_matches_a_path_fragment():
     assert skip("C:\\proj\\node_modules") is True, "the bare excluded directory itself"
     assert skip("C:\\proj\\node_modules\\pkg\\x.js") is True, "and everything under it"
     assert skip("C:\\proj\\notnode_modules") is False, "but not a prefix sibling"
+
+
+# ------------------------------------------------------------------ Cortex agent coverage
+def test_linux_skips_cortex_xdr_agent_install_root():
+    """The Cortex/Traps agent installs at /opt/traps on Linux (confirmed against the
+    official Cortex XDR Agent Administrator Guide, "Install the Cortex XDR agent for
+    Linux": "The script installs the files for the Cortex XDR agent for Linux in the
+    /opt/traps folder"). Windows and macOS already skip their vendor install roots;
+    Linux skipped none - a real, documented gap, not a guess.
+    """
+    cfg, skip = _predicate("Linux", "/opt/yara_scanner")
+    assert skip("/opt/traps") is True, "the agent's own install root"
+    assert skip("/opt/traps/bin/cytool") is True
+    assert skip("/opt/traps/logs/pmd.log") is True
+
+
+def test_linux_does_not_swallow_prefix_sibling_of_traps():
+    """Same boundary discipline as every other skip entry - a directory merely SHARING
+    the name prefix must stay scannable."""
+    cfg, skip = _predicate("Linux", "/opt/yara_scanner")
+    assert skip("/opt/trapsbackup/evil") is False
+    assert skip("/opt/not_traps/x") is False
+
+
+def test_darwin_skips_cortex_xdr_agent_log_location():
+    """Confirmed against the official docs (Cytool/troubleshooting pages for Mac):
+    the agent writes logs to /Library/Logs/PaloAltoNetworks/Cortex XDR/, a second real
+    vendor location the existing entry (Application Support only) did not cover.
+    """
+    cfg, skip = _predicate("Darwin", "/usr/local/yara_scanner")
+    assert skip("/Library/Logs/PaloAltoNetworks/Cortex XDR/pmd.log") is True

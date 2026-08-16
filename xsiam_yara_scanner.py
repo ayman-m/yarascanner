@@ -2756,6 +2756,12 @@ class ScanConfig:
             self.lin_skip_directory = [
                 "/sys/", "/proc/", "/dev/", "/run/", "/tmp/.X11-unix/",
                 "/var/run/", "/lost+found/", "/media/", "/opt/yara_scanner/",
+                # Cortex XDR / Traps agent install root. Confirmed against the official
+                # Cortex XDR Agent Administrator Guide ("Install the Cortex XDR agent for
+                # Linux"): "The script installs the files for the Cortex XDR agent for
+                # Linux in the /opt/traps folder". Windows and macOS already skip their
+                # vendor install roots; this was the one platform with no equivalent entry.
+                "/opt/traps/",
                 os.path.normpath(self.scanner_dir).rstrip("/") + "/",
             ]
         
@@ -2766,6 +2772,9 @@ class ScanConfig:
                 '/private/tmp/', '/dev/', '/Volumes/', '/.Spotlight-V100/',
                 '/.DocumentRevisions-V100/', '/.fseventsd/', '/.TemporaryItems/',
                 '/.Trashes/', '/Library/Application Support/PaloAltoNetworks/Traps/',
+                # Second real vendor location, confirmed against the official docs
+                # (Cytool/troubleshooting pages for Mac): the agent's own logs.
+                '/Library/Logs/PaloAltoNetworks/Cortex XDR/',
                 '/Library/Developer/', '/Library/Caches/', '/Library/Logs/',
                 'Library/Containers/', 'Library/Caches/',
                 'Library/Application Support/Google/',
