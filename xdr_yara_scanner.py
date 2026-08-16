@@ -197,6 +197,17 @@ CONFIG_ALERT_MAX_PER_SCAN = 500         # max per-finding alerts per scan; beyon
 # results/alert files keep every offset regardless (disk is not the scarce resource); only the
 # network upload is capped. <= 0 disables the cap.
 CONFIG_LOOKUP_ROWS_PER_FINDING_MAX = 50 # max dataset rows uploaded per (rule, file); rest logged only
+# Offsets RENDERED per (rule, file) in the local alert/<rule>.txt. Ported from the XSIAM
+# edition, where the unbounded version produced a 220 MB file on one endpoint - 98.6% of
+# it from four Windows event logs, because a rule hunting PowerShell strings legitimately
+# matches thousands of times inside a PowerShell log.
+#
+# Individual offsets are not what an analyst works from: which host, which rule, which
+# string IN that rule, and which file are. So the per-string-ID census below is written in
+# full and stays UNCAPPED, and only the offsets are sampled. 50 matches
+# CONFIG_LOOKUP_ROWS_PER_FINDING_MAX above, so the local file and the dataset row show the
+# same sample. 0 renders everything, as it does there.
+CONFIG_ALERT_OFFSETS_PER_FINDING_MAX = 50
 # Lookup dataset rotation: add_data merge time grows with DATASET SIZE (measured on-tenant: ~13s at
 # 15k rows, ~31s at 77k rows), so an ever-growing dataset eventually outlives any client timeout.
 # "monthly" starts a fresh _<YYYYMM> dataset each month -> bounded size -> bounded merge time,
@@ -4503,11 +4514,33 @@ class EvidenceCollector:
             self.config.evidence_zip, "w", zipfile.ZIP_DEFLATED
         ) as zip_file:
             if copy_files:
+                # Entries are content-addressed, but this iterated by PATH, so several
+                # paths holding identical bytes each wrote a full copy under the same
+                # entry name. zipfile only WARNS on a repeated arcname and stores the
+                # member anyway, so the archive silently carried N copies while readers
+                # could only ever extract the first. Measured on the XSIAM edition:
+                # 22,918 matched paths held 22,213 distinct files - 705 redundant copies,
+                # 506 MB. file_mapping.txt keeps the full path -> hash relation, which is
+                # what makes collapsing them lossless.
+                packaged_hashes = set()
+                duplicates_skipped = 0
                 for file_path, file_hash in self.file_hashes.items():
+                    if file_hash in packaged_hashes:
+                        duplicates_skipped += 1
+                        continue
                     try:
                         zip_file.write(file_path, f"matched_files/{file_hash}")
+                        # Only mark packaged after a successful write - if this path
+                        # vanished mid-scan, another path with the same content still
+                        # deserves a try.
+                        packaged_hashes.add(file_hash)
                     except Exception as e:
                         logging.error(f"Error adding file to zip {file_path}: {e}")
+                if duplicates_skipped:
+                    logging.info(
+                        f"Evidence ZIP: {len(packaged_hashes)} unique file(s) packaged, "
+                        f"{duplicates_skipped} duplicate copy(ies) skipped"
+                    )
             else:
                 logging.info("Evidence: collect_files=false - packaging metadata only (no matched file copies)")
 
@@ -6352,13 +6385,37 @@ rule test {{
                             f.write(f"File Creation Time: {file_creation_time}\n")
                         f.write("=" * 80 + "\n")
                         if strings:
-                            f.write("Matched Strings:\n")
+                            # Census first, and deliberately UNCAPPED: which string in
+                            # the rule fired and how many times is what an analyst works
+                            # from, and it costs one line no matter how many offsets there
+                            # are. The offsets below are sampled precisely so this can be
+                            # complete.
+                            id_counts = {}
+                            for (_o, _sid, _d) in strings:
+                                key = "$?" if _sid is None else str(_sid)
+                                id_counts[key] = id_counts.get(key, 0) + 1
+                            f.write(f"Total string hits: {len(strings)}\n")
+                            f.write("Hits per string ID: " + ", ".join(
+                                f"{k}={v}" for k, v in sorted(id_counts.items())) + "\n")
+                            f.write("=" * 80 + "\n")
+
+                            _cap = CONFIG_ALERT_OFFSETS_PER_FINDING_MAX
+                            shown = strings if _cap <= 0 else strings[:_cap]
+                            f.write(
+                                f"Matched Strings (showing {len(shown)} of {len(strings)}):\n")
                             f.write("-" * 40 + "\n")
-                            for (off, sid, data) in strings:
+                            for (off, sid, data) in shown:
                                 string_repr = _render_match_data(data)
                                 f.write(f"String ID: {sid}\n")
                                 f.write(f"Offset: {off}\n")
                                 f.write(f"Data: {string_repr}\n")
+                                f.write("-" * 40 + "\n")
+                            if len(shown) < len(strings):
+                                f.write(
+                                    f"{len(strings) - len(shown)} further offset(s) omitted "
+                                    f"(CONFIG_ALERT_OFFSETS_PER_FINDING_MAX={_cap}). Counts "
+                                    f"above are complete; re-run `yara -s` against this file "
+                                    f"for every offset.\n")
                                 f.write("-" * 40 + "\n")
                         f.flush()
                 except (IOError, OSError) as e:

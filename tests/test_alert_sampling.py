@@ -157,3 +157,75 @@ def test_return_value_still_reports_true_total(tmp_path, monkeypatch):
 if __name__ == "__main__":
     import subprocess
     raise SystemExit(subprocess.call([sys.executable, "-m", "pytest", __file__, "-v"]))
+
+
+# ------------------------------------------------------------------ XDR parity
+def _xdr_writer(tmpdir):
+    """Same duck-typed holder, for the XDR edition's _write_alerts."""
+    import xdr_yara_scanner as xm
+    holder = type("_S", (), {})()
+    holder.config = _StubConfig(tmpdir)
+    holder.lock_alert = threading.Lock()
+    holder.lock_counts = threading.Lock()
+    holder.detection_counts = defaultdict(int)
+    holder.total_detections = 0
+    holder.rule_source_map = {}
+    holder.results_uploader = _StubUploader()
+    return xm, holder
+
+
+def test_xdr_alert_offsets_are_capped_with_full_census(tmp_path, monkeypatch):
+    """The alert-text contract is a SHARED concern - the scanning and aggregation side is
+    the same in both editions even though delivery is completely different. XDR rendered
+    every offset, unbounded, exactly as XSIAM did before v4.3.0.
+    """
+    xm, holder = _xdr_writer(str(tmp_path))
+    monkeypatch.setattr(xm, "CONFIG_ALERT_OFFSETS_PER_FINDING_MAX", 10)
+    pairs = ([(i, "$ps", "powershell") for i in range(1000)]
+             + [(i, "$enc", "-enc") for i in range(500)])
+    xm.YaraScanner._write_alerts(holder, [_hit("R", pairs)], "/tmp/evil.evtx")
+
+    text = _alert_text(holder, "R")
+    assert text.count("Offset:") == 10, "rendered offsets must respect the cap"
+    assert "$ps=1000" in text, "census must report the TRUE uncapped count"
+    assert "$enc=500" in text
+    assert "1490" in text, "omission note must state how many were dropped"
+
+
+def test_xdr_small_finding_unchanged(tmp_path, monkeypatch):
+    xm, holder = _xdr_writer(str(tmp_path))
+    monkeypatch.setattr(xm, "CONFIG_ALERT_OFFSETS_PER_FINDING_MAX", 50)
+    xm.YaraScanner._write_alerts(
+        holder, [_hit("Mimikatz", [(i, "$a", "mimikatz") for i in range(6)])], "/tmp/x.dll")
+    text = _alert_text(holder, "Mimikatz")
+    assert text.count("Offset:") == 6
+    assert "omitted" not in text.lower()
+    assert "$a=6" in text
+
+
+def test_xdr_cap_does_not_leak_into_the_alert_event(tmp_path, monkeypatch):
+    """Sampling the FILE must not change what the delivery channel reports.
+
+    XDR's _write_alerts returns None - unlike XSIAM it has no merged-alert return value,
+    because its alerts go out through Insert Parsed Alerts. It reports the true total via
+    log_alert's total_string_matches, computed from _iter_hit_fields independently of the
+    rendering cap. Asserting on that is the XDR-equivalent guarantee.
+    """
+    xm, holder = _xdr_writer(str(tmp_path))
+    monkeypatch.setattr(xm, "CONFIG_ALERT_OFFSETS_PER_FINDING_MAX", 5)
+
+    captured = {}
+
+    class _LM:
+        def log_alert(self, msg, data=None, *a, **k):
+            captured.update(data or {})
+        def log_error(self, *a, **k):
+            pass
+
+    holder.log_manager = _LM()
+    xm.YaraScanner._write_alerts(
+        holder, [_hit("R", [(i, "$a", "hit") for i in range(777)])], "/tmp/x")
+
+    assert captured.get("total_string_matches") == 777, (
+        "the alert event must carry the true hit total, not the rendered sample")
+    assert _alert_text(holder, "R").count("Offset:") == 5, "file itself stays capped"

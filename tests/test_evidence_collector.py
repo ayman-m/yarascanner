@@ -195,3 +195,53 @@ def test_collection_disabled_keeps_archive_small(tmp_path):
 if __name__ == "__main__":
     import subprocess
     raise SystemExit(subprocess.call([sys.executable, "-m", "pytest", __file__, "-v"]))
+
+
+# ------------------------------------------------------------------ XDR parity
+def test_xdr_duplicate_content_stored_once(tmp_path):
+    """Evidence packaging is a SHARED concern: both editions content-address the archive
+    as matched_files/<sha256> but iterated by PATH, so identical bytes at several paths
+    each wrote a full copy under one entry name. XDR gates copying behind collect_files
+    (default off), so this only bites a deployer who opts in - but the defect is identical.
+    """
+    import xdr_yara_scanner as xm
+
+    tmpdir = str(tmp_path)
+    payload = b"MZ\x90\x00" + b"duplicated dll body" * 100
+    paths = _make_corpus(tmpdir, {
+        "System32/a.dll": payload,
+        "System32/downlevel/a.dll": payload,
+        "SysWOW64/a.dll": payload,
+    })
+
+    cfg = FakeConfig(tmpdir)
+    cfg.collect_files = True          # XDR's toggle name; off by default
+    collector = xm.EvidenceCollector(cfg)
+    for p in paths:
+        collector.add_matched_file(p)
+    collector.collect_evidence()
+
+    with zipfile.ZipFile(cfg.evidence_zip) as zf:
+        blobs = [n for n in zf.namelist() if n.startswith("matched_files/")]
+
+    assert len(blobs) == 1, f"expected 1 deduped blob, got {len(blobs)}"
+    assert len(set(blobs)) == len(blobs), "duplicate arcnames in archive"
+
+
+def test_xdr_metadata_only_by_default(tmp_path):
+    """collect_files defaults off there, so the archive must carry no file bytes."""
+    import xdr_yara_scanner as xm
+
+    tmpdir = str(tmp_path)
+    paths = _make_corpus(tmpdir, {"big.dll": b"x" * 50000})
+    cfg = FakeConfig(tmpdir)
+    cfg.collect_files = False
+    collector = xm.EvidenceCollector(cfg)
+    for p in paths:
+        collector.add_matched_file(p)
+    collector.collect_evidence()
+
+    with zipfile.ZipFile(cfg.evidence_zip) as zf:
+        names = zf.namelist()
+    assert not [n for n in names if n.startswith("matched_files/")]
+    assert "file_mapping.txt" in names, "mapping must survive so files remain locatable"
