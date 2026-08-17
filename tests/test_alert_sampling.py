@@ -48,14 +48,31 @@ def _writer(tmpdir):
     return holder
 
 
+class _Hit:
+    """A stand-in for a live yara.Match — the ONLY shape production produces.
+
+    This fixture used to build a dict with hex-encoded strings, which _iter_hit_fields
+    also accepted. That arm was unreachable in production: every call site iterates
+    `matches`, and `matches = self.rules.match(...)` returns Match objects. So these
+    offset-cap tests were exercising a branch the scanner never runs — the cap itself was
+    right (a live storm-file scan showed "Matched Strings (showing 50 of 6000)"), but
+    these tests were not what confirmed it.
+
+    Strings are (offset, string_id, BYTES), matching what _normalize_match_strings sees
+    from yara-python; the dict shape carried hex TEXT, which is the difference that let
+    the two paths drift apart unnoticed.
+    """
+
+    def __init__(self, rule, pairs):
+        self.rule = rule
+        self.tags = []
+        self.meta = {}
+        self.strings = [(off, sid, text.encode()) for off, sid, text in pairs]
+
+
 def _hit(rule, pairs):
-    """Build a cached-dict-shaped YARA hit. pairs = [(offset, string_id, text), ...]."""
-    return {
-        "rule": rule,
-        "tags": [],
-        "meta": {},
-        "strings": [(off, sid, text.encode().hex()) for off, sid, text in pairs],
-    }
+    """Build a live-Match-shaped YARA hit. pairs = [(offset, string_id, text), ...]."""
+    return _Hit(rule, pairs)
 
 
 def _alert_text(holder, rule):

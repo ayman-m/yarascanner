@@ -62,7 +62,7 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `RULE-041` | Lenient base64 rule-payload decoding (b64: prefix, URL-safe, unpadded) | 3 | supporting | ✅ pass | lenient base64 decode succeeded (canonical payload); the prefix/newline/URL-safe variants need four extra deliveries | — |
 | `RULE-042` | Condition-only match explanation mined from the rule's own source text | 3 | supporting | ✅ pass | condition-only explanation present in the alert text | — |
 | `RULE-043` | yara-python version shim for match strings (3.x tuples vs 4.x StringMatch instances) | 3 | supporting | ✅ pass | match strings normalised across yara-python versions (627 matches rendered without error) | — |
-| `RULE-044` | Dead cached-hit dict ingestion path in match-field extraction | not_covered | low | — not_covered | — | — |
+| `RULE-044` | Dead cached-hit dict ingestion path in match-field extraction | not_covered | low | — not_covered | — | Deleted. The dict arm was unreachable in production: three call sites all iterate `matches`, which has one binding to self.rules.match() returning Match objects; _write_alerts takes matches as a… |
 | `TRAV-001` | Explicit scan folder parameter | 3 | core | ✅ pass | scan_folder=/tmp/yara_r3_tree targets=['/tmp/yara_r3_tree'] | — |
 | `TRAV-002` | Comma-separated multi-target list | 3 | supporting | ✅ pass | comma-separated '/usr,/var' parsed into ['/usr', '/var'] | — |
 | `TRAV-003` | Per-target validation with independent rejection | 3 | supporting | ✅ pass | valid target scanned 12 files alongside a nonexistent one; outcome=completed | — |

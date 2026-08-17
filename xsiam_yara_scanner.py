@@ -1106,22 +1106,28 @@ def _render_match_data(data) -> str:
 
 
 def _iter_hit_fields(hit):
-    """Extract fields from YARA match (cached dict or live Match object)."""
-    if isinstance(hit, dict):
-        rule = hit.get("rule")
-        tags = hit.get("tags", [])
-        meta = hit.get("meta", {})
-        strings = []
-        for (o, sid, hx) in hit.get("strings", []):
-            try:
-                data = bytes.fromhex(hx)
-            except Exception:
-                data = hx.encode("utf-8", errors="ignore")
-            strings.append((o, sid, data))
-        return rule, tags, meta, strings
-    else:
-        strings = _normalize_match_strings(list(getattr(hit, "strings", []) or []))
-        return hit.rule, list(getattr(hit, "tags", []) or []), dict(getattr(hit, "meta", {}) or []), strings
+    """Extract rule, tags, meta and normalised strings from a live yara Match object.
+
+    This used to accept a second shape: a plain dict whose `strings` were
+    (offset, id, hex-text) triples, rehydrated with bytes.fromhex. That implied a match
+    CACHE - something that serialised findings and replayed them later. No such cache
+    exists, and the arm was unreachable:
+
+      * three call sites (the rules_matched list comprehension, the _write_alerts loop,
+        and the total_string_matches sum) all iterate `matches`;
+      * `matches` has exactly ONE binding, `matches = self.rules.match(...)`, which
+        returns yara.Match objects and never dicts;
+      * _write_alerts takes `matches` as a parameter but has a single caller, which
+        passes that same local;
+      * no module outside this file imports _iter_hit_fields.
+
+    It was removed rather than kept for safety, because it was not safe. Its decode
+    fallback was `hx.encode("utf-8", errors="ignore")` on anything bytes.fromhex
+    rejected - so a non-hex string produced WRONG BYTES silently instead of raising, and
+    every offset and matched-data field downstream would have been quietly corrupt.
+    """
+    strings = _normalize_match_strings(list(getattr(hit, "strings", []) or []))
+    return hit.rule, list(getattr(hit, "tags", []) or []), dict(getattr(hit, "meta", {}) or []), strings
 
 
 # ============================================================================
