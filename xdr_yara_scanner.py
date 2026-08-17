@@ -3,8 +3,8 @@ YARA Scanner (XDR API Edition)
 ==================================
 Enterprise-grade file scanner with real-time threat detection and Cortex XDR API reporting.
 
-    VERSION : 3.2.0
-    RELEASED: 2026-08-13
+    VERSION : 3.3.0
+    RELEASED: 2026-08-17
     SOURCE  : https://github.com/ayman-m/yarascanner
     NOTES   : https://github.com/ayman-m/yarascanner/blob/main/CHANGELOG.md
 
@@ -26,8 +26,8 @@ Report the version with any support request: behaviour differs between releases 
 the release notes above record what changed.
 """
 
-__version__ = "3.2.0"
-__release_date__ = "2026-08-13"
+__version__ = "3.3.0"
+__release_date__ = "2026-08-17"
 
 # Standard library imports
 import base64
@@ -300,7 +300,8 @@ RULE_CACHE_MAX_FILES = _env_number("YARA_RULE_CACHE_MAX", 5, cast=int, minimum=0
 RULE_CACHE_MAX_BYTES = int(_env_number("YARA_RULE_CACHE_MAX_MB", 256, minimum=0) * 1024 * 1024)
 _RULE_CACHE_LOCK = threading.Lock()
 # Fixed lookup-dataset base name (stable so dashboards can reference literally):
-#   <prefix>_matches -> one row per matched YARA string
+#   <prefix>_matches -> one row per (rule, file) FINDING (v3 grain; match_count carries
+#                       the true hit total, offsets/strings a capped sample)
 #   <prefix>_scans   -> scan-lifecycle rows (initiated/running/completed/cancelled/failed)
 LOOKUP_DATASET_PREFIX = "yara_scanner"
 SCANS_HEARTBEAT_SECS = _env_number("YARA_HEARTBEAT_SECS", 600, minimum=0)  # running-row cadence

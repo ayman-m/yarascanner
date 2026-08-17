@@ -15,6 +15,155 @@ fixes without changing behaviour you rely on.
 
 ---
 
+## xsiam_yara_scanner.py v4.4.0 — 2026-08-17
+
+Correctness and honesty release. Every finding below was reproduced before being fixed and
+verified afterwards on a real endpoint — Windows (`Windows-11-10.0.26200`, yara 4.1.0) and,
+for the shared paths, Linux (`6.8.0-gcp`, yara 3.11.0). One reported issue was **refuted**
+rather than fixed, and is recorded as such.
+
+### Fixed — a scan that covered nothing reported a clean success
+
+Three separate triggers produced the same shape: `outcome: completed`, 0 scanned, exit 0.
+
+- **A requested target inside the skip list** was dropped silently. An IR lead scanning
+  `AppData\Local\Temp` (covered by `skip_path_fragments`) got a green result and zero
+  coverage; the only signal was a `0`, indistinguishable from an empty directory. The
+  target is now named on the result line and recorded in `excluded_targets`.
+- **Skipped subtrees were counted nowhere.** The directory-level skip incremented nothing
+  while the per-file skip always did, so `files_scanned + files_skipped` could not be
+  reconciled against disk and `skip_rate` read 0%.
+- **A negative `YARA_MAX_MB`** made `max_file_bytes` negative, so every file failed the
+  size check.
+
+### Fixed — a deployer typo killed the scan before anything could report it
+
+Ten knobs read inside `ScanConfig` used bare `int()`/`float()`, and `main()` builds
+`ScanConfig` *before* `LogManager` exists — so `YARA_MAX_MB=128MB` raised `ValueError` and
+the run died with no local log recording why, no telemetry and no dataset row. The guard
+helper that exists precisely for this was applied to the undocumented knobs and withheld
+from six the Deployment Guide tells deployers to set. All reads are now guarded, and
+`_env_number` gained a `minimum` because parsing is not validation.
+
+### Fixed — the skip predicate, four separate defects
+
+- **Prefix over-match:** `startswith("c:\yara_scanner")` also matched
+  `c:\yara_scanner_backup\evil.dll`. Any directory whose name merely began with a skip
+  entry's was permanently unscannable — a blind spot anyone able to create one could use.
+- **Bare directory roots** never matched entries carrying a trailing separator, on all
+  three platforms and in the platform-independent fragment check. The last of these was
+  caught **only by re-verifying on Windows**; it passed on macOS through a Darwin-only
+  fallback list, a pass for the wrong reason.
+- **macOS:** 32 of 58 `mac_skip_directory` entries were relative and could never match an
+  absolute path, and neither side was case-folded despite APFS being case-insensitive.
+- **`win_skip_patterns`** was a glob matcher that never matched anything, confirmed by
+  direct execution. Retired in favour of exact vendor install roots.
+
+### Fixed — evidence and alert artefacts on the scanned host
+
+- A fatally-failed scan **skipped evidence collection entirely**, discarding the alert
+  texts and `file_mapping.txt` a responder needs from a partial run. Verified: 1 match,
+  1 alert text, **0 evidence ZIPs**. Both evidence and a terminal status now run first.
+- `skip_reasons` keys embedded absolute paths, so the dict grew one key per errored file —
+  unbounded, and shipped into telemetry (307 KB for 5,000 errored files). Bounded to the
+  exception type; the per-file detail is still logged.
+- Duplicate content was stored once per **path** rather than once per hash. `zipfile` only
+  warns on a repeated entry name and stores the member anyway.
+
+### Fixed — telemetry that could not be reconciled
+
+`upload_stats['total']` was incremented **before** the circuit-breaker check, so every
+re-queue re-counted the same events (one event bouncing three times reported `total=3`,
+`successful=0`, `failed=0`). Items stranded when the drain expired were computed at
+shutdown, logged, then discarded — so a total delivery outage read as clean.
+`telemetry_delivery` now carries `undelivered`, matching the match channel.
+
+`scan_status` also never reached a terminal value on success — `finishing` was the last
+one emitted, indistinguishable from a scan hung mid-shutdown.
+
+### Changed — the scheduled cleanup task actually does something now
+
+The embedded cleanup scripts targeted `c:\xdr-data\alert` and `/opt/xdr-data/alert`,
+paths this edition never creates, so the `.txt` → `.alert` rotation renamed nothing.
+Verified failing on a live endpoint (`Last Result = 1`) — every scan with alerts created a
+SYSTEM scheduled task that did nothing. Now generated at runtime from `config.alert_dir`,
+with the errorlevel guard that stops a wildcard `ren` running in an unintended directory.
+
+### Changed — Cortex agent install roots are skipped on every platform
+
+Windows and macOS already skipped their vendor roots; **Linux skipped none**. Added
+`/opt/traps/`, confirmed against the official Cortex XDR Agent Administrator Guide, plus
+`/Library/Logs/PaloAltoNetworks/Cortex XDR/` on macOS — a second real vendor location the
+existing entry did not cover.
+
+### Removed — the file-cache subsystem, and other dead weight
+
+`FileCacher` never ran once: `use_cache` was hardcoded `False`, `get`/`put` had no call
+sites, and nothing incremented its counters — so `cache_hit_rate` shipped a permanent `0`
+and the "Cache Performance" event never existed on any host. Removed along with its ~10
+telemetry sites, the parsing-rule extractions, and the guide's claim that it deduplicated
+rescans (it never did). Also removed: seven unreferenced functions, five write-only
+attributes, an unused import.
+
+**Kept deliberately:** XDR's *rule* cache is a different, live subsystem that saves ~90s of
+compile time per run on a large pack.
+
+### Refuted, not fixed
+
+An "unwritable scanner directory still reports success" report **does not reproduce**.
+Tested directly: the run returns `Scan failed: … Critical error occurred` and logs a
+`PermissionError` traceback. No change was made.
+
+### Tests
+
+266 → 311, including parity tests that run the shared paths against **both** editions.
+One caught a real contract difference between them. Also fixed a test bug that had the
+suite silently asserting nothing: pytest's `tmp_path` resolves under
+`/private/var/folders/`, which is itself in the macOS skip list.
+
+---
+
+## xdr_yara_scanner.py v3.3.0 — 2026-08-17
+
+Brings the XDR edition level with XSIAM on everything **shared** — scanning, file capping,
+evidence packaging, match aggregation and skip behaviour. Delivery is deliberately
+untouched: XSIAM streams NDJSON to an HTTP collector, XDR uses Insert Parsed Alerts plus
+lookup datasets, and those paths have nothing in common.
+
+A parity audit found ten shared fixes already present in both editions and two that were
+not. Both missing ones are in this release.
+
+### Fixed — evidence ZIP stored duplicate content once per path
+
+Identical to the XSIAM defect: entries are content-addressed as `matched_files/<sha256>`
+but were iterated by path, so identical bytes at several paths each wrote a full copy under
+one entry name. Gated behind `collect_files` (default off), so it only affected deployers
+who opted in. Measured on the XSIAM side: 22,918 matched paths held 22,213 distinct files —
+705 redundant copies, 506 MB.
+
+### Changed — alert texts sample offsets and report per-string-ID counts in full
+
+`alert/<rule>.txt` rendered **every** offset, unbounded — as XSIAM did before v4.3.0, where
+it produced a 220 MB file on one endpoint. New `CONFIG_ALERT_OFFSETS_PER_FINDING_MAX = 50`
+matches the existing `CONFIG_LOOKUP_ROWS_PER_FINDING_MAX`, so the local file and the dataset
+row show the same sample; `0` renders everything. The per-string-ID census is **uncapped** —
+which string fired and how often is what an analyst works from.
+
+### Also in this release, shared with XSIAM
+
+Env-guard hardening (28 reads, 23 of them at module level where a typo crashed at
+**import**, before anything could report it), the zero-coverage fixes, bounded
+`skip_reasons`, terminal scan status, evidence collection on fatal failure, the full skip
+predicate rework, cache removal, and the Cortex agent install roots.
+
+### Verified on Linux
+
+First live Linux verification of this branch, on the XDR tenant (`6.8.0-gcp`, yara
+**3.11.0** — note the spread against 4.1.0 on the Windows agent and 4.5.4 locally). All
+checks passed: `/opt/traps` skipped with its boundary sibling still scannable, case
+sensitivity correct for the platform, env guards, counters, excluded-target reporting, and
+the cleanup rotation confirmed working (`t.txt` → `t.alert`).
+
 ## xsiam_yara_scanner.py v4.3.0 — 2026-08-14
 
 Two independent fixes, both found by measuring rather than reading: a scan blind spot in

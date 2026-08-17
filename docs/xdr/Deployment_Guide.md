@@ -1,6 +1,6 @@
 % YARA Scanner for Cortex XDR — Deployment Guide
 % Cortex XDR edition (`xdr_yara_scanner.py`, v2)
-% Version 2.1.0 · Released 2026-08-06
+% Version 3.3.0 · Released 2026-08-17
 
 ---
 
@@ -198,6 +198,7 @@ re-upload. These are the deployment-wide behaviour knobs (no per-run input neede
 | `CONFIG_TENANT_ID` | string | `""` | Tenant tag (`""` = derive from API URL) |
 | `CONFIG_LOOKUP_SHARD` | `endpoint`/`none`/`<label>` | `endpoint` | Dataset sharding (§11) |
 | `CONFIG_ALERT_MAX_PER_SCAN` | int | `500` | Max per-finding alerts per scan; beyond → one rollup per rule. **Constant only** |
+| `CONFIG_ALERT_OFFSETS_PER_FINDING_MAX` | int | `50` | Offsets **rendered** per finding in the local `alert/<rule>.txt`. **New in v3.3.0** — the file previously listed every offset, which on a noisy rule against event logs grew it to hundreds of MB on the scanned host. The per-string-ID hit census above them is never capped, so which string fired and how often survives in full; only the offsets are sampled. `0` renders everything. **Constant only** |
 | `CONFIG_LOOKUP_ROTATION` | `monthly`/`none` | `monthly` | Monthly dataset rotation (§11). **Constant only** |
 | `CONFIG_HOST_CLEANUP` | `off`/`on_delivery`/`always` | `off` | Remove this run's working files from the endpoint at end of run. **Constant only** |
 | `CONFIG_HOST_CLEANUP_KEEP` | `nothing`/`summary`/`evidence` | `summary` | What to keep when cleanup runs. **Constant only** |
@@ -415,7 +416,7 @@ rails, and schema-change rules.
 
 # 12. Dashboard & XQL
 
-Import `dashboards/Yara XDR Scanner (Lookup).json` (**Dashboards → Import**). It ships **40
+Import `dashboards/xdr/YARA Scanner (Lookup).json` (**Dashboards → Import**). It ships **40
 widgets** across detections (by OS / scan-folder / file-size / severity / matched-length), fleet
 coverage, rule health (valid/failed/skipped), throughput & throttle, single-value KPI tiles, and
 alert-channel trends. Widgets build on the sharded lookup datasets via the `*` wildcard (plus the
@@ -428,7 +429,7 @@ fans every per-endpoint shard (and schema version) into one fleet-wide result.
 **Top rules by hits:**
 
 ```sql
-dataset = yara_scanner_matches* | comp count() as hits by rule | sort desc hits | limit 15
+dataset = yara_scanner_matches* | comp sum(match_count) as hits by rule | sort desc hits | limit 15
 ```
 
 **Latest state per scan:**
