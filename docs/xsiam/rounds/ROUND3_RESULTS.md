@@ -2,7 +2,7 @@
 
 **Endpoints:** `xsoar`, `OfficeiMac`, `thor`  
 **Criteria:** 121  
-**Result:** 98 pass · 0 fail · 23 blocked · 0 not run
+**Result:** 100 pass · 0 fail · 21 blocked · 0 not run
 
 ## Runs
 
@@ -14,6 +14,7 @@ endpoint's own logs plus the events that reached `yara_scans_raw` on the tenant.
 | `r3a-shapes-linux` | `None` | defaults | 310 | 1 | 3.87s | 80.07 f/s | 993 |
 | `r3b-shapes-macos` | `None` | defaults | 309 | 2 | 3.4s | 90.85 f/s | 991 |
 | `r3c-shapes-windows` | `None` | defaults | 310 | 1 | 3.17s | 97.85 f/s | 992 |
+| `r3d-wholefs-linux` | `None` | defaults | 469,170 | 658,034 | 712.47s | 658.51 f/s | 553,047 |
 | `r3e-cancel-linux` | `whole filesystem` | defaults | 30,593 | 21 | 99.47s | 307.55 f/s | 66,161 |
 
 ## What the runs measured
@@ -63,6 +64,32 @@ removed rather than left behind to report a phantom running scanner.
 This is the scenario the counter exists for. The failure it prevents is a cancelled scan
 reporting success while silently dropping 18% of its findings.
 
+### A whole-machine scan, and the fix under real pressure
+
+No `scan_folder` given, so Linux discovery selected the machine root:
+
+| | |
+|---|---|
+| target chosen | `/` |
+| scanned / skipped | 469,170 / 658,034 |
+| findings | 925,507 |
+| duration | 712 s |
+
+The skip breakdown reconciles exactly with `files_skipped`:
+`Skipped directory(655232), File does not exist(1965), Not a regular file(762),
+File too large(52), Special system file(23)`.
+
+762 non-regular files and 23 special system files were rejected without planting a
+single fifo — a root scan walks /dev, /proc and /run, which is the honest way to exercise
+that path; a planted fifo proves only that one contrived case works.
+
+This is also the hardest available test of the delivery-book fix. A 925,507-finding
+backlog left 669,991 undelivered, and the books still balance to the item:
+
+```
+255,516 + 0 + 669,991 = 925,507 = findings
+```
+
 ### The 500-finding book discrepancy — found, fixed, re-verified
 
 The first cancelled run booked `ok + undelivered = 69,650` against 69,150 findings. The
@@ -99,7 +126,6 @@ reaching them needs something we will not do to a live endpoint.
 | `RULE-027` | failed_rules/ is never pruned | the never-pruned property needs several runs against one scanner dir; each run here uses a fresh directory |
 | `RULE-028` | Un-splittable pack forensics | un-splittable-pack forensics needs a pack the splitter cannot divide at all |
 | `RULE-033` | Combined-compile failure reporting | combined-compile failure cannot be constructed deterministically: it needs rules that pass individually but fail together |
-| `TRAV-006` | Linux default target discovery (privilege-aware) | run r3d-wholefs-linux not archived |
 | `TRAV-016` | Per-platform problematic-junction skip list | per-platform junction skip list needs a planted reparse point |
 | `TRAV-017` | Directory-level junction pruning during the walk | directory-level junction pruning needs a planted reparse point |
 | `TRAV-018` | File-level junction skip, counted | file-level junction skip needs a planted reparse point |
@@ -111,7 +137,6 @@ reaching them needs something we will not do to a live endpoint.
 | `TRAV-024` | Browser force-scan allowlist (macOS carve-out) | the macOS browser force-scan carve-out needs a real browser cache path in scope |
 | `TRAV-025` | Boundary skips the force-scan allowlist cannot override | force-scan boundary needs a browser cache under a skipped root |
 | `TRAV-027` | Windows skip-drive mechanism | skip-drive mechanism needs a whole-machine Windows scan |
-| `TRAV-028` | Linux skip directories | run r3d-wholefs-linux not archived |
 | `TRAV-033` | Vendor security-agent path exclusions | vendor security-agent exclusions need those paths present; covered as a unit property by tests/test_extra_skip_paths.py |
 | `TRAV-037` | Second-line skip check inside the worker | the worker's second-line skip check shares one skip_reasons key with the producer's, so no artefact separates the two arms |
 | `TRAV-047` | Windows default scan scope is every mounted volume, including network and removable drives | Windows default scope covering every mounted volume needs a no-target whole-machine Windows scan |
@@ -130,7 +155,6 @@ reaching them needs something we will not do to a live endpoint.
 | `RULE-027` | failed_rules/ is never pruned | supporting | ⛔ blocked | the never-pruned property needs several runs against one scanner dir; each run here uses a fresh directory |
 | `RULE-028` | Un-splittable pack forensics | supporting | ⛔ blocked | un-splittable-pack forensics needs a pack the splitter cannot divide at all |
 | `RULE-033` | Combined-compile failure reporting | supporting | ⛔ blocked | combined-compile failure cannot be constructed deterministically: it needs rules that pass individually but fail together |
-| `TRAV-006` | Linux default target discovery (privilege-aware) | supporting | ⛔ blocked | run r3d-wholefs-linux not archived |
 | `TRAV-016` | Per-platform problematic-junction skip list | supporting | ⛔ blocked | per-platform junction skip list needs a planted reparse point |
 | `TRAV-017` | Directory-level junction pruning during the walk | supporting | ⛔ blocked | directory-level junction pruning needs a planted reparse point |
 | `TRAV-018` | File-level junction skip, counted | supporting | ⛔ blocked | file-level junction skip needs a planted reparse point |
@@ -142,7 +166,6 @@ reaching them needs something we will not do to a live endpoint.
 | `TRAV-024` | Browser force-scan allowlist (macOS carve-out) | supporting | ⛔ blocked | the macOS browser force-scan carve-out needs a real browser cache path in scope |
 | `TRAV-025` | Boundary skips the force-scan allowlist cannot override | supporting | ⛔ blocked | force-scan boundary needs a browser cache under a skipped root |
 | `TRAV-027` | Windows skip-drive mechanism | supporting | ⛔ blocked | skip-drive mechanism needs a whole-machine Windows scan |
-| `TRAV-028` | Linux skip directories | supporting | ⛔ blocked | run r3d-wholefs-linux not archived |
 | `TRAV-033` | Vendor security-agent path exclusions | core | ⛔ blocked | vendor security-agent exclusions need those paths present; covered as a unit property by tests/test_extra_skip_paths.py |
 | `TRAV-037` | Second-line skip check inside the worker | supporting | ⛔ blocked | the worker's second-line skip check shares one skip_reasons key with the producer's, so no artefact separates the two arms |
 | `TRAV-047` | Windows default scan scope is every mounted volume, including network and remov… | core | ⛔ blocked | Windows default scope covering every mounted volume needs a no-target whole-machine Windows scan |
@@ -226,6 +249,7 @@ reaching them needs something we will not do to a live endpoint.
 | `TRAV-003` | Per-target validation with independent rejection | supporting | ✅ pass | valid target scanned 12 files alongside a nonexistent one; outcome=completed |
 | `TRAV-004` | Hard failure when no requested target is valid | core | ✅ pass | YARA Scanner Critical Error: Critical scanner error: No valid scan directory among the specified scan folder(s): ['/nonexistent_a_zzz', '/nonexistent_b_zzz'] |
 | `TRAV-005` | Windows whole-machine default target discovery | supporting | ✅ pass | Windows run completed against an explicit target; whole-machine discovery is exercised by the no-target run |
+| `TRAV-006` | Linux default target discovery (privilege-aware) | supporting | ✅ pass | no target given -> ['/']; 469,170 scanned, 658,034 skipped |
 | `TRAV-007` | macOS default target discovery (privilege-aware) | supporting | ✅ pass | macOS run targets=['/tmp/yara_r3_tree'] |
 | `TRAV-009` | Excluded-target warning (requested target wholly skipped) | supporting | ✅ pass | excluded_targets=[] (empty — nothing was wholly skipped this run) |
 | `TRAV-010` | Non-root system-path pre-flight advisory | supporting | ✅ pass | Running as: root on Linux |
@@ -234,11 +258,12 @@ reaching them needs something we will not do to a live endpoint.
 | `TRAV-014` | Unreadable directory tolerated, subtree abandoned | supporting | ✅ pass | unreadable dir planted=True, outcome=completed, skips={'File too large': 1} |
 | `TRAV-015` | Junction / reparse-point detection | supporting | ✅ pass | Windows run completed; no junctions were planted (creating one needs elevation on this host) |
 | `TRAV-026` | Windows skip folders with component-boundary matching | supporting | ✅ pass | Windows component-boundary matching ran over 310 files without over-skipping (macOS/Linux parity: 310/309/310) |
+| `TRAV-028` | Linux skip directories | supporting | ✅ pass | 655,232 files attributed to skipped directories; breakdown {'Skipped directory': 655232, 'File does not exist': 1965, 'Not a regular file': 762, 'File too large': 52, 'Special system file': 23} sums to 658,034 = files_s… |
 | `TRAV-029` | macOS skip directories with three matching semantics | supporting | ✅ pass | macOS skipped 2 vs Linux 1 / Windows 1; breakdown {'Junction/symlink skip': 1, 'File too large': 1} |
 | `TRAV-030` | macOS AppleDouble and .DS_Store file skip | supporting | ✅ pass | skipped: macOS=2 linux=1 windows=1; macOS breakdown {'Junction/symlink skip': 1, 'File too large': 1} |
 | `TRAV-032` | Self-skip of the scanner's own directory and log file | core | ✅ pass | scanner artefacts inside the target: 0 |
 | `TRAV-034` | Maximum file size cap | core | ✅ pass | oversized planted=True, skip breakdown={'File too large': 1} |
-| `TRAV-035` | Non-regular-file rejection | supporting | ✅ pass | skip breakdown: {'File too large': 1} |
+| `TRAV-035` | Non-regular-file rejection | supporting | ✅ pass | 762 non-regular files and 23 special system files rejected on a root scan; outcome=completed |
 | `TRAV-036` | Existence and read-access pre-checks | supporting | ✅ pass | pre-checks let the scan complete over a tree containing an unreadable directory (1 skipped) |
 | `TRAV-040` | Bounded per-file error labels in the skip breakdown | supporting | ✅ pass | 1 distinct skip labels: ['File too large'] |
 | `TRAV-042` | Scan-configuration disclosure event | supporting | ✅ pass | scan-configuration disclosure event present |

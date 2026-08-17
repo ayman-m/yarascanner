@@ -11,9 +11,9 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 |---|---|---|---|---|---|
 | 1 | 53 | 53 | 0 | 0 | 0 |
 | 2 | 109 | 99 | 0 | 10 | 0 |
-| 3 | 121 | 98 | 0 | 23 | 0 |
+| 3 | 121 | 100 | 0 | 21 | 0 |
 
-**250 of 283 executed.**
+**252 of 283 executed.**
 
 ## All capabilities
 
@@ -68,7 +68,7 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `TRAV-003` | Per-target validation with independent rejection | 3 | supporting | ✅ pass | valid target scanned 12 files alongside a nonexistent one; outcome=completed | — |
 | `TRAV-004` | Hard failure when no requested target is valid | 3 | core | ✅ pass | YARA Scanner Critical Error: Critical scanner error: No valid scan directory among the specified scan folder(s): ['/nonexistent_a_zzz', '/nonexistent_b_zzz'] | — |
 | `TRAV-005` | Windows whole-machine default target discovery | 3 | supporting | ✅ pass | Windows run completed against an explicit target; whole-machine discovery is exercised by the no-target run | default-scope discovery needs a run with no scan_folder on Windows |
-| `TRAV-006` | Linux default target discovery (privilege-aware) | 3 | supporting | ⛔ blocked | — | run r3d-wholefs-linux not archived |
+| `TRAV-006` | Linux default target discovery (privilege-aware) | 3 | supporting | ✅ pass | no target given -> ['/']; 469,170 scanned, 658,034 skipped | — |
 | `TRAV-007` | macOS default target discovery (privilege-aware) | 3 | supporting | ✅ pass | macOS run targets=['/tmp/yara_r3_tree'] | privilege-aware default discovery needs a no-target run on macOS |
 | `TRAV-008` | Unknown-platform target fallback | not_covered | supporting | — not_covered | — | Requires a platform we do not have. The branch fires only when platform.system() is neither 'Windows', 'Linux' nor 'Darwin'; every endpoint in the XSIAM and XDR tenants is one of those three, so… |
 | `TRAV-009` | Excluded-target warning (requested target wholly skipped) | 3 | supporting | ✅ pass | excluded_targets=[] (empty — nothing was wholly skipped this run) | — |
@@ -90,14 +90,14 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `TRAV-025` | Boundary skips the force-scan allowlist cannot override | 3 | supporting | ⛔ blocked | — | force-scan boundary needs a browser cache under a skipped root |
 | `TRAV-026` | Windows skip folders with component-boundary matching | 3 | supporting | ✅ pass | Windows component-boundary matching ran over 310 files without over-skipping (macOS/Linux parity: 310/309/310) | — |
 | `TRAV-027` | Windows skip-drive mechanism | 3 | supporting | ⛔ blocked | — | skip-drive mechanism needs a whole-machine Windows scan |
-| `TRAV-028` | Linux skip directories | 3 | supporting | ⛔ blocked | — | run r3d-wholefs-linux not archived |
+| `TRAV-028` | Linux skip directories | 3 | supporting | ✅ pass | 655,232 files attributed to skipped directories; breakdown {'Skipped directory': 655232, 'File does not exist': 1965, 'Not a regular file': 762, 'File too large': 52, 'Special system file': 23} sums… | — |
 | `TRAV-029` | macOS skip directories with three matching semantics | 3 | supporting | ✅ pass | macOS skipped 2 vs Linux 1 / Windows 1; breakdown {'Junction/symlink skip': 1, 'File too large': 1} | — |
 | `TRAV-030` | macOS AppleDouble and .DS_Store file skip | 3 | supporting | ✅ pass | skipped: macOS=2 linux=1 windows=1; macOS breakdown {'Junction/symlink skip': 1, 'File too large': 1} | — |
 | `TRAV-031` | No directory skipping on unrecognised platforms | not_covered | supporting | — not_covered | — | Requires a platform we do not have. The final else-branch of _is_special_file (5230-5231) and the empty-list assignment in ScanConfig (3084-3086) execute only when platform.system() is neither… |
 | `TRAV-032` | Self-skip of the scanner's own directory and log file | 3 | core | ✅ pass | scanner artefacts inside the target: 0 | — |
 | `TRAV-033` | Vendor security-agent path exclusions | 3 | core | ⛔ blocked | — | vendor security-agent exclusions need those paths present; covered as a unit property by tests/test_extra_skip_paths.py |
 | `TRAV-034` | Maximum file size cap | 3 | core | ✅ pass | oversized planted=True, skip breakdown={'File too large': 1} | — |
-| `TRAV-035` | Non-regular-file rejection | 3 | supporting | ✅ pass | skip breakdown: {'File too large': 1} | non-regular-file rejection needs a fifo/socket in scope; none was planted |
+| `TRAV-035` | Non-regular-file rejection | 3 | supporting | ✅ pass | 762 non-regular files and 23 special system files rejected on a root scan; outcome=completed | — |
 | `TRAV-036` | Existence and read-access pre-checks | 3 | supporting | ✅ pass | pre-checks let the scan complete over a tree containing an unreadable directory (1 skipped) | — |
 | `TRAV-037` | Second-line skip check inside the worker | 3 | supporting | ⛔ blocked | — | the worker's second-line skip check shares one skip_reasons key with the producer's, so no artefact separates the two arms |
 | `TRAV-038` | Bulk attribution of a skipped directory's files | 2 | supporting | ✅ pass | nothing skipped on a seeded tree | — |
