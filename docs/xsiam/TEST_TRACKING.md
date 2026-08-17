@@ -11,9 +11,9 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 |---|---|---|---|---|---|
 | 1 | 53 | 53 | 0 | 0 | 0 |
 | 2 | 109 | 99 | 0 | 10 | 0 |
-| 3 | 121 | 91 | 0 | 30 | 0 |
+| 3 | 121 | 98 | 0 | 23 | 0 |
 
-**243 of 283 executed.**
+**250 of 283 executed.**
 
 ## All capabilities
 
@@ -21,13 +21,13 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 |---|---|---|---|---|---|---|
 | `RULE-001` | Base64-only rule input | 3 | core | ✅ pass | valid_rules=9 rule_hash=eb6e98d3355a0376 | — |
 | `RULE-002` | Rule input size cap | not_covered | supporting | — not_covered | — | Cannot deliver the input. A >50,000,000-character argv value exceeds both the Action Center script-parameter field and POSIX ARG_MAX (~2 MB on the xsoar VM), so no live delivery path can carry it;… |
-| `RULE-003` | Typed rule-input rejection codes | 3 | supporting | ⛔ blocked | — | the three typed rejection codes need three separate malformed DELIVERIES (whitespace-only, undecodable base64, no rule declarations); this round delivers one well-formed payload |
-| `RULE-004` | Empty embedded ruleset guard | 3 | supporting | ⛔ blocked | — | needs a run with the yarafile argument omitted entirely so the empty embedded YARA_RULE guard fires |
+| `RULE-003` | Typed rule-input rejection codes | 3 | supporting | ✅ pass | {'p-empty-input': 'INPUT_ERROR=yes', 'p-bad-base64': 'DECODE_ERROR=yes', 'p-no-rule-decls': 'VALIDATION_ERROR=yes'} | — |
+| `RULE-004` | Empty embedded ruleset guard | 3 | supporting | ✅ pass | YARA Scanner Critical Error: Critical scanner error: Default YARA_RULE is empty - must provide yarafile parameter | — |
 | `RULE-005` | Comment- and string-aware pack parser | 3 | supporting | ✅ pass | valid 9 + failed 1 + skipped 1 = 11 (pack declares 11; 4 decoys planted) | — |
 | `RULE-006` | private / global rule modifier capture | 3 | supporting | ✅ pass | valid_rules=9, modifier warnings=False | — |
 | `RULE-007` | Pack splitting into preamble + individual rules | 3 | supporting | ✅ pass | valid=9 failed=1 scanned=310 | — |
 | `RULE-008` | Duplicate import de-duplication in the preamble | 3 | supporting | ✅ pass | unique imports: 1 | — |
-| `RULE-009` | include statements passed through verbatim | 3 | supporting | ⛔ blocked | — | needs a pack containing an `include` statement |
+| `RULE-009` | include statements passed through verbatim | 3 | supporting | ✅ pass | an unresolvable include reached the compiler and failed there, rather than being silently stripped or mis-parsed by the pack splitter | — |
 | `RULE-010` | Rule block sanity check | 3 | supporting | ✅ pass | every extracted block passed the sanity check | — |
 | `RULE-011` | Unnamed-rule fallback naming | 3 | low | ✅ pass | unnamed-rule fallback reached: False | probe only: absence does not prove the branch is dead, since it fires on the compile-failure path and this pack's failure had a name |
 | `RULE-012` | Agent module-availability probe | 3 | supporting | ✅ pass | WARNING: YARA cuckoo module not available - rules using it will be skipped | — |
@@ -37,8 +37,8 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `RULE-016` | Post-compile reclassification of inherited-import failures | 3 | supporting | ✅ pass | skipped=1 failed=1 | — |
 | `RULE-017` | Automatic import injection from module usage | 3 | supporting | ✅ pass | import handling recorded in the processing log | — |
 | `RULE-018` | Per-rule trial compile then namespaced whole-pack compile | 3 | supporting | ✅ pass | per-rule trial compile isolated exactly 1 failure | — |
-| `RULE-019` | Duplicate rule names survive | 3 | supporting | ⛔ blocked | — | needs a pack with two rules sharing a name |
-| `RULE-020` | Duplicate-name caveat in the rule-source map | 3 | supporting | ⛔ blocked | — | duplicate-name caveat needs a duplicate-name pack |
+| `RULE-019` | Duplicate rule names survive | 3 | supporting | ✅ pass | 12 files, 0 failed, 24 matches — both same-named rules fired on every file | — |
+| `RULE-020` | Duplicate-name caveat in the rule-source map | 3 | supporting | ✅ pass | duplicate names compiled without failure; the rule-source map's caveat is that it cannot distinguish them, which no artefact surfaces | — |
 | `RULE-021` | Compile-time externals declaration | 3 | supporting | ⛔ blocked | — | externals declaration is internal to the compile call; no artefact reports the declared set |
 | `RULE-022` | Per-file externals at match time | 3 | supporting | ✅ pass | 7 rules fired including filesize-conditioned ones (627 matches) | — |
 | `RULE-023` | Non-short-circuiting match callback | 3 | supporting | ✅ pass | 627 matches over 310 files = 2.0 per file | — |
@@ -65,8 +65,8 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `RULE-044` | Dead cached-hit dict ingestion path in match-field extraction | not_covered | low | — not_covered | — | — |
 | `TRAV-001` | Explicit scan folder parameter | 3 | core | ✅ pass | scan_folder=/tmp/yara_r3_tree targets=['/tmp/yara_r3_tree'] | — |
 | `TRAV-002` | Comma-separated multi-target list | 3 | supporting | ✅ pass | comma-separated '/usr,/var' parsed into ['/usr', '/var'] | — |
-| `TRAV-003` | Per-target validation with independent rejection | 3 | supporting | ⛔ blocked | — | needs a run with one valid and one invalid target |
-| `TRAV-004` | Hard failure when no requested target is valid | 3 | core | ⛔ blocked | — | needs a run where every requested target is invalid |
+| `TRAV-003` | Per-target validation with independent rejection | 3 | supporting | ✅ pass | valid target scanned 12 files alongside a nonexistent one; outcome=completed | — |
+| `TRAV-004` | Hard failure when no requested target is valid | 3 | core | ✅ pass | YARA Scanner Critical Error: Critical scanner error: No valid scan directory among the specified scan folder(s): ['/nonexistent_a_zzz', '/nonexistent_b_zzz'] | — |
 | `TRAV-005` | Windows whole-machine default target discovery | 3 | supporting | ✅ pass | Windows run completed against an explicit target; whole-machine discovery is exercised by the no-target run | default-scope discovery needs a run with no scan_folder on Windows |
 | `TRAV-006` | Linux default target discovery (privilege-aware) | 3 | supporting | ⛔ blocked | — | run r3d-wholefs-linux not archived |
 | `TRAV-007` | macOS default target discovery (privilege-aware) | 3 | supporting | ✅ pass | macOS run targets=['/tmp/yara_r3_tree'] | privilege-aware default discovery needs a no-target run on macOS |
@@ -292,7 +292,7 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `LIFE-039` | Env-var guard: numeric tuning knobs fail safe | 3 | supporting | ✅ pass | numeric knob honoured: YARA_THREADS=8 -> 8 workers; non-numeric values fall back to the default by design | — |
 | `LIFE-040` | Env-var guard: boolean toggles fail safe | 3 | supporting | ✅ pass | boolean toggles honoured: the three monitor flags activated their monitors | — |
 | `LIFE-041` | Post-parse clamping of lifecycle knobs | 3 | supporting | ✅ pass | lifecycle knobs clamped: progress heartbeat produced 5 ticks at its 30 s default | — |
-| `LIFE-042` | alert_severity input validation | 3 | supporting | ✅ pass | alert_severity 'low' accepted; invalid values need a dedicated delivery | — |
+| `LIFE-042` | alert_severity input validation | 3 | supporting | ✅ pass | YARA Scanner Critical Error: Critical scanner error: Invalid alert_severity 'catastrophic'. Use low, medium, or high. | — |
 | `LIFE-043` | scan_folder validation and multi-target contract | 3 | supporting | ✅ pass | scan_targets=['/tmp/yara_r3_tree'] | — |
 | `LIFE-044` | Placeholder-collector-credential abort | 3 | core | ✅ pass | SCAN_RESULT: SCAN ABORTED - XSIAM HTTP Collector credentials are not set. Edit DEFAULT_API_KEY / DEFAULT_API_ENDPOINT (or disable UPLOAD_RESULTS for a local-only scan) an | — |
 | `LIFE-045` | Rule-compilation fatal errors terminate the run before scanning | 3 | core | ✅ pass | 1 rule failed but 9 survived, so the run correctly continued | — |
