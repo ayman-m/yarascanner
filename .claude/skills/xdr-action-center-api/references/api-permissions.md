@@ -13,10 +13,12 @@ editor; the machine keys (in `code`) are what `POST /platform/iam/v1/role` expec
 > insert while datasets still succeed. The two-permission delivery role below was smoke-
 > tested end-to-end: 6/6 finding alerts delivered, 8/8 dataset rows, 0 failed, 0 forbidden.
 
-## Cortex XDR — use two keys, not one
+## Cortex XDR — use three keys, not one
 
-The scanner (on endpoints) and the automation tooling (run/cancel/track) need different
-permissions. Splitting them keeps each key minimal and lets you revoke independently.
+The scanner (on endpoints), the automation tooling (run/cancel/track) and the
+dataset-management pack (consolidate/prune) need different permissions. Splitting them keeps
+each key minimal and lets you revoke independently — which matters most for the third, since
+it is the only one that can delete data.
 
 ### Key 1 — scanner delivery key (embedded in the uploaded script)
 
@@ -58,11 +60,69 @@ restricted to the endpoint groups you actually scan. The built-in **Privileged
 Responder** covers this surface (verified from live role grants) but is broader than
 needed — prefer the custom role.
 
-**Do not** grant the automation key Data Management: dataset pruning
-(`delete_dataset` / `lookups/remove_data`) is a rare maintenance task — run it with the
-delivery key or an interactive admin session.
+**Do not** grant the automation key Data Management: for *this* key's job (run/cancel/track)
+it is not needed. Note this caveat used to end "…dataset pruning is a rare maintenance task
+— run it with the delivery key or an interactive admin session." That is no longer true:
+the `Packs/YaraDatasetManagement` XSOAR pack prunes and consolidates on an unattended
+twice-daily schedule, so pruning is now routine automated behaviour and needs its own key.
+See **Key 3** below.
 
-### Both keys
+### Key 3 — dataset-management key (consolidation + retention pruning)
+
+Used by the `Packs/YaraDatasetManagement` XSOAR pack (`YaraConsolidateStatus`,
+`YaraConsolidateApply`, `YaraReport`, `YaraCleanup`) and by the `xdr_consolidate.py` /
+`xdr_data_management.py` CLIs. It never touches endpoints or scripts — it only reads and
+reshapes lookup datasets.
+
+| Operation (API) | Required permission component | Machine key |
+|---|---|---|
+| List datasets — `xql/get_datasets` | **Data Management** | `data_management_action` |
+| Create per-scan target — `xql/add_dataset` | **Data Management** | `data_management_action` |
+| Write rows — `xql/lookups/add_data` | **Data Management** | `data_management_action` |
+| Remove rows — `xql/lookups/remove_data` | **Data Management** | `data_management_action` |
+| Delete a shard — `xql/delete_dataset` (v2 path) | **Data Management** | `data_management_action` |
+| Read counts/rows/gates — XQL query APIs | **Query Center** | `investigation_query_view` |
+
+**Custom role recipe `yara-dataset-management`:** Data Management + Query Center. No
+endpoint scope (it touches no endpoints), no script components, no External Issues Mapping
+(it creates no alerts).
+
+#### Three findings from enumerating this tenant's real RBAC (2026-08-13)
+
+Taken from `GET /platform/iam/v1/role/permission-config` (91 components) and
+`POST /public_api/v1/rbac/get_roles` for the four built-ins — not from the docs.
+
+1. **Data Management has no view-only tier.** Its row is literally
+   `view=- action=data_management_action`. Every other dataset-ish component in the list has
+   a `view=` variant; this one does not. So *there is no way to grant read-only dataset
+   access* — the moment a key can list or read datasets through this component it can also
+   `delete_dataset`. Least privilege bottoms out here.
+2. **Among the built-in roles, only Admin has Data Management.** Privileged Responder,
+   Responder and Viewer all carry Query Center and Query Library but **not** Data Management.
+   There is therefore no built-in role that fits this pack — a custom role is mandatory
+   unless you are willing to deploy an Admin key, which you should not.
+3. **The granular-looking dataset permissions are not usable in a custom role.** Admin's
+   grant list shows `Create Datasets`, `Dataset Management`, `Datasets Access Control` and
+   `Edit Public Datasets` — none of which appear in `permission-config`, so
+   `POST /platform/iam/v1/role` cannot reference them. They are console/legacy surface names,
+   not custom-role building blocks. Do not go hunting for a narrower dataset role built out
+   of them; it cannot be constructed.
+
+**Consequence for the pack, and why its design is shaped the way it is.** Because the
+delete capability cannot be withheld at the RBAC layer, the guardrails on destructive
+behaviour have to live in the *code*, and they do: `YaraCleanup` is dry-run by default with
+an explicit opt-in argument, applies seven independent safety rails on both selection paths,
+and takes the consolidation lock before deleting. Treat those as the real control — the API
+key is not, and cannot be made, the thing that stops a bad delete.
+
+> **Not yet split empirically: Query Center `view` vs `action`.** Running an XQL query is a
+> read, and the built-in **Viewer** role carries Query Center, which is why
+> `investigation_query_view` is the recommended starting grant. It has not been isolated on
+> a live tenant the way the External-Issues-Mapping finding above was. If XQL returns 403
+> with view only, escalate that one component to `investigation_query_action` and record the
+> result here.
+
+### All keys
 
 - Use the **Advanced** key type (per-request HMAC; replay-resistant — the scanner and
   toolkit auto-detect it) and set an expiry.
