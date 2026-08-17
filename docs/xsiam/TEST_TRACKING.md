@@ -10,10 +10,10 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | Round | Total | pass | fail | blocked | not_run |
 |---|---|---|---|---|---|
 | 1 | 54 | 54 | 0 | 0 | 0 |
-| 2 | 106 | 106 | 0 | 0 | 0 |
+| 2 | 107 | 107 | 0 | 0 | 0 |
 | 3 | 113 | 113 | 0 | 0 | 0 |
 
-**273 of 273 executed.**
+**274 of 274 executed.**
 
 ## All capabilities
 
@@ -239,7 +239,7 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `DELI-044` | Local alert file as the uncapped offset record | 2 | supporting | ✅ pass | complete counts retained, e.g. Total string hits: 6000 | — |
 | `DELI-045` | No in-memory retention of per-offset detail | 2 | supporting | ✅ pass | RSS 58.0 -> 59.6 MB while 3,641 offsets were booked | — |
 | `DELI-046` | Six per-category log files as the local delivery record | 2 | supporting | ✅ pass | 6/6 category logs: ['system', 'statistics', 'performance', 'alerts', 'uploads', 'yara_processing'] | — |
-| `DELI-047` | Upload channels can be disabled independently | not_covered | low | — not_covered | — | — |
+| `DELI-047` | Upload channels can be disabled independently | 2 | low | ✅ pass | both-on match=8 telem=9; RESULTS=False match=0 telem=0 with 1 local alert file(s) and 8 findings; NON_MATCH=False match=8 telem=0 | — |
 | `DELI-048` | Queue-full handling on the findings channel | 2 | supporting | ✅ pass | undelivered findings=0 on a 12,001-finding flood | — |
 | `DELI-049` | Host identity (hostname / os_info / ipAddress) stamped on every uploaded event | 2 | supporting | ✅ pass | all 8 types carry hostname=xsoar os_info=Linux 5.4.0-216-generic [x86_64] ipAddress=Unknown | — |
 | `DELI-050` | Second, non-canonical scan_id inside the "Scan configuration established" payload | 2 | supporting | ✅ pass | config event present | — |

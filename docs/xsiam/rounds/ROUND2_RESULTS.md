@@ -1,8 +1,8 @@
 # Round 2 results — false-positive flood
 
 **Endpoints:** `xsoar` — Ubuntu 20.04; `thor` — Windows 10.0.26200  
-**Criteria:** 106  
-**Result:** 106 pass · 0 fail · 0 blocked · 0 not run
+**Criteria:** 107  
+**Result:** 107 pass · 0 fail · 0 blocked · 0 not run
 
 ## Runs
 
@@ -65,6 +65,7 @@ endpoint's own logs plus the events that reached `yara_scans_raw` on the tenant.
 | `DELI-044` | Local alert file as the uncapped offset record | supporting | ✅ pass | complete counts retained, e.g. Total string hits: 6000 |
 | `DELI-045` | No in-memory retention of per-offset detail | supporting | ✅ pass | RSS 58.0 -> 59.6 MB while 3,641 offsets were booked |
 | `DELI-046` | Six per-category log files as the local delivery record | supporting | ✅ pass | 6/6 category logs: ['system', 'statistics', 'performance', 'alerts', 'uploads', 'yara_processing'] |
+| `DELI-047` | Upload channels can be disabled independently | low | ✅ pass | both-on match=8 telem=9; RESULTS=False match=0 telem=0 with 1 local alert file(s) and 8 findings; NON_MATCH=False match=8 telem=0 |
 | `DELI-048` | Queue-full handling on the findings channel | supporting | ✅ pass | undelivered findings=0 on a 12,001-finding flood |
 | `DELI-049` | Host identity (hostname / os_info / ipAddress) stamped on every uploaded event | supporting | ✅ pass | all 8 types carry hostname=xsoar os_info=Linux 5.4.0-216-generic [x86_64] ipAddress=Unknown |
 | `DELI-050` | Second, non-canonical scan_id inside the "Scan configuration established" paylo… | supporting | ✅ pass | config event present |

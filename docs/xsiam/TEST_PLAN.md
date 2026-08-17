@@ -57,11 +57,11 @@ These were open; they are settled as follows so execution is unambiguous.
 | Round | Title | Capabilities | core | Endpoints | On failure |
 |---|---|---|---|---|---|
 | **1** | Resource discipline | 54 | 6 | `xsoar` | stop-on-fail |
-| **2** | False-positive flood | 106 | 7 | `xsoar`, `thor` | collect-through |
+| **2** | False-positive flood | 107 | 7 | `xsoar`, `thor` | collect-through |
 | **3** | Precision and resilience | 113 | 18 | `xsoar`, `OfficeiMac`, `thor` | collect-through |
-| — | Not covered | 24 | 0 | — | — |
+| — | Not covered | 23 | 0 | — | — |
 
-**Total 297 / 297.** 270 asserted, 3 reachability probes, 24 not covered.
+**Total 297 / 297.** 271 asserted, 3 reachability probes, 23 not covered.
 
 ---
 
@@ -558,7 +558,7 @@ These were open; they are settled as follows so execution is unambiguous.
 
 **Endpoints:** `xsoar`, `thor`  
 **On failure:** collect-through  
-**Capabilities:** 106 (7 core)
+**Capabilities:** 107 (7 core)
 
 **Scenario.** A ruleset that matches nearly every file, over a large seeded tree, on Linux and Windows. Drives caps, aggregation, batching, retry, the alert-footprint ceiling, and the delivery balance sheets to their limits.
 
@@ -877,7 +877,7 @@ These were open; they are settled as follows so execution is unambiguous.
 - **Setup** — Run the round-1 loaded scan twice on xsoar — once with defaults, once with YARA_ENABLE_PERF_MONITOR=true — and pull both statistics_<run_id>.log files over SSH before the third run prunes them.
 - **Evidence** — <scanner_dir>/logs/statistics_<run_id>.log — the literal line `COMPREHENSIVE STATISTICS SUMMARY` between two `====` rules, then `Performance Metrics: {...}` (peak_cpu_percent, avg_cpu_percent, peak_memory_mb, avg_memory_mb, samples_collected), `Time Estimates: {...}`, `Worker Summary: {...}` (per worker: files_processed, avg_processing_time_ms, error_rate_percent); corroborating line `Performance monitoring disabled in light profile` (1602).
 
-## Delivery (53)
+## Delivery (54)
 
 ### `DELI-001` HTTP Collector NDJSON transport
 
@@ -1266,6 +1266,15 @@ These were open; they are settled as follows so execution is unambiguous.
 - **Must be true** — Every run writes exactly six run-scoped category logs under <scanner_dir>/logs sharing one run_id, in the fixed "[ts.ms] [LEVEL] message" format, and uploads_<run_id>.log exists locally only.
 - **Threshold** — exactly 6 category files present for the run's run_id; all six paths appear in data.log_files_created; first line of each parses against ^\[\d{4}-.*\] \[(INFO\|WARNING\|ERROR\|DEBUG)\] ; zero rows in the tenant carry type=="upload".
 - **Evidence** — Listing of /opt/yara_scanner/logs after the run: alerts_, statistics_, scan_errors_, performance_, uploads_, system_ each suffixed <run_id>.log (paths PINNED:1843-1849), plus scan_summary_<run_id>.json; paths echoed in the Logging Summary event's data.log_files_created.
+
+### `DELI-047` Upload channels can be disabled independently
+
+*low* · on `xsoar`
+
+- **Must be true** — The effective values of the two module-level channel switches are visible on the wire in scanner_initialization and are consistent with what each channel actually delivered.
+- **Threshold** — data.upload_enabled == true and data.telemetry_upload_enabled == true on the shipped payload; match_delivery.successful_uploads > 0 and telemetry_delivery.summary.successful_uploads > 0, i.e. the echo is not contradicted by the books.
+- **Setup** — None beyond the round. Note the disabled branches are NOT covered: their evidence lines live in the dead ResultsUploader.upload_results() (PINNED:3515/3557, no callers), and the switches have no env override, so proving the disabled path needs the log_manager wiring described in the capability's observe field.
+- **Evidence** — XQL type="scanner_initialization" fields data.upload_enabled (UPLOAD_RESULTS) and data.telemetry_upload_enabled (UPLOAD_NON_MATCH_DATA); cross-checked against match_delivery and telemetry_delivery in scan_summary_<run_id>.json.
 
 ### `DELI-048` Queue-full handling on the findings channel
 
@@ -2568,7 +2577,6 @@ candidate for a follow-up change rather than a test.
 | `PERF-045` | File-descriptor leak sampling (skipped on every matched file, and on every skipped file) | `needs-instrumentation` | UNOBSERVABLE: a sample that finds nothing emits nothing, so you cannot tell whether a sample ran, was skipped by a match/skip path, or was lost to the unlocked increment. The only artefacts are threshold breaches in `<scanner_dir>/logs/system_<run_id>.log` (`logs_dir` built at 2686, SYSTEM file name at 1785): `Initial file descriptors in use: N` once at startup (6160), then `FD usage increased by <n> (current: <n>)` only when growth exceeds 100 (4970-4973) and `WARNING: High FD usage: <n>`… |
 | `DELI-004` | Approximate byte accounting for batch sizing | `no-artefact` | Inspect request sizes at the collector or on the wire: batches stay near but can overshoot the cap by at most one event. A finding carrying an unusually large matched string is the case to test. |
 | `DELI-006` | Circuit breaker on the telemetry channel | `unsafe-injection` | UNOBSERVABLE: With a dead collector, telemetry POSTs stop entirely for ~40 s windows while the queue grows; the per-type `total` in WebhookUploader.get_upload_statistics() (and scan_summary's telemetry_delivery) stays flat during an open window rather than inflating, and undelivered rises at shutdown. To close it: Minimal instrumentation: in CircuitBreaker.on_failure (1202-1210), emit on the two transitions into 'open' (after 1207 and after 1210) `logging.warning(f"Telemetry circuit opened… |
-| `DELI-047` | Upload channels can be disabled independently | `needs-instrumentation` | UNOBSERVABLE: scanner_initialization data.upload_enabled and data.telemetry_upload_enabled echo the two flags. With UPLOAD_RESULTS False, uploads_<run_id>.log ends with "Upload disabled - N matches saved locally"; with API_ENDPOINT empty it logs "API_ENDPOINT not configured - real-time match upload disabled". To close it: Minimal instrumentation for the live half: give ResultsUploader.__init__ a `log_manager=None` parameter (3174) and set `self.log_manager = log_manager` before the `if… |
 | `DELI-053` | Critical-path events post single-object JSON, not NDJSON — the only non-NDJSON body the collector sees | `no-artefact` | On the wire: a lone JSON object with `Content-Type: application/json` arriving out of band from the `text/plain` NDJSON batches. Locally, in `uploads_<run_id>.log` (path 1784): on a non-2xx, `Critical log immediate send failed (HTTP <code>): ... - falling back to async queue` (1973-1976); on an exception, `Critical log immediate send raised <ExcType>: ... - falling back to async queue (may deliver a duplicate if the request actually landed)` (1983-1986); if the fallback itself fails or no… |
 | `DELI-055` | Circuit-open batches go to the TAIL of the upload queue (telemetry reordering and re-bounce) | `unsafe-injection` | On the wire: during an induced collector outage, event arrival order for a single `scan_id` diverges from the `timestamp` field ordering. Locally there is almost nothing: the open-circuit path writes NO line, and the only failure line this method produces is `Webhook unexpected error for batch: ...` (3693), which goes through `log_manager.log_error` into `scan_errors_<run_id>.log` — NOT the uploads log. On a plain non-2xx or on retry exhaustion this method logs nothing at all. The only… |
 | `LIFE-022` | Fatal worker failure path | `wont-run` | Rewrite Observe to: "Instrumented, but not a live-scan criterion. When it fires, grep <scanner_dir>/logs/scan_errors_<run_id>.log for `Worker <thread-name> fatal error: <exc>` (log_manager.log_error at 4868-4869), followed by `Scan stopped due to fatal failures` (6451), scan_status 'failed' (6462) and outcome='failed' in scan_summary_<run_id>.json (6764). It cannot be provoked by file content - scan_file's blanket handler (5093-5099) and _worker's inner handler (4862-4866) absorb everything… |
