@@ -11,9 +11,9 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 |---|---|---|---|---|---|
 | 1 | 53 | 53 | 0 | 0 | 0 |
 | 2 | 106 | 106 | 0 | 0 | 0 |
-| 3 | 113 | 110 | 0 | 3 | 0 |
+| 3 | 113 | 111 | 0 | 2 | 0 |
 
-**269 of 272 executed.**
+**270 of 272 executed.**
 
 ## All capabilities
 
@@ -257,7 +257,7 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `LIFE-004` | Cancel flag file (control/cancel.flag) | 3 | core | ✅ pass | outcome=cancelled | — |
 | `LIFE-005` | Running marker (control/running.json) and liveness reporting | 1 | supporting | ✅ pass | running.json removed at finish: True | — |
 | `LIFE-006` | Running-marker refresh from two independent sites | 1 | supporting | ✅ pass | 5 heartbeat ticks | — |
-| `LIFE-007` | Stale cancel-flag protection anchored at module import | 3 | supporting | ⛔ blocked | — | stale-flag protection needs a cancel.flag older than the module import, planted before the run |
+| `LIFE-007` | Stale cancel-flag protection anchored at module import | 3 | supporting | ✅ pass | 24.0h-old flag present at import; scan completed=True, flag cleared=True | — |
 | `LIFE-008` | Cancellation watcher thread and poll cadence | 3 | supporting | ✅ pass | cancel to terminal state: ~70s (watcher polls every ~5s) | — |
 | `LIFE-009` | _request_cancel — idempotent, first-source-wins, thread-safe | 3 | supporting | ✅ pass | cancel request recorded once with a single source | — |
 | `LIFE-010` | Bounded cancellation latency in directory traversal (_walk_cancellable) | 3 | core | ✅ pass | walk interrupted mid-scan: 30593 files done when cancelled after 30s | — |

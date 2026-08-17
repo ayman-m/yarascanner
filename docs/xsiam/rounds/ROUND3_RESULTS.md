@@ -2,7 +2,7 @@
 
 **Endpoints:** `xsoar`, `OfficeiMac`, `thor`  
 **Criteria:** 113  
-**Result:** 110 pass · 0 fail · 3 blocked · 0 not run
+**Result:** 111 pass · 0 fail · 2 blocked · 0 not run
 
 ## Runs
 
@@ -147,19 +147,18 @@ reaching them needs something we will not do to a live endpoint.
 |---|---|---|
 | `TRAV-027` | Windows skip-drive mechanism | skip-drive mechanism needs a whole-machine Windows scan |
 | `TRAV-047` | Windows default scan scope is every mounted volume, including network and removable drives | Windows default scope covering every mounted volume needs a no-target whole-machine Windows scan |
-| `LIFE-007` | Stale cancel-flag protection anchored at module import | stale-flag protection needs a cancel.flag older than the module import, planted before the run |
 
 ## All criteria
 
 | ID | Capability | Pri | Status | Evidence |
 |---|---|---|---|---|
-| `LIFE-007` | Stale cancel-flag protection anchored at module import | supporting | ⛔ blocked | stale-flag protection needs a cancel.flag older than the module import, planted before the run |
 | `TRAV-027` | Windows skip-drive mechanism | supporting | ⛔ blocked | skip-drive mechanism needs a whole-machine Windows scan |
 | `TRAV-047` | Windows default scan scope is every mounted volume, including network and remov… | core | ⛔ blocked | Windows default scope covering every mounted volume needs a no-target whole-machine Windows scan |
 | `LIFE-001` | Scan entry point main(yarafile, scan_folder, alert_severity) | core | ✅ pass | main(yarafile, scan_folder, alert_severity) ran to completion |
 | `LIFE-002` | Cancel entry point cancel() — zero inputs | core | ✅ pass | CANCEL_RESULT: Cancel signal delivered (/tmp/yara_r3e/control/cancel.flag) \| scanner running: yes \| scan_id=xsoar_20260817_160806_408571_yara_eb6e98d3355a |
 | `LIFE-003` | CLI dispatch and exit-code contract | supporting | ✅ pass | entry point returned a result line, no traceback |
 | `LIFE-004` | Cancel flag file (control/cancel.flag) | core | ✅ pass | outcome=cancelled |
+| `LIFE-007` | Stale cancel-flag protection anchored at module import | supporting | ✅ pass | 24.0h-old flag present at import; scan completed=True, flag cleared=True |
 | `LIFE-008` | Cancellation watcher thread and poll cadence | supporting | ✅ pass | cancel to terminal state: ~70s (watcher polls every ~5s) |
 | `LIFE-009` | _request_cancel — idempotent, first-source-wins, thread-safe | supporting | ✅ pass | cancel request recorded once with a single source |
 | `LIFE-010` | Bounded cancellation latency in directory traversal (_walk_cancellable) | core | ✅ pass | walk interrupted mid-scan: 30593 files done when cancelled after 30s |
