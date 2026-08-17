@@ -268,6 +268,26 @@ COLLECT_MATCHED_FILES = _env_bool("YARA_COLLECT_MATCHED_FILES", False)
 # The complete list is never lost: the matched file is still on the host (the scanner never
 # quarantines, moves or deletes), so `yara -s <rules> "<path>"` regenerates every offset.
 # 0 disables the cap and restores the old render-everything behaviour.
+# --- CPU governance -------------------------------------------------------
+# Ported wholesale from the XDR edition, which replaced this edition's design after
+# measuring it. The old approach paused on SYSTEM CPU crossing a threshold - a quantity
+# the scanner cannot control. Measured on 8-core Linux: with unrelated load holding ~74%
+# CPU, the scanner parked 285s of a 347s scan waiting for a resume condition that could
+# never arrive, while protecting the competing workload by -3% to +1% versus not
+# throttling at all. It punished itself for load it did not cause.
+#
+# The governor asks instead "how much of the machine am I using?" and holds that under a
+# target, reacting to external load by SHRINKING its own share rather than stopping. It is
+# floored at CPU_FLOOR_PCT so it structurally cannot stall.
+#   headroom - adaptive: always leave CPU_HEADROOM_PCT of the host free (default)
+#   budget   - fixed: never exceed CPU_BUDGET_PCT of the host
+#   none     - disabled
+CPU_GUARANTEE    = (os.environ.get("YARA_CPU_GUARANTEE", "headroom").strip().lower() or "headroom")
+CPU_HEADROOM_PCT = _env_number("YARA_CPU_HEADROOM_PCT", 30, minimum=0)
+CPU_BUDGET_PCT   = _env_number("YARA_CPU_BUDGET_PCT", 25, minimum=0)
+CPU_FLOOR_PCT    = _env_number("YARA_CPU_FLOOR_PCT", 5, minimum=0)
+GOVERNOR_HEARTBEAT_SECS = _env_number("YARA_GOVERNOR_HEARTBEAT_SECS", 30, minimum=0)
+
 MAX_ALERT_OFFSETS_PER_FINDING = _env_number("YARA_MAX_ALERT_OFFSETS", 50, cast=int)
 MAX_ALERT_OFFSETS_PER_FINDING = max(0, MAX_ALERT_OFFSETS_PER_FINDING)
 
@@ -2526,6 +2546,125 @@ class SystemResourceMonitor:
 # CONFIGURATION
 # ============================================================================
 
+class CpuGovernor:
+    """Bounds the scanner's OWN CPU share so the host keeps a guaranteed remainder.
+
+    Replaces the previous system-CPU pause loop, which measured a quantity the scanner
+    cannot control. Measured consequence of that design (8-core Linux, 2026-08-01): with
+    unrelated load holding ~74% CPU, the scanner parked 285s of a 347s scan waiting for a
+    resume condition that could never arrive - while protecting the competing workload by
+    -3% to +1% versus not throttling at all. It punished itself for load it did not cause.
+
+    This governor instead asks "how much of the machine am I using?" and holds that under
+    a target. It reacts to external load only by SHRINKING its own share, never by
+    stopping, so it structurally cannot stall: the target is floored at floor_pct.
+
+    Policies:
+      "headroom" - adaptive; always leave headroom_pct of the host free for other work
+      "budget"   - fixed; never exceed budget_pct of the host
+      "none"     - disabled
+    """
+
+    GAIN = 0.05          # sleep-ratio change per point of CPU error
+    RATIO_MAX = 20.0     # ~5% duty floor; bounds a runaway error term
+    PACE_CAP_SECS = 1.0  # no single pace() sleep longer than this
+
+    def __init__(self, policy="headroom", headroom_pct=30.0, budget_pct=25.0,
+                 floor_pct=5.0, cpu_count=None, log_manager=None):
+        self.policy = str(policy or "none").strip().lower()
+        self.headroom_pct = float(headroom_pct)
+        self.budget_pct = float(budget_pct)
+        self.floor_pct = float(floor_pct)
+        self.cpu_count = int(cpu_count if cpu_count is not None else (os.cpu_count() or 1))
+        self.log_manager = log_manager
+        self.enabled = self.policy in ("headroom", "budget")
+        self.sleep_ratio = 0.0
+        self.slept_total = 0.0
+        self.floor_hits = 0
+        self.last_own = 0.0
+        self.last_others = 0.0
+        self.last_target = None
+        self._lock = threading.Lock()
+
+    def normalise_own(self, raw_pct):
+        """psutil reports PROCESS cpu as a percentage of ONE core - a 4-thread scanner
+        reads 400%. Convert to a share of the whole machine.
+
+        Omitting this holds the scanner to 1/N of the configured budget, and does so
+        invisibly: the scan still runs, still throttles, still reports success. It is
+        simply N times slower than promised, and the bigger the host the worse it gets.
+        """
+        if self.cpu_count <= 0:
+            return float(raw_pct)
+        return float(raw_pct) / self.cpu_count
+
+    def compute_target(self, others_pct):
+        """Target share of the machine for this scanner, per the configured policy."""
+        if not self.enabled:
+            return None
+        if self.policy == "budget":
+            return self.budget_pct
+        target = 100.0 - self.headroom_pct - max(0.0, float(others_pct))
+        if target < self.floor_pct:
+            self.floor_hits += 1
+            return self.floor_pct
+        return target
+
+    def update(self, own_raw_pct, system_pct):
+        """Recompute the sleep ratio from a fresh pair of CPU readings.
+
+        own_raw_pct is psutil's PROCESS reading (percent of one core); system_pct is the
+        machine-wide reading. `others` is what everyone else is using - deriving it as
+        (system - own) is what makes this immune to the original bug: the scanner reacts
+        to external load only by shrinking its own share, never by halting.
+
+        Returns the target share, or None when disabled.
+        """
+        if not self.enabled:
+            return None
+        own = self.normalise_own(own_raw_pct)
+        others = max(0.0, float(system_pct) - own)
+        target = self.compute_target(others)
+        error = own - target
+        with self._lock:
+            ratio = self.sleep_ratio + (self.GAIN * error)
+            self.sleep_ratio = max(0.0, min(self.RATIO_MAX, ratio))
+            self.last_own = own
+            self.last_others = others
+            self.last_target = target
+        return target
+
+    def pace(self, work_secs):
+        """Sleep in proportion to the work just done. Returns seconds slept.
+
+        Proportional rather than fixed sleeping keeps the slowdown factor stable
+        regardless of file size or machine speed, so the promised share holds on a
+        laptop and a 32-core server alike.
+        """
+        if not self.enabled:
+            return 0.0
+        ratio = self.sleep_ratio
+        if ratio <= 0.0:
+            return 0.0
+        secs = min(self.PACE_CAP_SECS, max(0.0, float(work_secs) * ratio))
+        if secs > 0.0:
+            time.sleep(secs)
+            with self._lock:
+                self.slept_total += secs
+        return secs
+
+    def stats(self):
+        return {
+            "policy": self.policy,
+            "target": round(self.last_target, 1) if self.last_target is not None else None,
+            "own": round(self.last_own, 1),
+            "others": round(self.last_others, 1),
+            "ratio": round(self.sleep_ratio, 3),
+            "slept_secs": round(self.slept_total, 2),
+            "floor_hits": self.floor_hits,
+        }
+
+
 class ScanConfig:
     """Configuration class for scan settings and environment setup."""
 
@@ -2641,16 +2780,12 @@ class ScanConfig:
         self.enable_resource_monitoring = ENABLE_RESOURCE_MONITOR
         self.enable_fd_monitoring = ENABLE_FD_MONITOR
         self.track_real_paths = False
-        self.light_throttle_enabled = True
-        # All four throttle knobs take minimum=0: a negative sleep makes Event.wait()
-        # return immediately, turning the throttle into the hot loop it exists to prevent.
+        # How often the governor re-reads CPU. minimum=0 because a negative interval
+        # makes the rate-limit check always true, sampling psutil on every file.
+        # The old YARA_LIGHT_* threshold knobs are gone with the system-CPU pause loop
+        # they drove; CPU behaviour is now the CPU_* governor settings at the top.
         self.throttle_check_interval_secs = _env_number(
-            "YARA_LIGHT_THROTTLE_CHECK_SECS", 0.5, minimum=0)
-        self.high_cpu_threshold = _env_number("YARA_LIGHT_HIGH_CPU", 80, minimum=0)
-        self.critical_cpu_threshold = _env_number("YARA_LIGHT_CRITICAL_CPU", 90, minimum=0)
-        self.throttle_sleep_secs = _env_number("YARA_LIGHT_SLEEP_SECS", 0.02, minimum=0)
-        self.critical_throttle_sleep_secs = _env_number(
-            "YARA_LIGHT_CRITICAL_SLEEP_SECS", 0.08, minimum=0)
+            "YARA_CPU_SAMPLE_SECS", 0.5, minimum=0)
         self.queue_backoff_secs = _env_number("YARA_QUEUE_BACKOFF_SECS", 0.25, minimum=0)
         self.skip_extensions = {
             ".iso", ".img", ".dmg", ".vmdk", ".vhd", ".vhdx", ".qcow", ".qcow2", ".sparsebundle"
@@ -4134,9 +4269,24 @@ class YaraScanner:
         # AppData\Local\Temp got a clean success and zero coverage.
         self.excluded_targets = []
         self.worker_processing_times = defaultdict(list)
-        self.last_throttle_check = 0.0
-        self.last_system_cpu = 0.0
-        self.last_throttle_sleep_secs = 0.0
+        self.cpu_governor = CpuGovernor(
+            policy=CPU_GUARANTEE,
+            headroom_pct=CPU_HEADROOM_PCT,
+            budget_pct=CPU_BUDGET_PCT,
+            floor_pct=CPU_FLOOR_PCT,
+            log_manager=self.log_manager,
+        )
+        # psutil's first cpu_percent() on a new Process always returns 0.0 - prime both
+        # readings so the governor's first real sample means something.
+        try:
+            self._governor_proc = psutil.Process()
+            self._governor_proc.cpu_percent(interval=None)
+            psutil.cpu_percent(interval=None)
+        except Exception:
+            self._governor_proc = None
+        self.last_governor_sample = 0.0
+        self._last_governor_emit = None
+        self._last_governor_emit_at = 0.0
         self.queue_full_events = 0
         
         self.log_manager.log_system(
@@ -4613,33 +4763,42 @@ rule test {{
     
 
 
-    def _maybe_throttle_scanning(self, force=False):
-        """Apply a small pause when the machine is already under CPU pressure."""
-        if not getattr(self.config, "light_throttle_enabled", False):
+    def _sample_governor(self):
+        """Feed the CPU governor a fresh reading. Cheap, rate-limited, fail-open.
+
+        Fail-open is deliberate: if CPU cannot be read we run unthrottled rather than
+        guessing. A scan that silently never finishes is worse than one that runs fast.
+        """
+        if not self.cpu_governor.enabled or self._governor_proc is None:
             return
-
-        sleep_for = 0.0
         now = time.time()
-        with self.lock_throttle:
-            if (not force and
-                (now - self.last_throttle_check) < self.config.throttle_check_interval_secs):
-                sleep_for = self.last_throttle_sleep_secs
-            else:
-                self.last_throttle_check = now
-                self.last_system_cpu = 0.0
-                self.last_throttle_sleep_secs = 0.0
-                try:
-                    self.last_system_cpu = psutil.cpu_percent(interval=None)
-                    if self.last_system_cpu >= self.config.critical_cpu_threshold:
-                        self.last_throttle_sleep_secs = self.config.critical_throttle_sleep_secs
-                    elif self.last_system_cpu >= self.config.high_cpu_threshold:
-                        self.last_throttle_sleep_secs = self.config.throttle_sleep_secs
-                except Exception:
-                    self.last_system_cpu = 0.0
-                sleep_for = self.last_throttle_sleep_secs
+        if (now - self.last_governor_sample) < self.config.throttle_check_interval_secs:
+            return
+        self.last_governor_sample = now
+        try:
+            own_raw = self._governor_proc.cpu_percent(interval=None)
+            system = psutil.cpu_percent(interval=None)
+        except Exception as e:
+            self.cpu_governor.enabled = False
+            self.log_manager.log_performance(
+                f"CPU governor disabled - could not read CPU ({e}). Scan continues unthrottled.")
+            return
+        self.cpu_governor.update(own_raw, system)
 
-        if sleep_for > 0:
-            time.sleep(sleep_for)
+        # Emit on meaningful change OR on a heartbeat: change-only emission produced a
+        # single line across a whole scan on an idle host, and a steady un-throttled scan
+        # is exactly the case a customer wants evidence for.
+        s_ = self.cpu_governor.stats()
+        changed = (self._last_governor_emit is None
+                   or abs(s_["ratio"] - self._last_governor_emit) >= 0.25)
+        heartbeat = (now - self._last_governor_emit_at) >= GOVERNOR_HEARTBEAT_SECS
+        if changed or heartbeat:
+            self._last_governor_emit = s_["ratio"]
+            self._last_governor_emit_at = now
+            self.log_manager.log_performance(
+                f"CPU governor | policy={s_['policy']} target={s_['target']}% "
+                f"own={s_['own']}% others={s_['others']}% ratio={s_['ratio']}",
+                s_)
 
     def _enqueue_scan_path(self, path):
         """Block gently when workers are saturated instead of dropping files."""
@@ -4653,7 +4812,7 @@ rule test {{
                     self.log_manager.log_performance(
                         f"Scan queue saturated ({self.scan_queue.qsize()} items) - backing off producer"
                     )
-                self._maybe_throttle_scanning(force=True)
+                self._sample_governor()
                 time.sleep(self.config.queue_backoff_secs)
             except Exception as e:
                 self.log_manager.log_error(f"Failed to enqueue file for scanning: {e}", {'file_path': path})
@@ -4730,12 +4889,18 @@ rule test {{
                 with self.lock_real_paths:
                     self.scanned_real_paths.add(real_path)
 
-            self._maybe_throttle_scanning()
+            self._sample_governor()
+            _work_started = time.time()
             matches = self.rules.match(
                 filepath=file_path,
                 externals=_build_yara_match_externals(file_path),
                 callback=self._yara_callback,
             )
+            # Pace AFTER the work, proportional to how long it took. The old code gated
+            # BEFORE the match on a system-CPU threshold, which is exactly why it could
+            # park indefinitely without ever doing any work. Proportional sleeping also
+            # keeps the slowdown factor stable regardless of file size or machine speed.
+            self.cpu_governor.pace(time.time() - _work_started)
 
             if matches:
                 file_creation_time = _get_file_creation_time_iso(file_path, st)
@@ -5553,7 +5718,7 @@ rule test {{
                 'resource_monitoring': self.config.enable_resource_monitoring,
                 'webhook_uploading': UPLOAD_RESULTS,
                 'worker_threads': self.config.max_workers,
-                'light_throttling': self.config.light_throttle_enabled,
+                'cpu_policy': CPU_GUARANTEE,
             }
         )
         
