@@ -2,7 +2,7 @@
 
 **Endpoints:** `xsoar`, `OfficeiMac`, `thor`  
 **Criteria:** 121  
-**Result:** 100 pass · 0 fail · 21 blocked · 0 not run
+**Result:** 102 pass · 0 fail · 19 blocked · 0 not run
 
 ## Runs
 
@@ -130,8 +130,6 @@ reaching them needs something we will not do to a live endpoint.
 | `TRAV-017` | Directory-level junction pruning during the walk | directory-level junction pruning needs a planted reparse point |
 | `TRAV-018` | File-level junction skip, counted | file-level junction skip needs a planted reparse point |
 | `TRAV-019` | Real-path deduplication (present but disabled) | real-path deduplication is present but DISABLED by design; no artefact reports it |
-| `TRAV-020` | Skip by file extension (disk-image containers) | disk-image extension skip needs a planted .iso/.vmdk |
-| `TRAV-021` | Skip by exact filename | exact-filename skip needs a planted file with a skipped name |
 | `TRAV-022` | Skip by bounded path fragment | the seeded tree contains no vendor-agent path; component-boundary matching is covered by tests/test_extra_skip_paths.py |
 | `TRAV-023` | Browser caches deliberately NOT skipped | browser caches are deliberately NOT skipped; observing that needs a host with a browser profile in the scan scope |
 | `TRAV-024` | Browser force-scan allowlist (macOS carve-out) | the macOS browser force-scan carve-out needs a real browser cache path in scope |
@@ -159,8 +157,6 @@ reaching them needs something we will not do to a live endpoint.
 | `TRAV-017` | Directory-level junction pruning during the walk | supporting | ⛔ blocked | directory-level junction pruning needs a planted reparse point |
 | `TRAV-018` | File-level junction skip, counted | supporting | ⛔ blocked | file-level junction skip needs a planted reparse point |
 | `TRAV-019` | Real-path deduplication (present but disabled) | supporting | ⛔ blocked | real-path deduplication is present but DISABLED by design; no artefact reports it |
-| `TRAV-020` | Skip by file extension (disk-image containers) | supporting | ⛔ blocked | disk-image extension skip needs a planted .iso/.vmdk |
-| `TRAV-021` | Skip by exact filename | supporting | ⛔ blocked | exact-filename skip needs a planted file with a skipped name |
 | `TRAV-022` | Skip by bounded path fragment | core | ⛔ blocked | the seeded tree contains no vendor-agent path; component-boundary matching is covered by tests/test_extra_skip_paths.py |
 | `TRAV-023` | Browser caches deliberately NOT skipped | supporting | ⛔ blocked | browser caches are deliberately NOT skipped; observing that needs a host with a browser profile in the scan scope |
 | `TRAV-024` | Browser force-scan allowlist (macOS carve-out) | supporting | ⛔ blocked | the macOS browser force-scan carve-out needs a real browser cache path in scope |
@@ -257,6 +253,8 @@ reaching them needs something we will not do to a live endpoint.
 | `TRAV-013` | Unreadable directory entry demoted to a file | supporting | ✅ pass | skip breakdown: {'File too large': 1} |
 | `TRAV-014` | Unreadable directory tolerated, subtree abandoned | supporting | ✅ pass | unreadable dir planted=True, outcome=completed, skips={'File too large': 1} |
 | `TRAV-015` | Junction / reparse-point detection | supporting | ✅ pass | Windows run completed; no junctions were planted (creating one needs elevation on this host) |
+| `TRAV-020` | Skip by file extension (disk-image containers) | supporting | ✅ pass | 19 planted (12 filler + .iso/.vmdk/.dmg + .DS_Store/Thumbs.db/desktop.ini + control.txt) -> 13 scanned, 13 matches |
+| `TRAV-021` | Skip by exact filename | supporting | ✅ pass | 6 skip-listed names planted alongside a control.txt carrying the same matching content; 13 of 19 scanned and control.txt was among them |
 | `TRAV-026` | Windows skip folders with component-boundary matching | supporting | ✅ pass | Windows component-boundary matching ran over 310 files without over-skipping (macOS/Linux parity: 310/309/310) |
 | `TRAV-028` | Linux skip directories | supporting | ✅ pass | 655,232 files attributed to skipped directories; breakdown {'Skipped directory': 655232, 'File does not exist': 1965, 'Not a regular file': 762, 'File too large': 52, 'Special system file': 23} sums to 658,034 = files_s… |
 | `TRAV-029` | macOS skip directories with three matching semantics | supporting | ✅ pass | macOS skipped 2 vs Linux 1 / Windows 1; breakdown {'Junction/symlink skip': 1, 'File too large': 1} |

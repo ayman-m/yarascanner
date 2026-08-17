@@ -11,9 +11,9 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 |---|---|---|---|---|---|
 | 1 | 53 | 53 | 0 | 0 | 0 |
 | 2 | 109 | 99 | 0 | 10 | 0 |
-| 3 | 121 | 100 | 0 | 21 | 0 |
+| 3 | 121 | 102 | 0 | 19 | 0 |
 
-**252 of 283 executed.**
+**254 of 283 executed.**
 
 ## All capabilities
 
@@ -82,8 +82,8 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `TRAV-017` | Directory-level junction pruning during the walk | 3 | supporting | ⛔ blocked | — | directory-level junction pruning needs a planted reparse point |
 | `TRAV-018` | File-level junction skip, counted | 3 | supporting | ⛔ blocked | — | file-level junction skip needs a planted reparse point |
 | `TRAV-019` | Real-path deduplication (present but disabled) | 3 | supporting | ⛔ blocked | — | real-path deduplication is present but DISABLED by design; no artefact reports it |
-| `TRAV-020` | Skip by file extension (disk-image containers) | 3 | supporting | ⛔ blocked | — | disk-image extension skip needs a planted .iso/.vmdk |
-| `TRAV-021` | Skip by exact filename | 3 | supporting | ⛔ blocked | — | exact-filename skip needs a planted file with a skipped name |
+| `TRAV-020` | Skip by file extension (disk-image containers) | 3 | supporting | ✅ pass | 19 planted (12 filler + .iso/.vmdk/.dmg + .DS_Store/Thumbs.db/desktop.ini + control.txt) -> 13 scanned, 13 matches | — |
+| `TRAV-021` | Skip by exact filename | 3 | supporting | ✅ pass | 6 skip-listed names planted alongside a control.txt carrying the same matching content; 13 of 19 scanned and control.txt was among them | — |
 | `TRAV-022` | Skip by bounded path fragment | 3 | core | ⛔ blocked | — | the seeded tree contains no vendor-agent path; component-boundary matching is covered by tests/test_extra_skip_paths.py |
 | `TRAV-023` | Browser caches deliberately NOT skipped | 3 | supporting | ⛔ blocked | — | browser caches are deliberately NOT skipped; observing that needs a host with a browser profile in the scan scope |
 | `TRAV-024` | Browser force-scan allowlist (macOS carve-out) | 3 | supporting | ⛔ blocked | — | the macOS browser force-scan carve-out needs a real browser cache path in scope |
