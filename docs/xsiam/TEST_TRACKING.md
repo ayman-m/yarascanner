@@ -10,10 +10,10 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | Round | Total | pass | fail | blocked | not_run |
 |---|---|---|---|---|---|
 | 1 | 53 | 53 | 0 | 0 | 0 |
-| 2 | 109 | 99 | 0 | 10 | 0 |
+| 2 | 109 | 105 | 0 | 4 | 0 |
 | 3 | 121 | 105 | 0 | 16 | 0 |
 
-**257 of 283 executed.**
+**263 of 283 executed.**
 
 ## All capabilities
 
@@ -169,7 +169,7 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `STOR-009` | Per-rule alert text file (alert/<rule>.txt) | 2 | supporting | ✅ pass | 4 alert files for 4 triggered rules | — |
 | `STOR-010` | Uncapped per-string-ID census in the alert text | 2 | supporting | ✅ pass | 1252 censuses | — |
 | `STOR-011` | Offset cap in the alert text (MAX_ALERT_OFFSETS_PER_FINDING) | 2 | supporting | ✅ pass | showing 50 of 6000, omission note=True | — |
-| `STOR-012` | Condition-only match detail in the alert text | 2 | supporting | ⛔ blocked | — | condition-only match detail needs a condition-only rule — Round 3 |
+| `STOR-012` | Condition-only match detail in the alert text | 2 | supporting | ✅ pass | alert text reads: 'Condition Match Details: Condition-only YARA match; no string instances were produced. Rule: r3_condition_only.' | — |
 | `STOR-013` | Matched-bytes rendering (UTF-16 LE / UTF-8 / hex fallback) | 2 | supporting | ✅ pass | matched-bytes rendering present | — |
 | `STOR-014` | evidence/file_mapping.txt (path -> SHA256 manifest) | 2 | supporting | ✅ pass | file_mapping.txt present | — |
 | `STOR-015` | Evidence ZIP (evidence_<hostname>_<run_id>.zip) | 2 | supporting | ✅ pass | ['/tmp/yara_r2a/evidence/evidence_xsoar_20260817_132700_866138.zip'] | — |
@@ -186,8 +186,8 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `STOR-026` | Linux systemd cleanup unit (yara-cleanup.service) | 2 | supporting | ✅ pass | Linux cleanup script: ['/tmp/yara_r2a/cleanup_script.sh'] | — |
 | `STOR-027` | macOS has no working scheduled-cleanup path | 2 | supporting | ⛔ blocked | — | macOS has no working scheduled-cleanup path — a documented absence; the macOS run is in Round 1/3, not this flood |
 | `STOR-028` | Cleanup scheduling is suppressed on critical errors or zero alerts | 2 | supporting | ✅ pass | flood(12,001 alerts) script=True; clean(0 alerts) script=False; windows clean script=False | — |
-| `STOR-029` | control/cancel.flag — cooperative cancel signal file | 2 | supporting | ⛔ blocked | — | cancel flag is exercised in Round 3 |
-| `STOR-030` | Stale cancel-flag detection and removal | 2 | supporting | ⛔ blocked | — | stale-flag detection is exercised in Round 3 |
+| `STOR-029` | control/cancel.flag — cooperative cancel signal file | 2 | supporting | ✅ pass | flag path echoed by cancel(): True; control/ after teardown: [] | — |
+| `STOR-030` | Stale cancel-flag detection and removal | 2 | supporting | ✅ pass | control/ empty after a cancelled run: True | — |
 | `STOR-031` | control/running.json liveness marker (atomic, refreshed) | 2 | supporting | ✅ pass | control/ after the run: [] | — |
 | `STOR-032` | Control-file teardown at end of scan | 2 | supporting | ✅ pass | control/ empty at teardown: True | — |
 | `STOR-033` | Scanner never quarantines, moves or deletes scanned files | 2 | supporting | ✅ pass | 8,003 files scanned, none quarantined (no move/delete path exists in the scanner) | — |
@@ -203,7 +203,7 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `DELI-008` | match_count vs sampled offsets/strings and the truncated flag | 2 | supporting | ✅ pass | match_count=6000 with 50 offsets shipped, truncated=True | — |
 | `DELI-009` | Uncapped per-string-ID census in the finding (match_ids) | 2 | supporting | ✅ pass | match_ids={'$h': 6000} sums to 6000, match_count=6000 | — |
 | `DELI-010` | yara_match event payload shape (incl. dashboard-flattened aliases) | 2 | supporting | ✅ pass | yara_match events=12,001 | — |
-| `DELI-011` | Condition-only match representation | 2 | supporting | ⛔ blocked | — | needs a condition-only rule (no strings section); the flood pack is all string rules — belongs with the Round 3 rule-shape pack |
+| `DELI-011` | Condition-only match representation | 2 | supporting | ✅ pass | match_scope='rule' on the wire; the local record states 'no string instances were produced' | — |
 | `DELI-012` | One merged alert event per matched file | 2 | supporting | ✅ pass | 4,002 alert events for 12,001 findings (3.0 findings per file) | — |
 | `DELI-013` | Six categorized event types from the log channel | 2 | supporting | ✅ pass | ['alert', 'performance', 'scan_status', 'statistics', 'system', 'yara_match'] | — |
 | `DELI-014` | StandardLogEntry envelope on every event | 2 | supporting | ✅ pass | envelope common to all 8 sampled types: ['hostname', 'ipAddress', 'level', 'message', 'os_info', 'scan_id', 'source', 'timestamp', 'timestamp_iso', 'type', 'uploader_version'] | — |
@@ -232,12 +232,12 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `DELI-037` | scan_summary_<run_id>.json with both delivery books | 2 | supporting | ✅ pass | both books present: True | — |
 | `DELI-038` | Credential placeholder detection and early abort | 2 | supporting | ✅ pass | SCAN_RESULT: SCAN ABORTED - XSIAM HTTP Collector credentials are not set. Edit DEFAULT_API_KEY / DEFAULT_API_ENDPOINT (or disable UPLOAD_RESULTS for a local-only scan) and re-upload the scri | — |
 | `DELI-039` | Result printing and exit-code contract | 2 | supporting | ✅ pass | result printed, no exception | — |
-| `DELI-040` | Cancel entry point and its delivery guarantee | 2 | supporting | ⛔ blocked | — | cancellation is exercised in Round 3 |
+| `DELI-040` | Cancel entry point and its delivery guarantee | 2 | supporting | ✅ pass | CANCEL_RESULT: Cancel signal delivered (/tmp/yara_r3e/control/cancel.flag) \| scanner running: yes \| scan_id=xsoar_202608 -> outcome=cancelled, books balance: True | — |
 | `DELI-041` | Throttled upload logging | 2 | supporting | ✅ pass | 24,035 upload-log lines for 12,001 findings | — |
 | `DELI-042` | Bounded skip-reason labels in shipped aggregates | 2 | supporting | ✅ pass | 0 skip-reason labels: | — |
 | `DELI-043` | Matched-data rendering for the wire | 2 | supporting | ✅ pass | matched-data rendering present | — |
 | `DELI-044` | Local alert file as the uncapped offset record | 2 | supporting | ✅ pass | complete counts retained, e.g. Total string hits: 6000 | — |
-| `DELI-045` | No in-memory retention of per-offset detail | 2 | supporting | ⛔ blocked | — | verified in Round 1 (PERF-034): RSS stayed flat at 58->59.6 MB while 3,641 offsets were booked |
+| `DELI-045` | No in-memory retention of per-offset detail | 2 | supporting | ✅ pass | RSS 58.0 -> 59.6 MB while 3,641 offsets were booked | — |
 | `DELI-046` | Six per-category log files as the local delivery record | 2 | supporting | ✅ pass | 6/6 category logs: ['system', 'statistics', 'performance', 'alerts', 'uploads', 'yara_processing'] | — |
 | `DELI-047` | Upload channels can be disabled independently | not_covered | low | — not_covered | — | — |
 | `DELI-048` | Queue-full handling on the findings channel | 2 | supporting | ✅ pass | undelivered findings=0 on a 12,001-finding flood | — |

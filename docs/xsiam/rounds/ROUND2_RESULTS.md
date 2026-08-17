@@ -2,7 +2,7 @@
 
 **Endpoints:** `xsoar` — Ubuntu 20.04; `thor` — Windows 10.0.26200  
 **Criteria:** 109  
-**Result:** 99 pass · 0 fail · 10 blocked · 0 not run
+**Result:** 105 pass · 0 fail · 4 blocked · 0 not run
 
 ## Runs
 
@@ -24,14 +24,8 @@ reaching them needs something we will not do to a live endpoint.
 
 | ID | Capability | Why |
 |---|---|---|
-| `STOR-012` | Condition-only match detail in the alert text | condition-only match detail needs a condition-only rule — Round 3 |
 | `STOR-027` | macOS has no working scheduled-cleanup path | macOS has no working scheduled-cleanup path — a documented absence; the macOS run is in Round 1/3, not this flood |
-| `STOR-029` | control/cancel.flag — cooperative cancel signal file | cancel flag is exercised in Round 3 |
-| `STOR-030` | Stale cancel-flag detection and removal | stale-flag detection is exercised in Round 3 |
 | `DELI-004` | Approximate byte accounting for batch sizing | byte-accounting for batch sizing is internal; no artefact reports the per-batch byte estimate |
-| `DELI-011` | Condition-only match representation | needs a condition-only rule (no strings section); the flood pack is all string rules — belongs with the Round 3 rule-shape pack |
-| `DELI-040` | Cancel entry point and its delivery guarantee | cancellation is exercised in Round 3 |
-| `DELI-045` | No in-memory retention of per-offset detail | verified in Round 1 (PERF-034): RSS stayed flat at 58->59.6 MB while 3,641 offsets were booked |
 | `DELI-053` | Critical-path events post single-object JSON, not NDJSON — the only non-NDJSON body the c… | single-object vs NDJSON framing is a wire-format detail; the collector normalises both, so no artefact distinguishes them |
 | `DELI-055` | Circuit-open batches go to the TAIL of the upload queue (telemetry reordering and re-boun… | circuit-open reordering needs an induced collector outage |
 
@@ -40,15 +34,9 @@ reaching them needs something we will not do to a live endpoint.
 | ID | Capability | Pri | Status | Evidence |
 |---|---|---|---|---|
 | `DELI-004` | Approximate byte accounting for batch sizing | supporting | ⛔ blocked | byte-accounting for batch sizing is internal; no artefact reports the per-batch byte estimate |
-| `DELI-011` | Condition-only match representation | supporting | ⛔ blocked | needs a condition-only rule (no strings section); the flood pack is all string rules — belongs with the Round 3 rule-shape pack |
-| `DELI-040` | Cancel entry point and its delivery guarantee | supporting | ⛔ blocked | cancellation is exercised in Round 3 |
-| `DELI-045` | No in-memory retention of per-offset detail | supporting | ⛔ blocked | verified in Round 1 (PERF-034): RSS stayed flat at 58->59.6 MB while 3,641 offsets were booked |
 | `DELI-053` | Critical-path events post single-object JSON, not NDJSON — the only non-NDJSON … | supporting | ⛔ blocked | single-object vs NDJSON framing is a wire-format detail; the collector normalises both, so no artefact distinguishes them |
 | `DELI-055` | Circuit-open batches go to the TAIL of the upload queue (telemetry reordering a… | supporting | ⛔ blocked | circuit-open reordering needs an induced collector outage |
-| `STOR-012` | Condition-only match detail in the alert text | supporting | ⛔ blocked | condition-only match detail needs a condition-only rule — Round 3 |
 | `STOR-027` | macOS has no working scheduled-cleanup path | supporting | ⛔ blocked | macOS has no working scheduled-cleanup path — a documented absence; the macOS run is in Round 1/3, not this flood |
-| `STOR-029` | control/cancel.flag — cooperative cancel signal file | supporting | ⛔ blocked | cancel flag is exercised in Round 3 |
-| `STOR-030` | Stale cancel-flag detection and removal | supporting | ⛔ blocked | stale-flag detection is exercised in Round 3 |
 | `DELI-001` | HTTP Collector NDJSON transport | core | ✅ pass | 16,055 events in yara_scans_raw across 10 types |
 | `DELI-002` | NDJSON-only multi-event encoding (JSON array is unsafe) | core | ✅ pass | 16,055 events delivered over 9 telemetry requests (~1784 events/request) |
 | `DELI-003` | Opportunistic (non-timer) batching with event and byte caps | supporting | ✅ pass | 4,054 telemetry events over 9 requests = 450/request (cap 500); 12,001 yara_match went via the match channel |
@@ -57,6 +45,7 @@ reaching them needs something we will not do to a live endpoint.
 | `DELI-008` | match_count vs sampled offsets/strings and the truncated flag | supporting | ✅ pass | match_count=6000 with 50 offsets shipped, truncated=True |
 | `DELI-009` | Uncapped per-string-ID census in the finding (match_ids) | supporting | ✅ pass | match_ids={'$h': 6000} sums to 6000, match_count=6000 |
 | `DELI-010` | yara_match event payload shape (incl. dashboard-flattened aliases) | supporting | ✅ pass | yara_match events=12,001 |
+| `DELI-011` | Condition-only match representation | supporting | ✅ pass | match_scope='rule' on the wire; the local record states 'no string instances were produced' |
 | `DELI-012` | One merged alert event per matched file | supporting | ✅ pass | 4,002 alert events for 12,001 findings (3.0 findings per file) |
 | `DELI-013` | Six categorized event types from the log channel | supporting | ✅ pass | ['alert', 'performance', 'scan_status', 'statistics', 'system', 'yara_match'] |
 | `DELI-014` | StandardLogEntry envelope on every event | supporting | ✅ pass | envelope common to all 8 sampled types: ['hostname', 'ipAddress', 'level', 'message', 'os_info', 'scan_id', 'source', 'timestamp', 'timestamp_iso', 'type', 'uploader_version'] |
@@ -85,10 +74,12 @@ reaching them needs something we will not do to a live endpoint.
 | `DELI-037` | scan_summary_<run_id>.json with both delivery books | supporting | ✅ pass | both books present: True |
 | `DELI-038` | Credential placeholder detection and early abort | supporting | ✅ pass | SCAN_RESULT: SCAN ABORTED - XSIAM HTTP Collector credentials are not set. Edit DEFAULT_API_KEY / DEFAULT_API_ENDPOINT (or disable UPLOAD_RESULTS for a local-only scan) and re-upload the scri |
 | `DELI-039` | Result printing and exit-code contract | supporting | ✅ pass | result printed, no exception |
+| `DELI-040` | Cancel entry point and its delivery guarantee | supporting | ✅ pass | CANCEL_RESULT: Cancel signal delivered (/tmp/yara_r3e/control/cancel.flag) \| scanner running: yes \| scan_id=xsoar_202608 -> outcome=cancelled, books balance: True |
 | `DELI-041` | Throttled upload logging | supporting | ✅ pass | 24,035 upload-log lines for 12,001 findings |
 | `DELI-042` | Bounded skip-reason labels in shipped aggregates | supporting | ✅ pass | 0 skip-reason labels: |
 | `DELI-043` | Matched-data rendering for the wire | supporting | ✅ pass | matched-data rendering present |
 | `DELI-044` | Local alert file as the uncapped offset record | supporting | ✅ pass | complete counts retained, e.g. Total string hits: 6000 |
+| `DELI-045` | No in-memory retention of per-offset detail | supporting | ✅ pass | RSS 58.0 -> 59.6 MB while 3,641 offsets were booked |
 | `DELI-046` | Six per-category log files as the local delivery record | supporting | ✅ pass | 6/6 category logs: ['system', 'statistics', 'performance', 'alerts', 'uploads', 'yara_processing'] |
 | `DELI-048` | Queue-full handling on the findings channel | supporting | ✅ pass | undelivered findings=0 on a 12,001-finding flood |
 | `DELI-049` | Host identity (hostname / os_info / ipAddress) stamped on every uploaded event | supporting | ✅ pass | all 8 types carry hostname=xsoar os_info=Linux 5.4.0-216-generic [x86_64] ipAddress=Unknown |
@@ -126,6 +117,7 @@ reaching them needs something we will not do to a live endpoint.
 | `STOR-009` | Per-rule alert text file (alert/<rule>.txt) | supporting | ✅ pass | 4 alert files for 4 triggered rules |
 | `STOR-010` | Uncapped per-string-ID census in the alert text | supporting | ✅ pass | 1252 censuses |
 | `STOR-011` | Offset cap in the alert text (MAX_ALERT_OFFSETS_PER_FINDING) | supporting | ✅ pass | showing 50 of 6000, omission note=True |
+| `STOR-012` | Condition-only match detail in the alert text | supporting | ✅ pass | alert text reads: 'Condition Match Details: Condition-only YARA match; no string instances were produced. Rule: r3_condition_only.' |
 | `STOR-013` | Matched-bytes rendering (UTF-16 LE / UTF-8 / hex fallback) | supporting | ✅ pass | matched-bytes rendering present |
 | `STOR-014` | evidence/file_mapping.txt (path -> SHA256 manifest) | supporting | ✅ pass | file_mapping.txt present |
 | `STOR-015` | Evidence ZIP (evidence_<hostname>_<run_id>.zip) | supporting | ✅ pass | ['/tmp/yara_r2a/evidence/evidence_xsoar_20260817_132700_866138.zip'] |
@@ -141,6 +133,8 @@ reaching them needs something we will not do to a live endpoint.
 | `STOR-025` | Windows scheduled cleanup task (CleanupScript) | supporting | ✅ pass | Windows: ['C:/yara_r2b/cleanup_script.bat']; Linux: ['/tmp/yara_r2a/cleanup_script.sh'] |
 | `STOR-026` | Linux systemd cleanup unit (yara-cleanup.service) | supporting | ✅ pass | Linux cleanup script: ['/tmp/yara_r2a/cleanup_script.sh'] |
 | `STOR-028` | Cleanup scheduling is suppressed on critical errors or zero alerts | supporting | ✅ pass | flood(12,001 alerts) script=True; clean(0 alerts) script=False; windows clean script=False |
+| `STOR-029` | control/cancel.flag — cooperative cancel signal file | supporting | ✅ pass | flag path echoed by cancel(): True; control/ after teardown: [] |
+| `STOR-030` | Stale cancel-flag detection and removal | supporting | ✅ pass | control/ empty after a cancelled run: True |
 | `STOR-031` | control/running.json liveness marker (atomic, refreshed) | supporting | ✅ pass | control/ after the run: [] |
 | `STOR-032` | Control-file teardown at end of scan | supporting | ✅ pass | control/ empty at teardown: True |
 | `STOR-033` | Scanner never quarantines, moves or deletes scanned files | supporting | ✅ pass | 8,003 files scanned, none quarantined (no move/delete path exists in the scanner) |
