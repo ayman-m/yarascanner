@@ -1,8 +1,8 @@
 # Round 3 results — precision and resilience
 
 **Endpoints:** `xsoar`, `OfficeiMac`, `thor`  
-**Criteria:** 113  
-**Result:** 113 pass · 0 fail · 0 blocked · 0 not run
+**Criteria:** 114  
+**Result:** 114 pass · 0 fail · 0 blocked · 0 not run
 
 ## Runs
 
@@ -254,5 +254,6 @@ percentage while overstating both totals — in the one scenario the counter exi
 | `TRAV-040` | Bounded per-file error labels in the skip breakdown | supporting | ✅ pass | 1 distinct skip labels: ['File too large'] |
 | `TRAV-042` | Scan-configuration disclosure event | supporting | ✅ pass | scan-configuration disclosure event present |
 | `TRAV-044` | Case-folding policy for path matching | supporting | ✅ pass | files_scanned per platform: {'linux': 310, 'macos': 309, 'windows': 310} |
+| `TRAV-045` | macOS case-sensitivity probe file written to /tmp for every file that reaches t… | low | ✅ pass | 400 files scanned -> 1 filesystem probe(s) (was one per file), 0 leftover /tmp probe files |
 | `TRAV-046` | Undocumented skip_breakdown keys: "Permission denied" and "Junction/symlink dup… | low | ✅ pass | skip keys seen: ['File too large']; undocumented keys present: [] |
 | `TRAV-047` | Windows default scan scope is every mounted volume, including network and remov… | core | ✅ pass | scan_folder=None -> ['C:\\', 'D:\\', 'E:\\', 'J:\\'] (3 fixed + 1 removable); 1,246,375 scanned, 325,476 skipped over 5218.19s |

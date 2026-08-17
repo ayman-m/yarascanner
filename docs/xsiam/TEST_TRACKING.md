@@ -11,9 +11,9 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 |---|---|---|---|---|---|
 | 1 | 54 | 54 | 0 | 0 | 0 |
 | 2 | 107 | 107 | 0 | 0 | 0 |
-| 3 | 113 | 113 | 0 | 0 | 0 |
+| 3 | 114 | 114 | 0 | 0 | 0 |
 
-**274 of 274 executed.**
+**275 of 275 executed.**
 
 ## All capabilities
 
@@ -107,7 +107,7 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `TRAV-042` | Scan-configuration disclosure event | 3 | supporting | ✅ pass | scan-configuration disclosure event present | — |
 | `TRAV-043` | No-drop enqueue under backpressure | 1 | core | ✅ pass | scanned=323261 skipped=82104 dropped=0 | — |
 | `TRAV-044` | Case-folding policy for path matching | 3 | supporting | ✅ pass | files_scanned per platform: {'linux': 310, 'macos': 309, 'windows': 310} | — |
-| `TRAV-045` | macOS case-sensitivity probe file written to /tmp for every file that reaches the scan body | not_covered | low | — not_covered | — | — |
+| `TRAV-045` | macOS case-sensitivity probe file written to /tmp for every file that reaches the scan body | 3 | low | ✅ pass | 400 files scanned -> 1 filesystem probe(s) (was one per file), 0 leftover /tmp probe files | — |
 | `TRAV-046` | Undocumented skip_breakdown keys: "Permission denied" and "Junction/symlink duplicate" | 3 | low | ✅ pass | skip keys seen: ['File too large']; undocumented keys present: [] | these keys appear only when their conditions occur; neither did here |
 | `TRAV-047` | Windows default scan scope is every mounted volume, including network and removable drives | 3 | core | ✅ pass | scan_folder=None -> ['C:\\', 'D:\\', 'E:\\', 'J:\\'] (3 fixed + 1 removable); 1,246,375 scanned, 325,476 skipped over 5218.19s | — |
 | `PERF-001` | CPU governor policy selection | 1 | core | ✅ pass | {'r1a-baseline': "6 lines policy={'headroom'}", 'r1d-budget': "2 lines policy={'budget'}", 'r1e-govnone': '0 governor lines (want 0)'} | — |

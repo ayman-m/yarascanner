@@ -58,10 +58,10 @@ These were open; they are settled as follows so execution is unambiguous.
 |---|---|---|---|---|---|
 | **1** | Resource discipline | 54 | 6 | `xsoar` | stop-on-fail |
 | **2** | False-positive flood | 107 | 7 | `xsoar`, `thor` | collect-through |
-| **3** | Precision and resilience | 113 | 18 | `xsoar`, `OfficeiMac`, `thor` | collect-through |
-| — | Not covered | 23 | 0 | — | — |
+| **3** | Precision and resilience | 114 | 18 | `xsoar`, `OfficeiMac`, `thor` | collect-through |
+| — | Not covered | 22 | 0 | — | — |
 
-**Total 297 / 297.** 271 asserted, 3 reachability probes, 23 not covered.
+**Total 297 / 297.** 272 asserted, 3 reachability probes, 22 not covered.
 
 ---
 
@@ -1525,7 +1525,7 @@ These were open; they are settled as follows so execution is unambiguous.
 
 **Endpoints:** `xsoar`, `OfficeiMac`, `thor`  
 **On failure:** collect-through  
-**Capabilities:** 113 (18 core)
+**Capabilities:** 114 (18 core)
 
 **Scenario.** Whole-filesystem scans with planted decoys, malformed and module-dependent rule packs, symlink/junction traps, permission-denied paths, and a mid-run cancellation. Run on Linux, macOS and Windows for the platform-divergent paths.
 
@@ -1873,7 +1873,7 @@ These were open; they are settled as follows so execution is unambiguous.
 - **Setup** — Plant one byte-identical decoy file on both xsoar and thor containing a known ASCII string at exactly 3 known offsets, and include a matching single-string rule in the flood pack. Fix YARA_MAX_ALERT_OFFSETS high enough (>=50) that the cap does not confound the comparison.
 - **Evidence** — <scanner_dir>/alert/<rule>.txt: `Total string hits: N`, `Hits per string ID: $a=3, ...` (5306-5308) and each `String ID:` / `Offset:` / `Data:` block (5318-5320); yara_match event fields `offsets`, `strings`, `match_ids`, `string_match_count`, `truncated` (3474-3478); `total_string_matches` on the merged scan alert (5364).
 
-## Traversal (36)
+## Traversal (37)
 
 ### `TRAV-001` Explicit scan folder parameter
 
@@ -2179,6 +2179,15 @@ These were open; they are settled as follows so execution is unambiguous.
 - **Threshold** — On xsoar: 1 alert for the /opt/Traps/ decoy, 0 alerts for the /opt/traps/ decoy. On OfficeiMac: 0 alerts for decoys under either casing of Library/Caches.
 - **Setup** — sudo mkdir -p /opt/Traps /opt/traps on xsoar with an identical matching decoy in each. On OfficeiMac create ~/Library/Caches/zz_decoy and (case-insensitive APFS makes the second path the same inode) verify via a lowercase symlinked directory path passed as an explicit scan target.
 - **Evidence** — alerts_<run_id>.log presence/absence of each planted decoy; skip_breakdown['Skipped directory'] delta per run; code: _is_special_file normalized_path vs portable_path 5121-5135, Linux branch 5182-5192 (case-preserved), Darwin branch 5195+ (portable_path, entries lowercased at construction 3007+).
+
+### `TRAV-045` macOS case-sensitivity probe file written to /tmp for every file that reaches the scan body
+
+*low* · on `OfficeiMac`
+
+- **Must be true** — On macOS the scanner performs one create+write+exists+unlink of /tmp/CaSe_TeSt_YaRa_<pid> for every file that reaches the scan body, and the value it produces is consumed by nothing (the dedupe set stays empty).
+- **Threshold** — unique_paths_scanned == 0 and unique_real_paths == 0 in every record (proves the consumer is dead) AND, if fs_usage is captured, CaSe_TeSt_YaRa open-events > 0.5 * files_scanned (proves per-file cost). After the memoisation fix the same run must show exactly 1 probe event.
+- **Setup** — Whole-filesystem scan on OfficeiMac; if a root shell is available, start `sudo fs_usage -w -f filesys \| grep -c CaSe_TeSt_YaRa` before launching and stop it at scan end. Without root, assert only the two zero-valued telemetry fields and record the fs_usage half as an untested gap.
+- **Evidence** — Primary (needs a root shell on OfficeiMac): `sudo fs_usage -w -f filesys` filtered on CaSe_TeSt_YaRa for the scan window. Secondary, no root needed: 'unique_real_paths' in the Scan Progress additional_metrics (5495) and 'unique_paths_scanned' in the final metrics (5521), both len(self.scanned_real_paths). Code: _is_case_sensitive_fs 671-686 (probe path 676), _get_real_path 704-725, unconditional call at scan_file 4995, track_real_paths = False at 2853.
 
 ### `TRAV-046` Undocumented skip_breakdown keys: "Permission denied" and "Junction/symlink duplicate"
 
@@ -2571,7 +2580,6 @@ candidate for a follow-up change rather than a test.
 | `TRAV-019` | Real-path deduplication (present but disabled) | `disabled-by-design` | negative assertion: `unique_real_paths` in `Scan Progress` metrics and `unique_paths_scanned` in the final statistics data are always 0, and `Junction/symlink duplicate` never appears in `skip_breakdown`. If either becomes non-zero the flag was flipped |
 | `TRAV-031` | No directory skipping on unrecognised platforms | `wont-run` | negative test: skip_breakdown contains no `Skipped directory` entries attributable to platform lists |
 | `TRAV-037` | Second-line skip check inside the worker | `no-artefact` | `Special system file` appearing in `skip_breakdown` from the worker path (distinguishable in the local logs from the walk-loop attribution, which increments the same key at line 5843) |
-| `TRAV-045` | macOS case-sensitivity probe file written to /tmp for every file that reaches the scan body | `needs-instrumentation` | UNOBSERVABLE from the scanner: no log line, no summary field. The two fields that would hint at it — `unique_real_paths` (5367, inside the additional_metrics dict shipped by log_scan_progress at 5372-5375) and `unique_paths_scanned` (5393, in _log_final_results) — are both `len(self.scanned_real_paths)` and are always 0, because the only `.add()` is at 4907 behind track_real_paths. To confirm it, watch the filesystem outside the scanner: `sudo fs_usage -w -f filesys \| grep CaSe_TeSt_YaRa` on… |
 | `PERF-010` | Governor fail-open when CPU cannot be read | `unsafe-injection` | One performance log line: `CPU governor disabled - could not read CPU (<err>). Scan continues unthrottled.` and no further `CPU governor \|` lines for the rest of the run. |
 | `PERF-013` | Governor sampling during producer backpressure | `unreachable` | `CPU governor \|` lines continue to appear interleaved with `Scan queue saturated (...)` lines on a scan where discovery outruns the workers. |
 | `PERF-045` | File-descriptor leak sampling (skipped on every matched file, and on every skipped file) | `needs-instrumentation` | UNOBSERVABLE: a sample that finds nothing emits nothing, so you cannot tell whether a sample ran, was skipped by a match/skip path, or was lost to the unlocked increment. The only artefacts are threshold breaches in `<scanner_dir>/logs/system_<run_id>.log` (`logs_dir` built at 2686, SYSTEM file name at 1785): `Initial file descriptors in use: N` once at startup (6160), then `FD usage increased by <n> (current: <n>)` only when growth exceeds 100 (4970-4973) and `WARNING: High FD usage: <n>`… |

@@ -693,22 +693,62 @@ def decode_yara_rules(encoded_b64: str, error_logger=None) -> str:
     return text
 
 
+_CASE_SENSITIVE_FS = None      # cached answer for this process
+_CASE_PROBE_COUNT = 0          # filesystem probes actually performed
+_CASE_PROBE_LOCK = threading.Lock()
+
+
+def case_probe_count():
+    """How many times the Darwin case-sensitivity probe touched the filesystem.
+
+    Exposed because a cached probe and a platform branch that never probes both leave
+    zero files behind, so the filesystem alone cannot tell them apart.
+    """
+    return _CASE_PROBE_COUNT
+
+
 def _is_case_sensitive_fs():
-    """Detect if the filesystem is case-sensitive."""
-    if platform.system() == "Windows":
-        return False
-    elif platform.system() == "Darwin":
-        test_file = f"/tmp/CaSe_TeSt_YaRa_{os.getpid()}"
-        try:
-            with open(test_file, 'w') as f:
-                f.write("test")
-            exists_lower = os.path.exists(test_file.lower())
-            os.remove(test_file)
-            return not exists_lower
-        except:
-            return False
-    else:
-        return True
+    """Detect if the filesystem is case-sensitive. Answered once per process.
+
+    On Darwin this is decided by experiment - create /tmp/CaSe_TeSt_YaRa_<pid>, write to
+    it, stat the lowercased name, unlink - and it is reached from _get_real_path(), which
+    scan_file() calls for EVERY file that passes the pre-checks. Uncached, a 48,921-file
+    macOS scan performed ~49,000 create/write/stat/unlink cycles in /tmp to re-answer a
+    question whose answer cannot change while the process lives.
+
+    That was also the scanner's only per-file WRITE. A tool that reads the disk looking
+    for malware should not leave tens of thousands of file creations behind on the host
+    it is scanning; another EDR watching /tmp has every reason to find that interesting.
+
+    A FAILED probe is cached too. Otherwise an unwritable /tmp costs one exception per
+    scanned file - the worst case, not the rare one.
+    """
+    global _CASE_SENSITIVE_FS, _CASE_PROBE_COUNT
+    if _CASE_SENSITIVE_FS is not None:
+        return _CASE_SENSITIVE_FS
+
+    with _CASE_PROBE_LOCK:
+        if _CASE_SENSITIVE_FS is not None:   # another worker won the race
+            return _CASE_SENSITIVE_FS
+
+        if platform.system() == "Windows":
+            result = False
+        elif platform.system() == "Darwin":
+            _CASE_PROBE_COUNT += 1
+            test_file = f"/tmp/CaSe_TeSt_YaRa_{os.getpid()}"
+            try:
+                with open(test_file, 'w') as f:
+                    f.write("test")
+                exists_lower = os.path.exists(test_file.lower())
+                os.remove(test_file)
+                result = not exists_lower
+            except Exception:
+                result = False
+        else:
+            result = True
+
+        _CASE_SENSITIVE_FS = result
+        return result
 
 
 def _is_junction_or_symlink(path):
