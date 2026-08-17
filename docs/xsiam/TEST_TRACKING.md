@@ -10,10 +10,10 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | Round | Total | pass | fail | blocked | not_run |
 |---|---|---|---|---|---|
 | 1 | 53 | 53 | 0 | 0 | 0 |
-| 2 | 106 | 105 | 0 | 1 | 0 |
-| 3 | 113 | 108 | 0 | 5 | 0 |
+| 2 | 106 | 106 | 0 | 0 | 0 |
+| 3 | 113 | 110 | 0 | 3 | 0 |
 
-**266 of 272 executed.**
+**269 of 272 executed.**
 
 ## All capabilities
 
@@ -84,7 +84,7 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `TRAV-019` | Real-path deduplication (present but disabled) | not_covered | supporting | — not_covered | — | Real-path deduplication is present but deliberately disabled, so there is no behaviour to observe. Its absence is recorded against the junction-cycle follow-up. |
 | `TRAV-020` | Skip by file extension (disk-image containers) | 3 | supporting | ✅ pass | 19 planted (12 filler + .iso/.vmdk/.dmg + .DS_Store/Thumbs.db/desktop.ini + control.txt) -> 13 scanned, 13 matches | — |
 | `TRAV-021` | Skip by exact filename | 3 | supporting | ✅ pass | 6 skip-listed names planted alongside a control.txt carrying the same matching content; 13 of 19 scanned and control.txt was among them | — |
-| `TRAV-022` | Skip by bounded path fragment | 3 | core | ⛔ blocked | — | the seeded tree contains no vendor-agent path; component-boundary matching is covered by tests/test_extra_skip_paths.py |
+| `TRAV-022` | Skip by bounded path fragment | 3 | core | ✅ pass | node_modules/ skipped=True, node_modules-bk/ scanned=True — the bounded form matches a whole component, so a prefix sibling survives | — |
 | `TRAV-023` | Browser caches deliberately NOT skipped | 3 | supporting | ✅ pass | scanned under /library/caches/: ['caches/firefox/', 'caches/com.apple.safari/', 'caches/google/chrome/'] | — |
 | `TRAV-024` | Browser force-scan allowlist (macOS carve-out) | 3 | supporting | ✅ pass | 4 scanned; library/caches/firefox reached=True, library/caches/other_app reached=False — the carve-out names browsers rather than re-opening the whole category | — |
 | `TRAV-025` | Boundary skips the force-scan allowlist cannot override | 3 | supporting | ✅ pass | the same firefox cache path was scanned normally (True) but skipped under /volumes/ (True); 4 scanned of 6 planted | — |
@@ -95,7 +95,7 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `TRAV-030` | macOS AppleDouble and .DS_Store file skip | 3 | supporting | ✅ pass | skipped: macOS=2 linux=1 windows=1; macOS breakdown {'Junction/symlink skip': 1, 'File too large': 1} | — |
 | `TRAV-031` | No directory skipping on unrecognised platforms | not_covered | supporting | — not_covered | — | Requires a platform we do not have. The final else-branch of _is_special_file (5230-5231) and the empty-list assignment in ScanConfig (3084-3086) execute only when platform.system() is neither… |
 | `TRAV-032` | Self-skip of the scanner's own directory and log file | 3 | core | ✅ pass | scanner artefacts inside the target: 0 | — |
-| `TRAV-033` | Vendor security-agent path exclusions | 3 | core | ⛔ blocked | — | vendor security-agent exclusions need those paths present; covered as a unit property by tests/test_extra_skip_paths.py |
+| `TRAV-033` | Vendor security-agent path exclusions | 3 | core | ✅ pass | 4,825 files under the real /opt/traps, 0 of them scanned; /opt/traps-backup sibling scanned=True | — |
 | `TRAV-034` | Maximum file size cap | 3 | core | ✅ pass | oversized planted=True, skip breakdown={'File too large': 1} | — |
 | `TRAV-035` | Non-regular-file rejection | 3 | supporting | ✅ pass | 762 non-regular files and 23 special system files rejected on a root scan; outcome=completed | — |
 | `TRAV-036` | Existence and read-access pre-checks | 3 | supporting | ✅ pass | pre-checks let the scan complete over a tree containing an unreadable directory (1 skipped) | — |
@@ -184,7 +184,7 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `STOR-024` | .txt -> .alert rotation performed by the scheduled cleanup | 2 | supporting | ✅ pass | 4 rotated .alert and 0 un-rotated .txt on disk; probe saw the rotation complete before main() returned: True | — |
 | `STOR-025` | Windows scheduled cleanup task (CleanupScript) | 2 | supporting | ✅ pass | Windows: ['C:/yara_r2b/cleanup_script.bat']; Linux: ['/tmp/yara_r2a/cleanup_script.sh'] | — |
 | `STOR-026` | Linux systemd cleanup unit (yara-cleanup.service) | 2 | supporting | ✅ pass | Linux cleanup script: ['/tmp/yara_r2a/cleanup_script.sh'] | — |
-| `STOR-027` | macOS has no working scheduled-cleanup path | 2 | supporting | ⛔ blocked | — | macOS has no working scheduled-cleanup path — a documented absence; the macOS run is in Round 1/3, not this flood |
+| `STOR-027` | macOS has no working scheduled-cleanup path | 2 | supporting | ✅ pass | script written on macOS=True and Linux=True; macOS alerts 7 .txt / 0 .alert, Linux 7 .alert | — |
 | `STOR-028` | Cleanup scheduling is suppressed on critical errors or zero alerts | 2 | supporting | ✅ pass | flood(12,001 alerts) script=True; clean(0 alerts) script=False; windows clean script=False | — |
 | `STOR-029` | control/cancel.flag — cooperative cancel signal file | 2 | supporting | ✅ pass | flag path echoed by cancel(): True; control/ after teardown: [] | — |
 | `STOR-030` | Stale cancel-flag detection and removal | 2 | supporting | ✅ pass | control/ empty after a cancelled run: True | — |

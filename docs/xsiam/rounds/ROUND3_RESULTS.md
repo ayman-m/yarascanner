@@ -2,7 +2,7 @@
 
 **Endpoints:** `xsoar`, `OfficeiMac`, `thor`  
 **Criteria:** 113  
-**Result:** 108 pass · 0 fail · 5 blocked · 0 not run
+**Result:** 110 pass · 0 fail · 3 blocked · 0 not run
 
 ## Runs
 
@@ -145,9 +145,7 @@ reaching them needs something we will not do to a live endpoint.
 
 | ID | Capability | Why |
 |---|---|---|
-| `TRAV-022` | Skip by bounded path fragment | the seeded tree contains no vendor-agent path; component-boundary matching is covered by tests/test_extra_skip_paths.py |
 | `TRAV-027` | Windows skip-drive mechanism | skip-drive mechanism needs a whole-machine Windows scan |
-| `TRAV-033` | Vendor security-agent path exclusions | vendor security-agent exclusions need those paths present; covered as a unit property by tests/test_extra_skip_paths.py |
 | `TRAV-047` | Windows default scan scope is every mounted volume, including network and removable drives | Windows default scope covering every mounted volume needs a no-target whole-machine Windows scan |
 | `LIFE-007` | Stale cancel-flag protection anchored at module import | stale-flag protection needs a cancel.flag older than the module import, planted before the run |
 
@@ -156,9 +154,7 @@ reaching them needs something we will not do to a live endpoint.
 | ID | Capability | Pri | Status | Evidence |
 |---|---|---|---|---|
 | `LIFE-007` | Stale cancel-flag protection anchored at module import | supporting | ⛔ blocked | stale-flag protection needs a cancel.flag older than the module import, planted before the run |
-| `TRAV-022` | Skip by bounded path fragment | core | ⛔ blocked | the seeded tree contains no vendor-agent path; component-boundary matching is covered by tests/test_extra_skip_paths.py |
 | `TRAV-027` | Windows skip-drive mechanism | supporting | ⛔ blocked | skip-drive mechanism needs a whole-machine Windows scan |
-| `TRAV-033` | Vendor security-agent path exclusions | core | ⛔ blocked | vendor security-agent exclusions need those paths present; covered as a unit property by tests/test_extra_skip_paths.py |
 | `TRAV-047` | Windows default scan scope is every mounted volume, including network and remov… | core | ⛔ blocked | Windows default scope covering every mounted volume needs a no-target whole-machine Windows scan |
 | `LIFE-001` | Scan entry point main(yarafile, scan_folder, alert_severity) | core | ✅ pass | main(yarafile, scan_folder, alert_severity) ran to completion |
 | `LIFE-002` | Cancel entry point cancel() — zero inputs | core | ✅ pass | CANCEL_RESULT: Cancel signal delivered (/tmp/yara_r3e/control/cancel.flag) \| scanner running: yes \| scan_id=xsoar_20260817_160806_408571_yara_eb6e98d3355a |
@@ -253,6 +249,7 @@ reaching them needs something we will not do to a live endpoint.
 | `TRAV-017` | Directory-level junction pruning during the walk | supporting | ✅ pass | the problematic junction's subtree was never walked — 3 files scanned, and its contents contributed none |
 | `TRAV-020` | Skip by file extension (disk-image containers) | supporting | ✅ pass | 19 planted (12 filler + .iso/.vmdk/.dmg + .DS_Store/Thumbs.db/desktop.ini + control.txt) -> 13 scanned, 13 matches |
 | `TRAV-021` | Skip by exact filename | supporting | ✅ pass | 6 skip-listed names planted alongside a control.txt carrying the same matching content; 13 of 19 scanned and control.txt was among them |
+| `TRAV-022` | Skip by bounded path fragment | core | ✅ pass | node_modules/ skipped=True, node_modules-bk/ scanned=True — the bounded form matches a whole component, so a prefix sibling survives |
 | `TRAV-023` | Browser caches deliberately NOT skipped | supporting | ✅ pass | scanned under /library/caches/: ['caches/firefox/', 'caches/com.apple.safari/', 'caches/google/chrome/'] |
 | `TRAV-024` | Browser force-scan allowlist (macOS carve-out) | supporting | ✅ pass | 4 scanned; library/caches/firefox reached=True, library/caches/other_app reached=False — the carve-out names browsers rather than re-opening the whole category |
 | `TRAV-025` | Boundary skips the force-scan allowlist cannot override | supporting | ✅ pass | the same firefox cache path was scanned normally (True) but skipped under /volumes/ (True); 4 scanned of 6 planted |
@@ -261,6 +258,7 @@ reaching them needs something we will not do to a live endpoint.
 | `TRAV-029` | macOS skip directories with three matching semantics | supporting | ✅ pass | macOS skipped 2 vs Linux 1 / Windows 1; breakdown {'Junction/symlink skip': 1, 'File too large': 1} |
 | `TRAV-030` | macOS AppleDouble and .DS_Store file skip | supporting | ✅ pass | skipped: macOS=2 linux=1 windows=1; macOS breakdown {'Junction/symlink skip': 1, 'File too large': 1} |
 | `TRAV-032` | Self-skip of the scanner's own directory and log file | core | ✅ pass | scanner artefacts inside the target: 0 |
+| `TRAV-033` | Vendor security-agent path exclusions | core | ✅ pass | 4,825 files under the real /opt/traps, 0 of them scanned; /opt/traps-backup sibling scanned=True |
 | `TRAV-034` | Maximum file size cap | core | ✅ pass | oversized planted=True, skip breakdown={'File too large': 1} |
 | `TRAV-035` | Non-regular-file rejection | supporting | ✅ pass | 762 non-regular files and 23 special system files rejected on a root scan; outcome=completed |
 | `TRAV-036` | Existence and read-access pre-checks | supporting | ✅ pass | pre-checks let the scan complete over a tree containing an unreadable directory (1 skipped) |

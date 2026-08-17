@@ -2,7 +2,7 @@
 
 **Endpoints:** `xsoar` — Ubuntu 20.04; `thor` — Windows 10.0.26200  
 **Criteria:** 106  
-**Result:** 105 pass · 0 fail · 1 blocked · 0 not run
+**Result:** 106 pass · 0 fail · 0 blocked · 0 not run
 
 ## Runs
 
@@ -17,20 +17,10 @@ endpoint's own logs plus the events that reached `yara_scans_raw` on the tenant.
 | `r2d-clean-windows` | `None` | defaults | 200 | 0 | 1.19s | 168.52 f/s | 49 |
 | `r2e-collect-files` | `None` | {'YARA_COLLECT_MATCHED_FILES': 'true'} | 120 | 0 | 2.69s | 44.67 f/s | 291 |
 
-## Blocked
-
-Not failures — the run needed to decide these did not produce the artefact, or
-reaching them needs something we will not do to a live endpoint.
-
-| ID | Capability | Why |
-|---|---|---|
-| `STOR-027` | macOS has no working scheduled-cleanup path | macOS has no working scheduled-cleanup path — a documented absence; the macOS run is in Round 1/3, not this flood |
-
 ## All criteria
 
 | ID | Capability | Pri | Status | Evidence |
 |---|---|---|---|---|
-| `STOR-027` | macOS has no working scheduled-cleanup path | supporting | ⛔ blocked | macOS has no working scheduled-cleanup path — a documented absence; the macOS run is in Round 1/3, not this flood |
 | `DELI-001` | HTTP Collector NDJSON transport | core | ✅ pass | 16,055 events in yara_scans_raw across 10 types |
 | `DELI-002` | NDJSON-only multi-event encoding (JSON array is unsafe) | core | ✅ pass | 16,055 events delivered over 9 telemetry requests (~1784 events/request) |
 | `DELI-003` | Opportunistic (non-timer) batching with event and byte caps | supporting | ✅ pass | 4,054 telemetry events over 9 requests = 450/request (cap 500); 12,001 yara_match went via the match channel |
@@ -126,6 +116,7 @@ reaching them needs something we will not do to a live endpoint.
 | `STOR-024` | .txt -> .alert rotation performed by the scheduled cleanup | supporting | ✅ pass | 4 rotated .alert and 0 un-rotated .txt on disk; probe saw the rotation complete before main() returned: True |
 | `STOR-025` | Windows scheduled cleanup task (CleanupScript) | supporting | ✅ pass | Windows: ['C:/yara_r2b/cleanup_script.bat']; Linux: ['/tmp/yara_r2a/cleanup_script.sh'] |
 | `STOR-026` | Linux systemd cleanup unit (yara-cleanup.service) | supporting | ✅ pass | Linux cleanup script: ['/tmp/yara_r2a/cleanup_script.sh'] |
+| `STOR-027` | macOS has no working scheduled-cleanup path | supporting | ✅ pass | script written on macOS=True and Linux=True; macOS alerts 7 .txt / 0 .alert, Linux 7 .alert |
 | `STOR-028` | Cleanup scheduling is suppressed on critical errors or zero alerts | supporting | ✅ pass | flood(12,001 alerts) script=True; clean(0 alerts) script=False; windows clean script=False |
 | `STOR-029` | control/cancel.flag — cooperative cancel signal file | supporting | ✅ pass | flag path echoed by cancel(): True; control/ after teardown: [] |
 | `STOR-030` | Stale cancel-flag detection and removal | supporting | ✅ pass | control/ empty after a cancelled run: True |
