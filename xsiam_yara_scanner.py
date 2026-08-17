@@ -87,6 +87,51 @@ def _env_number(name, default, cast=float, minimum=None):
     return value
 
 
+def _extra_skip_fragments(env_var="YARA_EXTRA_SKIP_PATHS"):
+    """Deployer-supplied skip fragments, normalised to the bounded "/x/" form.
+
+    The built-in skip lists are Python literals mid-file, so a site running a non-Cortex
+    EDR, a large build-artifact tree or an unusual mount layout had NO supported way to
+    exclude it - the only options were editing the script's internals or not scanning.
+
+    Two properties make this safe to expose:
+
+    ADDITIVE ONLY. The result is appended to the built-in list, never substituted for it.
+    A replace-style knob would let one deployer's typo silently drop the Cortex agent
+    paths, and the scanner would start re-scanning /opt/traps with no visible change.
+
+    BOUNDED. Every entry is forced to a leading and trailing separator, so it matches
+    whole path COMPONENTS only. An unbounded "cyvera" would match any path containing
+    that substring anywhere - which is an evasion vector, not a skip rule: an attacker
+    who can name a directory can then hide anything inside it. "/cyvera/" cannot do that.
+
+    A lone separator is rejected outright: it normalises to "/", which appears in every
+    absolute path and would silently disable the entire scan.
+    """
+    raw = os.environ.get(env_var, "")
+    if not raw.strip():
+        return ()
+    out = []
+    for chunk in raw.split(","):
+        frag = chunk.strip().replace("\\", "/").lower()
+        if not frag:
+            continue
+        if not frag.startswith("/"):
+            frag = "/" + frag
+        if not frag.endswith("/"):
+            frag = frag + "/"
+        if frag == "/":
+            logging.warning(
+                "Ignoring %s entry %r - it matches every path and would disable the scan",
+                env_var, chunk.strip())
+            continue
+        if frag not in out:
+            out.append(frag)
+    if out:
+        logging.info("Extra skip fragments from %s: %s", env_var, ", ".join(out))
+    return tuple(out)
+
+
 def _env_bool(name, default):
     """Read a boolean toggle constant below, honoring an env var override (for automation)
     without letting a malformed one crash the scanner at import time - same fail-safe
@@ -2827,6 +2872,12 @@ class ScanConfig:
             "/appdata/local/temp/",
             "/appdata/local/packages/",
         )
+
+        # Deployer extension point. APPENDED, never substituted: a replace-style knob
+        # would let one typo silently drop the Cortex agent paths above. Entries are
+        # forced to the bounded "/x/" form so they match whole path components only -
+        # see _extra_skip_fragments for why an unbounded fragment is an evasion vector.
+        self.skip_path_fragments = self.skip_path_fragments + _extra_skip_fragments()
         # The four browser cache/profile fragments that used to live above
         # ("/appdata/local/google/chrome/user data/default/cache/",
         #  "/appdata/local/microsoft/edge/user data/default/cache/",
