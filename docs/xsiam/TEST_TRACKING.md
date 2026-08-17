@@ -11,9 +11,9 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 |---|---|---|---|---|---|
 | 1 | 53 | 53 | 0 | 0 | 0 |
 | 2 | 109 | 99 | 0 | 10 | 0 |
-| 3 | 121 | 104 | 0 | 17 | 0 |
+| 3 | 121 | 105 | 0 | 16 | 0 |
 
-**256 of 283 executed.**
+**257 of 283 executed.**
 
 ## All capabilities
 
@@ -45,7 +45,7 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `RULE-024` | Condition-only (no-strings) rule support | 3 | supporting | ✅ pass | condition-only rule produced an alert artefact: True | — |
 | `RULE-025` | Per-rule compilation-failure diagnostics | 3 | supporting | ✅ pass | [2026-08-17 15:07:47.598] [ERROR] === RULE COMPILATION FAILURE #1 === | — |
 | `RULE-026` | failed_rules/ artifact directory | 3 | supporting | ✅ pass | 2 failed_rules artefacts; log references the directory: True | — |
-| `RULE-027` | failed_rules/ is never pruned | 3 | supporting | ⛔ blocked | — | the never-pruned property needs several runs against one scanner dir; each run here uses a fresh directory |
+| `RULE-027` | failed_rules/ is never pruned | 3 | supporting | ✅ pass | 2 run_ids in logs/ after two scans; failed_rules still holds 'failed_rule_lc_broken.yar' | — |
 | `RULE-028` | Un-splittable pack forensics | 3 | supporting | ⛔ blocked | — | un-splittable-pack forensics needs a pack the splitter cannot divide at all |
 | `RULE-029` | Split-stage failure isolation | not_covered | supporting | — not_covered | — | Requires injecting a failure we cannot cause. _get_yara_top_level_statements is a total character-scanner over any str input (no regex backtracking, no parsing that can raise), so no rule text… |
 | `RULE-030` | Three-way valid / failed / skipped accounting | 3 | supporting | ✅ pass | valid=9 failed=1 skipped=1 | — |
@@ -181,7 +181,7 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `STOR-021` | Initial cleanup at scan start (alert/ and evidence/ wiped) | 2 | supporting | ✅ pass | alert dir rebuilt this run: 9,704,660 bytes | — |
 | `STOR-022` | failed_rules/ artefacts are never retention-managed | 2 | supporting | ✅ pass | failed_rules artefacts: 0 (none expected — 0 rules failed) | retention exemption is only observable once a rule fails — Round 3 |
 | `STOR-023` | Cleanup script generated on disk (.bat / .sh) | 2 | supporting | ✅ pass | ['/tmp/yara_r2a/cleanup_script.sh'] | — |
-| `STOR-024` | .txt -> .alert rotation performed by the scheduled cleanup | 2 | supporting | ✅ pass | 4 .alert, 0 .txt in alert/ | rotation is performed by the scheduled cleanup, not the scan — observing the transition needs the scheduled task to fire |
+| `STOR-024` | .txt -> .alert rotation performed by the scheduled cleanup | 2 | supporting | ✅ pass | 4 rotated .alert and 0 un-rotated .txt on disk; probe saw the rotation complete before main() returned: True | — |
 | `STOR-025` | Windows scheduled cleanup task (CleanupScript) | 2 | supporting | ✅ pass | Windows: ['C:/yara_r2b/cleanup_script.bat']; Linux: ['/tmp/yara_r2a/cleanup_script.sh'] | — |
 | `STOR-026` | Linux systemd cleanup unit (yara-cleanup.service) | 2 | supporting | ✅ pass | Linux cleanup script: ['/tmp/yara_r2a/cleanup_script.sh'] | — |
 | `STOR-027` | macOS has no working scheduled-cleanup path | 2 | supporting | ⛔ blocked | — | macOS has no working scheduled-cleanup path — a documented absence; the macOS run is in Round 1/3, not this flood |

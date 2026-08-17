@@ -2,7 +2,7 @@
 
 **Endpoints:** `xsoar`, `OfficeiMac`, `thor`  
 **Criteria:** 121  
-**Result:** 104 pass · 0 fail · 17 blocked · 0 not run
+**Result:** 105 pass · 0 fail · 16 blocked · 0 not run
 
 ## Runs
 
@@ -146,7 +146,6 @@ reaching them needs something we will not do to a live endpoint.
 | ID | Capability | Why |
 |---|---|---|
 | `RULE-021` | Compile-time externals declaration | externals declaration is internal to the compile call; no artefact reports the declared set |
-| `RULE-027` | failed_rules/ is never pruned | the never-pruned property needs several runs against one scanner dir; each run here uses a fresh directory |
 | `RULE-028` | Un-splittable pack forensics | un-splittable-pack forensics needs a pack the splitter cannot divide at all |
 | `RULE-033` | Combined-compile failure reporting | combined-compile failure cannot be constructed deterministically: it needs rules that pass individually but fail together |
 | `TRAV-018` | File-level junction skip, counted | directory junctions are removed by the `dirs[:]` filter, which increments no counter; the counted file-level branch needs a FILE-type reparse point, not a directory junction. mklink /J creates only the latter. |
@@ -171,7 +170,6 @@ reaching them needs something we will not do to a live endpoint.
 | `LIFE-024` | Critical-error path in main() | supporting | ⛔ blocked | the critical-error path needs an induced fatal failure in main() |
 | `LIFE-025` | KeyboardInterrupt handling | supporting | ⛔ blocked | KeyboardInterrupt cannot be delivered through Action Center |
 | `RULE-021` | Compile-time externals declaration | supporting | ⛔ blocked | externals declaration is internal to the compile call; no artefact reports the declared set |
-| `RULE-027` | failed_rules/ is never pruned | supporting | ⛔ blocked | the never-pruned property needs several runs against one scanner dir; each run here uses a fresh directory |
 | `RULE-028` | Un-splittable pack forensics | supporting | ⛔ blocked | un-splittable-pack forensics needs a pack the splitter cannot divide at all |
 | `RULE-033` | Combined-compile failure reporting | supporting | ⛔ blocked | combined-compile failure cannot be constructed deterministically: it needs rules that pass individually but fail together |
 | `TRAV-018` | File-level junction skip, counted | supporting | ⛔ blocked | 3 scanned, 0 skipped |
@@ -244,6 +242,7 @@ reaching them needs something we will not do to a live endpoint.
 | `RULE-024` | Condition-only (no-strings) rule support | supporting | ✅ pass | condition-only rule produced an alert artefact: True |
 | `RULE-025` | Per-rule compilation-failure diagnostics | supporting | ✅ pass | [2026-08-17 15:07:47.598] [ERROR] === RULE COMPILATION FAILURE #1 === |
 | `RULE-026` | failed_rules/ artifact directory | supporting | ✅ pass | 2 failed_rules artefacts; log references the directory: True |
+| `RULE-027` | failed_rules/ is never pruned | supporting | ✅ pass | 2 run_ids in logs/ after two scans; failed_rules still holds 'failed_rule_lc_broken.yar' |
 | `RULE-030` | Three-way valid / failed / skipped accounting | supporting | ✅ pass | valid=9 failed=1 skipped=1 |
 | `RULE-031` | Compilation summary block | supporting | ✅ pass | compilation summary block present |
 | `RULE-032` | All-skipped vs all-failed fatal distinction | supporting | ✅ pass | a partially-failed pack still ran: outcome=completed |

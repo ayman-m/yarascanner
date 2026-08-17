@@ -17,68 +17,6 @@ endpoint's own logs plus the events that reached `yara_scans_raw` on the tenant.
 | `r2d-clean-windows` | `None` | defaults | 200 | 0 | 1.19s | 168.52 f/s | 49 |
 | `r2e-collect-files` | `None` | {'YARA_COLLECT_MATCHED_FILES': 'true'} | 120 | 0 | 2.69s | 44.67 f/s | 291 |
 
-## What the runs measured
-
-### The two delivery channels are separate, and only one publishes its request count
-
-The flood shipped **16,055 events**: 12,001 `yara_match` on the match channel and 4,054
-on the telemetry channel, the latter over 9 requests — **450 events per request**, inside
-the 500 cap. `match_delivery` books FINDINGS, not requests, so dividing all events by the
-telemetry request count reports ~1,784 per request and looks like a cap violation. It is
-not; it is the wrong denominator. Worth knowing before anyone reads these fields in
-anger.
-
-### Counts stay complete when detail is sampled
-
-The 6,000-hit storm finding shipped as:
-
-```
-match_count : 6000
-match_ids   : {"$h": 6000}     <- complete per-string-ID census
-offsets     : [50 entries]     <- sampled
-truncated   : true             <- and it says so
-```
-
-The alert file on disk agrees: `Total string hits: 6000`, `Matched Strings (showing 50 of
-6000)`, `5950 further offset(s) omitted`. Detail degrades; counts never do.
-
-### Every event carries the same envelope
-
-Across all 8 sampled event types: `hostname`, `ipAddress`, `level`, `message`, `os_info`,
-`scan_id`, `source`, `timestamp`, `timestamp_iso`, `type`, `uploader_version`. Host
-identity is on every event, not just the summary — so a finding is attributable without
-joining back to anything.
-
-(`ipAddress` reads `Unknown` on xsoar. The summary's `ip_address` says the same, so the
-two agree, but neither carries a usable address on this host.)
-
-### Books balanced on every run
-
-`failed_uploads: 0` and `undelivered: 0` on both channels, on both platforms, including a
-12,001-finding flood. 12,001 "Queued finding for upload" receipts for 12,001 findings.
-
-### Windows and Linux behaved identically where it counts
-
-Same pack, same seeded tree: **8,003 files and 12,001 matches on both**. The differences
-were the documented ones — `cleanup_script.bat` vs `.sh`, and `file_creation_time` absent
-on Linux.
-
-### Zero-match runs still produce their artefacts — and correctly skip cleanup
-
-The controls (200 files, 0 matches, both platforms) still wrote the summary, the
-lifecycle rows and both delivery books. They created **no** alert directory and **no**
-cleanup script, which is the documented suppression on zero alerts — a distinction a
-flood-only round cannot make.
-
-### Two safety behaviours confirmed by deliberately breaking the configuration
-
-- **Placeholder credentials abort the run**: `SCAN ABORTED - XSIAM HTTP Collector
-  credentials are not set … Nothing was scanned.` No summary is written. The failure this
-  prevents is a scan that looks successful while delivering nowhere.
-- **Matched-file collection is content-addressed**: with the toggle on, 120 identical
-  files collapsed to a single `matched_files/<sha256>` member. With it off (the default),
-  the ZIP has none.
-
 ## Blocked
 
 Not failures — the run needed to decide these did not produce the artefact, or
@@ -199,7 +137,7 @@ reaching them needs something we will not do to a live endpoint.
 | `STOR-021` | Initial cleanup at scan start (alert/ and evidence/ wiped) | supporting | ✅ pass | alert dir rebuilt this run: 9,704,660 bytes |
 | `STOR-022` | failed_rules/ artefacts are never retention-managed | supporting | ✅ pass | failed_rules artefacts: 0 (none expected — 0 rules failed) |
 | `STOR-023` | Cleanup script generated on disk (.bat / .sh) | supporting | ✅ pass | ['/tmp/yara_r2a/cleanup_script.sh'] |
-| `STOR-024` | .txt -> .alert rotation performed by the scheduled cleanup | supporting | ✅ pass | 4 .alert, 0 .txt in alert/ |
+| `STOR-024` | .txt -> .alert rotation performed by the scheduled cleanup | supporting | ✅ pass | 4 rotated .alert and 0 un-rotated .txt on disk; probe saw the rotation complete before main() returned: True |
 | `STOR-025` | Windows scheduled cleanup task (CleanupScript) | supporting | ✅ pass | Windows: ['C:/yara_r2b/cleanup_script.bat']; Linux: ['/tmp/yara_r2a/cleanup_script.sh'] |
 | `STOR-026` | Linux systemd cleanup unit (yara-cleanup.service) | supporting | ✅ pass | Linux cleanup script: ['/tmp/yara_r2a/cleanup_script.sh'] |
 | `STOR-028` | Cleanup scheduling is suppressed on critical errors or zero alerts | supporting | ✅ pass | flood(12,001 alerts) script=True; clean(0 alerts) script=False; windows clean script=False |
