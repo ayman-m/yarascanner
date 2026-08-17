@@ -2670,6 +2670,9 @@ class CpuGovernor:
         self.sleep_ratio = 0.0
         self.slept_total = 0.0
         self.floor_hits = 0
+        self.samples_taken = 0
+        self.last_sample_at = None
+        self.last_sample_gap = None
         self.last_own = 0.0
         self.last_others = 0.0
         self.last_target = None
@@ -2699,13 +2702,15 @@ class CpuGovernor:
             return self.floor_pct
         return target
 
-    def update(self, own_raw_pct, system_pct):
+    def update(self, own_raw_pct, system_pct, now=None):
         """Recompute the sleep ratio from a fresh pair of CPU readings.
 
         own_raw_pct is psutil's PROCESS reading (percent of one core); system_pct is the
         machine-wide reading. `others` is what everyone else is using - deriving it as
         (system - own) is what makes this immune to the original bug: the scanner reacts
         to external load only by shrinking its own share, never by halting.
+
+        `now` is injectable so the sampling cadence can be tested without sleeping.
 
         Returns the target share, or None when disabled.
         """
@@ -2715,12 +2720,23 @@ class CpuGovernor:
         others = max(0.0, float(system_pct) - own)
         target = self.compute_target(others)
         error = own - target
+        stamp = time.time() if now is None else float(now)
         with self._lock:
             ratio = self.sleep_ratio + (self.GAIN * error)
             self.sleep_ratio = max(0.0, min(self.RATIO_MAX, ratio))
             self.last_own = own
             self.last_others = others
             self.last_target = target
+            # Counted where readings are CONSUMED, not where they are logged. The
+            # `CPU governor |` line is emitted on a change threshold plus a 30 s
+            # heartbeat, so line spacing measures the emission policy and not the
+            # sampling rate; on a steady scan the two diverge completely. Without these
+            # an operator cannot tell "readings are steady so nothing is worth emitting"
+            # from "sampling has stalled" - both simply produce fewer lines.
+            self.last_sample_gap = (None if self.last_sample_at is None
+                                    else round(stamp - self.last_sample_at, 3))
+            self.last_sample_at = stamp
+            self.samples_taken += 1
         return target
 
     def pace(self, work_secs):
@@ -2751,6 +2767,9 @@ class CpuGovernor:
             "ratio": round(self.sleep_ratio, 3),
             "slept_secs": round(self.slept_total, 2),
             "floor_hits": self.floor_hits,
+            # Sampling cadence, distinct from the EMISSION cadence these lines appear at.
+            "samples_taken": self.samples_taken,
+            "secs_since_last_sample": self.last_sample_gap,
         }
 
 

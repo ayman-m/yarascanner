@@ -1,8 +1,8 @@
 # Round 1 results — resource discipline
 
-**Endpoint:** `xsoar` — Ubuntu 20.04, 16 cores, 16.7 GB RAM.  
-**Criteria:** 53  
-**Result:** 53 pass · 0 fail · 0 blocked · 0 not run
+**Endpoints:** `xsoar` — Ubuntu 20.04, 16 cores, 16.7 GB RAM; `OfficeiMac` — macOS 15  
+**Criteria:** 54  
+**Result:** 54 pass · 0 fail · 0 blocked · 0 not run
 
 ## Runs
 
@@ -24,6 +24,7 @@ endpoint's own logs plus the events that reached `yara_scans_raw` on the tenant.
 | `r1g-control-3` | `/usr` | defaults | 63,304 | 3,905 | 40.03s | 1581.38 f/s | 132 |
 | `r1h-backpressure` | `/usr` | {'YARA_THREADS': '1', 'YARA_QUEUE_SIZE': '2', 'YARA_QUEUE_BACKOFF_SECS': '0.05'} | 63,304 | 3,905 | 43.36s | 1460.07 f/s | 128 |
 | `r1i-macos` | `/usr,/Applications` | {'YARA_ENABLE_PERF_MONITOR': 'true', 'YARA_ENABLE_RESOURCE_MONITOR': 'true'} | 48,921 | 237,227 | 30.4s | 1609.46 f/s | 162 |
+| `r1j-governor` | `/usr` | defaults | 63,304 | 3,905 | 74.78s | 846.54 f/s | 0 |
 
 Runs were executed **sequentially**. These criteria measure CPU share, and
 concurrent scans would read each other's load as `others`.
@@ -120,6 +121,7 @@ will ever pass.
 | `PERF-006` | Proportional sleep-ratio controller (GAIN, RATIO_MAX) | supporting | ✅ pass | ratio range 0.0..0.0 |
 | `PERF-007` | pace() — post-work proportional sleeping with a per-call cap | supporting | ✅ pass | ratio==0.0 for every sample; no pacing was requested |
 | `PERF-008` | pace() call site is AFTER the YARA match, not before | supporting | ✅ pass | files_scanned=323261 with 0/6 paced samples |
+| `PERF-009` | Governor sampling cadence (rate limit) | low | ✅ pass | samples_taken=104 at 0.501s spacing over a 74.78s scan — ~149 samples against the 30 s line cadence |
 | `PERF-011` | psutil CPU-reading priming | supporting | ✅ pass | first sample own=0.1% |
 | `PERF-012` | Governor telemetry emission policy (change threshold + heartbeat) | supporting | ✅ pass | n=6 median gap=30.2s range=30.1..30.3 |
 | `PERF-014` | Worker thread pool, default 2 and operator-raisable | supporting | ✅ pass | default=2 YARA_THREADS=8 -> 8 |

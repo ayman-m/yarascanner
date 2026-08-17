@@ -56,12 +56,12 @@ These were open; they are settled as follows so execution is unambiguous.
 ## Coverage
 | Round | Title | Capabilities | core | Endpoints | On failure |
 |---|---|---|---|---|---|
-| **1** | Resource discipline | 53 | 6 | `xsoar` | stop-on-fail |
+| **1** | Resource discipline | 54 | 6 | `xsoar` | stop-on-fail |
 | **2** | False-positive flood | 106 | 7 | `xsoar`, `thor` | collect-through |
 | **3** | Precision and resilience | 113 | 18 | `xsoar`, `OfficeiMac`, `thor` | collect-through |
-| — | Not covered | 25 | 0 | — | — |
+| — | Not covered | 24 | 0 | — | — |
 
-**Total 297 / 297.** 269 asserted, 3 reachability probes, 25 not covered.
+**Total 297 / 297.** 270 asserted, 3 reachability probes, 24 not covered.
 
 ---
 
@@ -69,7 +69,7 @@ These were open; they are settled as follows so execution is unambiguous.
 
 **Endpoints:** `xsoar`  
 **On failure:** stop-on-fail  
-**Capabilities:** 53 (6 core)
+**Capabilities:** 54 (6 core)
 
 **Scenario.** A sustained real-filesystem scan on the 8-core Linux host with the CPU governor active. Long enough that monitors, the heartbeat, the worker pool and backpressure all reach steady state rather than finishing in a burst.
 
@@ -103,7 +103,7 @@ These were open; they are settled as follows so execution is unambiguous.
 - **Setup** — Long scan on xsoar with YARA_THREADS=1 and YARA_QUEUE_SIZE=2 so discovery outruns the workers, plus competing CPU load (stress-ng --cpu 6) to keep workers slow.
 - **Evidence** — 'Scan queue saturated (N items) - backing off producer' in /opt/yara_scanner/logs/performance_<run_id>.log (4931-4934); per-target files_found from the 'Target scan completed' statistics records; files_scanned + files_skipped from the final metrics and scan_summary_<run_id>.json. Code: _enqueue_scan_path 4923-4941 (put timeout 1.0s, loop while scan_active).
 
-## Performance (44)
+## Performance (45)
 
 ### `PERF-001` CPU governor policy selection
 
@@ -174,6 +174,14 @@ These were open; they are settled as follows so execution is unambiguous.
 - **Threshold** — Across the full heavy-load window there is no 90-second span in which files_scanned is unchanged while ratio > 0; the longest zero-progress gap is < 60s. A run that stalls with 0 files scanned and a non-zero ratio is a hard fail (this is the regression the governor replaced).
 - **Setup** — Long scan on xsoar with `stress-ng --cpu 7` held for the middle 4 minutes of the run.
 - **Evidence** — files_scanned in successive 'Scan Progress \| Files: N scanned, M skipped \| ...' statistics records in statistics_<run_id>.log (log_scan_progress 2090-2110, emitted every YARA_PROGRESS_LOG_SECS=30) correlated with ratio from the 'CPU governor \|' performance records; code scan_file 5012-5020 (_sample_governor, _work_started, rules.match, cpu_governor.pace).
+
+### `PERF-009` Governor sampling cadence (rate limit)
+
+*low* · on `xsoar`
+
+- **Must be true** — Not assertable today: no artefact records when a sample was taken, only when a line was emitted, and emission is separately gated by the change/heartbeat policy.
+- **Threshold** — n/a
+- **Evidence** — None. _sample_governor 4887-4896 returns early on (now - last_governor_sample) < throttle_check_interval_secs without logging; the only emitted record is the change/heartbeat-gated 'CPU governor \|' line at 4917-4921, whose spacing measures the emit policy, not the sample rate.
 
 ### `PERF-011` psutil CPU-reading priming
 
@@ -2555,7 +2563,6 @@ candidate for a follow-up change rather than a test.
 | `TRAV-031` | No directory skipping on unrecognised platforms | `wont-run` | negative test: skip_breakdown contains no `Skipped directory` entries attributable to platform lists |
 | `TRAV-037` | Second-line skip check inside the worker | `no-artefact` | `Special system file` appearing in `skip_breakdown` from the worker path (distinguishable in the local logs from the walk-loop attribution, which increments the same key at line 5843) |
 | `TRAV-045` | macOS case-sensitivity probe file written to /tmp for every file that reaches the scan body | `needs-instrumentation` | UNOBSERVABLE from the scanner: no log line, no summary field. The two fields that would hint at it — `unique_real_paths` (5367, inside the additional_metrics dict shipped by log_scan_progress at 5372-5375) and `unique_paths_scanned` (5393, in _log_final_results) — are both `len(self.scanned_real_paths)` and are always 0, because the only `.add()` is at 4907 behind track_real_paths. To confirm it, watch the filesystem outside the scanner: `sudo fs_usage -w -f filesys \| grep CaSe_TeSt_YaRa` on… |
-| `PERF-009` | Governor sampling cadence (rate limit) | `needs-instrumentation` | UNOBSERVABLE: Frequency of `CPU governor \|` performance lines is bounded by this interval combined with the emit policy below; with a debug build, `last_governor_sample` advances at most every 0.5 s. minimum=0 is deliberate — a negative value would make the check always true and sample psutil on every file. To close it: Instrument _sample_governor (line 4887). Add `self._governor_sample_count = 0` beside line 4408, then immediately after line 4898 insert `self._governor_sample_count += 1` and… |
 | `PERF-010` | Governor fail-open when CPU cannot be read | `unsafe-injection` | One performance log line: `CPU governor disabled - could not read CPU (<err>). Scan continues unthrottled.` and no further `CPU governor \|` lines for the rest of the run. |
 | `PERF-013` | Governor sampling during producer backpressure | `unreachable` | `CPU governor \|` lines continue to appear interleaved with `Scan queue saturated (...)` lines on a scan where discovery outruns the workers. |
 | `PERF-045` | File-descriptor leak sampling (skipped on every matched file, and on every skipped file) | `needs-instrumentation` | UNOBSERVABLE: a sample that finds nothing emits nothing, so you cannot tell whether a sample ran, was skipped by a match/skip path, or was lost to the unlocked increment. The only artefacts are threshold breaches in `<scanner_dir>/logs/system_<run_id>.log` (`logs_dir` built at 2686, SYSTEM file name at 1785): `Initial file descriptors in use: N` once at startup (6160), then `FD usage increased by <n> (current: <n>)` only when growth exceeds 100 (4970-4973) and `WARNING: High FD usage: <n>`… |

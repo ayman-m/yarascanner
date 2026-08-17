@@ -9,11 +9,11 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 
 | Round | Total | pass | fail | blocked | not_run |
 |---|---|---|---|---|---|
-| 1 | 53 | 53 | 0 | 0 | 0 |
+| 1 | 54 | 54 | 0 | 0 | 0 |
 | 2 | 106 | 106 | 0 | 0 | 0 |
 | 3 | 113 | 113 | 0 | 0 | 0 |
 
-**272 of 272 executed.**
+**273 of 273 executed.**
 
 ## All capabilities
 
@@ -118,7 +118,7 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `PERF-006` | Proportional sleep-ratio controller (GAIN, RATIO_MAX) | 1 | supporting | ✅ pass | ratio range 0.0..0.0 | — |
 | `PERF-007` | pace() — post-work proportional sleeping with a per-call cap | 1 | supporting | ✅ pass | ratio==0.0 for every sample; no pacing was requested | slept_secs not surfaced in the text line — consistent with zero pacing |
 | `PERF-008` | pace() call site is AFTER the YARA match, not before | 1 | supporting | ✅ pass | files_scanned=323261 with 0/6 paced samples | — |
-| `PERF-009` | Governor sampling cadence (rate limit) | not_covered | low | — not_covered | — | — |
+| `PERF-009` | Governor sampling cadence (rate limit) | 1 | low | ✅ pass | samples_taken=104 at 0.501s spacing over a 74.78s scan — ~149 samples against the 30 s line cadence | — |
 | `PERF-010` | Governor fail-open when CPU cannot be read | not_covered | supporting | — not_covered | — | Reaching the fail-open branch needs psutil's CPU read to raise, which cannot be induced on a live endpoint without breaking the host. |
 | `PERF-011` | psutil CPU-reading priming | 1 | supporting | ✅ pass | first sample own=0.1% | — |
 | `PERF-012` | Governor telemetry emission policy (change threshold + heartbeat) | 1 | supporting | ✅ pass | n=6 median gap=30.2s range=30.1..30.3 | — |
