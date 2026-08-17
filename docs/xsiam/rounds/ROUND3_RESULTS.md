@@ -14,7 +14,7 @@ endpoint's own logs plus the events that reached `yara_scans_raw` on the tenant.
 | `r3a-shapes-linux` | `None` | defaults | 310 | 1 | 3.87s | 80.07 f/s | 993 |
 | `r3b-shapes-macos` | `None` | defaults | 309 | 2 | 3.4s | 90.85 f/s | 991 |
 | `r3c-shapes-windows` | `None` | defaults | 310 | 1 | 3.17s | 97.85 f/s | 992 |
-| `r3e-cancel-linux` | `whole filesystem` | defaults | 34,575 | 21 | 157.66s | 219.3 f/s | 92,143 |
+| `r3e-cancel-linux` | `whole filesystem` | defaults | 30,593 | 21 | 99.47s | 307.55 f/s | 66,161 |
 
 ## What the runs measured
 
@@ -63,17 +63,30 @@ removed rather than left behind to report a phantom running scanner.
 This is the scenario the counter exists for. The failure it prevents is a cancelled scan
 reporting success while silently dropping 18% of its findings.
 
-### One number to follow up
+### The 500-finding book discrepancy — found, fixed, re-verified
 
-The result line and the settled summary disagree by exactly 500 — one upload batch. The
-line reported `ok=57,004`; the summary records `successful_uploads=57,504`. The code
-anticipates this direction (the line is computed before the last batch settles, and can
-only under-report), but `successful + undelivered = 69,650` then exceeds the run's 69,150
-findings by that same 500, which the one-item-per-finding grain does not explain.
+The first cancelled run booked `ok + undelivered = 69,650` against 69,150 findings. The
+uploads log named the cause at the same timestamp as its own "final" ledger:
+`Upload thread did not terminate within 60s timeout`.
 
-Not filed as a failure: the uploads log's terminal `Match delivery final:` ledger sits
-past the 2 MB collection cap applied to that run, so the authoritative internal view was
-not read. Worth resolving before trusting these two fields to agree on a cancelled run.
+`_upload_worker` consulted its stop flag only in the `except Empty` branch — unreachable
+against a full queue, which is precisely the condition the flag exists for. So after the
+drain budget expired and the sentinel was queued behind 12,146 items, the loop kept
+sending; the join timed out; `stop()` booked those items `undelivered`; and the live
+thread then delivered 1,000 of them into `successful_uploads`. The same items in two
+buckets.
+
+The flag is now checked before taking work. Re-run on the fixed build:
+
+```
+ok 35,504 + failed 0 + undelivered 25,682 = 61,186
+findings                                  = 61,186   balanced
+```
+
+This mattered beyond arithmetic: the operator's result line derives its shortfall
+denominator from `ok+failed+undelivered`, so the inflated sum understated the loss
+percentage while overstating both totals — in the one scenario the counter exists for.
+
 
 ## Blocked
 
@@ -148,21 +161,21 @@ reaching them needs something we will not do to a live endpoint.
 | `TRAV-037` | Second-line skip check inside the worker | supporting | ⛔ blocked | the worker's second-line skip check shares one skip_reasons key with the producer's, so no artefact separates the two arms |
 | `TRAV-047` | Windows default scan scope is every mounted volume, including network and remov… | core | ⛔ blocked | Windows default scope covering every mounted volume needs a no-target whole-machine Windows scan |
 | `LIFE-001` | Scan entry point main(yarafile, scan_folder, alert_severity) | core | ✅ pass | main(yarafile, scan_folder, alert_severity) ran to completion |
-| `LIFE-002` | Cancel entry point cancel() — zero inputs | core | ✅ pass | CANCEL_RESULT: Cancel signal delivered (/tmp/yara_r3e/control/cancel.flag) \| scanner running: yes \| scan_id=xsoar_20260817_151119_897352_yara_eb6e98d3355a |
+| `LIFE-002` | Cancel entry point cancel() — zero inputs | core | ✅ pass | CANCEL_RESULT: Cancel signal delivered (/tmp/yara_r3e/control/cancel.flag) \| scanner running: yes \| scan_id=xsoar_20260817_160806_408571_yara_eb6e98d3355a |
 | `LIFE-003` | CLI dispatch and exit-code contract | supporting | ✅ pass | entry point returned a result line, no traceback |
 | `LIFE-004` | Cancel flag file (control/cancel.flag) | core | ✅ pass | outcome=cancelled |
-| `LIFE-008` | Cancellation watcher thread and poll cadence | supporting | ✅ pass | cancel to terminal state: ~40s (watcher polls every ~5s) |
+| `LIFE-008` | Cancellation watcher thread and poll cadence | supporting | ✅ pass | cancel to terminal state: ~70s (watcher polls every ~5s) |
 | `LIFE-009` | _request_cancel — idempotent, first-source-wins, thread-safe | supporting | ✅ pass | cancel request recorded once with a single source |
-| `LIFE-010` | Bounded cancellation latency in directory traversal (_walk_cancellable) | core | ✅ pass | walk interrupted mid-scan: 34575 files done when cancelled after 30s |
-| `LIFE-011` | Worker-side cancellation and drain | core | ✅ pass | workers drained: files_scanned=34575 at cancel |
+| `LIFE-010` | Bounded cancellation latency in directory traversal (_walk_cancellable) | core | ✅ pass | walk interrupted mid-scan: 30593 files done when cancelled after 30s |
+| `LIFE-011` | Worker-side cancellation and drain | core | ✅ pass | workers drained: files_scanned=30593 at cancel |
 | `LIFE-012` | Worker join with bounded timeout | supporting | ✅ pass | Worker cleanup: 2 stopped, 0 timed out |
 | `LIFE-013` | Cancel-flag consumption and marker removal at shutdown | supporting | ✅ pass | cancel flag consumed and marker removed at shutdown: True |
-| `LIFE-014` | Backlog-proportional shutdown drain | supporting | ✅ pass | drain books after cancel: match={'total_matches': 69150, 'successful_uploads': 57504, 'failed_uploads': 0, 'undelivered': 12146} telemetry={'total_uploads': 9, 'successful_uploads': 9, 'failed_uploads': 0, 'undelivered'… |
+| `LIFE-014` | Backlog-proportional shutdown drain | supporting | ✅ pass | ok 35,504 + failed 0 + undelivered 25,682 = 61,186 against 61,186 findings on a cancelled run |
 | `LIFE-019` | Outcome classification (completed / cancelled / failed) | core | ✅ pass | outcome classified as cancelled (not completed, not failed) |
 | `LIFE-020` | Outcome agreement in end-of-scan telemetry | supporting | ✅ pass | summary outcome=cancelled with 5 lifecycle rows delivered |
-| `LIFE-023` | Evidence and terminal telemetry survive a fatal failure | supporting | ✅ pass | terminal telemetry survived cancellation: {'yara_match': 57504, 'alert': 34576, 'system': 33, 'performance': 10, 'statistics': 8, 'scan_status': 5} |
+| `LIFE-023` | Evidence and terminal telemetry survive a fatal failure | supporting | ✅ pass | terminal telemetry survived cancellation: {'yara_match': 35504, 'alert': 30594, 'system': 33, 'performance': 10, 'statistics': 8, 'scan_status': 5} |
 | `LIFE-026` | Guaranteed finalisation order in main()'s finally block | supporting | ✅ pass | finally-block ran: summary written and outcome recorded |
-| `LIFE-031` | Cancelled runs never report 'Scan completed' | core | ✅ pass | SCAN_RESULT: Scan cancelled (source=action_center): 34575 files scanned \| 1 rules failed compilation \| 1 rules skipped (module unavailable) \| 69150 matches found \| WARNING: 12146 o |
+| `LIFE-031` | Cancelled runs never report 'Scan completed' | core | ✅ pass | SCAN_RESULT: Scan cancelled (source=action_center): 30593 files scanned \| 1 rules failed compilation \| 1 rules skipped (module unavailable) \| 61186 matches found \| WARNING: 25682 o |
 | `LIFE-034` | Excluded-target detection | supporting | ✅ pass | excluded_targets=[] |
 | `LIFE-035` | Per-file outcome classification and skip reasons | supporting | ✅ pass | per-file outcomes reconcile: breakdown {'File too large': 1} sums to 1, files_skipped=1 |
 | `LIFE-036` | Bounded skip reason for per-file scan errors | supporting | ✅ pass | labels bounded: ['File too large'] |
@@ -180,7 +193,7 @@ reaching them needs something we will not do to a live endpoint.
 | `LIFE-053` | scan_system finally-block guarantee | supporting | ✅ pass | scan_system finally block produced its artefacts |
 | `LIFE-055` | Cleanup scheduling gated on rule-processing health | supporting | ✅ pass | cleanup scheduled after a run with 1 failed rule and 627 alerts: ['/tmp/yara_r3a/cleanup_script.sh'] |
 | `LIFE-061` | Scanner working-directory selection (shared by both entry points) | supporting | ✅ pass | both entry points resolve the same scanner working directory |
-| `LIFE-062` | `cancel` as the first CLI argument (cancel keyword dispatch) | supporting | ✅ pass | CANCEL_RESULT: Cancel signal delivered (/tmp/yara_r3e/control/cancel.flag) \| scanner running: yes \| scan_id=xsoar_20260817_151119_897352_yara_eb6e98d3355a |
+| `LIFE-062` | `cancel` as the first CLI argument (cancel keyword dispatch) | supporting | ✅ pass | CANCEL_RESULT: Cancel signal delivered (/tmp/yara_r3e/control/cancel.flag) \| scanner running: yes \| scan_id=xsoar_20260817_160806_408571_yara_eb6e98d3355a |
 | `LIFE-063` | Critical-error handler prints the Python traceback to STDOUT before the result … | supporting | ✅ pass | no traceback on a healthy run; the handler's output needs an induced fatal error |
 | `LIFE-064` | Placeholder-credential abort still wipes alert/, evidence/ and old run logs fir… | supporting | ✅ pass | placeholder abort wrote no scan summary: aborted=True no_summary=True |
 | `RULE-001` | Base64-only rule input | core | ✅ pass | valid_rules=9 rule_hash=eb6e98d3355a0376 |

@@ -252,19 +252,19 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `DELI-057` | Per-finding "Queued finding for upload" receipt in the uploads log (only local view of the truncated flag) | 2 | supporting | ✅ pass | 12,001 receipts for 12,001 findings | — |
 | `DELI-058` | performance_summary / performance_metrics blocks in the two terminal events | 2 | supporting | ✅ pass | both terminal events carry their metrics blocks | — |
 | `LIFE-001` | Scan entry point main(yarafile, scan_folder, alert_severity) | 3 | core | ✅ pass | main(yarafile, scan_folder, alert_severity) ran to completion | — |
-| `LIFE-002` | Cancel entry point cancel() — zero inputs | 3 | core | ✅ pass | CANCEL_RESULT: Cancel signal delivered (/tmp/yara_r3e/control/cancel.flag) \| scanner running: yes \| scan_id=xsoar_20260817_151119_897352_yara_eb6e98d3355a | — |
+| `LIFE-002` | Cancel entry point cancel() — zero inputs | 3 | core | ✅ pass | CANCEL_RESULT: Cancel signal delivered (/tmp/yara_r3e/control/cancel.flag) \| scanner running: yes \| scan_id=xsoar_20260817_160806_408571_yara_eb6e98d3355a | — |
 | `LIFE-003` | CLI dispatch and exit-code contract | 3 | supporting | ✅ pass | entry point returned a result line, no traceback | — |
 | `LIFE-004` | Cancel flag file (control/cancel.flag) | 3 | core | ✅ pass | outcome=cancelled | — |
 | `LIFE-005` | Running marker (control/running.json) and liveness reporting | 1 | supporting | ✅ pass | running.json removed at finish: True | — |
 | `LIFE-006` | Running-marker refresh from two independent sites | 1 | supporting | ✅ pass | 5 heartbeat ticks | — |
 | `LIFE-007` | Stale cancel-flag protection anchored at module import | 3 | supporting | ⛔ blocked | — | stale-flag protection needs a cancel.flag older than the module import, planted before the run |
-| `LIFE-008` | Cancellation watcher thread and poll cadence | 3 | supporting | ✅ pass | cancel to terminal state: ~40s (watcher polls every ~5s) | — |
+| `LIFE-008` | Cancellation watcher thread and poll cadence | 3 | supporting | ✅ pass | cancel to terminal state: ~70s (watcher polls every ~5s) | — |
 | `LIFE-009` | _request_cancel — idempotent, first-source-wins, thread-safe | 3 | supporting | ✅ pass | cancel request recorded once with a single source | — |
-| `LIFE-010` | Bounded cancellation latency in directory traversal (_walk_cancellable) | 3 | core | ✅ pass | walk interrupted mid-scan: 34575 files done when cancelled after 30s | — |
-| `LIFE-011` | Worker-side cancellation and drain | 3 | core | ✅ pass | workers drained: files_scanned=34575 at cancel | — |
+| `LIFE-010` | Bounded cancellation latency in directory traversal (_walk_cancellable) | 3 | core | ✅ pass | walk interrupted mid-scan: 30593 files done when cancelled after 30s | — |
+| `LIFE-011` | Worker-side cancellation and drain | 3 | core | ✅ pass | workers drained: files_scanned=30593 at cancel | — |
 | `LIFE-012` | Worker join with bounded timeout | 3 | supporting | ✅ pass | Worker cleanup: 2 stopped, 0 timed out | — |
 | `LIFE-013` | Cancel-flag consumption and marker removal at shutdown | 3 | supporting | ✅ pass | cancel flag consumed and marker removed at shutdown: True | — |
-| `LIFE-014` | Backlog-proportional shutdown drain | 3 | supporting | ✅ pass | drain books after cancel: match={'total_matches': 69150, 'successful_uploads': 57504, 'failed_uploads': 0, 'undelivered': 12146} telemetry={'total_uploads': 9, 'successful_uploads': 9,… | — |
+| `LIFE-014` | Backlog-proportional shutdown drain | 3 | supporting | ✅ pass | ok 35,504 + failed 0 + undelivered 25,682 = 61,186 against 61,186 findings on a cancelled run | — |
 | `LIFE-015` | Honest undelivered accounting after the drain window | 2 | core | ✅ pass | undelivered: match=0 telemetry=0 on a 12,001-finding flood | — |
 | `LIFE-016` | Idempotent uploader stop | 2 | supporting | ✅ pass | uploader stopped cleanly | — |
 | `LIFE-017` | scan_status lifecycle values and the terminal status | 2 | supporting | ✅ pass | scan_status rows=5 | — |
@@ -273,7 +273,7 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `LIFE-020` | Outcome agreement in end-of-scan telemetry | 3 | supporting | ✅ pass | summary outcome=cancelled with 5 lifecycle rows delivered | — |
 | `LIFE-021` | scan_completion_summary metrics block | 2 | supporting | ✅ pass | completion summary delivered | — |
 | `LIFE-022` | Fatal worker failure path | not_covered | supporting | — not_covered | — | Requires injecting a failure we cannot safely cause: scan_file's blanket handler (5093-5099 equivalent) and _worker's inner handler (4859-4866) absorb everything the loop body can raise, so only a… |
-| `LIFE-023` | Evidence and terminal telemetry survive a fatal failure | 3 | supporting | ✅ pass | terminal telemetry survived cancellation: {'yara_match': 57504, 'alert': 34576, 'system': 33, 'performance': 10, 'statistics': 8, 'scan_status': 5} | — |
+| `LIFE-023` | Evidence and terminal telemetry survive a fatal failure | 3 | supporting | ✅ pass | terminal telemetry survived cancellation: {'yara_match': 35504, 'alert': 30594, 'system': 33, 'performance': 10, 'statistics': 8, 'scan_status': 5} | — |
 | `LIFE-024` | Critical-error path in main() | 3 | supporting | ⛔ blocked | — | the critical-error path needs an induced fatal failure in main() |
 | `LIFE-025` | KeyboardInterrupt handling | 3 | supporting | ⛔ blocked | — | KeyboardInterrupt cannot be delivered through Action Center |
 | `LIFE-026` | Guaranteed finalisation order in main()'s finally block | 3 | supporting | ✅ pass | finally-block ran: summary written and outcome recorded | — |
@@ -281,7 +281,7 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `LIFE-028` | scan_summary field contract | 2 | core | ✅ pass | 27/27 fields present | — |
 | `LIFE-029` | Duration derivation for the summary | 2 | supporting | ✅ pass | duration_secs=35.24 | — |
 | `LIFE-030` | Operator result line composition | 2 | supporting | ✅ pass | SCAN_RESULT: Scan completed: 8003 files scanned \| 0 rules failed compilation \| 12001 matches found | — |
-| `LIFE-031` | Cancelled runs never report 'Scan completed' | 3 | core | ✅ pass | SCAN_RESULT: Scan cancelled (source=action_center): 34575 files scanned \| 1 rules failed compilation \| 1 rules skipped (module unavailable) \| 69150 matches found \| WARNING: 12146 o | — |
+| `LIFE-031` | Cancelled runs never report 'Scan completed' | 3 | core | ✅ pass | SCAN_RESULT: Scan cancelled (source=action_center): 30593 files scanned \| 1 rules failed compilation \| 1 rules skipped (module unavailable) \| 61186 matches found \| WARNING: 25682 o | — |
 | `LIFE-032` | Match-channel delivery shortfall on the result line | 2 | core | ✅ pass | no shortfall to surface (undelivered=0) | — |
 | `LIFE-033` | Telemetry upload-error surfacing | 2 | supporting | ✅ pass | failed_uploads=0 | — |
 | `LIFE-034` | Excluded-target detection | 3 | supporting | ✅ pass | excluded_targets=[] | — |
@@ -312,7 +312,7 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `LIFE-059` | Artefact retention across runs (bounded observability window) | 2 | supporting | ✅ pass | 1 run_ids in logs/ | — |
 | `LIFE-060` | Root-logger quieting during a scan | 2 | supporting | ✅ pass | diagnostics sink 2,842 bytes; stdout 326 bytes | — |
 | `LIFE-061` | Scanner working-directory selection (shared by both entry points) | 3 | supporting | ✅ pass | both entry points resolve the same scanner working directory | — |
-| `LIFE-062` | `cancel` as the first CLI argument (cancel keyword dispatch) | 3 | supporting | ✅ pass | CANCEL_RESULT: Cancel signal delivered (/tmp/yara_r3e/control/cancel.flag) \| scanner running: yes \| scan_id=xsoar_20260817_151119_897352_yara_eb6e98d3355a | — |
+| `LIFE-062` | `cancel` as the first CLI argument (cancel keyword dispatch) | 3 | supporting | ✅ pass | CANCEL_RESULT: Cancel signal delivered (/tmp/yara_r3e/control/cancel.flag) \| scanner running: yes \| scan_id=xsoar_20260817_160806_408571_yara_eb6e98d3355a | — |
 | `LIFE-063` | Critical-error handler prints the Python traceback to STDOUT before the result line | 3 | supporting | ✅ pass | no traceback on a healthy run; the handler's output needs an induced fatal error | — |
 | `LIFE-064` | Placeholder-credential abort still wipes alert/, evidence/ and old run logs first — and writes no scan summary | 3 | supporting | ✅ pass | placeholder abort wrote no scan summary: aborted=True no_summary=True | — |
 | `LIFE-065` | One failing scan target is abandoned mid-walk; the rest of the scan continues and still reports success | not_covered | supporting | — not_covered | — | Requires injecting a failure we cannot safely cause on a live tenant. The handler only fires for non-OSError exceptions raised by the loop body (log_manager calls, _is_special_file,… |
