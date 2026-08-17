@@ -3837,10 +3837,26 @@ class WebhookUploader:
 class EvidenceCollector:
     """Collects and packages matched files as evidence."""
     
-    def __init__(self, config):
+    def __init__(self, config, log_manager=None):
         self.config = config
+        # Explicit, because config never carries one: the collector is built inside
+        # YaraScanner.__init__, which already has the real LogManager.
+        self.log_manager = log_manager
         self.matched_files = set()
         self.file_hashes = {}
+
+    def _log(self, message, data=None):
+        """Route evidence diagnostics to LogManager, not the root logger.
+
+        setup_logging() removes every root handler and pins the level to WARNING, so the
+        logging.info() calls these replaced produced NOTHING - on any host, ever. The
+        dedupe and metadata-only paths were working and completely unobservable: the only
+        way to confirm either had run was to crack the ZIP open by hand. A capability with
+        no evidence trail cannot be a test criterion.
+        """
+        lm = self.log_manager or getattr(self.config, "log_manager", None)
+        if lm:
+            lm.log_system(message, data)
 
     def add_matched_file(self, file_path, file_sha256=None):
         """Add matched file to collection."""
@@ -3910,10 +3926,10 @@ class EvidenceCollector:
                     except Exception as e:
                         logging.error(f"Error adding file to zip {file_path}: {e}")
             else:
-                logging.info(
+                self._log(
                     "Evidence: COLLECT_MATCHED_FILES=false - packaging metadata only "
-                    "(paths + SHA256 + alert texts, no matched file copies)"
-                )
+                    "(paths + SHA256 + alert texts, no matched file copies)",
+                    {"collect_matched_files": False})
 
             for alert_file in os.listdir(self.config.alert_dir):
                 if alert_file.endswith(".txt"):
@@ -3923,10 +3939,11 @@ class EvidenceCollector:
             zip_file.write(self.config.file_mapping, "file_mapping.txt")
 
         if duplicates_skipped:
-            logging.info(
+            self._log(
                 f"Evidence ZIP: {len(packaged_hashes)} unique file(s) packaged, "
-                f"{duplicates_skipped} duplicate copy(ies) skipped"
-            )
+                f"{duplicates_skipped} duplicate copy(ies) skipped",
+                {"unique_files_packaged": len(packaged_hashes),
+                 "duplicate_copies_skipped": duplicates_skipped})
 
 
 class CleanupManager:
@@ -4226,7 +4243,7 @@ class YaraScanner:
         self.skip_reasons = defaultdict(int)
         self.last_log_time = time.time()
         self.last_scanned_file = ""
-        self.evidence_collector = EvidenceCollector(config)
+        self.evidence_collector = EvidenceCollector(config, log_manager=self.log_manager)
         self.detection_counts = defaultdict(int)
         self.total_detections = 0
         self.results_uploader = ResultsUploader(config)
