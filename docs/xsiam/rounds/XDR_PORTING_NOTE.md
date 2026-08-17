@@ -1,8 +1,12 @@
 # Fixes on this branch that the XDR edition does not have
 
 Everything here was found and fixed in `xsiam_yara_scanner.py` during the three
-acceptance rounds. `xdr_yara_scanner.py` was deliberately **not touched** — the work was
+acceptance rounds. No round-driven fix was applied to `xdr_yara_scanner.py` — the work was
 scoped to XSIAM — so this records the drift rather than closing it.
+
+(The XDR file *does* change elsewhere on this branch, in the sixteen commits that predate
+the rounds. Those were cross-edition fixes applied to both editions together. Nothing
+below is among them.)
 
 Line numbers are from the XDR file as of this branch and will move.
 
