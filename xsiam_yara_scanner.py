@@ -340,6 +340,14 @@ GOVERNOR_HEARTBEAT_SECS = _env_number("YARA_GOVERNOR_HEARTBEAT_SECS", 30, minimu
 # the one that produced a 220 MB alert file on a single endpoint.
 MAX_ALERT_OFFSETS_PER_FINDING = _env_number("YARA_MAX_ALERT_OFFSETS", 50, cast=int, minimum=0)
 
+# Ceiling on the TOTAL bytes this run may add under alert/. Per-finding caps
+# (MAX_ALERT_OFFSETS_PER_FINDING) bound each record but say nothing about the sum: F files
+# x R rules is unbounded, so a noisy ruleset on a small endpoint disk had no ceiling at all.
+# 0 disables the ceiling. On reaching it, offset DETAIL is dropped and the per-finding
+# count lines are still written - degrading detail while keeping counts complete is the
+# invariant, because the counts are what the tenant-side numbers are reconciled against.
+ALERT_DIR_MAX_BYTES = int(_env_number("YARA_ALERT_DIR_MAX_MB", 256, minimum=0) * 1024 * 1024)
+
 # How many runs' logs and scan summaries survive a prune. This was a bare `keep_scans=2`
 # default in the method signature - invisible to anyone reading the config block, and
 # unreachable without editing the body. Two runs is also thin: the previous run's evidence
@@ -4338,6 +4346,10 @@ class YaraScanner:
         self.evidence_collector = EvidenceCollector(config, log_manager=self.log_manager)
         self.detection_counts = defaultdict(int)
         self.total_detections = 0
+        # Footprint accounting for ALERT_DIR_MAX_BYTES. Guarded by lock_alert, which is
+        # already held around every alert write.
+        self._alert_bytes_written = 0
+        self._alert_detail_suppressed = 0
         self.results_uploader = ResultsUploader(config)
         self.lock_counts = threading.Lock()
         self.lock_files = threading.Lock()
@@ -5268,6 +5280,12 @@ rule test {{
             alert_path = os.path.join(self.config.alert_dir, f"{rule}.txt")
             with self.lock_alert:
                 try:
+                    _over_budget = (ALERT_DIR_MAX_BYTES > 0
+                                    and getattr(self, "_alert_bytes_written", 0) >= ALERT_DIR_MAX_BYTES)
+                    try:
+                        _size_before = os.path.getsize(alert_path)
+                    except OSError:
+                        _size_before = 0
                     with open(alert_path, "a", encoding="utf-8") as f:
                         f.write(f"\nYARA rule '{rule}' matched file: {file_path}\n")
                         if file_sha256:
@@ -5275,7 +5293,7 @@ rule test {{
                         if file_creation_time:
                             f.write(f"File Creation Time: {file_creation_time}\n")
                         f.write("=" * 80 + "\n")
-                        if strings:
+                        if strings and not _over_budget:
                             # Census first, and deliberately UNCAPPED: which string in the
                             # rule fired and how many times is the detail an analyst works
                             # from, and it costs one line no matter how many offsets there
@@ -5307,12 +5325,30 @@ rule test {{
                                     f"(YARA_MAX_ALERT_OFFSETS={cap}). Counts above are complete; "
                                     f"re-run `yara -s` against this file for every offset.\n")
                                 f.write("-" * 40 + "\n")
+                        elif strings:
+                            # Past the byte ceiling. The COUNT still ships - it is what the
+                            # tenant-side totals reconcile against - only the per-offset
+                            # detail is dropped.
+                            f.write(f"Total string hits: {len(strings)}\n")
+                            f.write(
+                                f"Offset detail omitted: alert directory byte budget "
+                                f"reached (YARA_ALERT_DIR_MAX_MB). Counts above and on the "
+                                f"tenant remain complete; re-run `yara -s` against this "
+                                f"file for offsets.\n")
+                            f.write("-" * 40 + "\n")
+                            self._alert_detail_suppressed = getattr(
+                                self, "_alert_detail_suppressed", 0) + 1
                         elif condition_only_detail:
                             f.write("Condition Match Details:\n")
                             f.write("-" * 40 + "\n")
                             f.write(condition_only_detail + "\n")
                             f.write("-" * 40 + "\n")
                         f.flush()
+                    try:
+                        self._alert_bytes_written = getattr(self, "_alert_bytes_written", 0) + max(
+                            0, os.path.getsize(alert_path) - _size_before)
+                    except OSError:
+                        pass
                 except (IOError, OSError) as e:
                     if hasattr(self, 'log_manager'):
                         self.log_manager.log_error(f"Failed to write alert file: {e}")
@@ -6741,6 +6777,13 @@ def main(yarafile=None, scan_folder=None, alert_severity="low"):
                         "skipped_rules": getattr(_el, "skipped_rules_count", 0),
                         "scan_rate_fps": (round(getattr(scanner, "files_scanned", 0) / _dur, 2)
                                           if _dur and _dur > 0 else 0),
+                        # Host footprint. alert_detail_suppressed > 0 means the byte
+                        # ceiling was reached and per-offset detail was dropped for that
+                        # many findings - the counts above are still complete, so a
+                        # non-zero value explains a thin alert file without implying loss.
+                        "alert_bytes_written": getattr(scanner, "_alert_bytes_written", None),
+                        "alert_detail_suppressed": getattr(scanner, "_alert_detail_suppressed", 0),
+                        "alert_dir_max_bytes": ALERT_DIR_MAX_BYTES,
                         # Delivery books. match_delivery is the findings channel (one item
                         # per rule/file finding); telemetry_delivery is everything else.
                         "match_delivery": _match_books,

@@ -246,6 +246,15 @@ CONFIG_ALERT_MAX_PER_SCAN = 500         # max per-finding alerts per scan; beyon
 # YARA_MAX_ALERT_OFFSETS) and a bare literal here made XDR strictly less tunable than
 # XSIAM on the one axis that drives per-finding upload volume.
 CONFIG_LOOKUP_ROWS_PER_FINDING_MAX = _env_number("YARA_LOOKUP_ROWS_PER_FINDING", 50, cast=int, minimum=0)
+
+# Ceiling on the TOTAL bytes this run may add under alert/. Per-finding caps bound each
+# record but say nothing about the sum: F files x R rules is unbounded, so a noisy ruleset
+# on a small endpoint disk had no ceiling at all. 0 disables it. On reaching it, offset
+# DETAIL is dropped while the per-finding count lines are still written - degrading detail
+# and keeping counts complete is the invariant, because the counts are what the tenant-side
+# dataset totals are reconciled against. The ceiling triggers degradation rather than a
+# hard stop, so the final size overshoots it by the compact records still being written.
+CONFIG_ALERT_DIR_MAX_BYTES = int(_env_number("YARA_ALERT_DIR_MAX_MB", 256, minimum=0) * 1024 * 1024)
 # Offsets RENDERED per (rule, file) in the local alert/<rule>.txt. Ported from the XSIAM
 # edition, where the unbounded version produced a 220 MB file on one endpoint - 98.6% of
 # it from four Windows event logs, because a rule hunting PowerShell strings legitimately
@@ -5097,6 +5106,9 @@ class YaraScanner:
         self.evidence_collector = EvidenceCollector(config, log_manager=self.log_manager)
         self.detection_counts = defaultdict(int)
         self.total_detections = 0
+        # Footprint accounting for CONFIG_ALERT_DIR_MAX_BYTES, guarded by lock_alert.
+        self._alert_bytes_written = 0
+        self._alert_detail_suppressed = 0
         self.results_uploader = ResultsUploader(config)
         self.lookup_uploader = LookupDatasetUploader(config, self.log_manager)
         self.lock_counts = threading.Lock()
@@ -6493,6 +6505,12 @@ rule test {{
             alert_path = os.path.join(self.config.alert_dir, f"{rule}.txt")
             with self.lock_alert:
                 try:
+                    _over_budget = (CONFIG_ALERT_DIR_MAX_BYTES > 0
+                                    and getattr(self, "_alert_bytes_written", 0) >= CONFIG_ALERT_DIR_MAX_BYTES)
+                    try:
+                        _size_before = os.path.getsize(alert_path)
+                    except OSError:
+                        _size_before = 0
                     with open(alert_path, "a", encoding="utf-8") as f:
                         f.write(f"\nYARA rule '{rule}' matched file: {file_path}\n")
                         if file_sha256:
@@ -6500,7 +6518,7 @@ rule test {{
                         if file_creation_time:
                             f.write(f"File Creation Time: {file_creation_time}\n")
                         f.write("=" * 80 + "\n")
-                        if strings:
+                        if strings and not _over_budget:
                             # Census first, and deliberately UNCAPPED: which string in
                             # the rule fired and how many times is what an analyst works
                             # from, and it costs one line no matter how many offsets there
@@ -6533,7 +6551,24 @@ rule test {{
                                     f"above are complete; re-run `yara -s` against this file "
                                     f"for every offset.\n")
                                 f.write("-" * 40 + "\n")
+                        elif strings:
+                            # Past the byte ceiling. The COUNT still ships - it is what the
+                            # dataset totals reconcile against - only per-offset detail goes.
+                            f.write(f"Total string hits: {len(strings)}\n")
+                            f.write(
+                                f"Offset detail omitted: alert directory byte budget "
+                                f"reached (YARA_ALERT_DIR_MAX_MB). Counts above and in the "
+                                f"lookup dataset remain complete; re-run `yara -s` against "
+                                f"this file for offsets.\n")
+                            f.write("-" * 40 + "\n")
+                            self._alert_detail_suppressed = getattr(
+                                self, "_alert_detail_suppressed", 0) + 1
                         f.flush()
+                    try:
+                        self._alert_bytes_written = getattr(self, "_alert_bytes_written", 0) + max(
+                            0, os.path.getsize(alert_path) - _size_before)
+                    except OSError:
+                        pass
                 except (IOError, OSError) as e:
                     if hasattr(self, 'log_manager'):
                         self.log_manager.log_error(f"Failed to write alert file: {e}")
@@ -7777,6 +7812,13 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
                         "failed_rules": getattr(_el, "failed_rules_count", None),
                         "valid_rules": getattr(_el, "valid_rules_count", None),
                         "skipped_rules": getattr(_el, "skipped_rules_count", 0),
+                        # Host footprint. alert_detail_suppressed > 0 means the byte ceiling
+                        # was reached and per-offset detail was dropped for that many
+                        # findings - counts above stay complete, so a non-zero value
+                        # explains a thin alert file without implying data loss.
+                        "alert_bytes_written": getattr(scanner, "_alert_bytes_written", None),
+                        "alert_detail_suppressed": getattr(scanner, "_alert_detail_suppressed", 0),
+                        "alert_dir_max_bytes": CONFIG_ALERT_DIR_MAX_BYTES,
                         "scan_rate_fps": (round(getattr(scanner, "files_scanned", 0) / _dur, 2)
                                           if _dur and _dur > 0 else 0),
                         "total_paused_secs": round(
