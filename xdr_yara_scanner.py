@@ -4573,9 +4573,32 @@ class EvidenceCollector:
 
 class CleanupManager:
     """Manages cleanup of scan artifacts."""
-    
-    def __init__(self, config):
+
+    def __init__(self, config, log_manager=None):
         self.config = config
+        # Every call site here used to read `self.config.log_manager`, which ScanConfig
+        # never assigns - so the entire cleanup-scheduling trail was dead. Cleanup
+        # installs a scheduled task / LaunchDaemon / systemd unit on the endpoint, which
+        # is exactly the kind of thing that must leave a record, so the channel is passed
+        # in explicitly rather than deleted.
+        self.log_manager = log_manager
+
+    def _log(self, message, data=None, level="system"):
+        """Emit through LogManager when available, else the root logger.
+
+        The fallback is real now: setup_logging gives root an INFO FileHandler, so an
+        unparented CleanupManager still leaves its trail in diagnostics_<run_id>.log.
+        """
+        if self.log_manager is not None:
+            try:
+                if level == "error":
+                    self.log_manager.log_error(message, data or {})
+                else:
+                    self.log_manager.log_system(message, data or {})
+                return
+            except Exception:
+                pass
+        (logging.error if level == "error" else logging.info)(message)
 
     def _extract_run_id_from_log_name(self, filename):
         """Extract scan run_id from a standardized log or summary filename."""
@@ -4679,57 +4702,50 @@ class CleanupManager:
             logging.warning("Continuing with scan despite cleanup issues")
 
     def schedule_final_cleanup(self):
-        """Schedule final cleanup with error checking."""
+        """Schedule final cleanup, unless the run produced no usable rules.
+
+        Cleanup is suppressed on exactly one condition: the ruleset failed to yield a
+        single valid rule, so the local artefacts are the only record of what went wrong.
+
+        A second suppressor used to sit here - "more than 50% of log events were errors" -
+        guarded by `hasattr(self.config, 'log_manager')`. ScanConfig never assigns
+        log_manager, so that guard was permanently False and the branch was dead. It was
+        removed rather than repaired, because the policy was wrong as well as unreachable:
+        an error RATIO conflates a noisy scan with a broken one. A healthy scan of a
+        locked-down host produces hundreds of legitimate permission errors and would have
+        had its diagnostics preserved forever.
+        """
         has_critical_errors = False
         
         if hasattr(self.config, 'error_logger'):
             error_logger = self.config.error_logger
             has_critical_errors = (error_logger.has_errors and error_logger.valid_rules_count == 0)
         
-        if hasattr(self.config, 'log_manager'):
-            log_stats = self.config.log_manager.get_upload_statistics()
-            error_ratio = log_stats['by_type'].get('error', 0) / max(log_stats['total_logs'], 1)
-            if error_ratio > 0.5:
-                has_critical_errors = True
-        
         if has_critical_errors:
-            if hasattr(self.config, 'log_manager'):
-                self.config.log_manager.log_system(
-                    "Critical errors detected - skipping cleanup to preserve diagnostic data",
-                    {'preserve_logs': True}
-                )
-            logging.info("Critical YARA processing errors detected - skipping cleanup")
+            self._log("No valid YARA rules compiled - skipping cleanup to preserve diagnostics",
+                      {'preserve_logs': True})
             return
-        
+
         if not self._check_for_alerts():
-            if hasattr(self.config, 'log_manager'):
-                self.config.log_manager.log_system("No alerts found, skipping cleanup scheduling")
-            logging.info("No alerts found, skipping final cleanup scheduling")
+            self._log("No alerts found, skipping cleanup scheduling")
             return
 
         try:
             self._decode_cleanup_script()
-            
-            if hasattr(self.config, 'log_manager'):
-                self.config.log_manager.log_system("Cleanup script decoded and ready for scheduling")
-            
+            self._log("Cleanup script decoded and ready for scheduling")
+
             if platform.system() == "Windows":
                 self._schedule_windows_cleanup()
-                if hasattr(self.config, 'log_manager'):
-                    self.config.log_manager.log_system("Windows cleanup task scheduled successfully")
+                self._log("Windows cleanup task scheduled successfully")
             elif platform.system() == "Darwin":
                 self._schedule_macos_cleanup()
-                if hasattr(self.config, 'log_manager'):
-                    self.config.log_manager.log_system("macOS cleanup LaunchDaemon scheduled")
+                self._log("macOS cleanup LaunchDaemon scheduled")
             else:
                 self._schedule_linux_cleanup()
-                if hasattr(self.config, 'log_manager'):
-                    self.config.log_manager.log_system("Linux cleanup service scheduled successfully")
-                    
+                self._log("Linux cleanup service scheduled successfully")
+
         except Exception as e:
-            if hasattr(self.config, 'log_manager'):
-                self.config.log_manager.log_error(f"Failed to schedule cleanup: {e}")
-            logging.error(f"Error scheduling final cleanup: {e}")
+            self._log(f"Failed to schedule cleanup: {e}", level="error")
             raise
 
     def _check_for_alerts(self):
@@ -4952,7 +4968,7 @@ class HostCleanup:
         # them (CleanupManager._extract_run_id_from_log_name), so the two mechanisms can
         # never disagree about which files belong to which run. The summary itself is
         # handled separately below (kept or removed per KEEP), never blind-removed here.
-        cm = CleanupManager(self.config)
+        cm = CleanupManager(self.config, getattr(self, 'log_manager', None))
         if os.path.isdir(logs_dir):
             for name in os.listdir(logs_dir):
                 if name == summary_name:
@@ -7210,6 +7226,13 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
             lookup_shard=lookup_shard,
         )
         log_manager = LogManager(config)
+        # Late-bind the channel onto config. ErrorLogger is constructed inside
+        # ScanConfig (long before this point) and reads `self.config.log_manager` when a
+        # rule fails to compile - a guard that was permanently False, so compilation
+        # failures never produced a telemetry error event carrying the rule name, error
+        # type and line number. Rules compile inside YaraScanner, well after this line,
+        # so binding it here is early enough for every consumer.
+        config.log_manager = log_manager
 
         # Fail loud on un-configured credentials BEFORE scanning: if the API creds are still the
         # 'replace_with_*' placeholders and this run intends to deliver (alerts and/or datasets),
@@ -7239,7 +7262,7 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
         _apply_light_process_priority(log_manager, throttle_mode="standard", config=config)
         exception_logger = config.exception_logger
         stats_manager = StatisticsManager(config, log_manager)
-        cleanup_manager = CleanupManager(config)
+        cleanup_manager = CleanupManager(config, log_manager)
 
         cleanup_manager.initial_cleanup()
         log_manager.log_system("Initial cleanup completed")
