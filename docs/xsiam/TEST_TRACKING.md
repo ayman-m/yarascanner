@@ -11,9 +11,9 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 |---|---|---|---|---|---|
 | 1 | 53 | 53 | 0 | 0 | 0 |
 | 2 | 106 | 106 | 0 | 0 | 0 |
-| 3 | 113 | 111 | 0 | 2 | 0 |
+| 3 | 113 | 113 | 0 | 0 | 0 |
 
-**270 of 272 executed.**
+**272 of 272 executed.**
 
 ## All capabilities
 
@@ -89,7 +89,7 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `TRAV-024` | Browser force-scan allowlist (macOS carve-out) | 3 | supporting | ✅ pass | 4 scanned; library/caches/firefox reached=True, library/caches/other_app reached=False — the carve-out names browsers rather than re-opening the whole category | — |
 | `TRAV-025` | Boundary skips the force-scan allowlist cannot override | 3 | supporting | ✅ pass | the same firefox cache path was scanned normally (True) but skipped under /volumes/ (True); 4 scanned of 6 planted | — |
 | `TRAV-026` | Windows skip folders with component-boundary matching | 3 | supporting | ✅ pass | Windows component-boundary matching ran over 310 files without over-skipping (macOS/Linux parity: 310/309/310) | — |
-| `TRAV-027` | Windows skip-drive mechanism | 3 | supporting | ⛔ blocked | — | skip-drive mechanism needs a whole-machine Windows scan |
+| `TRAV-027` | Windows skip-drive mechanism | 3 | supporting | ✅ pass | scan_targets=['C:\\', 'D:\\', 'E:\\', 'J:\\'] with excluded_targets=[]; removable volumes included: ['J:\\'] — the skip list is empty, so absent letters (F/I/K) are empty slots failing… | — |
 | `TRAV-028` | Linux skip directories | 3 | supporting | ✅ pass | 655,232 files attributed to skipped directories; breakdown {'Skipped directory': 655232, 'File does not exist': 1965, 'Not a regular file': 762, 'File too large': 52, 'Special system file': 23} sums… | — |
 | `TRAV-029` | macOS skip directories with three matching semantics | 3 | supporting | ✅ pass | macOS skipped 2 vs Linux 1 / Windows 1; breakdown {'Junction/symlink skip': 1, 'File too large': 1} | — |
 | `TRAV-030` | macOS AppleDouble and .DS_Store file skip | 3 | supporting | ✅ pass | skipped: macOS=2 linux=1 windows=1; macOS breakdown {'Junction/symlink skip': 1, 'File too large': 1} | — |
@@ -109,7 +109,7 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `TRAV-044` | Case-folding policy for path matching | 3 | supporting | ✅ pass | files_scanned per platform: {'linux': 310, 'macos': 309, 'windows': 310} | — |
 | `TRAV-045` | macOS case-sensitivity probe file written to /tmp for every file that reaches the scan body | not_covered | low | — not_covered | — | — |
 | `TRAV-046` | Undocumented skip_breakdown keys: "Permission denied" and "Junction/symlink duplicate" | 3 | low | ✅ pass | skip keys seen: ['File too large']; undocumented keys present: [] | these keys appear only when their conditions occur; neither did here |
-| `TRAV-047` | Windows default scan scope is every mounted volume, including network and removable drives | 3 | core | ⛔ blocked | — | Windows default scope covering every mounted volume needs a no-target whole-machine Windows scan |
+| `TRAV-047` | Windows default scan scope is every mounted volume, including network and removable drives | 3 | core | ✅ pass | scan_folder=None -> ['C:\\', 'D:\\', 'E:\\', 'J:\\'] (3 fixed + 1 removable); 1,246,375 scanned, 325,476 skipped over 5218.19s | — |
 | `PERF-001` | CPU governor policy selection | 1 | core | ✅ pass | {'r1a-baseline': "6 lines policy={'headroom'}", 'r1d-budget': "2 lines policy={'budget'}", 'r1e-govnone': '0 governor lines (want 0)'} | — |
 | `PERF-002` | Headroom policy target computation | 1 | core | ✅ pass | n=6 first target=70.0 others=0.0 | — |
 | `PERF-003` | Budget policy fixed ceiling | 1 | core | ✅ pass | n=2 targets=[25.0] | — |

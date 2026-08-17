@@ -2,7 +2,7 @@
 
 **Endpoints:** `xsoar`, `OfficeiMac`, `thor`  
 **Criteria:** 113  
-**Result:** 111 pass · 0 fail · 2 blocked · 0 not run
+**Result:** 113 pass · 0 fail · 0 blocked · 0 not run
 
 ## Runs
 
@@ -16,6 +16,7 @@ endpoint's own logs plus the events that reached `yara_scans_raw` on the tenant.
 | `r3c-shapes-windows` | `None` | defaults | 310 | 1 | 3.17s | 97.85 f/s | 992 |
 | `r3d-wholefs-linux` | `None` | defaults | 469,170 | 658,034 | 712.47s | 658.51 f/s | 553,047 |
 | `r3e-cancel-linux` | `whole filesystem` | defaults | 30,593 | 21 | 99.47s | 307.55 f/s | 66,161 |
+| `r3f-wholefs-windows` | `None` | defaults | 1,246,375 | 325,476 | 5218.19s | 238.85 f/s | 0 |
 
 ## What the runs measured
 
@@ -138,22 +139,10 @@ denominator from `ok+failed+undelivered`, so the inflated sum understated the lo
 percentage while overstating both totals — in the one scenario the counter exists for.
 
 
-## Blocked
-
-Not failures — the run needed to decide these did not produce the artefact, or
-reaching them needs something we will not do to a live endpoint.
-
-| ID | Capability | Why |
-|---|---|---|
-| `TRAV-027` | Windows skip-drive mechanism | skip-drive mechanism needs a whole-machine Windows scan |
-| `TRAV-047` | Windows default scan scope is every mounted volume, including network and removable drives | Windows default scope covering every mounted volume needs a no-target whole-machine Windows scan |
-
 ## All criteria
 
 | ID | Capability | Pri | Status | Evidence |
 |---|---|---|---|---|
-| `TRAV-027` | Windows skip-drive mechanism | supporting | ⛔ blocked | skip-drive mechanism needs a whole-machine Windows scan |
-| `TRAV-047` | Windows default scan scope is every mounted volume, including network and remov… | core | ⛔ blocked | Windows default scope covering every mounted volume needs a no-target whole-machine Windows scan |
 | `LIFE-001` | Scan entry point main(yarafile, scan_folder, alert_severity) | core | ✅ pass | main(yarafile, scan_folder, alert_severity) ran to completion |
 | `LIFE-002` | Cancel entry point cancel() — zero inputs | core | ✅ pass | CANCEL_RESULT: Cancel signal delivered (/tmp/yara_r3e/control/cancel.flag) \| scanner running: yes \| scan_id=xsoar_20260817_160806_408571_yara_eb6e98d3355a |
 | `LIFE-003` | CLI dispatch and exit-code contract | supporting | ✅ pass | entry point returned a result line, no traceback |
@@ -253,6 +242,7 @@ reaching them needs something we will not do to a live endpoint.
 | `TRAV-024` | Browser force-scan allowlist (macOS carve-out) | supporting | ✅ pass | 4 scanned; library/caches/firefox reached=True, library/caches/other_app reached=False — the carve-out names browsers rather than re-opening the whole category |
 | `TRAV-025` | Boundary skips the force-scan allowlist cannot override | supporting | ✅ pass | the same firefox cache path was scanned normally (True) but skipped under /volumes/ (True); 4 scanned of 6 planted |
 | `TRAV-026` | Windows skip folders with component-boundary matching | supporting | ✅ pass | Windows component-boundary matching ran over 310 files without over-skipping (macOS/Linux parity: 310/309/310) |
+| `TRAV-027` | Windows skip-drive mechanism | supporting | ✅ pass | scan_targets=['C:\\', 'D:\\', 'E:\\', 'J:\\'] with excluded_targets=[]; removable volumes included: ['J:\\'] — the skip list is empty, so absent letters (F/I/K) are empty slots failing os.path.isdir, not policy skips |
 | `TRAV-028` | Linux skip directories | supporting | ✅ pass | 655,232 files attributed to skipped directories; breakdown {'Skipped directory': 655232, 'File does not exist': 1965, 'Not a regular file': 762, 'File too large': 52, 'Special system file': 23} sums to 658,034 = files_s… |
 | `TRAV-029` | macOS skip directories with three matching semantics | supporting | ✅ pass | macOS skipped 2 vs Linux 1 / Windows 1; breakdown {'Junction/symlink skip': 1, 'File too large': 1} |
 | `TRAV-030` | macOS AppleDouble and .DS_Store file skip | supporting | ✅ pass | skipped: macOS=2 linux=1 windows=1; macOS breakdown {'Junction/symlink skip': 1, 'File too large': 1} |
@@ -265,3 +255,4 @@ reaching them needs something we will not do to a live endpoint.
 | `TRAV-042` | Scan-configuration disclosure event | supporting | ✅ pass | scan-configuration disclosure event present |
 | `TRAV-044` | Case-folding policy for path matching | supporting | ✅ pass | files_scanned per platform: {'linux': 310, 'macos': 309, 'windows': 310} |
 | `TRAV-046` | Undocumented skip_breakdown keys: "Permission denied" and "Junction/symlink dup… | low | ✅ pass | skip keys seen: ['File too large']; undocumented keys present: [] |
+| `TRAV-047` | Windows default scan scope is every mounted volume, including network and remov… | core | ✅ pass | scan_folder=None -> ['C:\\', 'D:\\', 'E:\\', 'J:\\'] (3 fixed + 1 removable); 1,246,375 scanned, 325,476 skipped over 5218.19s |
