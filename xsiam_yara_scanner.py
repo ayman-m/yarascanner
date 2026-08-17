@@ -110,12 +110,13 @@ UPLOAD_RESULTS = True  # Match and telemetry uploads to webhook
 UPLOAD_NON_MATCH_DATA = True  # Keep telemetry uploads enabled in webhook mode
 DEFAULT_TIMEOUT_SECS = 20            # increased request timeout everywhere
 MAX_RETRIES_PER_ITEM = 2             # hard cap to avoid infinite loops
-# minimum=1, NOT 0. Its consumer is `if len(sample) < CAP`, so 0 silently disables
-# sampling entirely - the exact opposite of what 0 means on its twin
-# MAX_ALERT_OFFSETS_PER_FINDING below, where 0 means "no cap". Two knobs named alike,
-# defaulted alike, whose 0 does opposite things is a footgun; here 0 or negative falls
-# back to the default rather than quietly shipping findings with no offsets at all.
-MAX_MATCH_SAMPLES_PER_FINDING = _env_number("YARA_MAX_MATCH_SAMPLES", 50, cast=int, minimum=1)
+# 0 means "no cap", matching its twin MAX_ALERT_OFFSETS_PER_FINDING below and the XDR
+# edition's CONFIG_LOOKUP_ROWS_PER_FINDING_MAX. This used to be minimum=1 because the
+# consumer was a bare `if len(sample) < CAP`, which turns 0 into "sample nothing" - the
+# exact opposite meaning. Two knobs named alike and defaulted alike whose 0 did opposite
+# things was a documented footgun; the consumer now short-circuits on <= 0 instead, so
+# the semantics match and the guard is no longer needed to paper over them.
+MAX_MATCH_SAMPLES_PER_FINDING = _env_number("YARA_MAX_MATCH_SAMPLES", 50, cast=int, minimum=0)
 # ^ Ported from the XDR edition after it hit this live: one loosely-written rule matching one
 # large file can produce tens of thousands of string-offset instances (measured there: 33,118
 # rows from one rule against one .evtx log; measured here: 36,213 in one match-upload backlog),
@@ -288,8 +289,18 @@ CPU_BUDGET_PCT   = _env_number("YARA_CPU_BUDGET_PCT", 25, minimum=0)
 CPU_FLOOR_PCT    = _env_number("YARA_CPU_FLOOR_PCT", 5, minimum=0)
 GOVERNOR_HEARTBEAT_SECS = _env_number("YARA_GOVERNOR_HEARTBEAT_SECS", 30, minimum=0)
 
-MAX_ALERT_OFFSETS_PER_FINDING = _env_number("YARA_MAX_ALERT_OFFSETS", 50, cast=int)
-MAX_ALERT_OFFSETS_PER_FINDING = max(0, MAX_ALERT_OFFSETS_PER_FINDING)
+# minimum=0, so 0 keeps its meaning ("no cap") while a NEGATIVE value falls back to the
+# default instead of being clamped into it. Without the guard, `max(0, -5)` turned a typo
+# into unbounded alert offsets - the precise failure this cap was added to prevent, and
+# the one that produced a 220 MB alert file on a single endpoint.
+MAX_ALERT_OFFSETS_PER_FINDING = _env_number("YARA_MAX_ALERT_OFFSETS", 50, cast=int, minimum=0)
+
+# How many runs' logs and scan summaries survive a prune. This was a bare `keep_scans=2`
+# default in the method signature - invisible to anyone reading the config block, and
+# unreachable without editing the body. Two runs is also thin: the previous run's evidence
+# is often exactly what you need when diagnosing the current one, and a diagnostics log
+# now shares the directory. Matches the XDR edition's YARA_LOG_KEEP.
+LOG_KEEP_SCANS = _env_number("YARA_LOG_KEEP", 10, cast=int, minimum=0)
 
 YARA_RULE = r""""""
 
@@ -3369,7 +3380,7 @@ class ResultsUploader:
             if _first_offset is None:
                 _first_offset = offset
                 _first_string = string_data
-            if len(_offsets_sample) < MAX_MATCH_SAMPLES_PER_FINDING:
+            if MAX_MATCH_SAMPLES_PER_FINDING <= 0 or len(_offsets_sample) < MAX_MATCH_SAMPLES_PER_FINDING:
                 _offsets_sample.append("" if offset is None else str(offset))
                 _strings_sample.append(string_data)
 
@@ -3993,7 +4004,7 @@ class CleanupManager:
         match = re.search(r'_(\d{8}_\d{6}_\d{6})\.(?:log|json|json\.tmp)$', filename)
         return match.group(1) if match else None
 
-    def _prune_old_scan_logs(self, keep_scans=2):
+    def _prune_old_scan_logs(self, keep_scans=LOG_KEEP_SCANS):
         """Keep logs for only the latest N scans (by run_id timestamp)."""
         logs_dir = self.config.logs_dir
         if not os.path.isdir(logs_dir):
@@ -4073,7 +4084,7 @@ class CleanupManager:
                             os.path.dirname(self.config.output_log)]:
                 os.makedirs(directory, exist_ok=True)
 
-            self._prune_old_scan_logs(keep_scans=2)
+            self._prune_old_scan_logs(keep_scans=LOG_KEEP_SCANS)
             
             if cleanup_failed:
                 logging.warning("Some cleanup operations failed - continuing with scan")

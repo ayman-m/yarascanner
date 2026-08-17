@@ -196,7 +196,11 @@ CONFIG_ALERT_MAX_PER_SCAN = 500         # max per-finding alerts per scan; beyon
 # distinct findings elsewhere in the same scan ever got a turn, starving them out silently. Local
 # results/alert files keep every offset regardless (disk is not the scarce resource); only the
 # network upload is capped. <= 0 disables the cap.
-CONFIG_LOOKUP_ROWS_PER_FINDING_MAX = 50 # max dataset rows uploaded per (rule, file); rest logged only
+# max dataset rows uploaded per (rule, file); rest logged only. 0 = no cap. Env-reachable
+# because the XSIAM twin exposes both of its equivalents (YARA_MAX_MATCH_SAMPLES,
+# YARA_MAX_ALERT_OFFSETS) and a bare literal here made XDR strictly less tunable than
+# XSIAM on the one axis that drives per-finding upload volume.
+CONFIG_LOOKUP_ROWS_PER_FINDING_MAX = _env_number("YARA_LOOKUP_ROWS_PER_FINDING", 50, cast=int, minimum=0)
 # Offsets RENDERED per (rule, file) in the local alert/<rule>.txt. Ported from the XSIAM
 # edition, where the unbounded version produced a 220 MB file on one endpoint - 98.6% of
 # it from four Windows event logs, because a rule hunting PowerShell strings legitimately
@@ -2899,6 +2903,18 @@ class ScanConfig:
             "/library/caches/microsoft edge/",
             "/library/caches/firefox/",
             "/library/caches/com.apple.safari/",
+        )
+
+        # Boundary skips a force-scan fragment must never override. These keep the scanner
+        # on THIS host; they are not noise reduction. A mounted Time Machine volume holds a
+        # browser cache per backup snapshot, so without this an allowlist fragment would
+        # walk every snapshot on the disk. Consulted in _is_special_file before the
+        # force_scan_fragments check.
+        self.force_scan_never_under = (
+            "/volumes/",   # macOS mounted volumes (also in mac_skip_directory)
+            "/media/",     # Linux removable media
+            "/mnt/",       # Linux mounts
+            "/net/",       # autofs network mounts
         )
 
         self.evidence_zip = os.path.join(
@@ -6280,8 +6296,22 @@ rule test {{
         # Force-scan allowlist wins over all path-based skips (fragments + platform
         # skip dirs): browser caches/profiles are scanned even if a broader rule excludes
         # them. Filename/extension skips above still apply (no point scanning a .iso).
-        if any(fragment in portable_path for fragment in getattr(self.config, "force_scan_fragments", ())):
-            return False
+        #
+        # Two constraints, both ported from the XSIAM edition:
+        #  - Probe with a trailing separator appended. os.walk yields a directory root with
+        #    no trailing separator, so ".../library/caches/firefox" failed to match the
+        #    "/library/caches/firefox/" fragment while still matching the broad
+        #    "/library/caches/" skip - the whole directory was pruned and no file inside
+        #    ever reached this allowlist.
+        #  - It must NOT override BOUNDARY skips. force_scan_never_under exists to keep the
+        #    scanner on THIS host, not to reduce noise: a Time Machine disk under /Volumes/
+        #    holds one browser cache per backup snapshot, and a force-scan fragment would
+        #    otherwise drag the walker across every one of them. Without this guard the
+        #    allowlist has no backstop at all.
+        _probe = portable_path + "/"
+        if not any(b in _probe for b in getattr(self.config, "force_scan_never_under", ())):
+            if any(fragment in _probe for fragment in getattr(self.config, "force_scan_fragments", ())):
+                return False
         # Matched as a bounded "/fragment/" substring AND at the tail. os.walk yields a
         # directory root with no trailing separator, so the directory that IS the excluded
         # component (".../node_modules") closed no bounded form and matched nothing, while
