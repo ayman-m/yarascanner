@@ -5897,20 +5897,52 @@ rule test {{
 # ============================================================================
 
 def setup_logging(config):
-    """Quiet the root logger.
+    """Keep the root logger off stdout, but give its INFO records somewhere to land.
 
-    Categorized logging is handled by LogManager; root-logger output is
-    suppressed below WARNING to avoid noisy stdout during scans. WARNING and
-    ERROR records still surface to stderr via Python's default handler so
-    customers running interactively can see fatal issues.
+    Categorized logging is handled by LogManager. Root-logger output stays off
+    stdout because Action Center truncates a script's stdout at 10,240 characters -
+    a chatty scan would push the SCAN_RESULT line out of the window entirely.
+
+    That is why this used to drop every root handler and pin WARNING. The side
+    effect was that the ~40 logging.info calls in this file reached NOTHING on any
+    host, and for a number of capabilities an info line is the only evidence the
+    behaviour ran at all - which made them impossible to verify on a live scan.
+    They now go to logs/diagnostics_<run_id>.log instead. stdout is unaffected and
+    stderr still shows WARNING+ so interactive runs surface fatal issues.
+
+    The three categorized loggers (error, exception, webhook) set propagate=False,
+    so nothing they emit is duplicated here.
     """
     try:
         for handler in logging.root.handlers[:]:
             handler.close()
             logging.root.removeHandler(handler)
-        logging.root.setLevel(logging.WARNING)
+
+        stream = logging.StreamHandler()
+        stream.setLevel(logging.WARNING)
+        stream.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+        logging.root.addHandler(stream)
+
+        try:
+            diagnostics_path = os.path.join(
+                config.logs_dir, f"diagnostics_{config.run_id}.log")
+            diag = logging.FileHandler(diagnostics_path, encoding="utf-8")
+            diag.setLevel(logging.INFO)
+            diag.setFormatter(logging.Formatter(
+                "%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+            logging.root.addHandler(diag)
+            logging.root.setLevel(logging.INFO)
+        except Exception as e:
+            # No disk sink is survivable - the scan still runs, it just loses the
+            # info-level trail. Keep the old WARNING behaviour rather than failing.
+            logging.root.setLevel(logging.WARNING)
+            print(f"Diagnostics log unavailable ({e}); root logging stays at WARNING")
+
+        # Third-party INFO chatter would bury our own records in that file.
+        for noisy in ("urllib3", "requests", "charset_normalizer", "chardet", "yara"):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
     except Exception as e:
-        print(f"Error quieting root logger: {e}")
+        print(f"Error configuring root logger: {e}")
 
 
 def upload_final_comprehensive_report(scanner, total_scan_time):
