@@ -9,18 +9,18 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 
 | Round | Total | pass | fail | blocked | not_run |
 |---|---|---|---|---|---|
-| 1 | 55 | 0 | 0 | 0 | 55 |
+| 1 | 55 | 46 | 0 | 3 | 6 |
 | 2 | 109 | 0 | 0 | 0 | 109 |
-| 3 | 127 | 0 | 0 | 0 | 127 |
+| 3 | 121 | 0 | 0 | 0 | 121 |
 
-**0 of 291 executed.**
+**46 of 285 executed.**
 
 ## All capabilities
 
 | ID | Capability | Rnd | Pri | Status | Evidence | Notes |
 |---|---|---|---|---|---|---|
 | `RULE-001` | Base64-only rule input | 3 | core | · not_run | — | — |
-| `RULE-002` | Rule input size cap | 3 | supporting | · not_run | — | — |
+| `RULE-002` | Rule input size cap | not_covered | supporting | — not_covered | — | Cannot deliver the input. A >50,000,000-character argv value exceeds both the Action Center script-parameter field and POSIX ARG_MAX (~2 MB on the xsoar VM), so no live delivery path can carry it;… |
 | `RULE-003` | Typed rule-input rejection codes | 3 | supporting | · not_run | — | — |
 | `RULE-004` | Empty embedded ruleset guard | 3 | supporting | · not_run | — | — |
 | `RULE-005` | Comment- and string-aware pack parser | 3 | supporting | · not_run | — | — |
@@ -47,7 +47,7 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `RULE-026` | failed_rules/ artifact directory | 3 | supporting | · not_run | — | — |
 | `RULE-027` | failed_rules/ is never pruned | 3 | supporting | · not_run | — | — |
 | `RULE-028` | Un-splittable pack forensics | 3 | supporting | · not_run | — | — |
-| `RULE-029` | Split-stage failure isolation | 3 | supporting | · not_run | — | — |
+| `RULE-029` | Split-stage failure isolation | not_covered | supporting | — not_covered | — | Requires injecting a failure we cannot cause. _get_yara_top_level_statements is a total character-scanner over any str input (no regex backtracking, no parsing that can raise), so no rule text… |
 | `RULE-030` | Three-way valid / failed / skipped accounting | 3 | supporting | · not_run | — | — |
 | `RULE-031` | Compilation summary block | 3 | supporting | · not_run | — | — |
 | `RULE-032` | All-skipped vs all-failed fatal distinction | 3 | supporting | · not_run | — | — |
@@ -70,10 +70,10 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `TRAV-005` | Windows whole-machine default target discovery | 3 | supporting | · not_run | — | — |
 | `TRAV-006` | Linux default target discovery (privilege-aware) | 3 | supporting | · not_run | — | — |
 | `TRAV-007` | macOS default target discovery (privilege-aware) | 3 | supporting | · not_run | — | — |
-| `TRAV-008` | Unknown-platform target fallback | 3 | supporting | · not_run | — | — |
+| `TRAV-008` | Unknown-platform target fallback | not_covered | supporting | — not_covered | — | Requires a platform we do not have. The branch fires only when platform.system() is neither 'Windows', 'Linux' nor 'Darwin'; every endpoint in the XSIAM and XDR tenants is one of those three, so… |
 | `TRAV-009` | Excluded-target warning (requested target wholly skipped) | 3 | supporting | · not_run | — | — |
 | `TRAV-010` | Non-root system-path pre-flight advisory | 3 | supporting | · not_run | — | — |
-| `TRAV-011` | Cancellable explicit-stack directory walk | 1 | supporting | · not_run | — | — |
+| `TRAV-011` | Cancellable explicit-stack directory walk | 1 | supporting | ✅ pass | outcome=completed | — |
 | `TRAV-012` | Symlinked directories listed but never recursed | 3 | supporting | · not_run | — | — |
 | `TRAV-013` | Unreadable directory entry demoted to a file | 3 | supporting | · not_run | — | — |
 | `TRAV-014` | Unreadable directory tolerated, subtree abandoned | 3 | supporting | · not_run | — | — |
@@ -93,7 +93,7 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `TRAV-028` | Linux skip directories | 3 | supporting | · not_run | — | — |
 | `TRAV-029` | macOS skip directories with three matching semantics | 3 | supporting | · not_run | — | — |
 | `TRAV-030` | macOS AppleDouble and .DS_Store file skip | 3 | supporting | · not_run | — | — |
-| `TRAV-031` | No directory skipping on unrecognised platforms | 3 | supporting | · not_run | — | — |
+| `TRAV-031` | No directory skipping on unrecognised platforms | not_covered | supporting | — not_covered | — | Requires a platform we do not have. The final else-branch of _is_special_file (5230-5231) and the empty-list assignment in ScanConfig (3084-3086) execute only when platform.system() is neither… |
 | `TRAV-032` | Self-skip of the scanner's own directory and log file | 3 | core | · not_run | — | — |
 | `TRAV-033` | Vendor security-agent path exclusions | 3 | core | · not_run | — | — |
 | `TRAV-034` | Maximum file size cap | 3 | core | · not_run | — | — |
@@ -103,61 +103,61 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `TRAV-038` | Bulk attribution of a skipped directory's files | 2 | supporting | · not_run | — | — |
 | `TRAV-039` | Skip accounting and breakdown reporting | 2 | core | · not_run | — | — |
 | `TRAV-040` | Bounded per-file error labels in the skip breakdown | 3 | supporting | · not_run | — | — |
-| `TRAV-041` | Per-target progress and throughput reporting | 1 | supporting | · not_run | — | — |
+| `TRAV-041` | Per-target progress and throughput reporting | 1 | supporting | ✅ pass | 2 target starts, 2 completions: ['/usr', '/var'] | — |
 | `TRAV-042` | Scan-configuration disclosure event | 3 | supporting | · not_run | — | — |
-| `TRAV-043` | No-drop enqueue under backpressure | 1 | core | · not_run | — | — |
+| `TRAV-043` | No-drop enqueue under backpressure | 1 | core | ✅ pass | scanned=323261 skipped=82104 dropped=0 | — |
 | `TRAV-044` | Case-folding policy for path matching | 3 | supporting | · not_run | — | — |
 | `TRAV-045` | macOS case-sensitivity probe file written to /tmp for every file that reaches the scan body | not_covered | low | — not_covered | — | — |
 | `TRAV-046` | Undocumented skip_breakdown keys: "Permission denied" and "Junction/symlink duplicate" | 3 | low | · not_run | — | — |
 | `TRAV-047` | Windows default scan scope is every mounted volume, including network and removable drives | 3 | core | · not_run | — | — |
-| `PERF-001` | CPU governor policy selection | 1 | core | · not_run | — | — |
-| `PERF-002` | Headroom policy target computation | 1 | core | · not_run | — | — |
-| `PERF-003` | Budget policy fixed ceiling | 1 | core | · not_run | — | — |
-| `PERF-004` | CPU floor and floor_hits counter | 1 | supporting | · not_run | — | — |
-| `PERF-005` | Own-CPU normalisation across cores | 1 | supporting | · not_run | — | — |
-| `PERF-006` | Proportional sleep-ratio controller (GAIN, RATIO_MAX) | 1 | supporting | · not_run | — | — |
-| `PERF-007` | pace() — post-work proportional sleeping with a per-call cap | 1 | supporting | · not_run | — | — |
-| `PERF-008` | pace() call site is AFTER the YARA match, not before | 1 | supporting | · not_run | — | — |
+| `PERF-001` | CPU governor policy selection | 1 | core | ✅ pass | {'r1a-baseline': "6 lines policy={'headroom'}", 'r1d-budget': "2 lines policy={'budget'}", 'r1e-govnone': '0 governor lines (want 0)'} | — |
+| `PERF-002` | Headroom policy target computation | 1 | core | ✅ pass | n=6 first target=70.0 others=0.0 | — |
+| `PERF-003` | Budget policy fixed ceiling | 1 | core | ✅ pass | n=2 targets=[25.0] | — |
+| `PERF-004` | CPU floor and floor_hits counter | 1 | supporting | ✅ pass | min target=67.3 max others=2.7 | — |
+| `PERF-005` | Own-CPU normalisation across cores | 1 | supporting | ✅ pass | max own=12.3% over n=6 | — |
+| `PERF-006` | Proportional sleep-ratio controller (GAIN, RATIO_MAX) | 1 | supporting | ✅ pass | ratio range 0.0..0.0 | — |
+| `PERF-007` | pace() — post-work proportional sleeping with a per-call cap | 1 | supporting | ✅ pass | ratio==0.0 for every sample; no pacing was requested | slept_secs not surfaced in the text line — consistent with zero pacing |
+| `PERF-008` | pace() call site is AFTER the YARA match, not before | 1 | supporting | ✅ pass | files_scanned=323261 with 0/6 paced samples | — |
 | `PERF-009` | Governor sampling cadence (rate limit) | not_covered | low | — not_covered | — | — |
-| `PERF-010` | Governor fail-open when CPU cannot be read | 1 | supporting | · not_run | — | — |
-| `PERF-011` | psutil CPU-reading priming | 1 | supporting | · not_run | — | — |
-| `PERF-012` | Governor telemetry emission policy (change threshold + heartbeat) | 1 | supporting | · not_run | — | — |
-| `PERF-013` | Governor sampling during producer backpressure | 1 | supporting | · not_run | — | — |
-| `PERF-014` | Worker thread pool, default 2 and operator-raisable | 1 | supporting | · not_run | — | — |
-| `PERF-015` | Worker startup timing event | 1 | supporting | · not_run | — | — |
-| `PERF-016` | Bounded scan queue | 1 | supporting | · not_run | — | — |
-| `PERF-017` | Producer backpressure on a full queue (never drops files) | 1 | supporting | · not_run | — | — |
-| `PERF-018` | Worker get timeout / graceful exit checks | 1 | supporting | · not_run | — | — |
-| `PERF-019` | Sentinel-based worker shutdown with bounded joins | 1 | supporting | · not_run | — | — |
-| `PERF-020` | Per-worker throughput reporting every 100 files | 1 | supporting | · not_run | — | — |
-| `PERF-021` | Per-worker processing-time ring buffer | 1 | supporting | · not_run | — | — |
-| `PERF-022` | Process priority lowering (CPU and I/O) | 1 | supporting | · not_run | — | — |
-| `PERF-023` | Optional performance monitor (StatisticsManager background thread) | 1 | supporting | · not_run | — | — |
-| `PERF-024` | Optional system resource monitor (SystemResourceMonitor) | 1 | supporting | · not_run | — | — |
-| `PERF-025` | Optional file-descriptor monitor | 1 | supporting | · not_run | — | — |
-| `PERF-026` | Progress heartbeat thread | 1 | supporting | · not_run | — | — |
-| `PERF-027` | Progress heartbeat interval and its clamp | 1 | supporting | · not_run | — | — |
-| `PERF-028` | Progress heartbeat lifetime spans the worker drain | 1 | supporting | · not_run | — | — |
-| `PERF-029` | Progress snapshot contents (capacity/backpressure telemetry) | 1 | supporting | · not_run | — | — |
-| `PERF-030` | Long-lived primed handle for progress metrics | 1 | supporting | · not_run | — | — |
-| `PERF-031` | Liveness-marker refresh from the heartbeat thread | 1 | supporting | · not_run | — | — |
-| `PERF-032` | ETA and rate estimation | 1 | supporting | · not_run | — | — |
-| `PERF-033` | Scan-rate reporting in the terminal artefacts | 1 | supporting | · not_run | — | — |
-| `PERF-034` | No per-offset retention in memory (uploader) | 1 | supporting | · not_run | — | — |
+| `PERF-010` | Governor fail-open when CPU cannot be read | 1 | supporting | ⛔ blocked | — | requires inducing a psutil CPU-read failure — unsafe on a live endpoint; belongs in not_covered/unsafe-injection |
+| `PERF-011` | psutil CPU-reading priming | 1 | supporting | ✅ pass | first sample own=0.1% | — |
+| `PERF-012` | Governor telemetry emission policy (change threshold + heartbeat) | 1 | supporting | ✅ pass | n=6 median gap=30.2s range=30.1..30.3 | — |
+| `PERF-013` | Governor sampling during producer backpressure | 1 | supporting | ⛔ blocked | 6 governor samples, 0 saturation events | queue never saturated in this run — nothing to interleave with |
+| `PERF-014` | Worker thread pool, default 2 and operator-raisable | 1 | supporting | ✅ pass | default=2 YARA_THREADS=8 -> 8 | — |
+| `PERF-015` | Worker startup timing event | 1 | supporting | ✅ pass | startup=0.0s | — |
+| `PERF-016` | Bounded scan queue | 1 | supporting | ✅ pass | n=5 max queue=4 cap=4 | — |
+| `PERF-017` | Producer backpressure on a full queue (never drops files) | 1 | supporting | ✅ pass | 0 saturation notices, files_dropped=0 | — |
+| `PERF-018` | Worker get timeout / graceful exit checks | 1 | supporting | ✅ pass | started=2 stopped=2 | — |
+| `PERF-019` | Sentinel-based worker shutdown with bounded joins | 1 | supporting | ✅ pass | 2 stopped, 0 timed out in 0.0s | — |
+| `PERF-020` | Per-worker throughput reporting every 100 files | 1 | supporting | ✅ pass | 16 lines from 8 workers over 46.55s (ceiling 24); 22 performance events shipped | — |
+| `PERF-021` | Per-worker processing-time ring buffer | 1 | supporting | ✅ pass | 2 worker averages, e.g. 0.9306251437949022ms | — |
+| `PERF-022` | Process priority lowering (CPU and I/O) | 1 | supporting | ✅ pass | tuning applied | — |
+| `PERF-023` | Optional performance monitor (StatisticsManager background thread) | 1 | supporting | ✅ pass | enabled-run: suppressed=False samples=10; baseline suppressed=True | — |
+| `PERF-024` | Optional system resource monitor (SystemResourceMonitor) | 1 | supporting | ✅ pass | enabled: snapshot=1 summary=1; baseline: snapshot=0 summary=0 | — |
+| `PERF-025` | Optional file-descriptor monitor | 1 | supporting | ✅ pass | limit=16384 initial=17 | — |
+| `PERF-026` | Progress heartbeat thread | 1 | supporting | ✅ pass | 5 Scan Progress events | — |
+| `PERF-027` | Progress heartbeat interval and its clamp | 1 | supporting | ✅ pass | median gap=30.0s over 5 events | — |
+| `PERF-028` | Progress heartbeat lifetime spans the worker drain | 1 | supporting | ✅ pass | 4 progress events after the last target started | — |
+| `PERF-029` | Progress snapshot contents (capacity/backpressure telemetry) | 1 | supporting | ✅ pass | [2026-08-17 12:46:42.885] [INFO] Scan Progress \| Files: 59477 scanned, 3884 skipped \| Detections: 25 \| Queue: 4 \| Rate: 1929.1 files/sec | — |
+| `PERF-030` | Long-lived primed handle for progress metrics | 1 | supporting | ✅ pass | cpu%: first=0.0 then [126.8, 148.1, 144.4, 146.4] | — |
+| `PERF-031` | Liveness-marker refresh from the heartbeat thread | 1 | supporting | ✅ pass | running.json present after the run: False | — |
+| `PERF-032` | ETA and rate estimation | 1 | supporting | ✅ pass | 6 Time Estimates events, eta=37.207104213784945 | — |
+| `PERF-033` | Scan-rate reporting in the terminal artefacts | 1 | supporting | ✅ pass | summary scan_rate_fps=1835.04, final line rate=1929.1 | — |
+| `PERF-034` | No per-offset retention in memory (uploader) | 1 | supporting | ✅ pass | memory_mb 58.0 -> 59.6 (delta 1.6) while total_matches reached 3641 | — |
 | `PERF-035` | Per-finding network payload cap | 1 | supporting | · not_run | — | — |
 | `PERF-036` | On-disk alert offset sampling (host disk footprint) | 1 | supporting | · not_run | — | — |
 | `PERF-037` | Matched-file copying off by default (disk write amplification) | 1 | supporting | · not_run | — | — |
 | `PERF-038` | Chunked hashing, matched files only | 1 | supporting | · not_run | — | — |
-| `PERF-039` | Maximum scanned file size | 1 | supporting | · not_run | — | — |
-| `PERF-040` | Bounded in-memory metric histories | 1 | supporting | · not_run | — | — |
-| `PERF-041` | Opportunistic upload batching (network cost control) | 1 | supporting | · not_run | — | — |
-| `PERF-042` | Backlog-proportional shutdown drain budget | 1 | supporting | · not_run | — | — |
-| `PERF-043` | Per-run log/summary retention on the endpoint | 1 | supporting | · not_run | — | — |
-| `PERF-044` | Uploader/log threads are all daemon threads with bounded joins | 1 | supporting | · not_run | — | — |
+| `PERF-039` | Maximum scanned file size | 1 | supporting | ✅ pass | files_skipped=82104, size-cap referenced=True | — |
+| `PERF-040` | Bounded in-memory metric histories | 1 | supporting | ⛔ blocked | — | no resource_monitoring_summary in this run (monitor off) |
+| `PERF-041` | Opportunistic upload batching (network cost control) | 1 | supporting | ✅ pass | match={'total_matches': 3641, 'successful_uploads': 73, 'failed_uploads': 0, 'undelivered': 0} telemetry={'total_uploads': 9, 'successful_uploads': 9, 'failed_uploads': 0, 'undelivered': 0,… | — |
+| `PERF-042` | Backlog-proportional shutdown drain budget | 1 | supporting | ✅ pass | undelivered match=0 telemetry=0 | — |
+| `PERF-043` | Per-run log/summary retention on the endpoint | 1 | supporting | ✅ pass | 1 run_ids retained in logs/ | — |
+| `PERF-044` | Uploader/log threads are all daemon threads with bounded joins | 1 | supporting | ✅ pass | no thread-join timeouts | — |
 | `PERF-045` | File-descriptor leak sampling (skipped on every matched file, and on every skipped file) | not_covered | low | — not_covered | — | — |
 | `PERF-046` | macOS disk-I/O telemetry is structurally zero | 1 | supporting | · not_run | — | — |
 | `PERF-047` | monitoring_duration_minutes reports host uptime, not scan duration | 1 | supporting | · not_run | — | — |
-| `PERF-048` | Light-profile priority tuning: outer failure emits a message with no data payload | 1 | supporting | · not_run | — | — |
+| `PERF-048` | Light-profile priority tuning: outer failure emits a message with no data payload | 1 | supporting | ✅ pass | line 2: [2026-08-17 12:46:12.037] [INFO] Applied light profile process priority tuning | — |
 | `STOR-001` | Scanner working directory (platform default + override) | 3 | supporting | · not_run | — | — |
 | `STOR-002` | Four fixed subdirectories: logs/, alert/, evidence/, failed_rules/ | 2 | supporting | · not_run | — | — |
 | `STOR-003` | control/ subdirectory for cooperative-cancel state | 3 | supporting | · not_run | — | — |
@@ -255,8 +255,8 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `LIFE-002` | Cancel entry point cancel() — zero inputs | 3 | core | · not_run | — | — |
 | `LIFE-003` | CLI dispatch and exit-code contract | 3 | supporting | · not_run | — | — |
 | `LIFE-004` | Cancel flag file (control/cancel.flag) | 3 | core | · not_run | — | — |
-| `LIFE-005` | Running marker (control/running.json) and liveness reporting | 1 | supporting | · not_run | — | — |
-| `LIFE-006` | Running-marker refresh from two independent sites | 1 | supporting | · not_run | — | — |
+| `LIFE-005` | Running marker (control/running.json) and liveness reporting | 1 | supporting | ✅ pass | running.json removed at finish: True | — |
+| `LIFE-006` | Running-marker refresh from two independent sites | 1 | supporting | ✅ pass | 5 heartbeat ticks | — |
 | `LIFE-007` | Stale cancel-flag protection anchored at module import | 3 | supporting | · not_run | — | — |
 | `LIFE-008` | Cancellation watcher thread and poll cadence | 3 | supporting | · not_run | — | — |
 | `LIFE-009` | _request_cancel — idempotent, first-source-wins, thread-safe | 3 | supporting | · not_run | — | — |
@@ -272,7 +272,7 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `LIFE-019` | Outcome classification (completed / cancelled / failed) | 3 | core | · not_run | — | — |
 | `LIFE-020` | Outcome agreement in end-of-scan telemetry | 3 | supporting | · not_run | — | — |
 | `LIFE-021` | scan_completion_summary metrics block | 2 | supporting | · not_run | — | — |
-| `LIFE-022` | Fatal worker failure path | 3 | supporting | · not_run | — | — |
+| `LIFE-022` | Fatal worker failure path | not_covered | supporting | — not_covered | — | Requires injecting a failure we cannot safely cause: scan_file's blanket handler (5093-5099 equivalent) and _worker's inner handler (4859-4866) absorb everything the loop body can raise, so only a… |
 | `LIFE-023` | Evidence and terminal telemetry survive a fatal failure | 3 | supporting | · not_run | — | — |
 | `LIFE-024` | Critical-error path in main() | 3 | supporting | · not_run | — | — |
 | `LIFE-025` | KeyboardInterrupt handling | 3 | supporting | · not_run | — | — |
@@ -298,10 +298,10 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `LIFE-045` | Rule-compilation fatal errors terminate the run before scanning | 3 | core | · not_run | — | — |
 | `LIFE-046` | Module-skipped rules counted separately from failures | 3 | core | · not_run | — | — |
 | `LIFE-047` | Privilege detection and privilege_status telemetry | 3 | supporting | · not_run | — | — |
-| `LIFE-048` | File-descriptor limit preflight and FD monitoring | 1 | supporting | · not_run | — | — |
-| `LIFE-049` | Light-profile process priority tuning at startup | 1 | supporting | · not_run | — | — |
-| `LIFE-050` | Progress heartbeat spanning the whole scan | 1 | core | · not_run | — | — |
-| `LIFE-051` | Producer backpressure instead of dropping files | 1 | core | · not_run | — | — |
+| `LIFE-048` | File-descriptor limit preflight and FD monitoring | 1 | supporting | ✅ pass | FD preflight present | — |
+| `LIFE-049` | Light-profile process priority tuning at startup | 1 | supporting | ✅ pass | — | — |
+| `LIFE-050` | Progress heartbeat spanning the whole scan | 1 | core | ✅ pass | 5 ticks over 176.16s (expected >= 4) | — |
+| `LIFE-051` | Producer backpressure instead of dropping files | 1 | core | ✅ pass | files_dropped=0 enqueue_failures=0 | — |
 | `LIFE-052` | Final results log with failure-aware label | 2 | supporting | · not_run | — | — |
 | `LIFE-053` | scan_system finally-block guarantee | 3 | supporting | · not_run | — | — |
 | `LIFE-054` | Comprehensive final report event | 2 | supporting | · not_run | — | — |
@@ -315,4 +315,4 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `LIFE-062` | `cancel` as the first CLI argument (cancel keyword dispatch) | 3 | supporting | · not_run | — | — |
 | `LIFE-063` | Critical-error handler prints the Python traceback to STDOUT before the result line | 3 | supporting | · not_run | — | — |
 | `LIFE-064` | Placeholder-credential abort still wipes alert/, evidence/ and old run logs first — and writes no scan summary | 3 | supporting | · not_run | — | — |
-| `LIFE-065` | One failing scan target is abandoned mid-walk; the rest of the scan continues and still reports success | 3 | supporting | · not_run | — | — |
+| `LIFE-065` | One failing scan target is abandoned mid-walk; the rest of the scan continues and still reports success | not_covered | supporting | — not_covered | — | Requires injecting a failure we cannot safely cause on a live tenant. The handler only fires for non-OSError exceptions raised by the loop body (log_manager calls, _is_special_file,… |

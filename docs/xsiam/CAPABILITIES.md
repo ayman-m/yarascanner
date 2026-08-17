@@ -975,11 +975,13 @@ Cleanup posts one `None` sentinel per worker (1 s put timeout each), then joins 
 - **Observe:** System events "Initiating worker thread cleanup" and "Waiting for workers to terminate (max 30 seconds)"; performance event `Worker cleanup: N stopped, M timed out in X.Xs`; if any thread survives, an error event `Threads did not terminate: [names]`.
 - **Source:** `YaraScanner._perform_enhanced_cleanup (`for _ in range(self.config.max_workers): self.scan_queue.put(None, timeout=1.0)`; `t.join(timeout=5)`)`
 
-### Per-worker throughput reporting every 100 files
+### Per-worker throughput reporting, sampled every 100 files and rate-limited by time
 
-Each worker emits its own throughput/error-rate line every 100 successfully processed files, computed from its rolling processing-time list.
+Each worker emits its own throughput/error-rate line, computed from its rolling processing-time list. Every 100 successfully processed files is the *sampling* point; a per-worker time gate decides whether that sample is written.
 
-- **Control:** hardcoded `files_processed % 100 == 0` — default `every 100 files per worker`
+Volume therefore scales with scan **duration**, not with the host's file count. Without the gate a 323,261-file scan wrote 3,260 of these lines — 99.5% of a 390 KB performance log, burying the six governor samples that diagnose a scan; a 10M-file server would write ~100,000 lines. A worker's first report always lands, so a scan too short to span one interval still produces a reading.
+
+- **Control:** sampling is hardcoded `files_processed % 100 == 0`; the gate is `WORKER_REPORT_MIN_SECS = _env_number("YARA_WORKER_REPORT_SECS", 30, minimum=0)`, per worker — default `30 s, matching the governor and progress heartbeats; 0 disables the gate and restores every-100-files`
 - **Observe:** Performance event `Worker Performance \| ScanWorker-N \| Files: X \| Avg Time: Y.Yms \| Error Rate: Z.Z%` with data `{worker_id, files_processed, avg_processing_time_ms, error_rate_percent}`.
 - **Source:** `YaraScanner._worker; LogManager.log_worker_performance`
 
