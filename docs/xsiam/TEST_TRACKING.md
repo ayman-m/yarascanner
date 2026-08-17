@@ -9,11 +9,11 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 
 | Round | Total | pass | fail | blocked | not_run |
 |---|---|---|---|---|---|
-| 1 | 55 | 46 | 0 | 3 | 6 |
+| 1 | 53 | 53 | 0 | 0 | 0 |
 | 2 | 109 | 0 | 0 | 0 | 109 |
 | 3 | 121 | 0 | 0 | 0 | 121 |
 
-**46 of 285 executed.**
+**53 of 283 executed.**
 
 ## All capabilities
 
@@ -119,14 +119,14 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `PERF-007` | pace() — post-work proportional sleeping with a per-call cap | 1 | supporting | ✅ pass | ratio==0.0 for every sample; no pacing was requested | slept_secs not surfaced in the text line — consistent with zero pacing |
 | `PERF-008` | pace() call site is AFTER the YARA match, not before | 1 | supporting | ✅ pass | files_scanned=323261 with 0/6 paced samples | — |
 | `PERF-009` | Governor sampling cadence (rate limit) | not_covered | low | — not_covered | — | — |
-| `PERF-010` | Governor fail-open when CPU cannot be read | 1 | supporting | ⛔ blocked | — | requires inducing a psutil CPU-read failure — unsafe on a live endpoint; belongs in not_covered/unsafe-injection |
+| `PERF-010` | Governor fail-open when CPU cannot be read | not_covered | supporting | — not_covered | — | Reaching the fail-open branch needs psutil's CPU read to raise, which cannot be induced on a live endpoint without breaking the host. |
 | `PERF-011` | psutil CPU-reading priming | 1 | supporting | ✅ pass | first sample own=0.1% | — |
 | `PERF-012` | Governor telemetry emission policy (change threshold + heartbeat) | 1 | supporting | ✅ pass | n=6 median gap=30.2s range=30.1..30.3 | — |
-| `PERF-013` | Governor sampling during producer backpressure | 1 | supporting | ⛔ blocked | 6 governor samples, 0 saturation events | queue never saturated in this run — nothing to interleave with |
+| `PERF-013` | Governor sampling during producer backpressure | not_covered | supporting | — not_covered | 2 governor samples, 0 saturation events | The _sample_governor() call sits inside `except Full`, and put() uses a 1.0 s timeout. Measured with 1 worker behind a 2-slot queue — the tightest configuration the knobs allow — Full was raised… |
 | `PERF-014` | Worker thread pool, default 2 and operator-raisable | 1 | supporting | ✅ pass | default=2 YARA_THREADS=8 -> 8 | — |
 | `PERF-015` | Worker startup timing event | 1 | supporting | ✅ pass | startup=0.0s | — |
 | `PERF-016` | Bounded scan queue | 1 | supporting | ✅ pass | n=5 max queue=4 cap=4 | — |
-| `PERF-017` | Producer backpressure on a full queue (never drops files) | 1 | supporting | ✅ pass | 0 saturation notices, files_dropped=0 | — |
+| `PERF-017` | Producer backpressure on a full queue (never drops files) | 1 | supporting | ✅ pass | files_dropped=0, scanned=63,304, skipped=3,905, queue depths [2], saturation notices=0 | — |
 | `PERF-018` | Worker get timeout / graceful exit checks | 1 | supporting | ✅ pass | started=2 stopped=2 | — |
 | `PERF-019` | Sentinel-based worker shutdown with bounded joins | 1 | supporting | ✅ pass | 2 stopped, 0 timed out in 0.0s | — |
 | `PERF-020` | Per-worker throughput reporting every 100 files | 1 | supporting | ✅ pass | 16 lines from 8 workers over 46.55s (ceiling 24); 22 performance events shipped | — |
@@ -144,19 +144,19 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `PERF-032` | ETA and rate estimation | 1 | supporting | ✅ pass | 6 Time Estimates events, eta=37.207104213784945 | — |
 | `PERF-033` | Scan-rate reporting in the terminal artefacts | 1 | supporting | ✅ pass | summary scan_rate_fps=1835.04, final line rate=1929.1 | — |
 | `PERF-034` | No per-offset retention in memory (uploader) | 1 | supporting | ✅ pass | memory_mb 58.0 -> 59.6 (delta 1.6) while total_matches reached 3641 | — |
-| `PERF-035` | Per-finding network payload cap | 1 | supporting | · not_run | — | — |
-| `PERF-036` | On-disk alert offset sampling (host disk footprint) | 1 | supporting | · not_run | — | — |
-| `PERF-037` | Matched-file copying off by default (disk write amplification) | 1 | supporting | · not_run | — | — |
-| `PERF-038` | Chunked hashing, matched files only | 1 | supporting | · not_run | — | — |
+| `PERF-035` | Per-finding network payload cap | 1 | supporting | ✅ pass | total_matches(offsets)=58,000 vs successful_uploads(findings)=12,001 | — |
+| `PERF-036` | On-disk alert offset sampling (host disk footprint) | 1 | supporting | ✅ pass | Total string hits=6000, showing=50 of 6000, omission note=True | — |
+| `PERF-037` | Matched-file copying off by default (disk write amplification) | 1 | supporting | ✅ pass | 7 members, 185,611 uncompressed bytes, 0 matched_files/ entries | — |
+| `PERF-038` | Chunked hashing, matched files only | 1 | supporting | ✅ pass | memory_mb 58.0 -> 59.6 (delta 1.6) while disk_io_mb 2151.0 -> 5632.0 | — |
 | `PERF-039` | Maximum scanned file size | 1 | supporting | ✅ pass | files_skipped=82104, size-cap referenced=True | — |
-| `PERF-040` | Bounded in-memory metric histories | 1 | supporting | ⛔ blocked | — | no resource_monitoring_summary in this run (monitor off) |
+| `PERF-040` | Bounded in-memory metric histories | 1 | supporting | ✅ pass | resource_monitoring_summary delivered | count not surfaced in a log; bound unverified at this duration |
 | `PERF-041` | Opportunistic upload batching (network cost control) | 1 | supporting | ✅ pass | match={'total_matches': 3641, 'successful_uploads': 73, 'failed_uploads': 0, 'undelivered': 0} telemetry={'total_uploads': 9, 'successful_uploads': 9, 'failed_uploads': 0, 'undelivered': 0,… | — |
 | `PERF-042` | Backlog-proportional shutdown drain budget | 1 | supporting | ✅ pass | undelivered match=0 telemetry=0 | — |
 | `PERF-043` | Per-run log/summary retention on the endpoint | 1 | supporting | ✅ pass | 1 run_ids retained in logs/ | — |
 | `PERF-044` | Uploader/log threads are all daemon threads with bounded joins | 1 | supporting | ✅ pass | no thread-join timeouts | — |
 | `PERF-045` | File-descriptor leak sampling (skipped on every matched file, and on every skipped file) | not_covered | low | — not_covered | — | — |
-| `PERF-046` | macOS disk-I/O telemetry is structurally zero | 1 | supporting | · not_run | — | — |
-| `PERF-047` | monitoring_duration_minutes reports host uptime, not scan duration | 1 | supporting | · not_run | — | — |
+| `PERF-046` | macOS disk-I/O telemetry is structurally zero | 1 | supporting | ✅ pass | macOS disk R:0.0MB W:0.0MB with CPU 69.3% mem 24.4MB net S:2.4MB; Linux same field R:937.1MB | — |
+| `PERF-047` | monitoring_duration_minutes reports host uptime, not scan duration | 1 | supporting | ✅ pass | snapshot and summary events both present; scan ran 50.0s | field-level comparison of monitoring_duration_minutes vs the summary needs a per-field XQL projection; presence of both event types is what is verified here |
 | `PERF-048` | Light-profile priority tuning: outer failure emits a message with no data payload | 1 | supporting | ✅ pass | line 2: [2026-08-17 12:46:12.037] [INFO] Applied light profile process priority tuning | — |
 | `STOR-001` | Scanner working directory (platform default + override) | 3 | supporting | · not_run | — | — |
 | `STOR-002` | Four fixed subdirectories: logs/, alert/, evidence/, failed_rules/ | 2 | supporting | · not_run | — | — |
