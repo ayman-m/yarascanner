@@ -6,11 +6,11 @@ live endpoints on the XSIAM tenant.
 
 | Round | Theme | Criteria | Pass | Fail | Endpoints |
 |---|---|---|---|---|---|
-| **1** | Resource discipline | 53 | **53** | 0 | `xsoar`, `OfficeiMac` |
-| **2** | False-positive flood | 106 | **106** | 0 | `xsoar`, `thor` |
-| **3** | Precision and resilience | 113 | **113** | 0 | `xsoar`, `OfficeiMac`, `thor` |
-| — | Not covered, with reasons | 25 | — | — | — |
-| | **Total** | **297** | **272** | **0** | |
+| **1** | Resource discipline | 55 | **55** | 0 | `xsoar`, `OfficeiMac` |
+| **2** | False-positive flood | 107 | **107** | 0 | `xsoar`, `thor` |
+| **3** | Precision and resilience | 114 | **114** | 0 | `xsoar`, `OfficeiMac`, `thor` |
+| — | Not covered, with reasons | 21 | — | — | — |
+| | **Total** | **297** | **276** | **0** | |
 
 25 archived run bundles and 15 targeted probes. Every criterion is decided from evidence
 on disk — the endpoint's own logs and artefacts plus the events that reached
@@ -112,6 +112,64 @@ AFTER_CLEANUP alert: ['lc_ok.alert']     <- nothing left to rename
 "Scheduled" was accurate for Windows, where the task is registered but not started. The
 heading and Observe now say which platform does which.
 
+### 6. The macOS case probe ran once per FILE
+
+`_is_case_sensitive_fs()` decides case-folding by experiment on Darwin — create
+`/tmp/CaSe_TeSt_YaRa_<pid>`, write, stat the lowercased name, unlink. It is reached from
+`_get_real_path()`, which `scan_file()` calls for every file past the pre-checks.
+
+A live macOS run scanned 48,921 files, so ~49,000 create/write/stat/unlink cycles in
+`/tmp` to re-answer a question whose answer cannot change while the process lives. It was
+also the scanner's only per-file WRITE: a tool that reads the disk looking for malware
+should not leave tens of thousands of file creations behind on the host it is scanning.
+
+**Fixed** by answering once and caching for the process, under a lock so racing workers
+cannot double-probe. A failed probe is cached too — otherwise an unwritable `/tmp` costs
+one exception per scanned file. Verified live: **400 files → 1 probe**, 0 leftover files.
+
+### 7. FD leak sampling barely ran, raced, and stayed silent
+
+The check sat at the end of `scan_file`, after six early returns including
+`return True, "Scanned and matched"`. Three defects in one block:
+
+- **Reach** — it ran only on files scanned that did *not* match. On the Round 2 flood
+  (8,003 files, 4,002 matching) over half the scan bypassed it; against a ruleset matching
+  everything it never ran at all. FD monitoring went quiet exactly when the scanner held
+  the most handles.
+- **Race** — `files_since_fd_check += 1` ran unlocked from every worker, so the
+  read-modify-write dropped increments and the effective interval was longer than
+  configured and unpredictable.
+- **Silence** — only threshold breaches emitted anything, so "sampled 40 times, all
+  healthy" and "never sampled" left identical evidence.
+
+**Fixed** by extracting `_maybe_sample_fds()` and calling it before any early return, under
+`lock_counts`, recording `fd_samples_taken` and `last_fd_count`. Verified with a ruleset
+matching **every** file — the configuration that previously yielded zero samples: 500
+files, 500 matches, **10 samples at interval 50**.
+
+### 8. An unreachable match path that would have corrupted silently
+
+`_iter_hit_fields` accepted a second shape: a dict whose `strings` were
+`(offset, id, hex-text)` triples rehydrated with `bytes.fromhex`. That implies a match
+cache the scanner does not have. Enumerated: three call sites all iterate `matches`;
+`matches` has one binding, `self.rules.match(...)`, which returns `Match` objects;
+`_write_alerts` takes it as a parameter but has a single caller passing that local; no
+module outside the scanner imports it.
+
+Removed rather than kept "for safety", because it was not safe — its decode fallback was
+`hx.encode("utf-8", errors="ignore")` on anything `bytes.fromhex` rejected, so a non-hex
+string produced **wrong bytes silently** instead of raising.
+
+**The deletion surfaced more than itself.** Six alert offset-cap tests were building
+dict-shaped hits, so the cap that prevents a 220 MB alert file had only ever been
+unit-tested through the branch production never runs. The behaviour was correct — a live
+storm-file scan showed `Matched Strings (showing 50 of 6000)` — but those tests were not
+what confirmed it. The fixture now builds a Match-shaped hit carrying bytes rather than
+hex text, which is the difference that let the two paths drift apart unnoticed.
+
+I had checked for importers outside the scanner and found none, which was true. I had not
+counted the test suite as a consumer. It was.
+
 ---
 
 ## What the rounds established
@@ -175,69 +233,62 @@ in scope by default.
 
 ---
 
-## Not covered — 25, each with a reason
+## Not covered — 21, each with a reason
 
 Recorded as `not_covered` rather than left blocked, because none can pass.
 
 ### unsafe-injection (4)
 Reproducing these means damaging a live host or a shared tenant.
 
-- `PERF-010` Governor fail-open when CPU cannot be read
 - `DELI-006` Circuit breaker on the telemetry channel
-- `DELI-055` Circuit-open batches go to the tail of the upload queue
-- `LIFE-024` Critical-error path in `main()`
+- `DELI-055` Circuit-open batches go to the TAIL of the upload queue (telemetry reordering and re-bounce) — Circuit-open reordering requires an induced collector outage mid-scan. The only way to cause one on this tenant is to break the collector for every ot…
+- `LIFE-024` Critical-error path in main() — The critical-error path needs an induced fatal failure inside main(). Causing one on a live endpoint means deliberately corrupting the scanner's own s…
+- `PERF-010` Governor fail-open when CPU cannot be read — Reaching the fail-open branch needs psutil's CPU read to raise, which cannot be induced on a live endpoint without breaking the host.
 
 ### wont-run (6)
 The input cannot be delivered, or the platform does not exist on this tenant.
 
-- `RULE-002` Rule input size cap — a >50,000,000-character argument exceeds both the
-  Action Center parameter field and POSIX `ARG_MAX`
-- `RULE-029` Split-stage failure isolation
-- `TRAV-008` Unknown-platform target fallback — needs an OS that is not Windows, Linux or
-  macOS
-- `TRAV-031` No directory skipping on unrecognised platforms — same
-- `LIFE-022` Fatal worker failure path
-- `LIFE-065` One failing scan target abandoned mid-walk while the rest continue
-
-### needs-instrumentation (5)
-The code emits nothing an external observer can read.
-
-- `PERF-009` Governor sampling cadence
-- `PERF-045` File-descriptor leak sampling
-- `RULE-044` Dead cached-hit dict ingestion path
-- `TRAV-045` macOS case-sensitivity probe file
-- `DELI-047` Upload channels can be disabled independently
+- `LIFE-022` Fatal worker failure path — Requires injecting a failure we cannot safely cause: scan_file's blanket handler (5093-5099 equivalent) and _worker's inner handler (4859-4866) absorb…
+- `LIFE-065` One failing scan target is abandoned mid-walk; the rest of the scan continues and still reports success — Requires injecting a failure we cannot safely cause on a live tenant. The handler only fires for non-OSError exceptions raised by the loop body (log_m…
+- `RULE-002` Rule input size cap — Cannot deliver the input. A >50,000,000-character argv value exceeds both the Action Center script-parameter field and POSIX ARG_MAX (~2 MB on the xso…
+- `RULE-029` Split-stage failure isolation — Requires injecting a failure we cannot cause. _get_yara_top_level_statements is a total character-scanner over any str input (no regex backtracking, n…
+- `TRAV-008` Unknown-platform target fallback — Requires a platform we do not have. The branch fires only when platform.system() is neither 'Windows', 'Linux' nor 'Darwin'; every endpoint in the XSI…
+- `TRAV-031` No directory skipping on unrecognised platforms — Requires a platform we do not have. The final else-branch of _is_special_file (5230-5231) and the empty-list assignment in ScanConfig (3084-3086) exec…
 
 ### no-artefact (4)
-The value exists only inside a call, or the collector normalises the distinction away.
+The value exists only inside a call, or the collector normalises the distinction away before it lands.
 
-- `RULE-021` Compile-time externals declaration
-- `TRAV-037` Second-line skip check inside the worker — shares one `skip_reasons` key with
-  the producer's, so no artefact separates the two arms
-- `DELI-004` Approximate byte accounting for batch sizing
-- `DELI-053` Critical-path events post single-object JSON, not NDJSON
+- `DELI-004` Approximate byte accounting for batch sizing — The per-batch byte estimate is internal to batch assembly and is never reported. Batch OCCUPANCY is observable and is covered by DELI-003; the byte ac…
+- `DELI-053` Critical-path events post single-object JSON, not NDJSON — the only non-NDJSON body the collector sees — The collector normalises single-object JSON and NDJSON into the same rows, so yara_scans_raw cannot distinguish the two framings. Proving it needs a p…
+- `RULE-021` Compile-time externals declaration — The externals set is declared inside the compile call and never surfaces in any log, event or file. Nothing an external observer can read distinguishe…
+- `TRAV-037` Second-line skip check inside the worker — The worker's second-line skip check writes the same skip_reasons key as the producer's, so no artefact separates the two arms. Closing it needs instru…
 
 ### cannot-construct (3)
 No input we can choose reliably produces the shape.
 
-- `RULE-028` Un-splittable pack forensics
-- `RULE-033` Combined-compile failure reporting — needs rules that pass individually but
-  fail together
-- `TRAV-018` File-level junction skip — needs a FILE-type reparse point; `mklink /J`
-  creates directory junctions only, and a file symlink needs a privilege we lack
-
-### disabled-by-design (1)
-- `TRAV-019` Real-path deduplication — present but deliberately off, so there is no
-  behaviour to observe
+- `RULE-028` Un-splittable pack forensics — Needs a pack the splitter cannot divide at all. Every malformed pack tried still splits; producing one that defeats the splitter without also defeatin…
+- `RULE-033` Combined-compile failure reporting — Needs rules that compile individually but fail in combination. That is a property of libyara's namespace handling, not something a chosen input reliab…
+- `TRAV-018` File-level junction skip, counted — The counted branch needs a FILE-type reparse point. mklink /J creates directory junctions only (removed by the dirs[:] filter, which increments no cou…
 
 ### unreachable (1)
-- `PERF-013` Governor sampling during producer backpressure — inside `except Full`, which
-  a 1.0 s `put()` timeout makes unreachable; measured at zero with 1 worker and a 2-slot
-  queue
+A guard upstream makes the branch unreachable in normal operation.
+
+- `PERF-013` Governor sampling during producer backpressure — The _sample_governor() call sits inside `except Full`, and put() uses a 1.0 s timeout. Measured with 1 worker behind a 2-slot queue — the tightest con…
+
+### disabled-by-design (1)
+Present but deliberately off, so there is no behaviour to observe.
+
+- `TRAV-019` Real-path deduplication (present but disabled) — Real-path deduplication is present but deliberately disabled, so there is no behaviour to observe. Its absence is recorded against the junction-cycle …
 
 ### no-delivery-path (1)
-- `LIFE-025` KeyboardInterrupt handling — Action Center has no signal channel to a running
-  payload; console Cancel hard-kills instead, which is a different path
+There is no channel through which the trigger can be delivered.
+
+- `LIFE-025` KeyboardInterrupt handling — KeyboardInterrupt cannot be delivered to a payload through Action Center — there is no signal channel to the running script. Console Cancel hard-kills…
+
+### deleted (1)
+Removed from the scanner after its unreachability was enumerated.
+
+- `RULE-044` Dead cached-hit dict ingestion path in match-field extraction — Deleted. The dict arm was unreachable in production: three call sites all iterate `matches`, which has one binding to self.rules.match() returning Mat…
 
 ---
 
