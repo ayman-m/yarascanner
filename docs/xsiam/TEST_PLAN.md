@@ -57,11 +57,11 @@ These were open; they are settled as follows so execution is unambiguous.
 | Round | Title | Capabilities | core | Endpoints | On failure |
 |---|---|---|---|---|---|
 | **1** | Resource discipline | 53 | 6 | `xsoar` | stop-on-fail |
-| **2** | False-positive flood | 109 | 7 | `xsoar`, `thor` | collect-through |
-| **3** | Precision and resilience | 121 | 18 | `xsoar`, `OfficeiMac`, `thor` | collect-through |
-| — | Not covered | 14 | 0 | — | — |
+| **2** | False-positive flood | 106 | 7 | `xsoar`, `thor` | collect-through |
+| **3** | Precision and resilience | 113 | 18 | `xsoar`, `OfficeiMac`, `thor` | collect-through |
+| — | Not covered | 25 | 0 | — | — |
 
-**Total 297 / 297.** 280 asserted, 3 reachability probes, 14 not covered.
+**Total 297 / 297.** 269 asserted, 3 reachability probes, 25 not covered.
 
 ---
 
@@ -550,7 +550,7 @@ These were open; they are settled as follows so execution is unambiguous.
 
 **Endpoints:** `xsoar`, `thor`  
 **On failure:** collect-through  
-**Capabilities:** 109 (7 core)
+**Capabilities:** 106 (7 core)
 
 **Scenario.** A ruleset that matches nearly every file, over a large seeded tree, on Linux and Windows. Drives caps, aggregation, batching, retry, the alert-footprint ceiling, and the delivery balance sheets to their limits.
 
@@ -869,7 +869,7 @@ These were open; they are settled as follows so execution is unambiguous.
 - **Setup** — Run the round-1 loaded scan twice on xsoar — once with defaults, once with YARA_ENABLE_PERF_MONITOR=true — and pull both statistics_<run_id>.log files over SSH before the third run prunes them.
 - **Evidence** — <scanner_dir>/logs/statistics_<run_id>.log — the literal line `COMPREHENSIVE STATISTICS SUMMARY` between two `====` rules, then `Performance Metrics: {...}` (peak_cpu_percent, avg_cpu_percent, peak_memory_mb, avg_memory_mb, samples_collected), `Time Estimates: {...}`, `Worker Summary: {...}` (per worker: files_processed, avg_processing_time_ms, error_rate_percent); corroborating line `Performance monitoring disabled in light profile` (1602).
 
-## Delivery (56)
+## Delivery (53)
 
 ### `DELI-001` HTTP Collector NDJSON transport
 
@@ -897,15 +897,6 @@ These were open; they are settled as follows so execution is unambiguous.
 - **Threshold** — flood run → mean N >= 100, max N == 500, and total findings / count(batch lines) >= 50; control run with 3 matches → 1-3 batch lines all with N <= 3, and the first batch line's timestamp within 2 s of the first queue line's (no linger delay added)
 - **Setup** — Pair each flood run with a 3-match control run on the same host using a narrow rule pack.
 - **Evidence** — uploads_<run_id>.log lines `YARA match batch uploaded: <N> event(s) (HTTP 2xx)`; the per-finding queue line `Queued finding for upload: rule='X', file=Y, hits=<n>` with its timestamp; UPLOAD_BATCH_MAX_EVENTS (default 500) and UPLOAD_BATCH_MAX_BYTES (default 4 MiB).
-
-### `DELI-004` Approximate byte accounting for batch sizing
-
-*supporting* · on `xsoar`
-
-- **Must be true** — Realized request bodies stay at or below UPLOAD_BATCH_MAX_BYTES except by at most one event's size, and a single event larger than the whole cap is still sent alone rather than aborting the batch.
-- **Threshold** — max(body_bytes) <= UPLOAD_BATCH_MAX_BYTES + max(single_event_bytes); >= 1 batch of N == 1 whose body exceeds the cap on its own (the oversized-first-item case); 0 batches dropped or errored due to size
-- **Setup** — Extra xsoar run against a local HTTP stub with YARA_UPLOAD_BATCH_MAX_BYTES=65536 and a rule whose matched string is ~200 KB (long hex string against a large planted file), so one event alone exceeds the cap within a short run.
-- **Evidence** — Content-Length of each POST body observed on the wire (tcpdump on xsoar against a local plaintext stub, or the stub's own request log), correlated by N with uploads_<run_id>.log batch lines; the estimator at `approx += len(json.dumps(nxt.to_dict(), ensure_ascii=False))` with the `except Exception: approx += 1024` fallback (779-784).
 
 ### `DELI-005` Bounded retry with jittered exponential backoff
 
@@ -1311,13 +1302,6 @@ These were open; they are settled as follows so execution is unambiguous.
 - **Setup** — Whole-filesystem xsoar scan (high skip rate) plus a rule pack containing at least one deliberately uncompilable rule, so both penalty terms are non-zero.
 - **Evidence** — XQL comprehensive_final_report: data.efficiency_score (PINNED:6136-6145) recomputed from data.file_processing (files_skipped/files_processed) and data.rule_compilation (failed/valid); message "Comprehensive scan report - Efficiency Score: N/100" (PINNED:6154); local line in statistics_<run_id>.log (PINNED:6162).
 
-### `DELI-053` Critical-path events post single-object JSON, not NDJSON — the only non-NDJSON body the collector sees
-
-*supporting* · on `xsoar`
-
-- **Must be true** — `LogManager._log_critical` bypasses the batching queue and does a synchronous `requests.post(json=standard_log.to_dict(), headers={'Content-Type': 'application/json'})` — one JSON object, one request. This is literally the only other `requests.post` in the file: the sole other call site is inside `_post_ndjson` (line 736), which sends `Content-Type: text/plain` with an NDJSON body. So if a collector-side HTTP Log Collector, proxy or WAF is configured or filtered on the NDJSON/text-plain body shape, these events are the ones that break, and they break differently from everything else. Scope correction: only two call sites exist — `log_performance_critical` for worker-thread startup (5773, once per scan) and `log_statistics_critical` for "Target scan completed: <target>" (5869, once per scan TARGET, so N per run) — not "scan started / target completed" as the docstring at 1946-1949…
-- **Evidence** — On the wire: a lone JSON object with `Content-Type: application/json` arriving out of band from the `text/plain` NDJSON batches. Locally, in `uploads_<run_id>.log` (path 1784): on a non-2xx, `Critical log immediate send failed (HTTP <code>): ... - falling back to async queue` (1973-1976); on an exception, `Critical log immediate send raised <ExcType>: ... - falling back to async queue (may deliver a duplicate if the request actually landed)` (1983-1986); if the fallback itself fails or no thread exists, `Critical log dropped for <type>: ...` plus a `failed_uploads` increment (1992-2000). A clean success writes no line — only `upload_stats['successful_uploads']` increments (1971), surfacing later in the upload statistics block.
-
 ### `DELI-054` LogManager's telemetry books over-count: total_logs increments before the upload gate
 
 *supporting* · on `xsoar`
@@ -1326,15 +1310,6 @@ These were open; they are settled as follows so execution is unambiguous.
 - **Threshold** — total_logs_generated - (webhook_successful_uploads + webhook_failed_uploads) >= logs_by_type["upload"] and > 0 on every run; on a black-hole run the gap grows and the derived "success rate" in the message reads below 100% even though nothing was lost locally.
 - **Setup** — Compare the healthy flood run against the black-hole flood run; no code change needed. The bare-except drop path at PINNED:1988-1989 is NOT covered — it has no realistic trigger and would leave no artefact, so proving it would need a dropped counter that does not exist.
 - **Evidence** — Logging Summary system event data.total_logs_generated, data.webhook_successful_uploads, data.webhook_failed_uploads, data.logs_by_type (counter at PINNED:1977-1978, gate at PINNED:1980-1981, by_type map).
-
-### `DELI-055` Circuit-open batches go to the TAIL of the upload queue (telemetry reordering and re-bounce)
-
-*supporting* · on `xsoar`
-
-- **Must be true** — With the collector unreachable for a whole flood run, the per-type telemetry `total` counters equal the number of distinct events emitted (never a multiple of it, because a re-queued batch is not re-counted), and no event is dropped on the re-put path.
-- **Threshold** — telemetry_delivery.successful_uploads == 0 and failed_uploads == total_uploads; total_uploads <= the emitted-event census counted from the local logs (i.e. no bounce double-count, ratio == 1.0 +/- 0); process still exits within 4 x DRAIN_MAX_SECS (60s) of cleanup start.
-- **Setup** — Second flood run on xsoar with API_ENDPOINT pointed at an unroutable black-hole (e.g. 10.255.255.1) so the breaker opens after CIRCUIT_FAILURE_THRESHOLD=5 consecutive failures; count the emitted event census from uploads_/system_/statistics_ logs before comparing.
-- **Evidence** — `telemetry_delivery` block in /opt/yara_scanner/logs/scan_summary_<run_id>.json (WebhookUploader.get_upload_statistics()['summary'], built at 3723-3775) cross-read against the per-type counters; plus /opt/yara_scanner/logs/scan_errors_<run_id>.log for any `Webhook unexpected error for batch:` line (3771).
 
 ### `DELI-056` file_creation_time is null on most Linux filesystems (platform-asymmetric derivation)
 
@@ -1533,13 +1508,13 @@ These were open; they are settled as follows so execution is unambiguous.
 
 **Endpoints:** `xsoar`, `OfficeiMac`, `thor`  
 **On failure:** collect-through  
-**Capabilities:** 121 (18 core)
+**Capabilities:** 113 (18 core)
 
 **Scenario.** Whole-filesystem scans with planted decoys, malformed and module-dependent rule packs, symlink/junction traps, permission-denied paths, and a mid-run cancellation. Run on Linux, macOS and Windows for the platform-divergent paths.
 
 **Why these belong together.** Correctness and failure handling need adversarial input. A clean scan cannot distinguish 'handles malformed rules' from 'never saw one'.
 
-## Rules (41)
+## Rules (38)
 
 ### `RULE-001` Base64-only rule input
 
@@ -1711,15 +1686,6 @@ These were open; they are settled as follows so execution is unambiguous.
 - **Setup** — Make both `flood_dup` copies condition-only (no strings) with different `meta: purpose = "..."` values, the second carrying a distinctive marker token.
 - **Evidence** — The `Condition Match Details:` block in /opt/yara_scanner/alert/<rule>.txt (written at line 5342); map built by _build_yara_rule_source_map keyed on lowercased name (lines 500-510 region, called from YaraScanner.__init__).
 
-### `RULE-021` Compile-time externals declaration
-
-*supporting* · on `xsoar`
-
-- **Must be true** — A rule whose condition references filepath / filepath_lower / filename / filename_lower compiles rather than failing with an undefined identifier.
-- **Threshold** — All 4 externals-referencing rules count toward valid_rules; failed_rules attributable to those rules == 0, on both xsoar (3.11.0) and OfficeiMac (4.1.0).
-- **Setup** — Pack with 4 rules, each condition referencing a different one of the four externals.
-- **Evidence** — `valid_rules` in /opt/yara_scanner/logs/scan_summary_<run_id>.json; absence of any `undefined_identifier` diagnosis for those rules in the `=== RULE COMPILATION FAILURE #n ===` blocks of yara_processing_<run_id>.log; YARA_COMPILE_EXTERNALS defined at line 885 and passed at 4472, 4639, 4730.
-
 ### `RULE-022` Per-file externals at match time
 
 *supporting* · on `xsoar`, `OfficeiMac`, `thor`
@@ -1774,15 +1740,6 @@ These were open; they are settled as follows so execution is unambiguous.
 - **Setup** — Run the round-3 broken pack after rounds 1 and 2 have already deposited failed-rule artifacts on xsoar; snapshot the directory before and after over SSH.
 - **Evidence** — Directory listing and mtimes of /opt/yara_scanner/failed_rules/ across runs; cleanup path list at lines 4122-4126; the ISO timestamp inside each file header.
 
-### `RULE-028` Un-splittable pack forensics
-
-*supporting* · on `xsoar`
-
-- **Must be true** — Content that passes the `rule`-token validation but yields zero extractable blocks dumps the full raw decoded text before aborting.
-- **Threshold** — raw_yara_content.yar exists and its body byte-matches the decoded input; exactly one COMPILATION_ERROR line; exit code non-zero with 0 files scanned.
-- **Setup** — Deliver base64 of text where every `rule` token is at non-zero brace depth - e.g. `x { rule a { condition: true } }` - so validation passes but no top-level rule statement is found.
-- **Evidence** — /opt/yara_scanner/failed_rules/raw_yara_content.yar (written at line 4580) prefixed `// RAW YARA CONTENT - Failed to split into individual rules`; `COMPILATION_ERROR: No YARA rules found in provided content` in yara_processing_<run_id>.log (4578).
-
 ### `RULE-030` Three-way valid / failed / skipped accounting
 
 *supporting* · on `xsoar`
@@ -1809,14 +1766,6 @@ These were open; they are settled as follows so execution is unambiguous.
 - **Threshold** — All-cuckoo pack on xsoar: message contains "agent capability limit", Skipped == N, Failed == 0. All-broken pack: message does NOT contain "agent capability limit", Failed == N, Skipped == 0. Both exit non-zero with 0 files scanned.
 - **Setup** — Two runs on xsoar: (a) 4 rules all importing cuckoo, (b) 4 rules all with syntax errors.
 - **Evidence** — stderr `CRITICAL: YARA rule compilation failed: No rules could run on this endpoint: all N rule(s) need YARA modules this agent's libyara build does not provide (available: ...). This is an agent capability limit, not a rule syntax error.` followed by `Valid rules: 0, Failed rules: 0, Skipped: N` (line 4725); `FINAL_COMPILATION_ERROR:` with the same text in yara_processing_<run_id>.log (4723).
-
-### `RULE-033` Combined-compile failure reporting
-
-*supporting* · on `xsoar`
-
-- **Must be true** — A ruleset that passes rule-by-rule but fails as one namespaced compile is recorded under its own COMBINED_COMPILATION_ERROR prefix and re-raised unchanged.
-- **Threshold** — n/a - not exercisable
-- **Evidence** — `COMBINED_COMPILATION_ERROR: <exc>` in /opt/yara_scanner/logs/yara_processing_<run_id>.log (line 4743) - distinct from FINAL_COMPILATION_ERROR.
 
 ### `RULE-034` Rule-pack hash and scan_id derivation
 
@@ -1907,7 +1856,7 @@ These were open; they are settled as follows so execution is unambiguous.
 - **Setup** — Plant one byte-identical decoy file on both xsoar and thor containing a known ASCII string at exactly 3 known offsets, and include a matching single-string rule in the flood pack. Fix YARA_MAX_ALERT_OFFSETS high enough (>=50) that the cap does not confound the comparison.
 - **Evidence** — <scanner_dir>/alert/<rule>.txt: `Total string hits: N`, `Hits per string ID: $a=3, ...` (5306-5308) and each `String ID:` / `Offset:` / `Data:` block (5318-5320); yara_match event fields `offsets`, `strings`, `match_ids`, `string_match_count`, `truncated` (3474-3478); `total_string_matches` on the merged scan alert (5364).
 
-## Traversal (39)
+## Traversal (36)
 
 ### `TRAV-001` Explicit scan folder parameter
 
@@ -2043,23 +1992,6 @@ These were open; they are settled as follows so execution is unambiguous.
 - **Threshold** — Scanning C:\Users\<THOR_USER> on thor: no path containing `\Application Data\` appears in alerts or the evidence file_mapping; the planted matching file under C:\Users\<THOR_USER>\AppData\Roaming appears exactly ONCE (not once per junction alias); and the pruned subtree adds 0 to `Junction/symlink skip` and 0 to `Skipped directory` — a directory-level prune must be uncounted, unlike the file-level skip. This is the Windows-only half: on POSIX _walk_cancellable already refuses to push symlinked dirs, so the prune is a no-op there.
 - **Setup** — On thor plant one matching file at C:\Users\<THOR_USER>\AppData\Roaming\decoy_hit.bin and run the flood pack with scan_folder=C:\Users\<THOR_USER> — avoids a recursive walk of thor's large attached disk.
 - **Evidence** — absence of any path under the pruned junction in logs\alerts_<run_id>.log and in the evidence ZIP file_mapping; `files_skipped` and every key of `file_processing.skip_breakdown` in the comprehensive_final_report event (6094); prune site 5967.
-
-### `TRAV-018` File-level junction skip, counted
-
-*supporting* · on `xsoar`
-
-- **Must be true** — A candidate file that is a listed junction/symlink is skipped, counted under three counters, never enqueued, and does not inflate total_files_found.
-- **Threshold** — OfficeiMac with 3 planted symlinked files under /tmp: skip_breakdown['Junction/symlink skip'] == 3, junction_skips == 3, files_skipped includes those 3, zero alert entries name /tmp/dl1..dl3, and the target's `files_found` (5951-5957) excludes them (the skip happens before total_files_found is incremented).
-- **Setup** — Reuse the /tmp symlink plant from the junction-detection criterion on OfficeiMac; scan_folder=/tmp.
-- **Evidence** — `Junction/symlink skip` in `file_processing.skip_breakdown` (6094) and in the `Skip reasons: ...` statistics data (5556-5557); `junction_skips` in the `Scan Progress` metrics (5494); `files_skipped` in logs/scan_summary_<run_id>.json; skip site 5975-5980.
-
-### `TRAV-019` Real-path deduplication (present but disabled)
-
-*supporting* · on `xsoar`, `OfficeiMac`, `thor`
-
-- **Must be true** — Real-path deduplication stays inert in this edition: the dedup set is never populated and no file is ever refused as a symlink duplicate.
-- **Threshold** — On every round-3 run: unique_real_paths == 0 AND unique_paths_scanned == 0 AND `Junction/symlink duplicate` is absent from every skip_breakdown — even on the leg with symlink decoys planted, where a live dedup would fire. Any non-zero value means the hardcoded flag was flipped.
-- **Evidence** — `unique_real_paths` in the `Scan Progress` statistics metrics (5495) and `unique_paths_scanned` in the final statistics data (5521), logs/statistics_<run_id>.log; the reason string `Junction/symlink duplicate` (4999) in `file_processing.skip_breakdown` (6094); flag `self.track_real_paths = False` (2854).
 
 ### `TRAV-020` Skip by file extension (disk-image containers)
 
@@ -2205,14 +2137,6 @@ These were open; they are settled as follows so execution is unambiguous.
 - **Setup** — Run the whole-filesystem scan on xsoar as LINUX_USER (NOT root) so /root, /etc/shadow etc. are unreadable. Concurrently delete ~20 files from a large scanned directory while the walk is in progress to drive the exists() arm.
 - **Evidence** — skip_breakdown keys 'File does not exist' (5964) and 'No read permission' (4990) in the 'Skip reasons' statistics record; per-file lines 'Permission denied: <path>' with data {'file_path','file_mode','owner_uid','scanner_uid','requires_root'} in /opt/yara_scanner/logs/system_<run_id>.log (log_system at 4981, permission_info built 4970-4979).
 
-### `TRAV-037` Second-line skip check inside the worker
-
-*supporting* · on `xsoar`
-
-- **Must be true** — Not assertable: the worker-side skip and the walk-side skip increment the identical skip_reasons key with no distinguishing marker.
-- **Threshold** — n/a
-- **Evidence** — None. scan_file returns (False, 'Special system file') at 4992-4993 and the worker folds it into skip_reasons['Special system file'] at 4844-4846; the walk loop increments the same key at 5987-5988. No field, log line or counter separates the two call sites.
-
 ### `TRAV-040` Bounded per-file error labels in the skip breakdown
 
 *supporting* · on `xsoar`
@@ -2275,7 +2199,7 @@ These were open; they are settled as follows so execution is unambiguous.
 - **Setup** — Round 3's mid-run cancellation on xsoar - poll `ls -la /opt/yara_scanner/control` over SSH every 2 s across the cancel. The permission-failure branch is not injected (would require chmod-ing a live scanner root); assert only that a normal run never reports the Cancel-failed string.
 - **Evidence** — `ls -la /opt/yara_scanner/control` during and after the run: `running.json` present while scanning (written by `_write_running_marker`), `cancel.flag` present after `cancel()` and consumed at cleanup (`_clear_cancel_flag`, 5820-5821); the cancel entry point creates the dir itself at 838-842 and returns the literal `Cancel failed: cannot create control dir <path>: <err>` on failure; ScanConfig's own creation is wrapped in try/except at 2752-2756.
 
-## Lifecycle (39)
+## Lifecycle (37)
 
 ### `LIFE-001` Scan entry point main(yarafile, scan_folder, alert_severity)
 
@@ -2411,24 +2335,6 @@ These were open; they are settled as follows so execution is unambiguous.
 - **Threshold** — Evidence ZIP exists, is non-empty, and contains the alert text for the planted match plus file_mapping; 'Evidence collected from failed scan' present; the last 'Scan status changed to' line is 'failed'; the result line starts 'Scan failed:' and reports 'Fatal failures: 1'.
 - **Setup** — Run the scanner via CLI over SSH on xsoar with a rule that matches a planted decoy early, wait for the first match to be written to alert/, then send SIGINT to the process - the KeyboardInterrupt handler sets scan_failed=True and execution falls into the fatal-failure branch at 6444.
 - **Evidence** — /opt/yara_scanner/evidence/evidence_<hostname>_<run_id>.zip; /opt/yara_scanner/logs/system_<run_id>.log `Evidence collected from failed scan` (6467) or the error lines `Evidence collection failed after fatal failure:` / `Could not emit terminal status after failure:` (6464/6469); terminal 'Scan status changed to: failed' in diagnostics_<run_id>.log.
-
-### `LIFE-024` Critical-error path in main()
-
-*supporting* · on `xsoar`
-
-- **Must be true** — An exception escaping main()'s body is converted into a result string ending 'Critical error occurred', with a machine-greppable 'SCAN_STATUS: ERROR' on stderr, and never propagates to the caller.
-- **Threshold** — Result string matches `^Scan failed: \d+ files scanned \\| \d+ rules failed compilation \\| \d+ matches found \\| Critical error occurred$`; stderr contains exactly one 'SCAN_STATUS: ERROR'; process exit code 1; no traceback escapes to the shell as a Python crash.
-- **Setup** — Invoke main via CLI on xsoar with alert_severity='bogus' - _parse_alert_severity raises ValueError inside ScanConfig, which is constructed inside main()'s try. Note: scanner does not exist at that point, so no scan_summary is expected for this variant.
-- **Evidence** — stderr line `SCAN_STATUS: ERROR` (6659); stdout 'CRITICAL ERROR: ...' block (6661-6664); the returned result line (6786-6788); /opt/yara_scanner/logs/script_exceptions_<run_id>.log if a log context exists.
-
-### `LIFE-025` KeyboardInterrupt handling
-
-*supporting* · on `xsoar`
-
-- **Must be true** — Ctrl+C around scan_system is recorded as an abnormal stop - status 'interrupted', scan_failed set with the reason, outcome 'failed' - not as a clean finish.
-- **Threshold** — 'Scan interrupted by user (Ctrl+C)' present exactly once; a 'Scan status changed to: interrupted' line exists and is followed by a terminal 'failed'; scan_summary.outcome == 'failed' with failure_reasons containing 'Scan interrupted by user'; result line starts 'Scan failed:'; exit code 1.
-- **Setup** — Run the scanner via CLI over paramiko SSH on xsoar (not Action Center) and send SIGINT to the PID ~60s into the scan.
-- **Evidence** — /opt/yara_scanner/logs/system_<run_id>.log `Scan interrupted by user (Ctrl+C)` (6434); diagnostics_<run_id>.log 'Scan status changed to: interrupted' (6438); scan_summary_<run_id>.json outcome and failure_reasons; the SCAN_RESULT line.
 
 ### `LIFE-026` Guaranteed finalisation order in main()'s finally block
 
@@ -2638,18 +2544,29 @@ candidate for a follow-up change rather than a test.
 | ID | Capability | Reason | What would close it |
 |---|---|---|---|
 | `RULE-002` | Rule input size cap | `wont-run` | Rewrite Observe to: "Pass a base64 blob longer than 50,000,000 characters. stderr shows `YARA Scanner Critical Error: Critical scanner error: YARA rules input too large` followed by `SCAN_STATUS: ERROR` (main's handler, lines 6651-6656), and the SCAN_RESULT line reads `Scan failed: 0 files scanned \| ... \| Critical error occurred` with exit code 1. logs/yara_processing_<run_id>.log already exists with its 4-line banner and ends with `CRITICAL: Failed to decode YARA rules: YARA rules input too… |
+| `RULE-021` | Compile-time externals declaration | `no-artefact` | A rule whose condition uses `filename_lower` compiles (counts toward `Valid rules compiled`) rather than producing an `undefined_identifier` entry in the compilation-failure block. |
+| `RULE-028` | Un-splittable pack forensics | `cannot-construct` | `failed_rules/raw_yara_content.yar` prefixed `// RAW YARA CONTENT - Failed to split into individual rules`; `yara_processing_<run_id>.log` carries `COMPILATION_ERROR: No YARA rules found in provided content`. |
 | `RULE-029` | Split-stage failure isolation | `wont-run` | `yara_processing_<run_id>.log`: `SPLIT_ERROR: Failed to split YARA rules: <exc>`. |
+| `RULE-033` | Combined-compile failure reporting | `cannot-construct` | `yara_processing_<run_id>.log`: `COMBINED_COMPILATION_ERROR: <exc>` — distinct from `FINAL_COMPILATION_ERROR`, and the only path where valid_rules_count > 0 yet no scan runs. |
 | `RULE-044` | Dead cached-hit dict ingestion path in match-field extraction | `needs-instrumentation` | UNOBSERVABLE: no live scan can reach it, so it cannot be a runtime test criterion. Every finding on a real scan takes the else-branch (993-995), because `matches` is always the return of self.rules.match(...) at 4911-4915. Confirmable only statically, or by a unit-level call such as _iter_hit_fields({'rule': 'r', 'strings': [(0, '$a', '4d5a')]}) asserting the returned data is b'MZ' (confirmed by direct execution). Making it observable on a scan would require a cache writer that persists hits… |
 | `TRAV-008` | Unknown-platform target fallback | `wont-run` | Rewrite Observe to: "Both halves are now checkable: `Unknown platform - manual target specification required` in yara_processing_<run_id>.log (3162), and the exact line `Using default Unix target: ['/']` in <scanner_dir>/logs/diagnostics_<run_id>.log (logging.info at 5423). The sibling `Using default Windows targets: [...]` (5420) and `Using configured scan targets: [...]` (5415) land in the same file, so the branch actually taken is distinguishable." |
+| `TRAV-018` | File-level junction skip, counted | `cannot-construct` | `Junction/symlink skip` key in the `Skip reasons: ...` statistics line (line 5411) and in `file_processing.skip_breakdown` of the `comprehensive_final_report` event (line 5917); `junction_skips` in `Scan Progress` metrics |
+| `TRAV-019` | Real-path deduplication (present but disabled) | `disabled-by-design` | negative assertion: `unique_real_paths` in `Scan Progress` metrics and `unique_paths_scanned` in the final statistics data are always 0, and `Junction/symlink duplicate` never appears in `skip_breakdown`. If either becomes non-zero the flag was flipped |
 | `TRAV-031` | No directory skipping on unrecognised platforms | `wont-run` | negative test: skip_breakdown contains no `Skipped directory` entries attributable to platform lists |
+| `TRAV-037` | Second-line skip check inside the worker | `no-artefact` | `Special system file` appearing in `skip_breakdown` from the worker path (distinguishable in the local logs from the walk-loop attribution, which increments the same key at line 5843) |
 | `TRAV-045` | macOS case-sensitivity probe file written to /tmp for every file that reaches the scan body | `needs-instrumentation` | UNOBSERVABLE from the scanner: no log line, no summary field. The two fields that would hint at it — `unique_real_paths` (5367, inside the additional_metrics dict shipped by log_scan_progress at 5372-5375) and `unique_paths_scanned` (5393, in _log_final_results) — are both `len(self.scanned_real_paths)` and are always 0, because the only `.add()` is at 4907 behind track_real_paths. To confirm it, watch the filesystem outside the scanner: `sudo fs_usage -w -f filesys \| grep CaSe_TeSt_YaRa` on… |
 | `PERF-009` | Governor sampling cadence (rate limit) | `needs-instrumentation` | UNOBSERVABLE: Frequency of `CPU governor \|` performance lines is bounded by this interval combined with the emit policy below; with a debug build, `last_governor_sample` advances at most every 0.5 s. minimum=0 is deliberate — a negative value would make the check always true and sample psutil on every file. To close it: Instrument _sample_governor (line 4887). Add `self._governor_sample_count = 0` beside line 4408, then immediately after line 4898 insert `self._governor_sample_count += 1` and… |
 | `PERF-010` | Governor fail-open when CPU cannot be read | `unsafe-injection` | One performance log line: `CPU governor disabled - could not read CPU (<err>). Scan continues unthrottled.` and no further `CPU governor \|` lines for the rest of the run. |
 | `PERF-013` | Governor sampling during producer backpressure | `unreachable` | `CPU governor \|` lines continue to appear interleaved with `Scan queue saturated (...)` lines on a scan where discovery outruns the workers. |
 | `PERF-045` | File-descriptor leak sampling (skipped on every matched file, and on every skipped file) | `needs-instrumentation` | UNOBSERVABLE: a sample that finds nothing emits nothing, so you cannot tell whether a sample ran, was skipped by a match/skip path, or was lost to the unlocked increment. The only artefacts are threshold breaches in `<scanner_dir>/logs/system_<run_id>.log` (`logs_dir` built at 2686, SYSTEM file name at 1785): `Initial file descriptors in use: N` once at startup (6160), then `FD usage increased by <n> (current: <n>)` only when growth exceeds 100 (4970-4973) and `WARNING: High FD usage: <n>`… |
+| `DELI-004` | Approximate byte accounting for batch sizing | `no-artefact` | Inspect request sizes at the collector or on the wire: batches stay near but can overshoot the cap by at most one event. A finding carrying an unusually large matched string is the case to test. |
 | `DELI-006` | Circuit breaker on the telemetry channel | `unsafe-injection` | UNOBSERVABLE: With a dead collector, telemetry POSTs stop entirely for ~40 s windows while the queue grows; the per-type `total` in WebhookUploader.get_upload_statistics() (and scan_summary's telemetry_delivery) stays flat during an open window rather than inflating, and undelivered rises at shutdown. To close it: Minimal instrumentation: in CircuitBreaker.on_failure (1202-1210), emit on the two transitions into 'open' (after 1207 and after 1210) `logging.warning(f"Telemetry circuit opened… |
 | `DELI-047` | Upload channels can be disabled independently | `needs-instrumentation` | UNOBSERVABLE: scanner_initialization data.upload_enabled and data.telemetry_upload_enabled echo the two flags. With UPLOAD_RESULTS False, uploads_<run_id>.log ends with "Upload disabled - N matches saved locally"; with API_ENDPOINT empty it logs "API_ENDPOINT not configured - real-time match upload disabled". To close it: Minimal instrumentation for the live half: give ResultsUploader.__init__ a `log_manager=None` parameter (3174) and set `self.log_manager = log_manager` before the `if… |
+| `DELI-053` | Critical-path events post single-object JSON, not NDJSON — the only non-NDJSON body the collector sees | `no-artefact` | On the wire: a lone JSON object with `Content-Type: application/json` arriving out of band from the `text/plain` NDJSON batches. Locally, in `uploads_<run_id>.log` (path 1784): on a non-2xx, `Critical log immediate send failed (HTTP <code>): ... - falling back to async queue` (1973-1976); on an exception, `Critical log immediate send raised <ExcType>: ... - falling back to async queue (may deliver a duplicate if the request actually landed)` (1983-1986); if the fallback itself fails or no… |
+| `DELI-055` | Circuit-open batches go to the TAIL of the upload queue (telemetry reordering and re-bounce) | `unsafe-injection` | On the wire: during an induced collector outage, event arrival order for a single `scan_id` diverges from the `timestamp` field ordering. Locally there is almost nothing: the open-circuit path writes NO line, and the only failure line this method produces is `Webhook unexpected error for batch: ...` (3693), which goes through `log_manager.log_error` into `scan_errors_<run_id>.log` — NOT the uploads log. On a plain non-2xx or on retry exhaustion this method logs nothing at all. The only… |
 | `LIFE-022` | Fatal worker failure path | `wont-run` | Rewrite Observe to: "Instrumented, but not a live-scan criterion. When it fires, grep <scanner_dir>/logs/scan_errors_<run_id>.log for `Worker <thread-name> fatal error: <exc>` (log_manager.log_error at 4868-4869), followed by `Scan stopped due to fatal failures` (6451), scan_status 'failed' (6462) and outcome='failed' in scan_summary_<run_id>.json (6764). It cannot be provoked by file content - scan_file's blanket handler (5093-5099) and _worker's inner handler (4862-4866) absorb everything… |
+| `LIFE-024` | Critical-error path in main() | `unsafe-injection` | stderr contains 'SCAN_STATUS: ERROR'; collector has a scan_completion_summary with data.status='critical_error'; <scanner_dir>/logs/script_exceptions_<run_id>.log exists (created lazily, only when an exception is logged); result line ends 'Critical error occurred'. |
+| `LIFE-025` | KeyboardInterrupt handling | `no-delivery-path` | system log 'Scan interrupted by user (Ctrl+C)'; scan_status='interrupted' event; summary outcome='failed' with that reason; result line 'Scan failed: ...'. |
 | `LIFE-065` | One failing scan target is abandoned mid-walk; the rest of the scan continues and still reports success | `wont-run` | Three-way check on one run. (1) `logs/scan_errors_<run_id>.log` contains `Error scanning target <path>: <exception>` (log_error 2010-2012 -> `_log_with_webhook` 1901-1911 -> LogType.ERROR file, mapped at 1782). (2) `logs/statistics_<run_id>.log` contains `Target scan completed: <target>` for every other target but **not** for that one — this is the load-bearing negative, and it holds only for this handler's exceptions, not for walk-level OS errors, which still reach the success path; the same… |
 
 ## Reachability probes (3)

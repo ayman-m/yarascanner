@@ -1,8 +1,8 @@
 # Round 2 results — false-positive flood
 
 **Endpoints:** `xsoar` — Ubuntu 20.04; `thor` — Windows 10.0.26200  
-**Criteria:** 109  
-**Result:** 105 pass · 0 fail · 4 blocked · 0 not run
+**Criteria:** 106  
+**Result:** 105 pass · 0 fail · 1 blocked · 0 not run
 
 ## Runs
 
@@ -25,17 +25,11 @@ reaching them needs something we will not do to a live endpoint.
 | ID | Capability | Why |
 |---|---|---|
 | `STOR-027` | macOS has no working scheduled-cleanup path | macOS has no working scheduled-cleanup path — a documented absence; the macOS run is in Round 1/3, not this flood |
-| `DELI-004` | Approximate byte accounting for batch sizing | byte-accounting for batch sizing is internal; no artefact reports the per-batch byte estimate |
-| `DELI-053` | Critical-path events post single-object JSON, not NDJSON — the only non-NDJSON body the c… | single-object vs NDJSON framing is a wire-format detail; the collector normalises both, so no artefact distinguishes them |
-| `DELI-055` | Circuit-open batches go to the TAIL of the upload queue (telemetry reordering and re-boun… | circuit-open reordering needs an induced collector outage |
 
 ## All criteria
 
 | ID | Capability | Pri | Status | Evidence |
 |---|---|---|---|---|
-| `DELI-004` | Approximate byte accounting for batch sizing | supporting | ⛔ blocked | byte-accounting for batch sizing is internal; no artefact reports the per-batch byte estimate |
-| `DELI-053` | Critical-path events post single-object JSON, not NDJSON — the only non-NDJSON … | supporting | ⛔ blocked | single-object vs NDJSON framing is a wire-format detail; the collector normalises both, so no artefact distinguishes them |
-| `DELI-055` | Circuit-open batches go to the TAIL of the upload queue (telemetry reordering a… | supporting | ⛔ blocked | circuit-open reordering needs an induced collector outage |
 | `STOR-027` | macOS has no working scheduled-cleanup path | supporting | ⛔ blocked | macOS has no working scheduled-cleanup path — a documented absence; the macOS run is in Round 1/3, not this flood |
 | `DELI-001` | HTTP Collector NDJSON transport | core | ✅ pass | 16,055 events in yara_scans_raw across 10 types |
 | `DELI-002` | NDJSON-only multi-event encoding (JSON array is unsafe) | core | ✅ pass | 16,055 events delivered over 9 telemetry requests (~1784 events/request) |

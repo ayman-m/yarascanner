@@ -1,8 +1,8 @@
 # Round 3 results — precision and resilience
 
 **Endpoints:** `xsoar`, `OfficeiMac`, `thor`  
-**Criteria:** 121  
-**Result:** 108 pass · 0 fail · 13 blocked · 0 not run
+**Criteria:** 113  
+**Result:** 108 pass · 0 fail · 5 blocked · 0 not run
 
 ## Runs
 
@@ -145,36 +145,20 @@ reaching them needs something we will not do to a live endpoint.
 
 | ID | Capability | Why |
 |---|---|---|
-| `RULE-021` | Compile-time externals declaration | externals declaration is internal to the compile call; no artefact reports the declared set |
-| `RULE-028` | Un-splittable pack forensics | un-splittable-pack forensics needs a pack the splitter cannot divide at all |
-| `RULE-033` | Combined-compile failure reporting | combined-compile failure cannot be constructed deterministically: it needs rules that pass individually but fail together |
-| `TRAV-018` | File-level junction skip, counted | directory junctions are removed by the `dirs[:]` filter, which increments no counter; the counted file-level branch needs a FILE-type reparse point, not a directory junction. mklink /J creates only the latter. |
-| `TRAV-019` | Real-path deduplication (present but disabled) | real-path deduplication is present but DISABLED by design; no artefact reports it |
 | `TRAV-022` | Skip by bounded path fragment | the seeded tree contains no vendor-agent path; component-boundary matching is covered by tests/test_extra_skip_paths.py |
 | `TRAV-027` | Windows skip-drive mechanism | skip-drive mechanism needs a whole-machine Windows scan |
 | `TRAV-033` | Vendor security-agent path exclusions | vendor security-agent exclusions need those paths present; covered as a unit property by tests/test_extra_skip_paths.py |
-| `TRAV-037` | Second-line skip check inside the worker | the worker's second-line skip check shares one skip_reasons key with the producer's, so no artefact separates the two arms |
 | `TRAV-047` | Windows default scan scope is every mounted volume, including network and removable drives | Windows default scope covering every mounted volume needs a no-target whole-machine Windows scan |
 | `LIFE-007` | Stale cancel-flag protection anchored at module import | stale-flag protection needs a cancel.flag older than the module import, planted before the run |
-| `LIFE-024` | Critical-error path in main() | the critical-error path needs an induced fatal failure in main() |
-| `LIFE-025` | KeyboardInterrupt handling | KeyboardInterrupt cannot be delivered through Action Center |
 
 ## All criteria
 
 | ID | Capability | Pri | Status | Evidence |
 |---|---|---|---|---|
 | `LIFE-007` | Stale cancel-flag protection anchored at module import | supporting | ⛔ blocked | stale-flag protection needs a cancel.flag older than the module import, planted before the run |
-| `LIFE-024` | Critical-error path in main() | supporting | ⛔ blocked | the critical-error path needs an induced fatal failure in main() |
-| `LIFE-025` | KeyboardInterrupt handling | supporting | ⛔ blocked | KeyboardInterrupt cannot be delivered through Action Center |
-| `RULE-021` | Compile-time externals declaration | supporting | ⛔ blocked | externals declaration is internal to the compile call; no artefact reports the declared set |
-| `RULE-028` | Un-splittable pack forensics | supporting | ⛔ blocked | un-splittable-pack forensics needs a pack the splitter cannot divide at all |
-| `RULE-033` | Combined-compile failure reporting | supporting | ⛔ blocked | combined-compile failure cannot be constructed deterministically: it needs rules that pass individually but fail together |
-| `TRAV-018` | File-level junction skip, counted | supporting | ⛔ blocked | 3 scanned, 0 skipped |
-| `TRAV-019` | Real-path deduplication (present but disabled) | supporting | ⛔ blocked | real-path deduplication is present but DISABLED by design; no artefact reports it |
 | `TRAV-022` | Skip by bounded path fragment | core | ⛔ blocked | the seeded tree contains no vendor-agent path; component-boundary matching is covered by tests/test_extra_skip_paths.py |
 | `TRAV-027` | Windows skip-drive mechanism | supporting | ⛔ blocked | skip-drive mechanism needs a whole-machine Windows scan |
 | `TRAV-033` | Vendor security-agent path exclusions | core | ⛔ blocked | vendor security-agent exclusions need those paths present; covered as a unit property by tests/test_extra_skip_paths.py |
-| `TRAV-037` | Second-line skip check inside the worker | supporting | ⛔ blocked | the worker's second-line skip check shares one skip_reasons key with the producer's, so no artefact separates the two arms |
 | `TRAV-047` | Windows default scan scope is every mounted volume, including network and remov… | core | ⛔ blocked | Windows default scope covering every mounted volume needs a no-target whole-machine Windows scan |
 | `LIFE-001` | Scan entry point main(yarafile, scan_folder, alert_severity) | core | ✅ pass | main(yarafile, scan_folder, alert_severity) ran to completion |
 | `LIFE-002` | Cancel entry point cancel() — zero inputs | core | ✅ pass | CANCEL_RESULT: Cancel signal delivered (/tmp/yara_r3e/control/cancel.flag) \| scanner running: yes \| scan_id=xsoar_20260817_160806_408571_yara_eb6e98d3355a |

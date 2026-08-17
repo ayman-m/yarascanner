@@ -10,10 +10,10 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | Round | Total | pass | fail | blocked | not_run |
 |---|---|---|---|---|---|
 | 1 | 53 | 53 | 0 | 0 | 0 |
-| 2 | 109 | 105 | 0 | 4 | 0 |
-| 3 | 121 | 108 | 0 | 13 | 0 |
+| 2 | 106 | 105 | 0 | 1 | 0 |
+| 3 | 113 | 108 | 0 | 5 | 0 |
 
-**266 of 283 executed.**
+**266 of 272 executed.**
 
 ## All capabilities
 
@@ -39,19 +39,19 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `RULE-018` | Per-rule trial compile then namespaced whole-pack compile | 3 | supporting | ✅ pass | per-rule trial compile isolated exactly 1 failure | — |
 | `RULE-019` | Duplicate rule names survive | 3 | supporting | ✅ pass | 12 files, 0 failed, 24 matches — both same-named rules fired on every file | — |
 | `RULE-020` | Duplicate-name caveat in the rule-source map | 3 | supporting | ✅ pass | duplicate names compiled without failure; the rule-source map's caveat is that it cannot distinguish them, which no artefact surfaces | — |
-| `RULE-021` | Compile-time externals declaration | 3 | supporting | ⛔ blocked | — | externals declaration is internal to the compile call; no artefact reports the declared set |
+| `RULE-021` | Compile-time externals declaration | not_covered | supporting | — not_covered | — | The externals set is declared inside the compile call and never surfaces in any log, event or file. Nothing an external observer can read distinguishes a correct declaration from an absent one. |
 | `RULE-022` | Per-file externals at match time | 3 | supporting | ✅ pass | 7 rules fired including filesize-conditioned ones (627 matches) | — |
 | `RULE-023` | Non-short-circuiting match callback | 3 | supporting | ✅ pass | 627 matches over 310 files = 2.0 per file | — |
 | `RULE-024` | Condition-only (no-strings) rule support | 3 | supporting | ✅ pass | condition-only rule produced an alert artefact: True | — |
 | `RULE-025` | Per-rule compilation-failure diagnostics | 3 | supporting | ✅ pass | [2026-08-17 15:07:47.598] [ERROR] === RULE COMPILATION FAILURE #1 === | — |
 | `RULE-026` | failed_rules/ artifact directory | 3 | supporting | ✅ pass | 2 failed_rules artefacts; log references the directory: True | — |
 | `RULE-027` | failed_rules/ is never pruned | 3 | supporting | ✅ pass | 2 run_ids in logs/ after two scans; failed_rules still holds 'failed_rule_lc_broken.yar' | — |
-| `RULE-028` | Un-splittable pack forensics | 3 | supporting | ⛔ blocked | — | un-splittable-pack forensics needs a pack the splitter cannot divide at all |
+| `RULE-028` | Un-splittable pack forensics | not_covered | supporting | — not_covered | — | Needs a pack the splitter cannot divide at all. Every malformed pack tried still splits; producing one that defeats the splitter without also defeating the compiler is not a shape we can construct… |
 | `RULE-029` | Split-stage failure isolation | not_covered | supporting | — not_covered | — | Requires injecting a failure we cannot cause. _get_yara_top_level_statements is a total character-scanner over any str input (no regex backtracking, no parsing that can raise), so no rule text… |
 | `RULE-030` | Three-way valid / failed / skipped accounting | 3 | supporting | ✅ pass | valid=9 failed=1 skipped=1 | — |
 | `RULE-031` | Compilation summary block | 3 | supporting | ✅ pass | compilation summary block present | — |
 | `RULE-032` | All-skipped vs all-failed fatal distinction | 3 | supporting | ✅ pass | a partially-failed pack still ran: outcome=completed | the all-skipped and all-failed fatal variants need packs with zero survivors |
-| `RULE-033` | Combined-compile failure reporting | 3 | supporting | ⛔ blocked | — | combined-compile failure cannot be constructed deterministically: it needs rules that pass individually but fail together |
+| `RULE-033` | Combined-compile failure reporting | not_covered | supporting | — not_covered | — | Needs rules that compile individually but fail in combination. That is a property of libyara's namespace handling, not something a chosen input reliably triggers. |
 | `RULE-034` | Rule-pack hash and scan_id derivation | 3 | supporting | ✅ pass | scan_id=xsoar_20260817_150747_580334_yara_eb6e98d3355a carries run_id and rule_hash[:12]=eb6e98d3355a | — |
 | `RULE-035` | Rule/import census at initialization | 3 | supporting | ✅ pass | YARA Rules loaded: 11 rules, 2 imports | — |
 | `RULE-036` | Brace-balance sanity check | 3 | supporting | ✅ pass | brace-balance check fired on the deliberately broken rule | — |
@@ -80,8 +80,8 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `TRAV-015` | Junction / reparse-point detection | 3 | supporting | ✅ pass | planted ['jlink', 'Application Data'] — each reparse=True while islink=False, so detection came from the reparse attribute rather than islink | — |
 | `TRAV-016` | Per-platform problematic-junction skip list | 3 | supporting | ✅ pass | 3 files scanned with both junctions present: 2 real files plus one copy through the benign `jlink`, while `Application Data` was pruned (4 would mean it was followed too, 2 that the list is blanket) | — |
 | `TRAV-017` | Directory-level junction pruning during the walk | 3 | supporting | ✅ pass | the problematic junction's subtree was never walked — 3 files scanned, and its contents contributed none | — |
-| `TRAV-018` | File-level junction skip, counted | 3 | supporting | ⛔ blocked | 3 scanned, 0 skipped | directory junctions are removed by the `dirs[:]` filter, which increments no counter; the counted file-level branch needs a FILE-type reparse point, not a directory junction. mklink /J creates only… |
-| `TRAV-019` | Real-path deduplication (present but disabled) | 3 | supporting | ⛔ blocked | — | real-path deduplication is present but DISABLED by design; no artefact reports it |
+| `TRAV-018` | File-level junction skip, counted | not_covered | supporting | — not_covered | 3 scanned, 0 skipped | The counted branch needs a FILE-type reparse point. mklink /J creates directory junctions only (removed by the dirs[:] filter, which increments no counter), and a file symlink needs… |
+| `TRAV-019` | Real-path deduplication (present but disabled) | not_covered | supporting | — not_covered | — | Real-path deduplication is present but deliberately disabled, so there is no behaviour to observe. Its absence is recorded against the junction-cycle follow-up. |
 | `TRAV-020` | Skip by file extension (disk-image containers) | 3 | supporting | ✅ pass | 19 planted (12 filler + .iso/.vmdk/.dmg + .DS_Store/Thumbs.db/desktop.ini + control.txt) -> 13 scanned, 13 matches | — |
 | `TRAV-021` | Skip by exact filename | 3 | supporting | ✅ pass | 6 skip-listed names planted alongside a control.txt carrying the same matching content; 13 of 19 scanned and control.txt was among them | — |
 | `TRAV-022` | Skip by bounded path fragment | 3 | core | ⛔ blocked | — | the seeded tree contains no vendor-agent path; component-boundary matching is covered by tests/test_extra_skip_paths.py |
@@ -99,7 +99,7 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `TRAV-034` | Maximum file size cap | 3 | core | ✅ pass | oversized planted=True, skip breakdown={'File too large': 1} | — |
 | `TRAV-035` | Non-regular-file rejection | 3 | supporting | ✅ pass | 762 non-regular files and 23 special system files rejected on a root scan; outcome=completed | — |
 | `TRAV-036` | Existence and read-access pre-checks | 3 | supporting | ✅ pass | pre-checks let the scan complete over a tree containing an unreadable directory (1 skipped) | — |
-| `TRAV-037` | Second-line skip check inside the worker | 3 | supporting | ⛔ blocked | — | the worker's second-line skip check shares one skip_reasons key with the producer's, so no artefact separates the two arms |
+| `TRAV-037` | Second-line skip check inside the worker | not_covered | supporting | — not_covered | — | The worker's second-line skip check writes the same skip_reasons key as the producer's, so no artefact separates the two arms. Closing it needs instrumentation that does not exist. |
 | `TRAV-038` | Bulk attribution of a skipped directory's files | 2 | supporting | ✅ pass | nothing skipped on a seeded tree | — |
 | `TRAV-039` | Skip accounting and breakdown reporting | 2 | core | ✅ pass | scanned=8,003 skipped=0; breakdown sums to 0 | — |
 | `TRAV-040` | Bounded per-file error labels in the skip breakdown | 3 | supporting | ✅ pass | 1 distinct skip labels: ['File too large'] | — |
@@ -196,7 +196,7 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `DELI-001` | HTTP Collector NDJSON transport | 2 | core | ✅ pass | 16,055 events in yara_scans_raw across 10 types | — |
 | `DELI-002` | NDJSON-only multi-event encoding (JSON array is unsafe) | 2 | core | ✅ pass | 16,055 events delivered over 9 telemetry requests (~1784 events/request) | — |
 | `DELI-003` | Opportunistic (non-timer) batching with event and byte caps | 2 | supporting | ✅ pass | 4,054 telemetry events over 9 requests = 450/request (cap 500); 12,001 yara_match went via the match channel | — |
-| `DELI-004` | Approximate byte accounting for batch sizing | 2 | supporting | ⛔ blocked | — | byte-accounting for batch sizing is internal; no artefact reports the per-batch byte estimate |
+| `DELI-004` | Approximate byte accounting for batch sizing | not_covered | supporting | — not_covered | — | The per-batch byte estimate is internal to batch assembly and is never reported. Batch OCCUPANCY is observable and is covered by DELI-003; the byte accounting itself is not. |
 | `DELI-005` | Bounded retry with jittered exponential backoff | 2 | supporting | ✅ pass | 0 retry mentions, failed_uploads=0 | — |
 | `DELI-006` | Circuit breaker on the telemetry channel | not_covered | low | — not_covered | — | — |
 | `DELI-007` | Match finding grain: one upload item per (rule, file) | 2 | supporting | ✅ pass | matches=12,001 uploaded=12,001 yara_match events=12,001 | — |
@@ -245,9 +245,9 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `DELI-050` | Second, non-canonical scan_id inside the "Scan configuration established" payload | 2 | supporting | ✅ pass | config event present | — |
 | `DELI-051` | Uncapped per-rule detection breakdown in comprehensive_final_report | 2 | supporting | ✅ pass | unique_rules_triggered=4 of 7 valid | — |
 | `DELI-052` | efficiency_score formula (what the 0-100 number in the final report actually means) | 2 | supporting | ✅ pass | efficiency_score=100.0 | — |
-| `DELI-053` | Critical-path events post single-object JSON, not NDJSON — the only non-NDJSON body the collector sees | 2 | supporting | ⛔ blocked | — | single-object vs NDJSON framing is a wire-format detail; the collector normalises both, so no artefact distinguishes them |
+| `DELI-053` | Critical-path events post single-object JSON, not NDJSON — the only non-NDJSON body the collector sees | not_covered | supporting | — not_covered | — | The collector normalises single-object JSON and NDJSON into the same rows, so yara_scans_raw cannot distinguish the two framings. Proving it needs a packet capture between agent and collector. |
 | `DELI-054` | LogManager's telemetry books over-count: total_logs increments before the upload gate | 2 | supporting | ✅ pass | {"total_uploads": 9, "successful_uploads": 9, "failed_uploads": 0, "undelivered": 0, "success_rate_percent": 100.0} | — |
-| `DELI-055` | Circuit-open batches go to the TAIL of the upload queue (telemetry reordering and re-bounce) | 2 | supporting | ⛔ blocked | — | circuit-open reordering needs an induced collector outage |
+| `DELI-055` | Circuit-open batches go to the TAIL of the upload queue (telemetry reordering and re-bounce) | not_covered | supporting | — not_covered | — | Circuit-open reordering requires an induced collector outage mid-scan. The only way to cause one on this tenant is to break the collector for every other consumer. |
 | `DELI-056` | file_creation_time is null on most Linux filesystems (platform-asymmetric derivation) | 2 | supporting | ✅ pass | Linux carries file_creation_time: False; Windows: False | — |
 | `DELI-057` | Per-finding "Queued finding for upload" receipt in the uploads log (only local view of the truncated flag) | 2 | supporting | ✅ pass | 12,001 receipts for 12,001 findings | — |
 | `DELI-058` | performance_summary / performance_metrics blocks in the two terminal events | 2 | supporting | ✅ pass | both terminal events carry their metrics blocks | — |
@@ -274,8 +274,8 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `LIFE-021` | scan_completion_summary metrics block | 2 | supporting | ✅ pass | completion summary delivered | — |
 | `LIFE-022` | Fatal worker failure path | not_covered | supporting | — not_covered | — | Requires injecting a failure we cannot safely cause: scan_file's blanket handler (5093-5099 equivalent) and _worker's inner handler (4859-4866) absorb everything the loop body can raise, so only a… |
 | `LIFE-023` | Evidence and terminal telemetry survive a fatal failure | 3 | supporting | ✅ pass | terminal telemetry survived cancellation: {'yara_match': 35504, 'alert': 30594, 'system': 33, 'performance': 10, 'statistics': 8, 'scan_status': 5} | — |
-| `LIFE-024` | Critical-error path in main() | 3 | supporting | ⛔ blocked | — | the critical-error path needs an induced fatal failure in main() |
-| `LIFE-025` | KeyboardInterrupt handling | 3 | supporting | ⛔ blocked | — | KeyboardInterrupt cannot be delivered through Action Center |
+| `LIFE-024` | Critical-error path in main() | not_covered | supporting | — not_covered | — | The critical-error path needs an induced fatal failure inside main(). Causing one on a live endpoint means deliberately corrupting the scanner's own state. |
+| `LIFE-025` | KeyboardInterrupt handling | not_covered | supporting | — not_covered | — | KeyboardInterrupt cannot be delivered to a payload through Action Center — there is no signal channel to the running script. Console Cancel hard-kills the process instead, which is a different path. |
 | `LIFE-026` | Guaranteed finalisation order in main()'s finally block | 3 | supporting | ✅ pass | finally-block ran: summary written and outcome recorded | — |
 | `LIFE-027` | scan_summary_<run_id>.json artefact | 2 | core | ✅ pass | scan_summary artefact on disk | — |
 | `LIFE-028` | scan_summary field contract | 2 | core | ✅ pass | 27/27 fields present | — |
