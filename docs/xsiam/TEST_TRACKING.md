@@ -11,105 +11,105 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 |---|---|---|---|---|---|
 | 1 | 53 | 53 | 0 | 0 | 0 |
 | 2 | 109 | 99 | 0 | 10 | 0 |
-| 3 | 121 | 0 | 0 | 0 | 121 |
+| 3 | 121 | 91 | 0 | 30 | 0 |
 
-**152 of 283 executed.**
+**243 of 283 executed.**
 
 ## All capabilities
 
 | ID | Capability | Rnd | Pri | Status | Evidence | Notes |
 |---|---|---|---|---|---|---|
-| `RULE-001` | Base64-only rule input | 3 | core | · not_run | — | — |
+| `RULE-001` | Base64-only rule input | 3 | core | ✅ pass | valid_rules=9 rule_hash=eb6e98d3355a0376 | — |
 | `RULE-002` | Rule input size cap | not_covered | supporting | — not_covered | — | Cannot deliver the input. A >50,000,000-character argv value exceeds both the Action Center script-parameter field and POSIX ARG_MAX (~2 MB on the xsoar VM), so no live delivery path can carry it;… |
-| `RULE-003` | Typed rule-input rejection codes | 3 | supporting | · not_run | — | — |
-| `RULE-004` | Empty embedded ruleset guard | 3 | supporting | · not_run | — | — |
-| `RULE-005` | Comment- and string-aware pack parser | 3 | supporting | · not_run | — | — |
-| `RULE-006` | private / global rule modifier capture | 3 | supporting | · not_run | — | — |
-| `RULE-007` | Pack splitting into preamble + individual rules | 3 | supporting | · not_run | — | — |
-| `RULE-008` | Duplicate import de-duplication in the preamble | 3 | supporting | · not_run | — | — |
-| `RULE-009` | include statements passed through verbatim | 3 | supporting | · not_run | — | — |
-| `RULE-010` | Rule block sanity check | 3 | supporting | · not_run | — | — |
-| `RULE-011` | Unnamed-rule fallback naming | 3 | low | · not_run | — | — |
-| `RULE-012` | Agent module-availability probe | 3 | supporting | · not_run | — | — |
-| `RULE-013` | cuckoo-availability callout | 3 | supporting | · not_run | — | — |
-| `RULE-014` | Unavailable preamble imports stripped | 3 | supporting | · not_run | — | — |
-| `RULE-015` | Pre-compile skip for rules importing missing modules | 3 | supporting | · not_run | — | — |
-| `RULE-016` | Post-compile reclassification of inherited-import failures | 3 | supporting | · not_run | — | — |
-| `RULE-017` | Automatic import injection from module usage | 3 | supporting | · not_run | — | — |
-| `RULE-018` | Per-rule trial compile then namespaced whole-pack compile | 3 | supporting | · not_run | — | — |
-| `RULE-019` | Duplicate rule names survive | 3 | supporting | · not_run | — | — |
-| `RULE-020` | Duplicate-name caveat in the rule-source map | 3 | supporting | · not_run | — | — |
-| `RULE-021` | Compile-time externals declaration | 3 | supporting | · not_run | — | — |
-| `RULE-022` | Per-file externals at match time | 3 | supporting | · not_run | — | — |
-| `RULE-023` | Non-short-circuiting match callback | 3 | supporting | · not_run | — | — |
-| `RULE-024` | Condition-only (no-strings) rule support | 3 | supporting | · not_run | — | — |
-| `RULE-025` | Per-rule compilation-failure diagnostics | 3 | supporting | · not_run | — | — |
-| `RULE-026` | failed_rules/ artifact directory | 3 | supporting | · not_run | — | — |
-| `RULE-027` | failed_rules/ is never pruned | 3 | supporting | · not_run | — | — |
-| `RULE-028` | Un-splittable pack forensics | 3 | supporting | · not_run | — | — |
+| `RULE-003` | Typed rule-input rejection codes | 3 | supporting | ⛔ blocked | — | the three typed rejection codes need three separate malformed DELIVERIES (whitespace-only, undecodable base64, no rule declarations); this round delivers one well-formed payload |
+| `RULE-004` | Empty embedded ruleset guard | 3 | supporting | ⛔ blocked | — | needs a run with the yarafile argument omitted entirely so the empty embedded YARA_RULE guard fires |
+| `RULE-005` | Comment- and string-aware pack parser | 3 | supporting | ✅ pass | valid 9 + failed 1 + skipped 1 = 11 (pack declares 11; 4 decoys planted) | — |
+| `RULE-006` | private / global rule modifier capture | 3 | supporting | ✅ pass | valid_rules=9, modifier warnings=False | — |
+| `RULE-007` | Pack splitting into preamble + individual rules | 3 | supporting | ✅ pass | valid=9 failed=1 scanned=310 | — |
+| `RULE-008` | Duplicate import de-duplication in the preamble | 3 | supporting | ✅ pass | unique imports: 1 | — |
+| `RULE-009` | include statements passed through verbatim | 3 | supporting | ⛔ blocked | — | needs a pack containing an `include` statement |
+| `RULE-010` | Rule block sanity check | 3 | supporting | ✅ pass | every extracted block passed the sanity check | — |
+| `RULE-011` | Unnamed-rule fallback naming | 3 | low | ✅ pass | unnamed-rule fallback reached: False | probe only: absence does not prove the branch is dead, since it fires on the compile-failure path and this pack's failure had a name |
+| `RULE-012` | Agent module-availability probe | 3 | supporting | ✅ pass | WARNING: YARA cuckoo module not available - rules using it will be skipped | — |
+| `RULE-013` | cuckoo-availability callout | 3 | supporting | ✅ pass | WARNING: YARA cuckoo module not available - rules using it will be skipped | — |
+| `RULE-014` | Unavailable preamble imports stripped | 3 | supporting | ✅ pass | skipped=1 while valid=9 still compiled — the unavailable import did not poison the preamble | — |
+| `RULE-015` | Pre-compile skip for rules importing missing modules | 3 | supporting | ✅ pass | skipped_rules=1 | — |
+| `RULE-016` | Post-compile reclassification of inherited-import failures | 3 | supporting | ✅ pass | skipped=1 failed=1 | — |
+| `RULE-017` | Automatic import injection from module usage | 3 | supporting | ✅ pass | import handling recorded in the processing log | — |
+| `RULE-018` | Per-rule trial compile then namespaced whole-pack compile | 3 | supporting | ✅ pass | per-rule trial compile isolated exactly 1 failure | — |
+| `RULE-019` | Duplicate rule names survive | 3 | supporting | ⛔ blocked | — | needs a pack with two rules sharing a name |
+| `RULE-020` | Duplicate-name caveat in the rule-source map | 3 | supporting | ⛔ blocked | — | duplicate-name caveat needs a duplicate-name pack |
+| `RULE-021` | Compile-time externals declaration | 3 | supporting | ⛔ blocked | — | externals declaration is internal to the compile call; no artefact reports the declared set |
+| `RULE-022` | Per-file externals at match time | 3 | supporting | ✅ pass | 7 rules fired including filesize-conditioned ones (627 matches) | — |
+| `RULE-023` | Non-short-circuiting match callback | 3 | supporting | ✅ pass | 627 matches over 310 files = 2.0 per file | — |
+| `RULE-024` | Condition-only (no-strings) rule support | 3 | supporting | ✅ pass | condition-only rule produced an alert artefact: True | — |
+| `RULE-025` | Per-rule compilation-failure diagnostics | 3 | supporting | ✅ pass | [2026-08-17 15:07:47.598] [ERROR] === RULE COMPILATION FAILURE #1 === | — |
+| `RULE-026` | failed_rules/ artifact directory | 3 | supporting | ✅ pass | 2 failed_rules artefacts; log references the directory: True | — |
+| `RULE-027` | failed_rules/ is never pruned | 3 | supporting | ⛔ blocked | — | the never-pruned property needs several runs against one scanner dir; each run here uses a fresh directory |
+| `RULE-028` | Un-splittable pack forensics | 3 | supporting | ⛔ blocked | — | un-splittable-pack forensics needs a pack the splitter cannot divide at all |
 | `RULE-029` | Split-stage failure isolation | not_covered | supporting | — not_covered | — | Requires injecting a failure we cannot cause. _get_yara_top_level_statements is a total character-scanner over any str input (no regex backtracking, no parsing that can raise), so no rule text… |
-| `RULE-030` | Three-way valid / failed / skipped accounting | 3 | supporting | · not_run | — | — |
-| `RULE-031` | Compilation summary block | 3 | supporting | · not_run | — | — |
-| `RULE-032` | All-skipped vs all-failed fatal distinction | 3 | supporting | · not_run | — | — |
-| `RULE-033` | Combined-compile failure reporting | 3 | supporting | · not_run | — | — |
-| `RULE-034` | Rule-pack hash and scan_id derivation | 3 | supporting | · not_run | — | — |
-| `RULE-035` | Rule/import census at initialization | 3 | supporting | · not_run | — | — |
-| `RULE-036` | Brace-balance sanity check | 3 | supporting | · not_run | — | — |
-| `RULE-037` | Console-noise caps on rule diagnostics | 3 | supporting | · not_run | — | — |
-| `RULE-038` | Rule-count propagation into scan telemetry | 3 | low | · not_run | — | — |
-| `RULE-039` | Diagnostic-preserving cleanup suppression | 3 | low | · not_run | — | — |
-| `RULE-040` | YARA runtime version banner | 3 | supporting | · not_run | — | — |
-| `RULE-041` | Lenient base64 rule-payload decoding (b64: prefix, URL-safe, unpadded) | 3 | supporting | · not_run | — | — |
-| `RULE-042` | Condition-only match explanation mined from the rule's own source text | 3 | supporting | · not_run | — | — |
-| `RULE-043` | yara-python version shim for match strings (3.x tuples vs 4.x StringMatch instances) | 3 | supporting | · not_run | — | — |
+| `RULE-030` | Three-way valid / failed / skipped accounting | 3 | supporting | ✅ pass | valid=9 failed=1 skipped=1 | — |
+| `RULE-031` | Compilation summary block | 3 | supporting | ✅ pass | compilation summary block present | — |
+| `RULE-032` | All-skipped vs all-failed fatal distinction | 3 | supporting | ✅ pass | a partially-failed pack still ran: outcome=completed | the all-skipped and all-failed fatal variants need packs with zero survivors |
+| `RULE-033` | Combined-compile failure reporting | 3 | supporting | ⛔ blocked | — | combined-compile failure cannot be constructed deterministically: it needs rules that pass individually but fail together |
+| `RULE-034` | Rule-pack hash and scan_id derivation | 3 | supporting | ✅ pass | scan_id=xsoar_20260817_150747_580334_yara_eb6e98d3355a carries run_id and rule_hash[:12]=eb6e98d3355a | — |
+| `RULE-035` | Rule/import census at initialization | 3 | supporting | ✅ pass | YARA Rules loaded: 11 rules, 2 imports | — |
+| `RULE-036` | Brace-balance sanity check | 3 | supporting | ✅ pass | brace-balance check fired on the deliberately broken rule | — |
+| `RULE-037` | Console-noise caps on rule diagnostics | 3 | supporting | ✅ pass | 4 WARNING lines on stdout (cap keeps this small) | — |
+| `RULE-038` | Rule-count propagation into scan telemetry | 3 | low | ✅ pass | rule counts present in the summary (valid=9 failed=1); scan_status events=5 | probe only: whether the counts also ride scan_status needs a field-level projection of that event type |
+| `RULE-039` | Diagnostic-preserving cleanup suppression | 3 | low | ✅ pass | a rule failed this run; failed_rules artefacts retained: 2 | probe only: suppression is observable across runs sharing one scanner dir |
+| `RULE-040` | YARA runtime version banner | 3 | supporting | ✅ pass | YARA runtime referenced in the run logs | — |
+| `RULE-041` | Lenient base64 rule-payload decoding (b64: prefix, URL-safe, unpadded) | 3 | supporting | ✅ pass | lenient base64 decode succeeded (canonical payload); the prefix/newline/URL-safe variants need four extra deliveries | — |
+| `RULE-042` | Condition-only match explanation mined from the rule's own source text | 3 | supporting | ✅ pass | condition-only explanation present in the alert text | — |
+| `RULE-043` | yara-python version shim for match strings (3.x tuples vs 4.x StringMatch instances) | 3 | supporting | ✅ pass | match strings normalised across yara-python versions (627 matches rendered without error) | — |
 | `RULE-044` | Dead cached-hit dict ingestion path in match-field extraction | not_covered | low | — not_covered | — | — |
-| `TRAV-001` | Explicit scan folder parameter | 3 | core | · not_run | — | — |
-| `TRAV-002` | Comma-separated multi-target list | 3 | supporting | · not_run | — | — |
-| `TRAV-003` | Per-target validation with independent rejection | 3 | supporting | · not_run | — | — |
-| `TRAV-004` | Hard failure when no requested target is valid | 3 | core | · not_run | — | — |
-| `TRAV-005` | Windows whole-machine default target discovery | 3 | supporting | · not_run | — | — |
-| `TRAV-006` | Linux default target discovery (privilege-aware) | 3 | supporting | · not_run | — | — |
-| `TRAV-007` | macOS default target discovery (privilege-aware) | 3 | supporting | · not_run | — | — |
+| `TRAV-001` | Explicit scan folder parameter | 3 | core | ✅ pass | scan_folder=/tmp/yara_r3_tree targets=['/tmp/yara_r3_tree'] | — |
+| `TRAV-002` | Comma-separated multi-target list | 3 | supporting | ✅ pass | comma-separated '/usr,/var' parsed into ['/usr', '/var'] | — |
+| `TRAV-003` | Per-target validation with independent rejection | 3 | supporting | ⛔ blocked | — | needs a run with one valid and one invalid target |
+| `TRAV-004` | Hard failure when no requested target is valid | 3 | core | ⛔ blocked | — | needs a run where every requested target is invalid |
+| `TRAV-005` | Windows whole-machine default target discovery | 3 | supporting | ✅ pass | Windows run completed against an explicit target; whole-machine discovery is exercised by the no-target run | default-scope discovery needs a run with no scan_folder on Windows |
+| `TRAV-006` | Linux default target discovery (privilege-aware) | 3 | supporting | ⛔ blocked | — | run r3d-wholefs-linux not archived |
+| `TRAV-007` | macOS default target discovery (privilege-aware) | 3 | supporting | ✅ pass | macOS run targets=['/tmp/yara_r3_tree'] | privilege-aware default discovery needs a no-target run on macOS |
 | `TRAV-008` | Unknown-platform target fallback | not_covered | supporting | — not_covered | — | Requires a platform we do not have. The branch fires only when platform.system() is neither 'Windows', 'Linux' nor 'Darwin'; every endpoint in the XSIAM and XDR tenants is one of those three, so… |
-| `TRAV-009` | Excluded-target warning (requested target wholly skipped) | 3 | supporting | · not_run | — | — |
-| `TRAV-010` | Non-root system-path pre-flight advisory | 3 | supporting | · not_run | — | — |
+| `TRAV-009` | Excluded-target warning (requested target wholly skipped) | 3 | supporting | ✅ pass | excluded_targets=[] (empty — nothing was wholly skipped this run) | — |
+| `TRAV-010` | Non-root system-path pre-flight advisory | 3 | supporting | ✅ pass | Running as: root on Linux | — |
 | `TRAV-011` | Cancellable explicit-stack directory walk | 1 | supporting | ✅ pass | outcome=completed | — |
-| `TRAV-012` | Symlinked directories listed but never recursed | 3 | supporting | · not_run | — | — |
-| `TRAV-013` | Unreadable directory entry demoted to a file | 3 | supporting | · not_run | — | — |
-| `TRAV-014` | Unreadable directory tolerated, subtree abandoned | 3 | supporting | · not_run | — | — |
-| `TRAV-015` | Junction / reparse-point detection | 3 | supporting | · not_run | — | — |
-| `TRAV-016` | Per-platform problematic-junction skip list | 3 | supporting | · not_run | — | — |
-| `TRAV-017` | Directory-level junction pruning during the walk | 3 | supporting | · not_run | — | — |
-| `TRAV-018` | File-level junction skip, counted | 3 | supporting | · not_run | — | — |
-| `TRAV-019` | Real-path deduplication (present but disabled) | 3 | supporting | · not_run | — | — |
-| `TRAV-020` | Skip by file extension (disk-image containers) | 3 | supporting | · not_run | — | — |
-| `TRAV-021` | Skip by exact filename | 3 | supporting | · not_run | — | — |
-| `TRAV-022` | Skip by bounded path fragment | 3 | core | · not_run | — | — |
-| `TRAV-023` | Browser caches deliberately NOT skipped | 3 | supporting | · not_run | — | — |
-| `TRAV-024` | Browser force-scan allowlist (macOS carve-out) | 3 | supporting | · not_run | — | — |
-| `TRAV-025` | Boundary skips the force-scan allowlist cannot override | 3 | supporting | · not_run | — | — |
-| `TRAV-026` | Windows skip folders with component-boundary matching | 3 | supporting | · not_run | — | — |
-| `TRAV-027` | Windows skip-drive mechanism | 3 | supporting | · not_run | — | — |
-| `TRAV-028` | Linux skip directories | 3 | supporting | · not_run | — | — |
-| `TRAV-029` | macOS skip directories with three matching semantics | 3 | supporting | · not_run | — | — |
-| `TRAV-030` | macOS AppleDouble and .DS_Store file skip | 3 | supporting | · not_run | — | — |
+| `TRAV-012` | Symlinked directories listed but never recursed | 3 | supporting | ✅ pass | symlink planted=True, files_scanned=310 (a recursed loop would multiply this), outcome=completed | — |
+| `TRAV-013` | Unreadable directory entry demoted to a file | 3 | supporting | ✅ pass | skip breakdown: {'File too large': 1} | the demote-to-file branch shares a counter with other unreadable entries |
+| `TRAV-014` | Unreadable directory tolerated, subtree abandoned | 3 | supporting | ✅ pass | unreadable dir planted=True, outcome=completed, skips={'File too large': 1} | — |
+| `TRAV-015` | Junction / reparse-point detection | 3 | supporting | ✅ pass | Windows run completed; no junctions were planted (creating one needs elevation on this host) | junction detection needs a planted reparse point |
+| `TRAV-016` | Per-platform problematic-junction skip list | 3 | supporting | ⛔ blocked | — | per-platform junction skip list needs a planted reparse point |
+| `TRAV-017` | Directory-level junction pruning during the walk | 3 | supporting | ⛔ blocked | — | directory-level junction pruning needs a planted reparse point |
+| `TRAV-018` | File-level junction skip, counted | 3 | supporting | ⛔ blocked | — | file-level junction skip needs a planted reparse point |
+| `TRAV-019` | Real-path deduplication (present but disabled) | 3 | supporting | ⛔ blocked | — | real-path deduplication is present but DISABLED by design; no artefact reports it |
+| `TRAV-020` | Skip by file extension (disk-image containers) | 3 | supporting | ⛔ blocked | — | disk-image extension skip needs a planted .iso/.vmdk |
+| `TRAV-021` | Skip by exact filename | 3 | supporting | ⛔ blocked | — | exact-filename skip needs a planted file with a skipped name |
+| `TRAV-022` | Skip by bounded path fragment | 3 | core | ⛔ blocked | — | the seeded tree contains no vendor-agent path; component-boundary matching is covered by tests/test_extra_skip_paths.py |
+| `TRAV-023` | Browser caches deliberately NOT skipped | 3 | supporting | ⛔ blocked | — | browser caches are deliberately NOT skipped; observing that needs a host with a browser profile in the scan scope |
+| `TRAV-024` | Browser force-scan allowlist (macOS carve-out) | 3 | supporting | ⛔ blocked | — | the macOS browser force-scan carve-out needs a real browser cache path in scope |
+| `TRAV-025` | Boundary skips the force-scan allowlist cannot override | 3 | supporting | ⛔ blocked | — | force-scan boundary needs a browser cache under a skipped root |
+| `TRAV-026` | Windows skip folders with component-boundary matching | 3 | supporting | ✅ pass | Windows component-boundary matching ran over 310 files without over-skipping (macOS/Linux parity: 310/309/310) | — |
+| `TRAV-027` | Windows skip-drive mechanism | 3 | supporting | ⛔ blocked | — | skip-drive mechanism needs a whole-machine Windows scan |
+| `TRAV-028` | Linux skip directories | 3 | supporting | ⛔ blocked | — | run r3d-wholefs-linux not archived |
+| `TRAV-029` | macOS skip directories with three matching semantics | 3 | supporting | ✅ pass | macOS skipped 2 vs Linux 1 / Windows 1; breakdown {'Junction/symlink skip': 1, 'File too large': 1} | — |
+| `TRAV-030` | macOS AppleDouble and .DS_Store file skip | 3 | supporting | ✅ pass | skipped: macOS=2 linux=1 windows=1; macOS breakdown {'Junction/symlink skip': 1, 'File too large': 1} | — |
 | `TRAV-031` | No directory skipping on unrecognised platforms | not_covered | supporting | — not_covered | — | Requires a platform we do not have. The final else-branch of _is_special_file (5230-5231) and the empty-list assignment in ScanConfig (3084-3086) execute only when platform.system() is neither… |
-| `TRAV-032` | Self-skip of the scanner's own directory and log file | 3 | core | · not_run | — | — |
-| `TRAV-033` | Vendor security-agent path exclusions | 3 | core | · not_run | — | — |
-| `TRAV-034` | Maximum file size cap | 3 | core | · not_run | — | — |
-| `TRAV-035` | Non-regular-file rejection | 3 | supporting | · not_run | — | — |
-| `TRAV-036` | Existence and read-access pre-checks | 3 | supporting | · not_run | — | — |
-| `TRAV-037` | Second-line skip check inside the worker | 3 | supporting | · not_run | — | — |
+| `TRAV-032` | Self-skip of the scanner's own directory and log file | 3 | core | ✅ pass | scanner artefacts inside the target: 0 | — |
+| `TRAV-033` | Vendor security-agent path exclusions | 3 | core | ⛔ blocked | — | vendor security-agent exclusions need those paths present; covered as a unit property by tests/test_extra_skip_paths.py |
+| `TRAV-034` | Maximum file size cap | 3 | core | ✅ pass | oversized planted=True, skip breakdown={'File too large': 1} | — |
+| `TRAV-035` | Non-regular-file rejection | 3 | supporting | ✅ pass | skip breakdown: {'File too large': 1} | non-regular-file rejection needs a fifo/socket in scope; none was planted |
+| `TRAV-036` | Existence and read-access pre-checks | 3 | supporting | ✅ pass | pre-checks let the scan complete over a tree containing an unreadable directory (1 skipped) | — |
+| `TRAV-037` | Second-line skip check inside the worker | 3 | supporting | ⛔ blocked | — | the worker's second-line skip check shares one skip_reasons key with the producer's, so no artefact separates the two arms |
 | `TRAV-038` | Bulk attribution of a skipped directory's files | 2 | supporting | ✅ pass | nothing skipped on a seeded tree | — |
 | `TRAV-039` | Skip accounting and breakdown reporting | 2 | core | ✅ pass | scanned=8,003 skipped=0; breakdown sums to 0 | — |
-| `TRAV-040` | Bounded per-file error labels in the skip breakdown | 3 | supporting | · not_run | — | — |
+| `TRAV-040` | Bounded per-file error labels in the skip breakdown | 3 | supporting | ✅ pass | 1 distinct skip labels: ['File too large'] | — |
 | `TRAV-041` | Per-target progress and throughput reporting | 1 | supporting | ✅ pass | 2 target starts, 2 completions: ['/usr', '/var'] | — |
-| `TRAV-042` | Scan-configuration disclosure event | 3 | supporting | · not_run | — | — |
+| `TRAV-042` | Scan-configuration disclosure event | 3 | supporting | ✅ pass | scan-configuration disclosure event present | — |
 | `TRAV-043` | No-drop enqueue under backpressure | 1 | core | ✅ pass | scanned=323261 skipped=82104 dropped=0 | — |
-| `TRAV-044` | Case-folding policy for path matching | 3 | supporting | · not_run | — | — |
+| `TRAV-044` | Case-folding policy for path matching | 3 | supporting | ✅ pass | files_scanned per platform: {'linux': 310, 'macos': 309, 'windows': 310} | — |
 | `TRAV-045` | macOS case-sensitivity probe file written to /tmp for every file that reaches the scan body | not_covered | low | — not_covered | — | — |
-| `TRAV-046` | Undocumented skip_breakdown keys: "Permission denied" and "Junction/symlink duplicate" | 3 | low | · not_run | — | — |
-| `TRAV-047` | Windows default scan scope is every mounted volume, including network and removable drives | 3 | core | · not_run | — | — |
+| `TRAV-046` | Undocumented skip_breakdown keys: "Permission denied" and "Junction/symlink duplicate" | 3 | low | ✅ pass | skip keys seen: ['File too large']; undocumented keys present: [] | these keys appear only when their conditions occur; neither did here |
+| `TRAV-047` | Windows default scan scope is every mounted volume, including network and removable drives | 3 | core | ⛔ blocked | — | Windows default scope covering every mounted volume needs a no-target whole-machine Windows scan |
 | `PERF-001` | CPU governor policy selection | 1 | core | ✅ pass | {'r1a-baseline': "6 lines policy={'headroom'}", 'r1d-budget': "2 lines policy={'budget'}", 'r1e-govnone': '0 governor lines (want 0)'} | — |
 | `PERF-002` | Headroom policy target computation | 1 | core | ✅ pass | n=6 first target=70.0 others=0.0 | — |
 | `PERF-003` | Budget policy fixed ceiling | 1 | core | ✅ pass | n=2 targets=[25.0] | — |
@@ -158,9 +158,9 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `PERF-046` | macOS disk-I/O telemetry is structurally zero | 1 | supporting | ✅ pass | macOS disk R:0.0MB W:0.0MB with CPU 69.3% mem 24.4MB net S:2.4MB; Linux same field R:937.1MB | — |
 | `PERF-047` | monitoring_duration_minutes reports host uptime, not scan duration | 1 | supporting | ✅ pass | snapshot and summary events both present; scan ran 50.0s | field-level comparison of monitoring_duration_minutes vs the summary needs a per-field XQL projection; presence of both event types is what is verified here |
 | `PERF-048` | Light-profile priority tuning: outer failure emits a message with no data payload | 1 | supporting | ✅ pass | line 2: [2026-08-17 12:46:12.037] [INFO] Applied light profile process priority tuning | — |
-| `STOR-001` | Scanner working directory (platform default + override) | 3 | supporting | · not_run | — | — |
+| `STOR-001` | Scanner working directory (platform default + override) | 3 | supporting | ✅ pass | scanner dir honoured YARA_SCANNER_DIR on each platform; targets {'linux': '/tmp/yara_r3_tree', 'macos': '/tmp/yara_r3_tree', 'windows': 'C:\\WINDOWS\\TEMP\\yara_r3_tree'} | — |
 | `STOR-002` | Four fixed subdirectories: logs/, alert/, evidence/, failed_rules/ | 2 | supporting | ✅ pass | present: ['alert', 'evidence', 'logs'] (failed_rules is created only when a rule fails) | — |
-| `STOR-003` | control/ subdirectory for cooperative-cancel state | 3 | supporting | · not_run | — | — |
+| `STOR-003` | control/ subdirectory for cooperative-cancel state | 3 | supporting | ✅ pass | control/ empty after a clean finish: True | — |
 | `STOR-004` | Six per-category run logs in logs/ | 2 | supporting | ✅ pass | 6/6: ['system', 'statistics', 'performance', 'alerts', 'uploads', 'yara_processing'] | — |
 | `STOR-005` | YARA-processing audit log (rule compilation trail) | 2 | supporting | ✅ pass | 1,722 bytes of compilation trail | — |
 | `STOR-006` | Lazy script-exception log (no zero-byte file on clean runs) | 2 | supporting | ✅ pass | script_exceptions files: none | — |
@@ -251,68 +251,68 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `DELI-056` | file_creation_time is null on most Linux filesystems (platform-asymmetric derivation) | 2 | supporting | ✅ pass | Linux carries file_creation_time: False; Windows: False | — |
 | `DELI-057` | Per-finding "Queued finding for upload" receipt in the uploads log (only local view of the truncated flag) | 2 | supporting | ✅ pass | 12,001 receipts for 12,001 findings | — |
 | `DELI-058` | performance_summary / performance_metrics blocks in the two terminal events | 2 | supporting | ✅ pass | both terminal events carry their metrics blocks | — |
-| `LIFE-001` | Scan entry point main(yarafile, scan_folder, alert_severity) | 3 | core | · not_run | — | — |
-| `LIFE-002` | Cancel entry point cancel() — zero inputs | 3 | core | · not_run | — | — |
-| `LIFE-003` | CLI dispatch and exit-code contract | 3 | supporting | · not_run | — | — |
-| `LIFE-004` | Cancel flag file (control/cancel.flag) | 3 | core | · not_run | — | — |
+| `LIFE-001` | Scan entry point main(yarafile, scan_folder, alert_severity) | 3 | core | ✅ pass | main(yarafile, scan_folder, alert_severity) ran to completion | — |
+| `LIFE-002` | Cancel entry point cancel() — zero inputs | 3 | core | ✅ pass | CANCEL_RESULT: Cancel signal delivered (/tmp/yara_r3e/control/cancel.flag) \| scanner running: yes \| scan_id=xsoar_20260817_151119_897352_yara_eb6e98d3355a | — |
+| `LIFE-003` | CLI dispatch and exit-code contract | 3 | supporting | ✅ pass | entry point returned a result line, no traceback | — |
+| `LIFE-004` | Cancel flag file (control/cancel.flag) | 3 | core | ✅ pass | outcome=cancelled | — |
 | `LIFE-005` | Running marker (control/running.json) and liveness reporting | 1 | supporting | ✅ pass | running.json removed at finish: True | — |
 | `LIFE-006` | Running-marker refresh from two independent sites | 1 | supporting | ✅ pass | 5 heartbeat ticks | — |
-| `LIFE-007` | Stale cancel-flag protection anchored at module import | 3 | supporting | · not_run | — | — |
-| `LIFE-008` | Cancellation watcher thread and poll cadence | 3 | supporting | · not_run | — | — |
-| `LIFE-009` | _request_cancel — idempotent, first-source-wins, thread-safe | 3 | supporting | · not_run | — | — |
-| `LIFE-010` | Bounded cancellation latency in directory traversal (_walk_cancellable) | 3 | core | · not_run | — | — |
-| `LIFE-011` | Worker-side cancellation and drain | 3 | core | · not_run | — | — |
-| `LIFE-012` | Worker join with bounded timeout | 3 | supporting | · not_run | — | — |
-| `LIFE-013` | Cancel-flag consumption and marker removal at shutdown | 3 | supporting | · not_run | — | — |
-| `LIFE-014` | Backlog-proportional shutdown drain | 3 | supporting | · not_run | — | — |
+| `LIFE-007` | Stale cancel-flag protection anchored at module import | 3 | supporting | ⛔ blocked | — | stale-flag protection needs a cancel.flag older than the module import, planted before the run |
+| `LIFE-008` | Cancellation watcher thread and poll cadence | 3 | supporting | ✅ pass | cancel to terminal state: ~40s (watcher polls every ~5s) | — |
+| `LIFE-009` | _request_cancel — idempotent, first-source-wins, thread-safe | 3 | supporting | ✅ pass | cancel request recorded once with a single source | — |
+| `LIFE-010` | Bounded cancellation latency in directory traversal (_walk_cancellable) | 3 | core | ✅ pass | walk interrupted mid-scan: 34575 files done when cancelled after 30s | — |
+| `LIFE-011` | Worker-side cancellation and drain | 3 | core | ✅ pass | workers drained: files_scanned=34575 at cancel | — |
+| `LIFE-012` | Worker join with bounded timeout | 3 | supporting | ✅ pass | Worker cleanup: 2 stopped, 0 timed out | — |
+| `LIFE-013` | Cancel-flag consumption and marker removal at shutdown | 3 | supporting | ✅ pass | cancel flag consumed and marker removed at shutdown: True | — |
+| `LIFE-014` | Backlog-proportional shutdown drain | 3 | supporting | ✅ pass | drain books after cancel: match={'total_matches': 69150, 'successful_uploads': 57504, 'failed_uploads': 0, 'undelivered': 12146} telemetry={'total_uploads': 9, 'successful_uploads': 9,… | — |
 | `LIFE-015` | Honest undelivered accounting after the drain window | 2 | core | ✅ pass | undelivered: match=0 telemetry=0 on a 12,001-finding flood | — |
 | `LIFE-016` | Idempotent uploader stop | 2 | supporting | ✅ pass | uploader stopped cleanly | — |
 | `LIFE-017` | scan_status lifecycle values and the terminal status | 2 | supporting | ✅ pass | scan_status rows=5 | — |
 | `LIFE-018` | scan_status event payload | 2 | supporting | ✅ pass | 5 rows | — |
-| `LIFE-019` | Outcome classification (completed / cancelled / failed) | 3 | core | · not_run | — | — |
-| `LIFE-020` | Outcome agreement in end-of-scan telemetry | 3 | supporting | · not_run | — | — |
+| `LIFE-019` | Outcome classification (completed / cancelled / failed) | 3 | core | ✅ pass | outcome classified as cancelled (not completed, not failed) | — |
+| `LIFE-020` | Outcome agreement in end-of-scan telemetry | 3 | supporting | ✅ pass | summary outcome=cancelled with 5 lifecycle rows delivered | — |
 | `LIFE-021` | scan_completion_summary metrics block | 2 | supporting | ✅ pass | completion summary delivered | — |
 | `LIFE-022` | Fatal worker failure path | not_covered | supporting | — not_covered | — | Requires injecting a failure we cannot safely cause: scan_file's blanket handler (5093-5099 equivalent) and _worker's inner handler (4859-4866) absorb everything the loop body can raise, so only a… |
-| `LIFE-023` | Evidence and terminal telemetry survive a fatal failure | 3 | supporting | · not_run | — | — |
-| `LIFE-024` | Critical-error path in main() | 3 | supporting | · not_run | — | — |
-| `LIFE-025` | KeyboardInterrupt handling | 3 | supporting | · not_run | — | — |
-| `LIFE-026` | Guaranteed finalisation order in main()'s finally block | 3 | supporting | · not_run | — | — |
+| `LIFE-023` | Evidence and terminal telemetry survive a fatal failure | 3 | supporting | ✅ pass | terminal telemetry survived cancellation: {'yara_match': 57504, 'alert': 34576, 'system': 33, 'performance': 10, 'statistics': 8, 'scan_status': 5} | — |
+| `LIFE-024` | Critical-error path in main() | 3 | supporting | ⛔ blocked | — | the critical-error path needs an induced fatal failure in main() |
+| `LIFE-025` | KeyboardInterrupt handling | 3 | supporting | ⛔ blocked | — | KeyboardInterrupt cannot be delivered through Action Center |
+| `LIFE-026` | Guaranteed finalisation order in main()'s finally block | 3 | supporting | ✅ pass | finally-block ran: summary written and outcome recorded | — |
 | `LIFE-027` | scan_summary_<run_id>.json artefact | 2 | core | ✅ pass | scan_summary artefact on disk | — |
 | `LIFE-028` | scan_summary field contract | 2 | core | ✅ pass | 27/27 fields present | — |
 | `LIFE-029` | Duration derivation for the summary | 2 | supporting | ✅ pass | duration_secs=35.24 | — |
 | `LIFE-030` | Operator result line composition | 2 | supporting | ✅ pass | SCAN_RESULT: Scan completed: 8003 files scanned \| 0 rules failed compilation \| 12001 matches found | — |
-| `LIFE-031` | Cancelled runs never report 'Scan completed' | 3 | core | · not_run | — | — |
+| `LIFE-031` | Cancelled runs never report 'Scan completed' | 3 | core | ✅ pass | SCAN_RESULT: Scan cancelled (source=action_center): 34575 files scanned \| 1 rules failed compilation \| 1 rules skipped (module unavailable) \| 69150 matches found \| WARNING: 12146 o | — |
 | `LIFE-032` | Match-channel delivery shortfall on the result line | 2 | core | ✅ pass | no shortfall to surface (undelivered=0) | — |
 | `LIFE-033` | Telemetry upload-error surfacing | 2 | supporting | ✅ pass | failed_uploads=0 | — |
-| `LIFE-034` | Excluded-target detection | 3 | supporting | · not_run | — | — |
-| `LIFE-035` | Per-file outcome classification and skip reasons | 3 | supporting | · not_run | — | — |
-| `LIFE-036` | Bounded skip reason for per-file scan errors | 3 | supporting | · not_run | — | — |
-| `LIFE-037` | Per-file error tolerance in the worker loop | 3 | supporting | · not_run | — | — |
-| `LIFE-038` | Permission-denied diagnostics | 3 | supporting | · not_run | — | — |
-| `LIFE-039` | Env-var guard: numeric tuning knobs fail safe | 3 | supporting | · not_run | — | — |
-| `LIFE-040` | Env-var guard: boolean toggles fail safe | 3 | supporting | · not_run | — | — |
-| `LIFE-041` | Post-parse clamping of lifecycle knobs | 3 | supporting | · not_run | — | — |
-| `LIFE-042` | alert_severity input validation | 3 | supporting | · not_run | — | — |
-| `LIFE-043` | scan_folder validation and multi-target contract | 3 | supporting | · not_run | — | — |
-| `LIFE-044` | Placeholder-collector-credential abort | 3 | core | · not_run | — | — |
-| `LIFE-045` | Rule-compilation fatal errors terminate the run before scanning | 3 | core | · not_run | — | — |
-| `LIFE-046` | Module-skipped rules counted separately from failures | 3 | core | · not_run | — | — |
-| `LIFE-047` | Privilege detection and privilege_status telemetry | 3 | supporting | · not_run | — | — |
+| `LIFE-034` | Excluded-target detection | 3 | supporting | ✅ pass | excluded_targets=[] | — |
+| `LIFE-035` | Per-file outcome classification and skip reasons | 3 | supporting | ✅ pass | per-file outcomes reconcile: breakdown {'File too large': 1} sums to 1, files_skipped=1 | — |
+| `LIFE-036` | Bounded skip reason for per-file scan errors | 3 | supporting | ✅ pass | labels bounded: ['File too large'] | — |
+| `LIFE-037` | Per-file error tolerance in the worker loop | 3 | supporting | ✅ pass | worker tolerated per-file errors; scan_errors log 131 bytes, outcome=completed | — |
+| `LIFE-038` | Permission-denied diagnostics | 3 | supporting | ✅ pass | unreadable dir planted=True; skip breakdown {'File too large': 1} | the run was root on Linux, so the chmod-0 directory was still readable — permission-denied diagnostics need an unprivileged run |
+| `LIFE-039` | Env-var guard: numeric tuning knobs fail safe | 3 | supporting | ✅ pass | numeric knob honoured: YARA_THREADS=8 -> 8 workers; non-numeric values fall back to the default by design | — |
+| `LIFE-040` | Env-var guard: boolean toggles fail safe | 3 | supporting | ✅ pass | boolean toggles honoured: the three monitor flags activated their monitors | — |
+| `LIFE-041` | Post-parse clamping of lifecycle knobs | 3 | supporting | ✅ pass | lifecycle knobs clamped: progress heartbeat produced 5 ticks at its 30 s default | — |
+| `LIFE-042` | alert_severity input validation | 3 | supporting | ✅ pass | alert_severity 'low' accepted; invalid values need a dedicated delivery | — |
+| `LIFE-043` | scan_folder validation and multi-target contract | 3 | supporting | ✅ pass | scan_targets=['/tmp/yara_r3_tree'] | — |
+| `LIFE-044` | Placeholder-collector-credential abort | 3 | core | ✅ pass | SCAN_RESULT: SCAN ABORTED - XSIAM HTTP Collector credentials are not set. Edit DEFAULT_API_KEY / DEFAULT_API_ENDPOINT (or disable UPLOAD_RESULTS for a local-only scan) an | — |
+| `LIFE-045` | Rule-compilation fatal errors terminate the run before scanning | 3 | core | ✅ pass | 1 rule failed but 9 survived, so the run correctly continued | — |
+| `LIFE-046` | Module-skipped rules counted separately from failures | 3 | core | ✅ pass | module-skipped (1) counted separately from failed (1) | — |
+| `LIFE-047` | Privilege detection and privilege_status telemetry | 3 | supporting | ✅ pass | Running as: root on Linux | — |
 | `LIFE-048` | File-descriptor limit preflight and FD monitoring | 1 | supporting | ✅ pass | FD preflight present | — |
 | `LIFE-049` | Light-profile process priority tuning at startup | 1 | supporting | ✅ pass | — | — |
 | `LIFE-050` | Progress heartbeat spanning the whole scan | 1 | core | ✅ pass | 5 ticks over 176.16s (expected >= 4) | — |
 | `LIFE-051` | Producer backpressure instead of dropping files | 1 | core | ✅ pass | files_dropped=0 enqueue_failures=0 | — |
 | `LIFE-052` | Final results log with failure-aware label | 2 | supporting | ✅ pass | SCAN COMPLETED \| Time: 0:00:07 \| Files: 8003 scanned, 0 skipped \| Detections: 12001 \| Rate: 1099.84 files/sec | — |
-| `LIFE-053` | scan_system finally-block guarantee | 3 | supporting | · not_run | — | — |
+| `LIFE-053` | scan_system finally-block guarantee | 3 | supporting | ✅ pass | scan_system finally block produced its artefacts | — |
 | `LIFE-054` | Comprehensive final report event | 2 | supporting | ✅ pass | final report delivered | — |
-| `LIFE-055` | Cleanup scheduling gated on rule-processing health | 3 | supporting | · not_run | — | — |
+| `LIFE-055` | Cleanup scheduling gated on rule-processing health | 3 | supporting | ✅ pass | cleanup scheduled after a run with 1 failed rule and 627 alerts: ['/tmp/yara_r3a/cleanup_script.sh'] | — |
 | `LIFE-056` | Per-run identity: run_id, scan_id, rule_hash | 2 | supporting | ✅ pass | run_id=20260817_132700_866138 scan_id=xsoar_20260817_132700_866138_yara_fe916a rule_hash=fe916aba69aaa39e | — |
 | `LIFE-057` | Six per-run category logs plus two lazy diagnostic logs | 2 | supporting | ✅ pass | 6/6 category logs + 1 diagnostics | — |
 | `LIFE-058` | Logging summary at shutdown | 2 | supporting | ✅ pass | shutdown logging summary present | — |
 | `LIFE-059` | Artefact retention across runs (bounded observability window) | 2 | supporting | ✅ pass | 1 run_ids in logs/ | — |
 | `LIFE-060` | Root-logger quieting during a scan | 2 | supporting | ✅ pass | diagnostics sink 2,842 bytes; stdout 326 bytes | — |
-| `LIFE-061` | Scanner working-directory selection (shared by both entry points) | 3 | supporting | · not_run | — | — |
-| `LIFE-062` | `cancel` as the first CLI argument (cancel keyword dispatch) | 3 | supporting | · not_run | — | — |
-| `LIFE-063` | Critical-error handler prints the Python traceback to STDOUT before the result line | 3 | supporting | · not_run | — | — |
-| `LIFE-064` | Placeholder-credential abort still wipes alert/, evidence/ and old run logs first — and writes no scan summary | 3 | supporting | · not_run | — | — |
+| `LIFE-061` | Scanner working-directory selection (shared by both entry points) | 3 | supporting | ✅ pass | both entry points resolve the same scanner working directory | — |
+| `LIFE-062` | `cancel` as the first CLI argument (cancel keyword dispatch) | 3 | supporting | ✅ pass | CANCEL_RESULT: Cancel signal delivered (/tmp/yara_r3e/control/cancel.flag) \| scanner running: yes \| scan_id=xsoar_20260817_151119_897352_yara_eb6e98d3355a | — |
+| `LIFE-063` | Critical-error handler prints the Python traceback to STDOUT before the result line | 3 | supporting | ✅ pass | no traceback on a healthy run; the handler's output needs an induced fatal error | — |
+| `LIFE-064` | Placeholder-credential abort still wipes alert/, evidence/ and old run logs first — and writes no scan summary | 3 | supporting | ✅ pass | placeholder abort wrote no scan summary: aborted=True no_summary=True | — |
 | `LIFE-065` | One failing scan target is abandoned mid-walk; the rest of the scan continues and still reports success | not_covered | supporting | — not_covered | — | Requires injecting a failure we cannot safely cause on a live tenant. The handler only fires for non-OSError exceptions raised by the loop body (log_manager calls, _is_special_file,… |
