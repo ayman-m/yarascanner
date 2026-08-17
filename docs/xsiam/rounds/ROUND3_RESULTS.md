@@ -2,7 +2,7 @@
 
 **Endpoints:** `xsoar`, `OfficeiMac`, `thor`  
 **Criteria:** 121  
-**Result:** 105 pass · 0 fail · 16 blocked · 0 not run
+**Result:** 108 pass · 0 fail · 13 blocked · 0 not run
 
 ## Runs
 
@@ -151,9 +151,6 @@ reaching them needs something we will not do to a live endpoint.
 | `TRAV-018` | File-level junction skip, counted | directory junctions are removed by the `dirs[:]` filter, which increments no counter; the counted file-level branch needs a FILE-type reparse point, not a directory junction. mklink /J creates only the latter. |
 | `TRAV-019` | Real-path deduplication (present but disabled) | real-path deduplication is present but DISABLED by design; no artefact reports it |
 | `TRAV-022` | Skip by bounded path fragment | the seeded tree contains no vendor-agent path; component-boundary matching is covered by tests/test_extra_skip_paths.py |
-| `TRAV-023` | Browser caches deliberately NOT skipped | browser caches are deliberately NOT skipped; observing that needs a host with a browser profile in the scan scope |
-| `TRAV-024` | Browser force-scan allowlist (macOS carve-out) | the macOS browser force-scan carve-out needs a real browser cache path in scope |
-| `TRAV-025` | Boundary skips the force-scan allowlist cannot override | force-scan boundary needs a browser cache under a skipped root |
 | `TRAV-027` | Windows skip-drive mechanism | skip-drive mechanism needs a whole-machine Windows scan |
 | `TRAV-033` | Vendor security-agent path exclusions | vendor security-agent exclusions need those paths present; covered as a unit property by tests/test_extra_skip_paths.py |
 | `TRAV-037` | Second-line skip check inside the worker | the worker's second-line skip check shares one skip_reasons key with the producer's, so no artefact separates the two arms |
@@ -175,9 +172,6 @@ reaching them needs something we will not do to a live endpoint.
 | `TRAV-018` | File-level junction skip, counted | supporting | ⛔ blocked | 3 scanned, 0 skipped |
 | `TRAV-019` | Real-path deduplication (present but disabled) | supporting | ⛔ blocked | real-path deduplication is present but DISABLED by design; no artefact reports it |
 | `TRAV-022` | Skip by bounded path fragment | core | ⛔ blocked | the seeded tree contains no vendor-agent path; component-boundary matching is covered by tests/test_extra_skip_paths.py |
-| `TRAV-023` | Browser caches deliberately NOT skipped | supporting | ⛔ blocked | browser caches are deliberately NOT skipped; observing that needs a host with a browser profile in the scan scope |
-| `TRAV-024` | Browser force-scan allowlist (macOS carve-out) | supporting | ⛔ blocked | the macOS browser force-scan carve-out needs a real browser cache path in scope |
-| `TRAV-025` | Boundary skips the force-scan allowlist cannot override | supporting | ⛔ blocked | force-scan boundary needs a browser cache under a skipped root |
 | `TRAV-027` | Windows skip-drive mechanism | supporting | ⛔ blocked | skip-drive mechanism needs a whole-machine Windows scan |
 | `TRAV-033` | Vendor security-agent path exclusions | core | ⛔ blocked | vendor security-agent exclusions need those paths present; covered as a unit property by tests/test_extra_skip_paths.py |
 | `TRAV-037` | Second-line skip check inside the worker | supporting | ⛔ blocked | the worker's second-line skip check shares one skip_reasons key with the producer's, so no artefact separates the two arms |
@@ -275,6 +269,9 @@ reaching them needs something we will not do to a live endpoint.
 | `TRAV-017` | Directory-level junction pruning during the walk | supporting | ✅ pass | the problematic junction's subtree was never walked — 3 files scanned, and its contents contributed none |
 | `TRAV-020` | Skip by file extension (disk-image containers) | supporting | ✅ pass | 19 planted (12 filler + .iso/.vmdk/.dmg + .DS_Store/Thumbs.db/desktop.ini + control.txt) -> 13 scanned, 13 matches |
 | `TRAV-021` | Skip by exact filename | supporting | ✅ pass | 6 skip-listed names planted alongside a control.txt carrying the same matching content; 13 of 19 scanned and control.txt was among them |
+| `TRAV-023` | Browser caches deliberately NOT skipped | supporting | ✅ pass | scanned under /library/caches/: ['caches/firefox/', 'caches/com.apple.safari/', 'caches/google/chrome/'] |
+| `TRAV-024` | Browser force-scan allowlist (macOS carve-out) | supporting | ✅ pass | 4 scanned; library/caches/firefox reached=True, library/caches/other_app reached=False — the carve-out names browsers rather than re-opening the whole category |
+| `TRAV-025` | Boundary skips the force-scan allowlist cannot override | supporting | ✅ pass | the same firefox cache path was scanned normally (True) but skipped under /volumes/ (True); 4 scanned of 6 planted |
 | `TRAV-026` | Windows skip folders with component-boundary matching | supporting | ✅ pass | Windows component-boundary matching ran over 310 files without over-skipping (macOS/Linux parity: 310/309/310) |
 | `TRAV-028` | Linux skip directories | supporting | ✅ pass | 655,232 files attributed to skipped directories; breakdown {'Skipped directory': 655232, 'File does not exist': 1965, 'Not a regular file': 762, 'File too large': 52, 'Special system file': 23} sums to 658,034 = files_s… |
 | `TRAV-029` | macOS skip directories with three matching semantics | supporting | ✅ pass | macOS skipped 2 vs Linux 1 / Windows 1; breakdown {'Junction/symlink skip': 1, 'File too large': 1} |

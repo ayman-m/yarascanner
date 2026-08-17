@@ -11,9 +11,9 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 |---|---|---|---|---|---|
 | 1 | 53 | 53 | 0 | 0 | 0 |
 | 2 | 109 | 105 | 0 | 4 | 0 |
-| 3 | 121 | 105 | 0 | 16 | 0 |
+| 3 | 121 | 108 | 0 | 13 | 0 |
 
-**263 of 283 executed.**
+**266 of 283 executed.**
 
 ## All capabilities
 
@@ -85,9 +85,9 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `TRAV-020` | Skip by file extension (disk-image containers) | 3 | supporting | ✅ pass | 19 planted (12 filler + .iso/.vmdk/.dmg + .DS_Store/Thumbs.db/desktop.ini + control.txt) -> 13 scanned, 13 matches | — |
 | `TRAV-021` | Skip by exact filename | 3 | supporting | ✅ pass | 6 skip-listed names planted alongside a control.txt carrying the same matching content; 13 of 19 scanned and control.txt was among them | — |
 | `TRAV-022` | Skip by bounded path fragment | 3 | core | ⛔ blocked | — | the seeded tree contains no vendor-agent path; component-boundary matching is covered by tests/test_extra_skip_paths.py |
-| `TRAV-023` | Browser caches deliberately NOT skipped | 3 | supporting | ⛔ blocked | — | browser caches are deliberately NOT skipped; observing that needs a host with a browser profile in the scan scope |
-| `TRAV-024` | Browser force-scan allowlist (macOS carve-out) | 3 | supporting | ⛔ blocked | — | the macOS browser force-scan carve-out needs a real browser cache path in scope |
-| `TRAV-025` | Boundary skips the force-scan allowlist cannot override | 3 | supporting | ⛔ blocked | — | force-scan boundary needs a browser cache under a skipped root |
+| `TRAV-023` | Browser caches deliberately NOT skipped | 3 | supporting | ✅ pass | scanned under /library/caches/: ['caches/firefox/', 'caches/com.apple.safari/', 'caches/google/chrome/'] | — |
+| `TRAV-024` | Browser force-scan allowlist (macOS carve-out) | 3 | supporting | ✅ pass | 4 scanned; library/caches/firefox reached=True, library/caches/other_app reached=False — the carve-out names browsers rather than re-opening the whole category | — |
+| `TRAV-025` | Boundary skips the force-scan allowlist cannot override | 3 | supporting | ✅ pass | the same firefox cache path was scanned normally (True) but skipped under /volumes/ (True); 4 scanned of 6 planted | — |
 | `TRAV-026` | Windows skip folders with component-boundary matching | 3 | supporting | ✅ pass | Windows component-boundary matching ran over 310 files without over-skipping (macOS/Linux parity: 310/309/310) | — |
 | `TRAV-027` | Windows skip-drive mechanism | 3 | supporting | ⛔ blocked | — | skip-drive mechanism needs a whole-machine Windows scan |
 | `TRAV-028` | Linux skip directories | 3 | supporting | ✅ pass | 655,232 files attributed to skipped directories; breakdown {'Skipped directory': 655232, 'File does not exist': 1965, 'Not a regular file': 762, 'File too large': 52, 'Special system file': 23} sums… | — |
