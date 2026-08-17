@@ -344,19 +344,25 @@ when the directory walker is blocked on a saturated queue.
 opt in. Expect one extra rule compile per host on the first scan (cache-key change), and
 roughly 4× more local progress-log lines from the 30s interval.
 
-### Known issue — the bundled XDR dashboard is still on the pre-v3 match grain
+### Fixed (2026-08-13) — a prior fix pass had claimed this dashboard was corrected; it wasn't
 
-The standalone widget files under `widgets/xdr/` were rewritten for the v3.0.0 grain change
-(one dataset row per *finding* rather than per matched offset, with the true hit total in
-`match_count`). **The bundled `dashboards/xdr/YARA Scanner (Lookup).json` was not.** All 18 of
-its match-related queries still use the pre-v3 shape (`count()` over rows,
-`matched_length`), and none reference `match_count`.
+An earlier release note (and commit message, `da48609`) claimed `dashboards/xdr/YARA Scanner
+(Lookup).json`'s 14 match-grain queries had been synced to the standalone `widgets/xdr/*.xql`
+fixes and verified byte-identical. That verification was wrong: the sync script's
+update-in-place path silently no-opped for all 14 existing widgets (only the one brand-new
+widget that commit also added actually landed, since inserting new content doesn't exercise
+the same code path as replacing existing content) — the dashboard shipped with the pre-v3
+`count()`/`matched_length` shape the whole time, undercounting hit volume by orders of
+magnitude on any rule with many string hits per file.
 
-Consequence: importing that dashboard as-is produces hit counts that **undercount by orders
-of magnitude** on any rule with many string hits per file — the queries run and return data,
-they are simply wrong. This is the same defect corrected on the XSIAM side in v3.0.0.
+Actually fixed this time, verified by reading the file back in a **fresh subprocess** (not
+trusting in-memory state, which is what let the previous silent failure through) and
+confirming, for every one of the 14 widgets, an exact string match against its standalone
+file in *both* the dashboard's `layout` and `widgets_data` structures, plus a scan for zero
+remaining occurrences of the old query shapes anywhere in the file.
 
-Until it is fixed, prefer the individual `.xql` files in `widgets/xdr/`, which are correct.
+Until you re-import, `widgets/xdr/*.xql` remain the source of truth for anything you build
+on top of this dashboard directly.
 Note also that `Matched-Length Size Buckets` was replaced by `Match Count Buckets` (the old
 `matched_length` column does not exist at the v3 grain).
 

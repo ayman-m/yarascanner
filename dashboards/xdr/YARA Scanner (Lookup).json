@@ -2,7 +2,7 @@
     "dashboards_data": [
         {
             "name": "Yara XDR Scanner (Lookup)",
-            "description": "Comprehensive YARA scanner dashboard \u2014 detections, fleet coverage, rule health, throughput and alerts over the sharded yara_scanner_matches* / yara_scanner_scans* datasets and the alerts channel.",
+            "description": "Comprehensive YARA scanner dashboard — detections, fleet coverage, rule health, throughput and alerts over the sharded yara_scanner_matches* / yara_scanner_scans* datasets and the alerts channel.",
             "status": "ENABLED",
             "layout": [
                 {
@@ -91,7 +91,7 @@
                                 "type": "Custom XQL",
                                 "width": 33.0,
                                 "height": 400,
-                                "phrase": "/**************************************************************************\n  Top Rules by Hits\n\n  Noisiest YARA rules by total match count (yara_scanner_matches).\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n**************************************************************************/\ndataset = yara_scanner_matches*\n| comp count() as hits by rule\n| sort desc hits\n| limit 15\n\n| view graph type = pie subtype = full header = \"Top YARA Rules by Hits\" xaxis = rule yaxis = hits\n",
+                                "phrase": "/**************************************************************************\n  Top Rules by Hits\n\n  Noisiest YARA rules by total match count (yara_scanner_matches).\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n\n  2026-08 grain change: rows are one per (rule, file) finding, not one per matched-string\n  offset - hits sums match_count (the true per-finding total) instead of counting rows.\n  Also dedups by (scan_id, hostname, rule, filename) against the narrow window where\n  consolidation has copied a finding into its per-scan target but not yet removed it from\n  the per-host source shard.\n**************************************************************************/\ndataset = yara_scanner_matches*\n| dedup scan_id, hostname, rule, filename\n| comp sum(to_integer(match_count)) as hits by rule\n| sort desc hits\n| limit 15\n\n| view graph type = pie subtype = full header = \"Top YARA Rules by Hits\" xaxis = rule yaxis = hits\n",
                                 "time_frame": {
                                     "relativeTime": 604800000
                                 },
@@ -115,7 +115,7 @@
                                 "type": "Custom XQL",
                                 "width": 33.0,
                                 "height": 400,
-                                "phrase": "/**************************************************************************\n  Hot Hosts\n\n  Endpoints with the most matches.\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n**************************************************************************/\ndataset = yara_scanner_matches*\n| comp count() as hits by hostname\n| sort desc hits\n| limit 15\n\n| view graph type = pie subtype = donut header = \"Hot Hosts (Most Matches)\" xaxis = hostname yaxis = hits\n",
+                                "phrase": "/**************************************************************************\n  Hot Hosts\n\n  Endpoints with the most matches.\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n\n  2026-08 grain change: rows are one per (rule, file) finding, not one per matched-string\n  offset - hits sums match_count (the true per-finding total) instead of counting rows.\n  Also dedups by (scan_id, hostname, rule, filename) against the narrow window where\n  consolidation has copied a finding into its per-scan target but not yet removed it from\n  the per-host source shard.\n**************************************************************************/\ndataset = yara_scanner_matches*\n| dedup scan_id, hostname, rule, filename\n| comp sum(to_integer(match_count)) as hits by hostname\n| sort desc hits\n| limit 15\n\n| view graph type = pie subtype = donut header = \"Hot Hosts (Most Matches)\" xaxis = hostname yaxis = hits\n",
                                 "time_frame": {
                                     "relativeTime": 604800000
                                 },
@@ -139,7 +139,7 @@
                                 "type": "Custom XQL",
                                 "width": 34.0,
                                 "height": 400,
-                                "phrase": "/**************************************************************************\n  Severity Split\n\n  Distribution of match severity.\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n**************************************************************************/\ndataset = yara_scanner_matches*\n| comp count() as hits by severity\n\n| view graph type = pie subtype = donut header = \"Matches by Severity\" xaxis = severity yaxis = hits\n",
+                                "phrase": "/**************************************************************************\n  Severity Split\n\n  Distribution of match severity.\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n\n  2026-08 grain change: rows are one per (rule, file) finding, not one per matched-string\n  offset - hits sums match_count (the true per-finding total) instead of counting rows.\n  Also dedups by (scan_id, hostname, rule, filename) against the narrow window where\n  consolidation has copied a finding into its per-scan target but not yet removed it from\n  the per-host source shard.\n**************************************************************************/\ndataset = yara_scanner_matches*\n| dedup scan_id, hostname, rule, filename\n| comp sum(to_integer(match_count)) as hits by severity\n\n| view graph type = pie subtype = donut header = \"Matches by Severity\" xaxis = severity yaxis = hits\n",
                                 "time_frame": {
                                     "relativeTime": 604800000
                                 },
@@ -168,7 +168,7 @@
                                 "type": "Custom XQL",
                                 "width": 50.0,
                                 "height": 400,
-                                "phrase": "/**************************************************************************\n  Endpoints Impacted per Rule\n\n  How many distinct endpoints each rule fired on.\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n**************************************************************************/\ndataset = yara_scanner_matches*\n| comp count_distinct(hostname) as endpoints by rule\n| sort desc endpoints\n| limit 15\n\n| view graph type = bar header = \"Endpoints Impacted per Rule\" xaxis = rule yaxis = endpoints\n",
+                                "phrase": "/**************************************************************************\n  Endpoints Impacted per Rule\n\n  How many distinct endpoints each rule fired on.\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n\n  Unaffected by the 2026-08 match-upload grain change (count_distinct is unaffected by row\n  grain), but still dedups by (scan_id, hostname, rule, filename) as defense-in-depth\n  against the narrow window where consolidation has copied a finding into its per-scan\n  target but not yet removed it from the per-host source shard.\n**************************************************************************/\ndataset = yara_scanner_matches*\n| dedup scan_id, hostname, rule, filename\n| comp count_distinct(hostname) as endpoints by rule\n| sort desc endpoints\n| limit 15\n\n| view graph type = bar header = \"Endpoints Impacted per Rule\" xaxis = rule yaxis = endpoints\n",
                                 "time_frame": {
                                     "relativeTime": 604800000
                                 },
@@ -192,7 +192,7 @@
                                 "type": "Custom XQL",
                                 "width": 50.0,
                                 "height": 400,
-                                "phrase": "/**************************************************************************\n  Matches Over Time\n\n  Match volume in hourly buckets. Lookup rows have no _time, so we bucket on\nevent_timestamp_ms (epoch ms) -> hourly timestamp.\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n**************************************************************************/\ndataset = yara_scanner_matches*\n| alter bucket_ms = multiply(to_integer(divide(event_timestamp_ms, 3600000)), 3600000)\n| alter ts = to_timestamp(bucket_ms, \"MILLIS\")\n| comp count() as hits by ts\n| sort asc ts\n\n| view graph type = line header = \"Matches Over Time (hourly)\" xaxis = ts yaxis = hits\n",
+                                "phrase": "/**************************************************************************\n  Matches Over Time\n\n  Match volume in hourly buckets. Lookup rows have no _time, so we bucket on\nevent_timestamp_ms (epoch ms) -> hourly timestamp.\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n\n  2026-08 grain change: rows are one per (rule, file) finding, not one per matched-string\n  offset - hits sums match_count (the true per-finding total) instead of counting rows.\n  Also dedups by (scan_id, hostname, rule, filename) against the narrow window where\n  consolidation has copied a finding into its per-scan target but not yet removed it from\n  the per-host source shard.\n**************************************************************************/\ndataset = yara_scanner_matches*\n| dedup scan_id, hostname, rule, filename\n| alter bucket_ms = multiply(to_integer(divide(event_timestamp_ms, 3600000)), 3600000)\n| alter ts = to_timestamp(bucket_ms, \"MILLIS\")\n| comp sum(to_integer(match_count)) as hits by ts\n| sort asc ts\n\n| view graph type = line header = \"Matches Over Time (hourly)\" xaxis = ts yaxis = hits\n",
                                 "time_frame": {
                                     "relativeTime": 604800000
                                 },
@@ -221,7 +221,7 @@
                                 "type": "Custom XQL",
                                 "width": 50.0,
                                 "height": 420,
-                                "phrase": "/**************************************************************************\n  Top Matched Files\n\n  Files triggering the most string matches (by path + sha256).\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n**************************************************************************/\ndataset = yara_scanner_matches*\n| comp count() as hits by filename, file_sha256\n| sort desc hits\n| limit 20\n\n| view graph type = table header = \"Top Matched Files\"\n",
+                                "phrase": "/**************************************************************************\n  Top Matched Files\n\n  Files triggering the most string matches (by path + sha256).\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n\n  2026-08 grain change: rows are one per (rule, file) finding, not one per matched-string\n  offset - hits sums match_count (the true per-finding total) instead of counting rows.\n  Also dedups by (scan_id, hostname, rule, filename) against the narrow window where\n  consolidation has copied a finding into its per-scan target but not yet removed it from\n  the per-host source shard.\n**************************************************************************/\ndataset = yara_scanner_matches*\n| dedup scan_id, hostname, rule, filename\n| comp sum(to_integer(match_count)) as hits by filename, file_sha256\n| sort desc hits\n| limit 20\n\n| view graph type = table header = \"Top Matched Files\"\n",
                                 "time_frame": {
                                     "relativeTime": 604800000
                                 },
@@ -303,7 +303,7 @@
                                 "type": "Custom XQL",
                                 "width": 25.0,
                                 "height": 180,
-                                "phrase": "dataset = yara_scanner_matches* | comp count_distinct(rule) as distinct_rules | view graph type = single header = \"Rules Fired\"",
+                                "phrase": "/* Distinct Rules Fired\n   Single-value KPI of how many unique YARA rules produced at least one match.\n   category: alerts-and-kpis\n\n   Unaffected by the 2026-08 match-upload grain change (count_distinct is unaffected by row\n   grain), but still dedups by (scan_id, hostname, rule, filename) as defense-in-depth\n   against the narrow window where consolidation has copied a finding into its per-scan\n   target but not yet removed it from the per-host source shard. */\ndataset = yara_scanner_matches*\n| dedup scan_id, hostname, rule, filename\n| comp count_distinct(rule) as distinct_rules\n| view graph type = single header = \"Rules Fired\"\n",
                                 "time_frame": {
                                     "relativeTime": 604800000
                                 },
@@ -375,7 +375,7 @@
                                 "type": "Custom XQL",
                                 "width": 25.0,
                                 "height": 180,
-                                "phrase": "dataset = yara_scanner_matches* | comp count() as total_matches | view graph type = single header = \"Total Matches\"",
+                                "phrase": "/* Total YARA Matches\n   Single-value KPI of every matched YARA string across the fleet.\n   category: alerts-and-kpis\n\n   2026-08 grain change: yara_scanner_matches rows are one per (rule, file) finding, not\n   one per matched-string offset. match_count carries the true per-finding total, so this\n   sums match_count instead of counting rows - counting rows would report finding count,\n   not match count (orders of magnitude lower on any rule with many string-offset hits).\n   Also dedups by (scan_id, hostname, rule, filename): xdr_consolidate.py copies a finding\n   into its per-scan target before removing it from the per-host source shard, so a query\n   across both during that window would otherwise double-count it. */\ndataset = yara_scanner_matches*\n| dedup scan_id, hostname, rule, filename\n| comp sum(to_integer(match_count)) as total_matches\n| view graph type = single header = \"Total Matches\"\n",
                                 "time_frame": {
                                     "relativeTime": 604800000
                                 },
@@ -452,7 +452,7 @@
                                 "type": "Custom XQL",
                                 "width": 36.3,
                                 "height": 360,
-                                "phrase": "dataset = yara_scanner_matches* | comp count() as hits, count_distinct(hostname) as endpoints by os_type | sort desc hits | view graph type = pie subtype = full header = \"Detections by OS Platform\" xaxis = os_type yaxis = hits",
+                                "phrase": "/* Detections by OS Platform\n   Segment YARA matches across Windows/Linux/macOS to reveal which platform carries the most detection load.\n   category: detection-depth\n\n   2026-08 grain change: rows are one per (rule, file) finding, not one per matched-string\n   offset - hits sums match_count (the true per-finding total) instead of counting rows;\n   endpoints (count_distinct) is unaffected by row grain. Dedups by (scan_id, hostname,\n   rule, filename) against the narrow window where consolidation has copied a finding into\n   its per-scan target but not yet removed it from the per-host source shard. */\ndataset = yara_scanner_matches*\n| dedup scan_id, hostname, rule, filename\n| comp sum(to_integer(match_count)) as hits, count_distinct(hostname) as endpoints by os_type\n| sort desc hits\n| view graph type = pie subtype = full header = \"Detections by OS Platform\" xaxis = os_type yaxis = hits\n",
                                 "time_frame": {
                                     "relativeTime": 604800000
                                 },
@@ -635,7 +635,7 @@
                                 "type": "Custom XQL",
                                 "width": 50.0,
                                 "height": 360,
-                                "phrase": "dataset = yara_scanner_matches* | comp count() as hits, count_distinct(file_sha256) as unique_files by scan_folder | sort desc hits | limit 15 | view graph type = bar header = \"Detection Hotspot Folders\" xaxis = scan_folder yaxis = hits",
+                                "phrase": "/* Detection Hotspot Folders\n   Rank the scan folders where matches cluster, exposing directories that concentrate suspicious files.\n   category: detection-depth\n\n   2026-08 grain change: rows are one per (rule, file) finding, not one per matched-string\n   offset - hits sums match_count (the true per-finding total) instead of counting rows;\n   unique_files (count_distinct) is unaffected by row grain. Dedups by (scan_id, hostname,\n   rule, filename) against the narrow window where consolidation has copied a finding into\n   its per-scan target but not yet removed it from the per-host source shard. */\ndataset = yara_scanner_matches*\n| dedup scan_id, hostname, rule, filename\n| comp sum(to_integer(match_count)) as hits, count_distinct(file_sha256) as unique_files by scan_folder\n| sort desc hits\n| limit 15\n| view graph type = bar header = \"Detection Hotspot Folders\" xaxis = scan_folder yaxis = hits\n",
                                 "time_frame": {
                                     "relativeTime": 604800000
                                 },
@@ -664,7 +664,7 @@
                                 "type": "Custom XQL",
                                 "width": 50.0,
                                 "height": 360,
-                                "phrase": "dataset = yara_scanner_matches* | alter len_bucket = if(matched_length < 16, \"01: <16B\", matched_length < 64, \"02: 16-64B\", matched_length < 256, \"03: 64-256B\", matched_length < 1024, \"04: 256B-1KB\", \"05: >=1KB\") | comp count() as hits by len_bucket | sort asc len_bucket | view graph type = column header = \"Matched-Length Size Buckets\" xaxis = len_bucket yaxis = hits",
+                                "phrase": "/* Matched-Length Size Buckets\n   Bucket findings by how many times their pattern matched, to distinguish a single\n   incidental hit from a file saturated with a signature.\n   category: detection-depth\n\n   2026-08 grain change: yara_scanner_matches rows no longer carry a per-offset\n   matched_length column at all - each row is now one (rule, file) finding, and the\n   original byte-length-of-match data was dropped from the schema in that redesign (only a\n   capped sample of the matched substrings themselves survives, in `strings`). There is no\n   way to recover the original per-offset length distribution from what's stored, so this\n   widget is repurposed to bucket by match_count (the true, uncapped per-finding hit\n   count) instead of by matched-string byte length - the closest still-available signal\n   for the same underlying question (\"is this a trivial one-off match or a saturated\n   file?\"). Dedups by (scan_id, hostname, rule, filename) against the narrow window where\n   consolidation has copied a finding into its per-scan target but not yet removed it from\n   the per-host source shard. */\ndataset = yara_scanner_matches*\n| dedup scan_id, hostname, rule, filename\n| alter mc = to_integer(match_count)\n| alter hit_bucket = if(mc < 2, \"01: 1 hit\", mc < 5, \"02: 2-4 hits\", mc < 20, \"03: 5-19 hits\", mc < 100, \"04: 20-99 hits\", \"05: >=100 hits\")\n| comp count() as findings by hit_bucket\n| sort asc hit_bucket\n| view graph type = column header = \"Match Count Buckets\" xaxis = hit_bucket yaxis = findings\n",
                                 "time_frame": {
                                     "relativeTime": 604800000
                                 },
@@ -675,7 +675,7 @@
                                             "command": {
                                                 "op": "=",
                                                 "name": "header",
-                                                "value": "\"Matched-Length Size Buckets\""
+                                                "value": "\"Match Count Buckets\""
                                             }
                                         }
                                     ]
@@ -688,7 +688,7 @@
                                 "type": "Custom XQL",
                                 "width": 50.0,
                                 "height": 360,
-                                "phrase": "dataset = yara_scanner_matches* | comp count_distinct(file_sha256) as unique_files, count() as hits by rule | sort desc unique_files | limit 15 | view graph type = column header = \"Unique Malicious Files per Rule\" xaxis = rule yaxis = unique_files",
+                                "phrase": "/* Unique Malicious Files per Rule\n   Count distinct SHA-256 files behind each rule to separate broad-impact rules from single-file noise.\n   category: detection-depth\n\n   2026-08 grain change: rows are one per (rule, file) finding, not one per matched-string\n   offset - hits sums match_count (the true per-finding total) instead of counting rows;\n   unique_files (count_distinct) is unaffected by row grain. Dedups by (scan_id, hostname,\n   rule, filename) against the narrow window where consolidation has copied a finding into\n   its per-scan target but not yet removed it from the per-host source shard. */\ndataset = yara_scanner_matches*\n| dedup scan_id, hostname, rule, filename\n| comp count_distinct(file_sha256) as unique_files, sum(to_integer(match_count)) as hits by rule\n| sort desc unique_files\n| limit 15\n| view graph type = column header = \"Unique Malicious Files per Rule\" xaxis = rule yaxis = unique_files\n",
                                 "time_frame": {
                                     "relativeTime": 604800000
                                 },
@@ -905,7 +905,7 @@
                                 "type": "Custom XQL",
                                 "width": 100.0,
                                 "height": 360,
-                                "phrase": "dataset = yara_scanner_matches* | filter severity = \"High\" | sort desc event_timestamp_ms | limit 25 | fields scan_date, hostname, os_type, rule, filename, file_size, offset, matched_length, file_sha256 | view graph type = table header = \"High-Severity Triage Queue\"",
+                                "phrase": "/* High-Severity Triage Queue\n   Actionable triage table of the newest High-severity matches with host, file, rule and\n   match detail for immediate hunting.\n   category: detection-depth\n\n   2026-08 grain change: yara_scanner_matches rows no longer carry offset/matched_length -\n   each row is now one (rule, file) finding with match_count (true total hits) and\n   offsets/strings (JSON arrays, sampled up to CONFIG_LOOKUP_ROWS_PER_FINDING_MAX per\n   finding) plus truncated (bool, true if the finding had more hits than the sample\n   holds). Shows the raw sample fields as-is for the analyst to inspect; explode them\n   further with json_extract_array() if a per-offset breakdown is needed. Also dedups by\n   (scan_id, hostname, rule, filename) against the narrow window where consolidation has\n   copied a finding into its per-scan target but not yet removed it from the source shard. */\ndataset = yara_scanner_matches*\n| filter severity = \"High\"\n| sort desc event_timestamp_ms\n| dedup scan_id, hostname, rule, filename\n| limit 25\n| fields scan_date, hostname, os_type, rule, filename, file_size, match_count, truncated, offsets, file_sha256\n| view graph type = table header = \"High-Severity Triage Queue\"\n",
                                 "time_frame": {
                                     "relativeTime": 604800000
                                 },
@@ -934,7 +934,7 @@
                                 "type": "Custom XQL",
                                 "width": 100.0,
                                 "height": 360,
-                                "phrase": "dataset = yara_scanner_matches* | comp max(file_size) as bytes, count() as hits by filename, rule, hostname | sort desc bytes | limit 20 | view graph type = table header = \"Largest Matched Files\"",
+                                "phrase": "/* Largest Matched Files\n   Surface the biggest files that triggered a YARA hit, where bulky payloads or packed binaries often hide.\n   category: detection-depth\n\n   2026-08 grain change: rows are one per (rule, file) finding, not one per matched-string\n   offset - hits sums match_count (the true per-finding total) instead of counting rows;\n   max(file_size) is unaffected by row grain. Dedups by (scan_id, hostname, rule, filename)\n   against the narrow window where consolidation has copied a finding into its per-scan\n   target but not yet removed it from the per-host source shard. */\ndataset = yara_scanner_matches*\n| dedup scan_id, hostname, rule, filename\n| comp max(file_size) as bytes, sum(to_integer(match_count)) as hits by filename, rule, hostname\n| sort desc bytes\n| limit 20\n| view graph type = table header = \"Largest Matched Files\"\n",
                                 "time_frame": {
                                     "relativeTime": 604800000
                                 },
@@ -1210,7 +1210,7 @@
             "creation_time": 1783600000000,
             "description": "",
             "data": {
-                "phrase": "/**************************************************************************\n  Top Rules by Hits\n\n  Noisiest YARA rules by total match count (yara_scanner_matches).\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n**************************************************************************/\ndataset = yara_scanner_matches*\n| comp count() as hits by rule\n| sort desc hits\n| limit 15\n\n| view graph type = pie subtype = full header = \"Top YARA Rules by Hits\" xaxis = rule yaxis = hits\n",
+                "phrase": "/**************************************************************************\n  Top Rules by Hits\n\n  Noisiest YARA rules by total match count (yara_scanner_matches).\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n\n  2026-08 grain change: rows are one per (rule, file) finding, not one per matched-string\n  offset - hits sums match_count (the true per-finding total) instead of counting rows.\n  Also dedups by (scan_id, hostname, rule, filename) against the narrow window where\n  consolidation has copied a finding into its per-scan target but not yet removed it from\n  the per-host source shard.\n**************************************************************************/\ndataset = yara_scanner_matches*\n| dedup scan_id, hostname, rule, filename\n| comp sum(to_integer(match_count)) as hits by rule\n| sort desc hits\n| limit 15\n\n| view graph type = pie subtype = full header = \"Top YARA Rules by Hits\" xaxis = rule yaxis = hits\n",
                 "time_frame": {
                     "relativeTime": 604800000
                 },
@@ -1242,7 +1242,7 @@
             "creation_time": 1783600000000,
             "description": "",
             "data": {
-                "phrase": "/**************************************************************************\n  Hot Hosts\n\n  Endpoints with the most matches.\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n**************************************************************************/\ndataset = yara_scanner_matches*\n| comp count() as hits by hostname\n| sort desc hits\n| limit 15\n\n| view graph type = pie subtype = donut header = \"Hot Hosts (Most Matches)\" xaxis = hostname yaxis = hits\n",
+                "phrase": "/**************************************************************************\n  Hot Hosts\n\n  Endpoints with the most matches.\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n\n  2026-08 grain change: rows are one per (rule, file) finding, not one per matched-string\n  offset - hits sums match_count (the true per-finding total) instead of counting rows.\n  Also dedups by (scan_id, hostname, rule, filename) against the narrow window where\n  consolidation has copied a finding into its per-scan target but not yet removed it from\n  the per-host source shard.\n**************************************************************************/\ndataset = yara_scanner_matches*\n| dedup scan_id, hostname, rule, filename\n| comp sum(to_integer(match_count)) as hits by hostname\n| sort desc hits\n| limit 15\n\n| view graph type = pie subtype = donut header = \"Hot Hosts (Most Matches)\" xaxis = hostname yaxis = hits\n",
                 "time_frame": {
                     "relativeTime": 604800000
                 },
@@ -1274,7 +1274,7 @@
             "creation_time": 1783600000000,
             "description": "",
             "data": {
-                "phrase": "/**************************************************************************\n  Severity Split\n\n  Distribution of match severity.\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n**************************************************************************/\ndataset = yara_scanner_matches*\n| comp count() as hits by severity\n\n| view graph type = pie subtype = donut header = \"Matches by Severity\" xaxis = severity yaxis = hits\n",
+                "phrase": "/**************************************************************************\n  Severity Split\n\n  Distribution of match severity.\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n\n  2026-08 grain change: rows are one per (rule, file) finding, not one per matched-string\n  offset - hits sums match_count (the true per-finding total) instead of counting rows.\n  Also dedups by (scan_id, hostname, rule, filename) against the narrow window where\n  consolidation has copied a finding into its per-scan target but not yet removed it from\n  the per-host source shard.\n**************************************************************************/\ndataset = yara_scanner_matches*\n| dedup scan_id, hostname, rule, filename\n| comp sum(to_integer(match_count)) as hits by severity\n\n| view graph type = pie subtype = donut header = \"Matches by Severity\" xaxis = severity yaxis = hits\n",
                 "time_frame": {
                     "relativeTime": 604800000
                 },
@@ -1306,7 +1306,7 @@
             "creation_time": 1783600000000,
             "description": "",
             "data": {
-                "phrase": "/**************************************************************************\n  Endpoints Impacted per Rule\n\n  How many distinct endpoints each rule fired on.\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n**************************************************************************/\ndataset = yara_scanner_matches*\n| comp count_distinct(hostname) as endpoints by rule\n| sort desc endpoints\n| limit 15\n\n| view graph type = bar header = \"Endpoints Impacted per Rule\" xaxis = rule yaxis = endpoints\n",
+                "phrase": "/**************************************************************************\n  Endpoints Impacted per Rule\n\n  How many distinct endpoints each rule fired on.\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n\n  Unaffected by the 2026-08 match-upload grain change (count_distinct is unaffected by row\n  grain), but still dedups by (scan_id, hostname, rule, filename) as defense-in-depth\n  against the narrow window where consolidation has copied a finding into its per-scan\n  target but not yet removed it from the per-host source shard.\n**************************************************************************/\ndataset = yara_scanner_matches*\n| dedup scan_id, hostname, rule, filename\n| comp count_distinct(hostname) as endpoints by rule\n| sort desc endpoints\n| limit 15\n\n| view graph type = bar header = \"Endpoints Impacted per Rule\" xaxis = rule yaxis = endpoints\n",
                 "time_frame": {
                     "relativeTime": 604800000
                 },
@@ -1338,7 +1338,7 @@
             "creation_time": 1783600000000,
             "description": "",
             "data": {
-                "phrase": "/**************************************************************************\n  Matches Over Time\n\n  Match volume in hourly buckets. Lookup rows have no _time, so we bucket on\nevent_timestamp_ms (epoch ms) -> hourly timestamp.\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n**************************************************************************/\ndataset = yara_scanner_matches*\n| alter bucket_ms = multiply(to_integer(divide(event_timestamp_ms, 3600000)), 3600000)\n| alter ts = to_timestamp(bucket_ms, \"MILLIS\")\n| comp count() as hits by ts\n| sort asc ts\n\n| view graph type = line header = \"Matches Over Time (hourly)\" xaxis = ts yaxis = hits\n",
+                "phrase": "/**************************************************************************\n  Matches Over Time\n\n  Match volume in hourly buckets. Lookup rows have no _time, so we bucket on\nevent_timestamp_ms (epoch ms) -> hourly timestamp.\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n\n  2026-08 grain change: rows are one per (rule, file) finding, not one per matched-string\n  offset - hits sums match_count (the true per-finding total) instead of counting rows.\n  Also dedups by (scan_id, hostname, rule, filename) against the narrow window where\n  consolidation has copied a finding into its per-scan target but not yet removed it from\n  the per-host source shard.\n**************************************************************************/\ndataset = yara_scanner_matches*\n| dedup scan_id, hostname, rule, filename\n| alter bucket_ms = multiply(to_integer(divide(event_timestamp_ms, 3600000)), 3600000)\n| alter ts = to_timestamp(bucket_ms, \"MILLIS\")\n| comp sum(to_integer(match_count)) as hits by ts\n| sort asc ts\n\n| view graph type = line header = \"Matches Over Time (hourly)\" xaxis = ts yaxis = hits\n",
                 "time_frame": {
                     "relativeTime": 604800000
                 },
@@ -1370,7 +1370,7 @@
             "creation_time": 1783600000000,
             "description": "",
             "data": {
-                "phrase": "/**************************************************************************\n  Top Matched Files\n\n  Files triggering the most string matches (by path + sha256).\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n**************************************************************************/\ndataset = yara_scanner_matches*\n| comp count() as hits by filename, file_sha256\n| sort desc hits\n| limit 20\n\n| view graph type = table header = \"Top Matched Files\"\n",
+                "phrase": "/**************************************************************************\n  Top Matched Files\n\n  Files triggering the most string matches (by path + sha256).\n\n  Dataset(s): yara_scanner_matches. Lookup rows carry no _time; time-filter on\n  event_timestamp_ms. tenant_id is present on every row for multi-tenant views.\n\n  2026-08 grain change: rows are one per (rule, file) finding, not one per matched-string\n  offset - hits sums match_count (the true per-finding total) instead of counting rows.\n  Also dedups by (scan_id, hostname, rule, filename) against the narrow window where\n  consolidation has copied a finding into its per-scan target but not yet removed it from\n  the per-host source shard.\n**************************************************************************/\ndataset = yara_scanner_matches*\n| dedup scan_id, hostname, rule, filename\n| comp sum(to_integer(match_count)) as hits by filename, file_sha256\n| sort desc hits\n| limit 20\n\n| view graph type = table header = \"Top Matched Files\"\n",
                 "time_frame": {
                     "relativeTime": 604800000
                 },
@@ -1466,7 +1466,7 @@
             "creation_time": 1783600000000,
             "description": "",
             "data": {
-                "phrase": "dataset = yara_scanner_matches* | comp count_distinct(rule) as distinct_rules | view graph type = single header = \"Rules Fired\"",
+                "phrase": "/* Distinct Rules Fired\n   Single-value KPI of how many unique YARA rules produced at least one match.\n   category: alerts-and-kpis\n\n   Unaffected by the 2026-08 match-upload grain change (count_distinct is unaffected by row\n   grain), but still dedups by (scan_id, hostname, rule, filename) as defense-in-depth\n   against the narrow window where consolidation has copied a finding into its per-scan\n   target but not yet removed it from the per-host source shard. */\ndataset = yara_scanner_matches*\n| dedup scan_id, hostname, rule, filename\n| comp count_distinct(rule) as distinct_rules\n| view graph type = single header = \"Rules Fired\"\n",
                 "time_frame": {
                     "relativeTime": 604800000
                 },
@@ -1562,7 +1562,7 @@
             "creation_time": 1783600000000,
             "description": "",
             "data": {
-                "phrase": "dataset = yara_scanner_matches* | comp count() as total_matches | view graph type = single header = \"Total Matches\"",
+                "phrase": "/* Total YARA Matches\n   Single-value KPI of every matched YARA string across the fleet.\n   category: alerts-and-kpis\n\n   2026-08 grain change: yara_scanner_matches rows are one per (rule, file) finding, not\n   one per matched-string offset. match_count carries the true per-finding total, so this\n   sums match_count instead of counting rows - counting rows would report finding count,\n   not match count (orders of magnitude lower on any rule with many string-offset hits).\n   Also dedups by (scan_id, hostname, rule, filename): xdr_consolidate.py copies a finding\n   into its per-scan target before removing it from the per-host source shard, so a query\n   across both during that window would otherwise double-count it. */\ndataset = yara_scanner_matches*\n| dedup scan_id, hostname, rule, filename\n| comp sum(to_integer(match_count)) as total_matches\n| view graph type = single header = \"Total Matches\"\n",
                 "time_frame": {
                     "relativeTime": 604800000
                 },
@@ -1658,7 +1658,7 @@
             "creation_time": 1783600000000,
             "description": "",
             "data": {
-                "phrase": "dataset = yara_scanner_matches* | comp count() as hits, count_distinct(hostname) as endpoints by os_type | sort desc hits | view graph type = pie subtype = full header = \"Detections by OS Platform\" xaxis = os_type yaxis = hits",
+                "phrase": "/* Detections by OS Platform\n   Segment YARA matches across Windows/Linux/macOS to reveal which platform carries the most detection load.\n   category: detection-depth\n\n   2026-08 grain change: rows are one per (rule, file) finding, not one per matched-string\n   offset - hits sums match_count (the true per-finding total) instead of counting rows;\n   endpoints (count_distinct) is unaffected by row grain. Dedups by (scan_id, hostname,\n   rule, filename) against the narrow window where consolidation has copied a finding into\n   its per-scan target but not yet removed it from the per-host source shard. */\ndataset = yara_scanner_matches*\n| dedup scan_id, hostname, rule, filename\n| comp sum(to_integer(match_count)) as hits, count_distinct(hostname) as endpoints by os_type\n| sort desc hits\n| view graph type = pie subtype = full header = \"Detections by OS Platform\" xaxis = os_type yaxis = hits\n",
                 "time_frame": {
                     "relativeTime": 604800000
                 },
@@ -1882,7 +1882,7 @@
             "creation_time": 1783600000000,
             "description": "",
             "data": {
-                "phrase": "dataset = yara_scanner_matches* | comp count() as hits, count_distinct(file_sha256) as unique_files by scan_folder | sort desc hits | limit 15 | view graph type = bar header = \"Detection Hotspot Folders\" xaxis = scan_folder yaxis = hits",
+                "phrase": "/* Detection Hotspot Folders\n   Rank the scan folders where matches cluster, exposing directories that concentrate suspicious files.\n   category: detection-depth\n\n   2026-08 grain change: rows are one per (rule, file) finding, not one per matched-string\n   offset - hits sums match_count (the true per-finding total) instead of counting rows;\n   unique_files (count_distinct) is unaffected by row grain. Dedups by (scan_id, hostname,\n   rule, filename) against the narrow window where consolidation has copied a finding into\n   its per-scan target but not yet removed it from the per-host source shard. */\ndataset = yara_scanner_matches*\n| dedup scan_id, hostname, rule, filename\n| comp sum(to_integer(match_count)) as hits, count_distinct(file_sha256) as unique_files by scan_folder\n| sort desc hits\n| limit 15\n| view graph type = bar header = \"Detection Hotspot Folders\" xaxis = scan_folder yaxis = hits\n",
                 "time_frame": {
                     "relativeTime": 604800000
                 },
@@ -1910,11 +1910,11 @@
         },
         {
             "widget_key": "xql_e05e3d4d55f1e0e9",
-            "title": "Yara XDR - Matched-Length Size Buckets",
+            "title": "Yara XDR - Match Count Buckets",
             "creation_time": 1783600000000,
             "description": "",
             "data": {
-                "phrase": "dataset = yara_scanner_matches* | alter len_bucket = if(matched_length < 16, \"01: <16B\", matched_length < 64, \"02: 16-64B\", matched_length < 256, \"03: 64-256B\", matched_length < 1024, \"04: 256B-1KB\", \"05: >=1KB\") | comp count() as hits by len_bucket | sort asc len_bucket | view graph type = column header = \"Matched-Length Size Buckets\" xaxis = len_bucket yaxis = hits",
+                "phrase": "/* Matched-Length Size Buckets\n   Bucket findings by how many times their pattern matched, to distinguish a single\n   incidental hit from a file saturated with a signature.\n   category: detection-depth\n\n   2026-08 grain change: yara_scanner_matches rows no longer carry a per-offset\n   matched_length column at all - each row is now one (rule, file) finding, and the\n   original byte-length-of-match data was dropped from the schema in that redesign (only a\n   capped sample of the matched substrings themselves survives, in `strings`). There is no\n   way to recover the original per-offset length distribution from what's stored, so this\n   widget is repurposed to bucket by match_count (the true, uncapped per-finding hit\n   count) instead of by matched-string byte length - the closest still-available signal\n   for the same underlying question (\"is this a trivial one-off match or a saturated\n   file?\"). Dedups by (scan_id, hostname, rule, filename) against the narrow window where\n   consolidation has copied a finding into its per-scan target but not yet removed it from\n   the per-host source shard. */\ndataset = yara_scanner_matches*\n| dedup scan_id, hostname, rule, filename\n| alter mc = to_integer(match_count)\n| alter hit_bucket = if(mc < 2, \"01: 1 hit\", mc < 5, \"02: 2-4 hits\", mc < 20, \"03: 5-19 hits\", mc < 100, \"04: 20-99 hits\", \"05: >=100 hits\")\n| comp count() as findings by hit_bucket\n| sort asc hit_bucket\n| view graph type = column header = \"Match Count Buckets\" xaxis = hit_bucket yaxis = findings\n",
                 "time_frame": {
                     "relativeTime": 604800000
                 },
@@ -1925,7 +1925,7 @@
                             "command": {
                                 "op": "=",
                                 "name": "header",
-                                "value": "\"Matched-Length Size Buckets\""
+                                "value": "\"Match Count Buckets\""
                             }
                         }
                     ]
@@ -1946,7 +1946,7 @@
             "creation_time": 1783600000000,
             "description": "",
             "data": {
-                "phrase": "dataset = yara_scanner_matches* | comp count_distinct(file_sha256) as unique_files, count() as hits by rule | sort desc unique_files | limit 15 | view graph type = column header = \"Unique Malicious Files per Rule\" xaxis = rule yaxis = unique_files",
+                "phrase": "/* Unique Malicious Files per Rule\n   Count distinct SHA-256 files behind each rule to separate broad-impact rules from single-file noise.\n   category: detection-depth\n\n   2026-08 grain change: rows are one per (rule, file) finding, not one per matched-string\n   offset - hits sums match_count (the true per-finding total) instead of counting rows;\n   unique_files (count_distinct) is unaffected by row grain. Dedups by (scan_id, hostname,\n   rule, filename) against the narrow window where consolidation has copied a finding into\n   its per-scan target but not yet removed it from the per-host source shard. */\ndataset = yara_scanner_matches*\n| dedup scan_id, hostname, rule, filename\n| comp count_distinct(file_sha256) as unique_files, sum(to_integer(match_count)) as hits by rule\n| sort desc unique_files\n| limit 15\n| view graph type = column header = \"Unique Malicious Files per Rule\" xaxis = rule yaxis = unique_files\n",
                 "time_frame": {
                     "relativeTime": 604800000
                 },
@@ -2202,7 +2202,7 @@
             "creation_time": 1783600000000,
             "description": "",
             "data": {
-                "phrase": "dataset = yara_scanner_matches* | filter severity = \"High\" | sort desc event_timestamp_ms | limit 25 | fields scan_date, hostname, os_type, rule, filename, file_size, offset, matched_length, file_sha256 | view graph type = table header = \"High-Severity Triage Queue\"",
+                "phrase": "/* High-Severity Triage Queue\n   Actionable triage table of the newest High-severity matches with host, file, rule and\n   match detail for immediate hunting.\n   category: detection-depth\n\n   2026-08 grain change: yara_scanner_matches rows no longer carry offset/matched_length -\n   each row is now one (rule, file) finding with match_count (true total hits) and\n   offsets/strings (JSON arrays, sampled up to CONFIG_LOOKUP_ROWS_PER_FINDING_MAX per\n   finding) plus truncated (bool, true if the finding had more hits than the sample\n   holds). Shows the raw sample fields as-is for the analyst to inspect; explode them\n   further with json_extract_array() if a per-offset breakdown is needed. Also dedups by\n   (scan_id, hostname, rule, filename) against the narrow window where consolidation has\n   copied a finding into its per-scan target but not yet removed it from the source shard. */\ndataset = yara_scanner_matches*\n| filter severity = \"High\"\n| sort desc event_timestamp_ms\n| dedup scan_id, hostname, rule, filename\n| limit 25\n| fields scan_date, hostname, os_type, rule, filename, file_size, match_count, truncated, offsets, file_sha256\n| view graph type = table header = \"High-Severity Triage Queue\"\n",
                 "time_frame": {
                     "relativeTime": 604800000
                 },
@@ -2234,7 +2234,7 @@
             "creation_time": 1783600000000,
             "description": "",
             "data": {
-                "phrase": "dataset = yara_scanner_matches* | comp max(file_size) as bytes, count() as hits by filename, rule, hostname | sort desc bytes | limit 20 | view graph type = table header = \"Largest Matched Files\"",
+                "phrase": "/* Largest Matched Files\n   Surface the biggest files that triggered a YARA hit, where bulky payloads or packed binaries often hide.\n   category: detection-depth\n\n   2026-08 grain change: rows are one per (rule, file) finding, not one per matched-string\n   offset - hits sums match_count (the true per-finding total) instead of counting rows;\n   max(file_size) is unaffected by row grain. Dedups by (scan_id, hostname, rule, filename)\n   against the narrow window where consolidation has copied a finding into its per-scan\n   target but not yet removed it from the per-host source shard. */\ndataset = yara_scanner_matches*\n| dedup scan_id, hostname, rule, filename\n| comp max(file_size) as bytes, sum(to_integer(match_count)) as hits by filename, rule, hostname\n| sort desc bytes\n| limit 20\n| view graph type = table header = \"Largest Matched Files\"\n",
                 "time_frame": {
                     "relativeTime": 604800000
                 },
