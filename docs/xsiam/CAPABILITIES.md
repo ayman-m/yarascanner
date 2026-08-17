@@ -923,12 +923,13 @@ When the scan queue is full the producer calls `_sample_governor()` on each back
 - **Observe:** `CPU governor \|` lines continue to appear interleaved with `Scan queue saturated (...)` lines on a scan where discovery outruns the workers.
 - **Source:** `YaraScanner._enqueue_scan_path (`except Full: ... self._sample_governor(); time.sleep(self.config.queue_backoff_secs)`)`
 
-### Worker thread pool with a hard cap of 2
+### Worker thread pool, default 2 and operator-raisable
 
-**⚠ CONTROL GAP**  
-Scan workers are `ScanWorker-N` daemon threads. The configured worker count is clamped to at most 2 regardless of request or core count (`max(1, min(2, configured_workers))`); the pre-clamp default is 1 on <=2-core hosts, else 2.
+Scan workers are `ScanWorker-N` daemon threads. `YARA_THREADS` sets the count and is honoured as given; the default is 1 on <=2-core hosts, else 2.
 
-- **Control:** `configured_workers = _env_number("YARA_THREADS", default_workers, cast=int, minimum=1)`; `self.max_workers = max(1, min(2, configured_workers))` — default `1 worker if `os.cpu_count() <= 2`, otherwise 2; hard ceiling 2 even if YARA_THREADS is larger`
+Two stays the default on any core count because measurement, not caution, put it there: this work is disk-bound, and on 8-core Linux over /usr (93k files) 2 workers took 71 s, 4 took 93 s and 8 took 101 s. More threads contend for the same spindle and finish later. The old `min(2, ...)` ceiling additionally made the knob a no-op — an operator on a 16-core host who set `YARA_THREADS=8` silently got 2 — so the ceiling was removed while the default was kept.
+
+- **Control:** `configured_workers = _env_number("YARA_THREADS", default_workers, cast=int, minimum=1)`; `self.max_workers = max(1, configured_workers)` — default `1 worker if `os.cpu_count() <= 2`, otherwise 2; no ceiling — YARA_THREADS is honoured as given`
 - **Observe:** System event "YaraScanner initialized with N workers" with `max_workers` in its data; init event data `max_workers`; "All monitoring systems activated" `worker_threads`; per-tick `active_workers` in Scan Progress events; thread names ScanWorker-1/ScanWorker-2 in "Worker <name> started/stopped" system events; `worker_threads_used` in the final summary payload.
 - **Source:** `ScanConfig.__init__ (`default_workers = 1 if cpu_count <= 2 else 2`); YaraScanner.scan_system (`for i in range(self.config.max_workers): threading.Thread(target=self._worker, name=f"ScanWorker-{i+1}", daemon=True)`)`
 
@@ -2064,7 +2065,7 @@ os.walk replacement driven by an explicit stack, checking scan_active before eve
 **⚠ CONTROL GAP**  
 Each worker loops `while self.scan_active`, taking paths with a 5.0s queue timeout (Empty -> continue). Cancellation drops scan_active so workers exit their loop; at shutdown one None sentinel per worker is also pushed so idle workers wake immediately. Each worker logs a 'Worker <id> stopped' event with files_processed, errors_encountered and average_processing_time_ms.
 
-- **Control:** config.max_workers (env YARA_THREADS), hard-clamped to at most 2; queue get timeout is hardcoded 5.0s in _worker (module constant WORKER_GET_TIMEOUT_SECS=2.0 is used by the webhook uploader, not here) — default `max_workers = max(1, min(2, YARA_THREADS or (1 if cpu_count<=2 else 2)))`
+- **Control:** config.max_workers (env YARA_THREADS), honoured as given; queue get timeout is hardcoded 5.0s in _worker (module constant WORKER_GET_TIMEOUT_SECS=2.0 is used by the webhook uploader, not here) — default `max_workers = max(1, YARA_THREADS or (1 if cpu_count<=2 else 2))`
 - **Observe:** system_<run_id>.log 'Worker ScanWorker-N started' / 'Worker ScanWorker-N stopped' pairs with their data payloads; performance log 'Worker cleanup: X stopped, Y timed out in Z s'.
 - **Source:** `YaraScanner._worker(); _perform_enhanced_cleanup() sentinel loop `for _ in range(self.config.max_workers): self.scan_queue.put(None, timeout=1.0)``
 
@@ -2307,9 +2308,9 @@ _env_bool accepts 1/true/yes/on and 0/false/no/off (case-insensitive, trimmed); 
 **⚠ CONTROL GAP**  
 Several knobs are clamped after parsing so a legal-but-unusable value cannot break the run: CANCEL_POLL_SECS floored at 0.5 (0 would busy-spin, negative would raise inside time.sleep and silently kill the watcher); log_interval floored at 1 (Event.wait(0) would busy-spin and flood the unbounded webhook queue); scan_queue_size floored at 2; max_workers clamped to max(1, min(2, ...)); UPLOAD_BATCH_MAX_EVENTS >= 1 and UPLOAD_BATCH_MAX_BYTES >= 64KB.
 
-- **Control:** YARA_CANCEL_POLL_SECS, YARA_PROGRESS_LOG_SECS, YARA_QUEUE_SIZE, YARA_THREADS, YARA_UPLOAD_BATCH_MAX_EVENTS/BYTES — default `5s poll, 30s progress, queue = max_workers*2, workers 1-2, 500 events / 4 MiB`
-- **Observe:** Set YARA_PROGRESS_LOG_SECS=0 and YARA_THREADS=99 and confirm the scanner_initialization event still reports max_workers<=2 and that progress events arrive about once a second rather than continuously.
-- **Source:** `CANCEL_POLL_SECS = max(0.5, ...); self.log_interval = max(1, ...); self.max_workers = max(1, min(2, configured_workers)); UPLOAD_BATCH_MAX_* clamps`
+- **Control:** YARA_CANCEL_POLL_SECS, YARA_PROGRESS_LOG_SECS, YARA_QUEUE_SIZE, YARA_THREADS, YARA_UPLOAD_BATCH_MAX_EVENTS/BYTES — default `5s poll, 30s progress, queue = max_workers*2, workers 1-2 by core count, 500 events / 4 MiB`
+- **Observe:** Set YARA_PROGRESS_LOG_SECS=0 and confirm progress events arrive about once a second rather than continuously — the clamp turns a busy-spin into a 1 s floor. YARA_THREADS is deliberately NOT clamped: setting it to 99 yields 99 workers in the scanner_initialization event, because a knob that silently ignores its input is worse than an unwise value.
+- **Source:** `CANCEL_POLL_SECS = max(0.5, ...); self.log_interval = max(1, ...); self.max_workers = max(1, configured_workers); UPLOAD_BATCH_MAX_* clamps`
 
 ### alert_severity input validation
 

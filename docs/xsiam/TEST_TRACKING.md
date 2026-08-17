@@ -123,7 +123,7 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `PERF-011` | psutil CPU-reading priming | 1 | supporting | · not_run | — | — |
 | `PERF-012` | Governor telemetry emission policy (change threshold + heartbeat) | 1 | supporting | · not_run | — | — |
 | `PERF-013` | Governor sampling during producer backpressure | 1 | supporting | · not_run | — | — |
-| `PERF-014` | Worker thread pool with a hard cap of 2 | 1 | supporting | · not_run | — | — |
+| `PERF-014` | Worker thread pool, default 2 and operator-raisable | 1 | supporting | · not_run | — | — |
 | `PERF-015` | Worker startup timing event | 1 | supporting | · not_run | — | — |
 | `PERF-016` | Bounded scan queue | 1 | supporting | · not_run | — | — |
 | `PERF-017` | Producer backpressure on a full queue (never drops files) | 1 | supporting | · not_run | — | — |
