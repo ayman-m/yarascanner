@@ -4,14 +4,122 @@ Every released version of `xdr_yara_scanner.py`, `xsiam_yara_scanner.py`, and th
 companion scripts. Each entry records what changed and **why**, so you can decide whether
 a release is worth taking.
 
-The guides in `docs/xdr/` and `docs/xsiam/` describe the **current** version only. Anything about how a
-behaviour used to work, or the testing behind a change, lives here.
+The guides in `docs/xdr/` and `docs/xsiam/` are the reference for deployment and day-to-day
+operation, but they are **not currently in step with the shipped scanners**: both Deployment
+Guides, both Troubleshooting docs and four of the five `docs/xdr/topics/` guides are still
+stamped **v2.1.0 (2026-08-06)**, against a shipped XDR scanner of **v3.2.0** and XSIAM of
+**v4.1.0**. `docs/xdr/topics/Known_Limitations.md` is the only one carrying a current stamp.
+Until the rest are re-stamped, treat this file as authoritative for anything added after
+v2.1.0. Anything about how a behaviour used to work, or the testing behind a change, lives
+here.
 
-**Which version am I running?** Read `scanner_version` in `scan_summary_<run_id>.json`, or
-the `VERSION` line at the top of `yara_processing_<run_id>.log`.
+**Which version am I running?** Read `scanner_version` in `scan_summary_<run_id>.json` — both
+editions write it. The XDR edition *additionally* logs a `YARA Scanner VERSION <v> (released
+<date>)` line into `yara_processing_<run_id>.log`; the XSIAM edition writes the same log file
+but emits no version line into it, so on XSIAM the summary JSON is the only place to look.
 
 Versioning is semantic: **MAJOR** breaks something, **MINOR** adds capability, **PATCH**
 fixes without changing behaviour you rely on.
+
+---
+
+## xdr_data_management.py v2.2.0 — 2026-08-13
+
+### Fixed — `--delete-legacy`'s rails skipped the oldest, least replaceable datasets
+
+Every name-derived rail in `select_legacy_for_deletion` was gated on
+`parse_dataset_name(name) is not None`. That parse **requires the `_vN` segment** — and the
+oldest legacy names predate versioning entirely (`yara_scanner_scans_hostA`). So for exactly
+the data `--delete-legacy` is aimed at, all three rails were skipped and the name fell
+straight through onto the delete list, while its versioned sibling (`..._v1_hostA`) was
+correctly protected by the same function two lines above.
+
+The worst case is the unsuffixed rail: an unsuffixed dataset holds **all** of a host's
+pre-rotation history, which is the whole reason that rail exists — "removing one is a bigger
+decision than dropping a month." A `yara_scanner_scans_hostA` was deletable with no rail
+applied and no skip reason recorded.
+
+The rails now derive what they need — is this a per-scan target, does it carry a month suffix
+— from the name itself when the full contract will not parse, for any name inside the
+`yara_scanner_` prefix. Genuinely pre-contract names (no prefix at all) deliberately keep the
+previous behaviour and stay candidates: inferring an unsuffixed-ness that cannot be verified
+would make `--delete-legacy` vacuous for the oldest data it exists to remove, and
+`filter_recently_written` / `filter_unconsolidated` still run after this as their last line of
+defence.
+
+Found by auditing the release notes against the code — the v1.1.0 pack entry claimed
+"unsuffixed datasets and per-scan consolidated targets" were protected on this path, which
+was true only for names carrying a `_vN`.
+
+Two regression tests, both verified to fail with the fix reverted. This release also carries
+the version bump that the pack v1.1.0 entry's three `xdr_data_management.py` changes
+(the `select_legacy_for_deletion` return-type change, the per-scan-target guard, and the
+tightened `MONTH_RE`) should have had and did not — the module reported `2.1.1` throughout.
+
+### Upgrading
+
+**Drop-in**, and strictly more conservative: the change only ever moves a dataset from the
+delete list to the skip list. Any automation calling `select_legacy_for_deletion` directly
+should note it has returned `(candidates, skipped)` rather than a bare list since the pack
+v1.1.0 work.
+
+---
+
+## xdr_yara_scanner.py v3.2.1 — 2026-08-13
+
+Makes v3.2.0's rule-classification fix actually take effect, and makes the skipped-rule count
+actually reach the operator. Both defects had the same shape: the fix was real, but the rule
+**cache** served a stale answer, so on the hosts that matter — any host that had already
+scanned that ruleset — nothing changed. Found by auditing the release notes against the code,
+not by a scan reporting something odd, which is precisely the problem: neither defect is
+visible from the outside.
+
+### Fixed — the v3.2.0 classification fix silently did not apply on a warm rule cache
+
+v3.2.0 changed *when* a rule is classified as skipped (only when yara itself raises
+`undefined identifier`, rather than when the rule's text merely mentions a module name),
+recovering rules that were being dropped without ever being compiled. But the rule cache is
+keyed on a hash of format tag + yara version + externals + module set + rule text — and
+classification logic is not one of those inputs. `RULE_CACHE_FORMAT` stayed `"1"`, despite
+that constant's own comment reading *"bump when compile logic changes"* and
+`_rule_cache_key`'s docstring saying *"bump RULE_CACHE_FORMAT whenever the compile/split/
+inject logic changes."*
+
+So an upgraded host scanning the same ruleset computed the same key, took a cache HIT, and
+kept running the bundle v3.1.0 compiled — the one that never contained the wrongly-skipped
+rules. The cache lives under the fixed scanner dir, survives between runs, is enabled by
+default, and host cleanup deliberately never touches it, so this persisted until the entry
+was LRU-evicted (5 files) or the rule text changed. **Net effect: the release that fixed a
+silent detection loss did not fix it on any already-scanned host, while its release notes
+said "Drop-in."**
+
+`RULE_CACHE_FORMAT` now defaults to `"2"`, which changes every key and forces one recompile
+per host — the behaviour v3.2.0's notes incorrectly promised. Verified by computing the real
+key both ways against the actual hash inputs: `39a9f851…` at format `1` vs `5d5bbfaf…` at
+format `2`, i.e. a guaranteed miss on any pre-existing entry.
+
+### Fixed — `skipped_rules_count` read 0 on every cache hit
+
+v3.2.0 put the skipped-rule count on the `SCAN_RESULT` line and in
+`scan_summary_<run_id>.json`, so a pack whose rules mostly could not run would stop reporting
+"0 rules failed compilation" and say so instead. That worked only on a fresh compile.
+`_restore_cache_meta` assigns `valid_rules_count` and `failed_rules_count` back onto the error
+logger on a cache HIT but merely *returned* the skipped count, and its single caller used the
+return value for one log line and nothing else — so `error_logger.skipped_rules_count` stayed
+at its initialised `0`. The `SCAN_RESULT` segment is emitted only `if _skipped`, so it
+vanished entirely, and the summary reported `skipped_rules: 0`.
+
+Because a repeat scan of the same ruleset always hits the cache, **the silent-zero was the
+normal case, not the exception** — the exact failure the count was added to prevent. The
+value is now assigned onto the logger, and explicitly zeroed on the no/broken-sidecar path
+rather than left to whatever a previous run set.
+
+### Upgrading
+
+**Drop-in, and this time that is true.** Expect exactly one extra rule compile per host on
+the first scan after upgrading — that recompile is the point: it is what replaces the stale
+pre-fix bundle. If you already worked around the v3.2.0 defect by setting
+`YARA_RULE_CACHE_FORMAT=2` by hand, you can drop the override; the default now matches it.
 
 ---
 
@@ -89,8 +197,11 @@ Re-measured on the same endpoint with **2.5× more offsets** (2,653,415): peak R
 - **11 new dashboard widgets**, each live-validated against a tenant: scanner memory growth,
   host load vs scanner CPU share, scan ETA, disk headroom, thread count, disk I/O, agent
   fleet inventory, rule-only vs string matches, truncated findings, detection density, and
-  rule compilation health. Of the 84 fields the parsing rule extracts, only 24 were
-  previously visualized.
+  rule compilation health. Of the 84 fields the parsing rule extracts, only **21** were
+  actually queried by a shipped widget before this release — 19 once the dead Cache Hit-Rate
+  widget below is removed. These 11 take the total to 36. (An earlier draft of this line said
+  24; that count also caught `match_ids`, `offset` and `truncated`, which appear only inside
+  widget *comments* and are never queried.)
 - **Removed the Cache Hit-Rate widget.** Scan caching is a roadmap feature that is hardcoded
   off, so the scanner has never emitted a cache event — the widget could not populate.
 - **Documented why the CPU/memory widgets are blank during a running scan** (Deployment
@@ -136,8 +247,18 @@ module name compiles and runs normally.
 ### Fixed — skipped rules were invisible, and cancelled runs under-reported
 
 - `skipped_rules_count` was set but never read by anything operator-facing, so a pack whose
-  rules mostly could not run still reported "0 rules failed compilation". Now on the
-  `SCAN_RESULT` line and in `scan_summary_<run_id>.json`.
+  rules mostly could not run still reported "0 rules failed compilation". It is now on the
+  `SCAN_RESULT` line (as `| N rules skipped (module unavailable)`) and in
+  `scan_summary_<run_id>.json` — under the key **`skipped_rules`**, not `skipped_rules_count`;
+  grep for the former. **Known gap, still open:** this only holds for a run that actually
+  compiles rules. On a rule-cache HIT the count is never put back on the error logger —
+  `_save_rule_cache` does persist it into the cache sidecar (`xdr_yara_scanner.py:5586`) and
+  `_restore_cache_meta` (`:5553`) reads it back, but that function assigns only
+  `valid_rules_count`/`failed_rules_count` and merely *returns* the skipped count, which its
+  one caller spends on a log line (`:5657`). So a cached run — which, because the disk cache
+  hits on every repeat scan of the same ruleset, is the normal case — still reports 0 skipped
+  rules in both places. Until that is fixed, read the skipped count off the
+  `Rule cache HIT … (valid=… failed=… skipped=…)` line in the system log.
 - An all-skipped ruleset reported a compilation failure; it now reports an agent capability
   limit, so the operator is not sent hunting for a syntax error that does not exist.
 - The cancel path returned early and **bypassed the delivery-shortfall check entirely** — the
@@ -146,8 +267,20 @@ module name compiles and runs normally.
 
 ### Upgrading
 
-**Drop-in.** Expect one extra rule compile per host on the first scan after upgrading (the
-module-probe fix changes the rule-cache key).
+**As shipped, this release was not drop-in on a host with a warm rule cache — take
+v3.2.1 instead, which fixes it.** An earlier version of this section said "Drop-in. Expect
+one extra rule compile per host on the first scan after upgrading (the module-probe fix
+changes the rule-cache key)." That was wrong on both halves, and wrong in the direction that
+hides a detection gap: this release changes the compile loop's *classification* logic only,
+touching neither `_get_available_yara_modules` nor `_rule_cache_key`, and left
+`RULE_CACHE_FORMAT` at `"1"` despite that constant's own comment saying to bump it when
+compile logic changes. An upgraded host scanning the same ruleset therefore produced the same
+cache key, took a HIT, and kept running the bundle v3.1.0 compiled — the one that never
+contained the wrongly-skipped rules. No host recompiled, and the headline fix above did not
+take effect there.
+
+Everything else in this release — the memory fix, the summary/`SCAN_RESULT` reporting, the
+cancel-path shortfall check — is unaffected by the cache and applied on the first scan.
 
 ---
 
@@ -198,9 +331,16 @@ Chrome, Edge and Firefox cache and profile directories were on the skip list on 
 platform, so a payload staged in one was invisible to this scanner. Those four skip entries
 are removed, and a small allowlist re-opens browser caches on macOS where a broader
 `/library/caches/` rule would still have excluded them. The allowlist deliberately does not
-override *boundary* skips — mounted volumes, removable and network media (`/Volumes/`,
-`/media/`, `/mnt/`, `/net/`) stay excluded, so a Time Machine disk's per-snapshot browser
-caches cannot turn the carve-out into an unbounded walk.
+override *boundary* paths — `/Volumes/`, `/media/`, `/mnt/` and `/net/` are listed in
+`force_scan_never_under` and the carve-out can never re-open a path under one of them, so a
+Time Machine disk's per-snapshot browser caches cannot turn it into an unbounded walk.
+
+Note what that list is and is not: it constrains the **allowlist only**, it is not itself a
+skip rule. `/Volumes/` (macOS) and `/media/` (Linux) are also on their platform's skip
+directory list and are genuinely never walked; `/mnt/` and `/net/` are on no skip list at all,
+so a default `/` scan on Linux still walks them — including NFS/autofs mounts — exactly as it
+did before this release. An earlier version of this paragraph said all four "stay excluded",
+which is true only of the first two.
 
 **This widens what gets scanned.** Expect more files scanned, and potentially new detections,
 in user profile directories.
@@ -229,10 +369,20 @@ no longer treated as missing.
 Progress logging was checked only inside the file-discovery loop, which almost never runs
 long enough to cross the interval; enumeration is fast, and the worker threads matching file
 content are what take minutes. Confirmed against the tenant: **zero** "Scan Progress" or
-"Cache Performance" events had ever been recorded, on any host. It now runs on a background
-heartbeat spanning the whole scan, and the default interval is **30s** (was 120s, which was
-longer than many scans' active phase). The value is clamped to a 1s minimum — setting `0`
-does not disable progress logging, it would have busy-spun; use a large value instead.
+"Cache Performance" events had ever been recorded, on any host. Progress logging now runs on a
+background heartbeat spanning the whole scan, and the default interval is **30s** (was 120s,
+which was longer than many scans' active phase). The value is clamped to a 1s minimum —
+setting `0` does not disable progress logging, it would have busy-spun; use a large value
+instead.
+
+**"Cache Performance" is not restored by this fix, and cannot be.** The emit inside
+`_log_progress()` is gated on `cache_stats['hits'] + cache_stats['misses'] > 0`, and nothing
+in the codebase ever increments those counters — `StatisticsManager.update_cache_stats()` is
+their only writer and has no call sites, while `ScanConfig.use_cache` is hardcoded `False`
+("Roadmap Feature"). So the heartbeat runs and the emit never fires, whatever the interval.
+The parsing rule's `filter type = "statistics" and message contains "Cache Performance"` block
+is dead for the same reason. See the v4.1.0 entry above, where the Cache Hit-Rate widget built
+on it is removed; that entry states the position correctly and this one previously did not.
 
 Two long-standing metric bugs surfaced by that fix: CPU was reported as `0.0%` forever (a
 fresh psutil handle was created per sample, and psutil's first reading is always zero), and
@@ -332,8 +482,12 @@ availability probed against what the rules actually import rather than a fixed l
 psutil handle primed and reused so CPU is no longer reported as `0.0%` forever, with
 `io_counters()` guarded so macOS does not lose memory and network metrics too.
 
-Note the module-probe fix changes the rule-cache key, so the first scan on each host after
-upgrading recompiles rules once.
+Note the module-probe fix *can* change the rule-cache key, but only for packs that import a
+module outside the fixed eight-name probe list (`pe`, `elf`, `cuckoo`, `magic`, `hash`,
+`math`, `dotnet`, `time`) which the agent's libyara in fact supports: the fix only ever
+*appends* to that list, so for a pack importing nothing outside it — including `cuckoo`, the
+module these notes use as their worked example — the module set, the cache key and the cached
+bundle are all unchanged and no host recompiles.
 
 Separately, the dataset heartbeat now runs on its own thread, so liveness no longer stalls
 when the directory walker is blocked on a saturated queue.
@@ -341,22 +495,36 @@ when the directory walker is blocked on a saturated queue.
 ### Upgrading
 
 **Drop-in** — `CONFIG_HOST_CLEANUP` defaults to `off`, so behaviour is unchanged until you
-opt in. Expect one extra rule compile per host on the first scan (cache-key change), and
-roughly 4× more local progress-log lines from the 30s interval.
+opt in. Expect roughly 4× more local progress-log lines from the 30s interval, and — only on
+fleets running packs with imports outside the eight-name probe list, per the note above — one
+extra rule compile per host on the first scan. An earlier version of this line promised that
+extra compile unconditionally; for the common packs it does not happen.
 
-### Known issue — the bundled XDR dashboard is still on the pre-v3 match grain
+### Fixed (2026-08-17) — a prior fix pass had claimed this dashboard was corrected; it wasn't
 
-The standalone widget files under `widgets/xdr/` were rewritten for the v3.0.0 grain change
-(one dataset row per *finding* rather than per matched offset, with the true hit total in
-`match_count`). **The bundled `dashboards/xdr/YARA Scanner (Lookup).json` was not.** All 18 of
-its match-related queries still use the pre-v3 shape (`count()` over rows,
-`matched_length`), and none reference `match_count`.
+**This landed on 2026-08-17, after the 2026-08-13 releases, and carries no version bump** —
+an earlier version of this heading dated it 2026-08-13, which reads as if the XDR v3.2.0 /
+XSIAM v4.1.0 builds already contained it. They do not: anyone who took those releases got the
+broken dashboard, and the scanner version stamp gives no way to tell. If you are running
+v3.2.0, re-import the dashboard.
 
-Consequence: importing that dashboard as-is produces hit counts that **undercount by orders
-of magnitude** on any rule with many string hits per file — the queries run and return data,
-they are simply wrong. This is the same defect corrected on the XSIAM side in v3.0.0.
+An earlier release note (and commit message, `da48609`) claimed `dashboards/xdr/YARA Scanner
+(Lookup).json`'s 14 match-grain queries had been synced to the standalone `widgets/xdr/*.xql`
+fixes and verified byte-identical. That verification was wrong: the sync script's
+update-in-place path silently no-opped for all 14 existing widgets (only the one brand-new
+widget that commit also added actually landed, since inserting new content doesn't exercise
+the same code path as replacing existing content) — the dashboard shipped with the pre-v3
+`count()`/`matched_length` shape the whole time, undercounting hit volume by orders of
+magnitude on any rule with many string hits per file.
 
-Until it is fixed, prefer the individual `.xql` files in `widgets/xdr/`, which are correct.
+Actually fixed this time, verified by reading the file back in a **fresh subprocess** (not
+trusting in-memory state, which is what let the previous silent failure through) and
+confirming, for every one of the 14 widgets, an exact string match against its standalone
+file in *both* the dashboard's `layout` and `widgets_data` structures, plus a scan for zero
+remaining occurrences of the old query shapes anywhere in the file.
+
+Until you re-import, `widgets/xdr/*.xql` remain the source of truth for anything you build
+on top of this dashboard directly.
 Note also that `Matched-Length Size Buckets` was replaced by `Match Count Buckets` (the old
 `matched_length` column does not exist at the v3 grain).
 
@@ -374,9 +542,10 @@ arbitrary repo files at runtime, so the pack carries its own copy and a test gat
 two honest). Nothing about the consolidation playbook, its schedule, or its behaviour
 changes; neither new automation is a task in it.
 
-Suite is **217 tests, all passing** (was 125) — 83 in the new
+Suite was **217 tests, all passing** at this release (was 125) — 83 in the new
 `tests/test_pack_data_management.py` and 9 added to `tests/test_data_management.py` for the
-canonical-side changes below.
+canonical-side changes below. (It is **234** today: the extra 17 are `tests/test_host_cleanup.py`,
+which arrived later with the host-cleanup work in the XDR v3.1.0 entry above.)
 
 ### Added — `YaraReport`: read-only dataset inventory in the console
 
@@ -408,12 +577,17 @@ make it hard to run by accident are the feature, not the pruning:
 * **No implicit retention window.** `older_than_months` keeps the CLI's deliberate lack of a
   default. With neither it nor `delete_legacy`, the run selects nothing, deletes nothing,
   says so, and returns before making a single API call.
-* **All seven rails, on both selection paths.** Never the current month, never a
+* **All seven rails on the month-based path.** Never the current month, never a
   future-dated month, never an unsuffixed dataset, never a newer schema version, never a
   name outside the `yara_scanner_*` contract, never a dataset written to within
   `min_quiet_hours`, never a dataset still holding a scan consolidation has not verified
   into a per-scan target. Rails 6 and 7 are live XQL and both **keep** the dataset on query
-  error, matching the skip-to-be-safe posture of every other rail.
+  error, matching the skip-to-be-safe posture of every other rail. On the `delete_legacy`
+  path the coverage is narrower than an earlier version of this bullet claimed — the
+  newer-schema refusal is unconditional, but the four name-derived rails and rail 7 are inert
+  for a legacy name that carries no `_v<N>` segment. See the `--delete-legacy` entry below,
+  which has the same limitation and describes it in full; the pack's
+  `select_legacy_for_deletion` is a verbatim port of it.
 * **Takes the consolidation lock before deleting, in a `try`/`finally`, exactly as
   `consolidate_all` does** — same `yara_scanner_consolidation_lock` marker. Pruning and
   consolidation mutate the same shards and rails 6/7 are point-in-time checks, so a
@@ -469,12 +643,35 @@ a typo, or automation bumping it ahead of the fleet rollout — and every live,
 actively-written dataset on the tenant reclassifies as legacy. The classification alone is
 no longer allowed to authorise a delete. `--delete-legacy` is now **refused outright while
 any newer-schema dataset exists** (that proves the assumed version is stale — the keep-guard
-`xdr_action_center.py prune-datasets` already carried, now shared), unsuffixed datasets and
-per-scan consolidated targets are never blanket candidates, the current and future-month
-rails apply, and `main()` runs the survivors through `filter_recently_written` and
-`filter_unconsolidated` just as it does the rotated path. The signature gained
-`newer_names`/`now_yyyymm` and the return became `(candidates, skip_reasons)` to match
-`select_rotated_for_deletion`'s shape.
+`xdr_action_center.py prune-datasets` already carried, now shared); for a legacy name that
+still carries a recognisable `_v<N>` segment, unsuffixed datasets and per-scan consolidated
+targets are never blanket candidates and the current and future-month rails apply; and
+`main()` runs the survivors through `filter_recently_written` and `filter_unconsolidated`
+just as it does the rotated path. The signature gained `newer_names`/`now_yyyymm` and the
+return became `(candidates, skip_reasons)` to match `select_rotated_for_deletion`'s shape.
+
+**Known limitation, on this path only — an earlier version of this entry claimed the rails
+applied unconditionally, and they do not.** Every name-derived rail inside
+`select_legacy_for_deletion` is guarded by `if info is not None`, and `parse_dataset_name`
+returns `None` for any name without a `_v<N>` segment (`NAME_RE` requires one). That is
+exactly the *unversioned* half of what `classify_yara_datasets` puts in the legacy bucket —
+"legacy = older/unversioned" — so those names fall straight through to the unconditional
+`candidates.append(name)` with no rail applied. Rail 7 does not catch them either:
+`filter_unconsolidated` passes through anything it cannot parse. Verified by calling the real
+function read-only: a legacy list containing the unsuffixed `yara_scanner_matches_thor_a1b2c3`,
+the *current* month's `…_202608`, a future-dated `…_209912` and the out-of-contract
+`yara_matches_thor_a1b2c3` returns all four as candidates and skips only their `_v<N>`
+equivalents. So an unversioned dataset holding a host's entire pre-rotation history, or the
+current month's dataset a scan is writing to, remains a blanket `--delete-legacy` candidate
+gated only by `filter_recently_written` — on a platform with no undelete. The newer-schema
+refusal is the rail that does hold unconditionally, and it is the one that matters most, but
+do not read this entry as saying the others cover the unversioned names.
+
+Note also that these three `xdr_data_management.py` changes ship under an **unchanged**
+`__version__ = "2.1.1"` — the same version as the v2.1.1 entry further down, which predates
+all of them. There is currently no version by which to tell a rails-hardened build from the
+pre-fix one, and `select_legacy_for_deletion`'s return shape changed from a bare list to
+`(candidates, skip_reasons)`, so any external caller must be updated regardless.
 
 ### Fixed — `MONTH_RE`'s bare `\d{6}` resolved two ambiguities the wrong way
 
@@ -548,7 +745,7 @@ leaves open.
 
 ### Fixed — `xdr_consolidate.py` v2.6.0: two more Action Center states recognized as terminal (edge case #2)
 
-`TERMINAL_ACTION` (`xdr_consolidate.py:55`, was `{"COMPLETED_SUCCESSFULLY", "FAILED",
+`TERMINAL_ACTION` (`xdr_consolidate.py:56`, was `{"COMPLETED_SUCCESSFULLY", "FAILED",
 "ABORTED", "EXPIRED", "TIMEOUT", "CANCELED", "CANCELLED"}`) was missing
 `COMPLETED_WITH_ERRORS` and `COMPLETED_PARTIAL` — two Action Center statuses this repo's own
 `xdr_action_center.py` and the `xdr-yara-scan-test` skill's `xdr_lib.py` already treat as
@@ -565,8 +762,16 @@ unit test, `test_terminal_action_includes_partial_and_with_errors_states`.
 
 Distinct from v3.0.1's self-healing dataset recreation below (that fixed the *consequence* of
 an abandoned-cutoff misjudgment; this fixes a different way a scan can go quiet in the first
-place, and is the follow-up that entry's own last line pointed to). `_maybe_heartbeat()` was
-previously called only from the directory-walker loop, once per directory finished.
+place). It is **not** the follow-up that entry's last line pointed to, as an earlier version
+of this sentence claimed — and the two halves of that claim contradicted each other. That
+follow-up is specifically the consolidation gate's own precision: checking whether a scan's
+Action Center action is still executing before applying the age-based cutoff. It is still
+open. This fix changes only `xdr_yara_scanner.py`; `_gate_scan` still decides "abandoned" on
+row age plus the endpoint-stamp backstop, and `action_state` reaches it only through
+`shard_is_terminal`, which can declare a scan *finished* but has no still-running veto.
+
+`_maybe_heartbeat()` was previously called only from the directory-walker loop, once per
+directory finished.
 `_enqueue_scan_path()` blocks — retrying on `queue_backoff_secs` — rather than dropping files
 when the scan queue is saturated, so a large single directory on a heavily CPU-governor-
 throttled host could leave the walker parked there, and the heartbeat unsent, well past the
@@ -585,7 +790,7 @@ A revoked/rotated/expired `DEFAULT_XDR_API_KEY` previously produced a bare `HTTP
 before finally surfacing, with nothing in the repo telling an operator that a 401 here means
 "check the key" rather than "transient API/network blip" — the twice-daily Job's first task
 would just fail, unexplained. Both methods
-(`YaraConsolidateCommon.py:706` / `:734`) now re-raise immediately on `HTTP 401` instead of
+(`YaraConsolidateCommon.py:1488` / `:1516`) now re-raise immediately on `HTTP 401` instead of
 retrying. `Packs/YaraDatasetManagement/README.md` gets a new Troubleshooting table row mapping
 the exact symptom (`... failed: ... HTTP 401 ...` in the Job's task error) to cause
 (rotated/revoked/expired/mistyped key, or a Standard/Advanced type mismatch — the response body
@@ -598,8 +803,9 @@ it's re-imported/re-installed).
 Task 8 ("Flag failures for attention") still only writes a flag into its own run's ephemeral
 XSOAR context — turning that into a real push notification is a product decision, see the
 next entry — but the two structural gaps under it are closed. `YaraConsolidateCommon.py`
-adds `record_consolidation_run()` (`:143`), which writes one row per `YaraConsolidateApply`
-pass to a new `yara_scanner_consolidation_runs` lookup dataset: `status`
+adds `record_consolidation_run()` (`:166`, writing to the `_RUNS_DATASET` declared at `:158`),
+which writes one row per `YaraConsolidateApply` pass to a new
+`yara_scanner_consolidation_runs` lookup dataset: `status`
 (`success`/`partial_failure`/`crashed`), plus counts, failed scan IDs/reasons, and — for a
 crash — the exception text. `YaraConsolidateApply.py` calls it on *both* the normal-completion
 path and inside the `except` block wrapping `consolidate_all()`, writing the `"crashed"` row
@@ -877,15 +1083,27 @@ new rule — this is an XSIAM platform behaviour, not something this fix can wor
 
 ### Fixed — three dashboard widgets that were silently empty
 
-Found and fixed alongside the grain-split work above, all three because the widget's filter
-referenced a column the scanner never actually populated at that level:
+Found alongside the grain-split work above. An earlier version of this section gave one root
+cause for all three — "the widget's filter referenced a column the scanner never actually
+populated at that level" — and for the first two that is not what the repo shows:
 
-- **"Capacity vs Backpressure"** filters on a top-level `active_workers` column;
-  `log_scan_progress()` only ever nested it under `metrics.active_workers`. Now also emitted
-  at the top level.
-- **CPU/memory widgets** filter on top-level `proc_cpu_percent`, `proc_memory_mb`,
-  `sys_cpu_percent`, `sys_memory_used_percent`; `SystemResourceMonitor` only nested these
-  under `resource_data['process']`/`['system']`. Now also flattened to the top level.
+- **"Capacity vs Backpressure"** and the **CPU/memory widgets** filter on the top-level
+  columns `active_workers`, `proc_cpu_percent`, `proc_memory_mb`, `sys_cpu_percent`,
+  `sys_memory_used_percent`. Those columns were never read from the scanner's top-level
+  payload: the parsing rule creates them from exactly the nested paths
+  (`$.metrics.active_workers`, `$.process.cpu_percent`, `$.process.memory_mb`,
+  `$.system.cpu_percent`, `$.system.memory_used_percent`), and has done since it was checked
+  in on 2026-08-11, the day before this release. The columns were not missing from the event
+  shape. What was actually wrong is recorded in the header of
+  `parsing_rules/xsiam/parsing_rule.xql`: the rule was found on-tenant wrapped in a single
+  `/* … */` comment spanning its entire body, including the `[INGEST:…]` header — which
+  silently disabled the whole rule. That file also explicitly warns against re-pointing these
+  paths at the top-level aliases.
+  As belt-and-braces, `log_scan_progress()` now also emits `active_workers` at the top level
+  and `SystemResourceMonitor` also flattens the four process/system fields, so a hand-written
+  query against the raw event resolves without going through the parsing rule. That
+  flattening is redundant with the parsing rule, not the thing that made the widgets
+  populate, and nothing needs re-importing on its account.
 - **Resource monitoring stopped after file discovery, not after scanning finished.**
   `_perform_enhanced_cleanup()` stopped `resource_monitor`/`stats_manager` as soon as file
   discovery completed — a different, earlier moment than when the worker threads actually
@@ -906,9 +1124,16 @@ direct send fails. Verified live: 246s → 1s.
 ### Changed — shutdown drain budget scales with backlog instead of a flat timeout
 
 Ported XDR's proportional drain-budget design (`DRAIN_MIN_SECS`/`DRAIN_PER_ITEM_SECS`/
-`DRAIN_MAX_SECS`, env-overridable) to all 4 of this edition's independent drain sites
-(`LogManager.stop_logging` + 3 uploader classes) — a flat timeout was either too short for a
-heavy backlog (events dropped, not delayed) or wastefully long for a light one. Tuned down
+`DRAIN_MAX_SECS`, env-overridable) to all 4 of this edition's drain sites —
+`LogManager.stop_logging`, `ResultsUploader.stop`, `ResultsUploader.upload_results` and
+`WebhookUploader.stop_uploader`. (An earlier version of this line, and the module comment it
+was taken from, said "`LogManager.stop_logging` + 3 uploader classes"; it is two uploader
+classes, with `ResultsUploader` contributing two of the four sites. The edition's third
+uploader class, `ScanStatusUploader`, has no queue of its own and forwards through
+`WebhookUploader._queue_standard_upload`, and `upload_results` has no callers, so three of the
+four actually run at shutdown — which also makes the 4 × 60s worst case below an
+overestimate.) A flat timeout was either too short for a heavy backlog (events dropped, not
+delayed) or wastefully long for a light one. Tuned down
 from an initial, too-generous `DRAIN_MAX_SECS=300` after a live 4-host concurrent test showed
 3 of 4 hosts hit Action Center `TIMEOUT` (each of the 4 drain sites approaching 300s
 sequentially exceeded the snippet's own timeout) — final values (15 / 0.3 / 60) re-verified
@@ -945,8 +1170,15 @@ real issues, all fixed here:
 - `dashboards/xsiam/YARA Matches.json`'s `widgets_data[]` catalog copies of the 5 grain-
   affected widgets were never patched — only the `dashboards_data[].layout[]` copies were,
   earlier in this same release. Anyone editing/reusing a widget from the widget library (not
-  just viewing the dashboard) would have silently gotten the old, wrong query. Patched to
-  match.
+  just viewing the dashboard) would have silently gotten the old, wrong query. The catalog
+  copies now carry the same `sum(to_integer(match_count))` grain (and the same `strings`
+  explode) as the layout copies, and agree with `widgets/xsiam/*.xql`. **"Patched to match" is
+  not literally true of the whole query**, as an earlier version of this bullet said: three of
+  the five pairs still differ in non-grain respects — the layout tile for `Top Matched
+  Strings` pins `config timeframe = 24h` and the catalog copy does not; `Hot Hosts (Most
+  Matches)` renders as a grouped column chart in the layout and a pie in the catalog; and
+  `Top Rules by Hits`'s `view graph` options differ. In all three the catalog copy is the one
+  that matches the standalone `.xql`, so `widgets/xsiam/*.xql` remains the source of truth.
 
 ### Known gap (not fixed here)
 

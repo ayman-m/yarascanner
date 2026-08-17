@@ -1,0 +1,518 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>YARA Scanner v3.2.1 &amp; Dataset Management — Cortex XDR</title>
+<style>
+/* ============================================================================
+   Tokens lifted verbatim from docs/xdr/presentation.html so the two decks read
+   as one family. Elevation ladder, not flat fills: in a dark UI a surface reads
+   raised because it is LIGHTER — shadows are invisible against near-black.
+   --wire is its own token, deliberately bright: connectors sit on the PAGE, not
+   on a panel, so a border colour is far too dark for them.
+   ========================================================================== */
+:root{
+  --font:"Inter var","Inter","SF Pro Display","SF Pro Text",-apple-system,BlinkMacSystemFont,
+         "Segoe UI Variable","Segoe UI","Helvetica Neue",Helvetica,Arial,sans-serif;
+  --label:var(--font);
+  --mono:"JetBrains Mono","IBM Plex Mono","SF Mono",ui-monospace,SFMono-Regular,
+         Menlo,Consolas,"Roboto Mono",monospace;
+  --ease:cubic-bezier(.16,.84,.32,1);
+  --ease-out:cubic-bezier(.22,1,.36,1);
+}
+[data-theme="dark"]{
+  --bg:#000000;
+  --surface:#242925; --surface-2:#30352F; --overlay:#3B413A;
+  --line:rgba(255,255,255,.14); --line-hi:rgba(255,255,255,.26);
+  --lift:inset 0 1px 0 rgba(255,255,255,.07);
+  --wire:rgba(255,255,255,.90);
+  --panel:#050605; --panel-line:rgba(255,255,255,.30);
+  --ink:#F6FAF7; --ink-2:#DFE7E1; --ink-3:#D2DBD5;
+  --acc:#4ADE80; --acc-deep:#1E9E52; --acc2:#5EEAD4; --on-acc:#04140B;
+  --grad-1:rgba(74,222,128,.12);  --grad-1b:rgba(74,222,128,0);
+  --grad-2:rgba(94,234,212,.09);  --grad-2b:rgba(94,234,212,0);
+  --good:#4ADE80; --warn:#F0B429; --crit:#F2685C;
+  --sheen:rgba(255,255,255,.055);
+  --shadow:0 30px 80px -30px rgba(0,0,0,.9);
+}
+[data-theme="light"]{
+  --bg:#FAFAF9;
+  --surface:#FFFFFF; --surface-2:#F3F4F2; --overlay:#FFFFFF;
+  --line:rgba(14,20,16,.12); --line-hi:rgba(14,20,16,.24);
+  --lift:inset 0 1px 0 rgba(255,255,255,.65);
+  --wire:rgba(14,20,16,.66);
+  --panel:#FFFFFF; --panel-line:rgba(14,20,16,.30);
+  --ink:#0A100D; --ink-2:#2A322D; --ink-3:#3A433D;
+  --acc:#15803D; --acc-deep:#116430; --acc2:#0D9488; --on-acc:#FFFFFF;
+  --grad-1:rgba(21,128,61,.07);   --grad-1b:rgba(21,128,61,0);
+  --grad-2:rgba(13,148,136,.05);  --grad-2b:rgba(13,148,136,0);
+  --good:#15803D; --warn:#A16207; --crit:#BE123C;
+  --sheen:rgba(14,20,16,.04);
+  --shadow:0 24px 60px -34px rgba(14,30,20,.22);
+}
+[data-theme]{ --glow:color-mix(in srgb,var(--acc) 34%,transparent); }
+
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:var(--bg);color:var(--ink);font-family:var(--font);
+  -webkit-font-smoothing:antialiased;overflow:hidden}
+#fit{position:fixed;inset:0;display:grid;place-items:center}
+#stage{width:1600px;height:900px;position:relative;transform-origin:center center}
+
+.slide{position:absolute;inset:0;padding:64px 92px 76px;display:none;
+  background:
+    radial-gradient(1100px 620px at 82% -8%, var(--grad-1), var(--grad-1b) 62%),
+    radial-gradient(900px 520px at -6% 104%, var(--grad-2), var(--grad-2b) 60%),
+    var(--bg);
+  grid-template-rows:auto 1fr;}
+.slide.active{display:grid}
+
+.eyebrow{font-family:var(--label);font-size:13px;font-weight:650;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--acc);margin-bottom:14px}
+h1{font-size:60px;line-height:1.04;letter-spacing:-.022em;font-weight:680;max-width:22ch}
+h2{font-size:41px;line-height:1.1;letter-spacing:-.018em;font-weight:660;max-width:30ch}
+h2 em{font-style:normal;color:var(--acc)}
+.sub{margin-top:16px;font-size:20px;line-height:1.5;color:var(--ink-2);max-width:74ch}
+.body{margin-top:34px;min-height:0;display:flex;flex-direction:column;justify-content:center}
+
+/* ---- cards: equal height (stretch) + content centred inside.
+   Stretched-with-top-clumped content and natural-height-stranded-low both read
+   as unfinished; equal heights with centred content lands every heading on the
+   same y and makes the surrounding space look deliberate. ---- */
+.grid{display:grid;gap:18px;align-items:stretch}
+.g2{grid-template-columns:repeat(2,1fr)} .g3{grid-template-columns:repeat(3,1fr)}
+.g4{grid-template-columns:repeat(4,1fr)}
+.card{background:var(--panel);border:1px solid var(--panel-line);border-radius:15px;
+  padding:24px 24px 26px;box-shadow:var(--lift);
+  display:flex;flex-direction:column;justify-content:center;gap:9px}
+.card .k{font-family:var(--label);font-size:12px;font-weight:660;letter-spacing:.12em;
+  text-transform:uppercase;color:var(--acc)}
+.card h3{font-size:23px;line-height:1.2;font-weight:640;letter-spacing:-.012em}
+.card p{font-size:16px;line-height:1.52;color:var(--ink-2)}
+.card .num{font-size:44px;line-height:1;font-weight:700;letter-spacing:-.028em;
+  font-family:var(--mono)}
+/* a word-valued stat must NOT be mono — "predictable" in mono reads like a filename */
+.card .word{font-size:31px;line-height:1.08;font-weight:680;letter-spacing:-.018em;
+  font-family:var(--font)}
+.card.crit{border-color:color-mix(in srgb,var(--crit) 52%,var(--panel-line))}
+.card.crit .k{color:var(--crit)}
+.card.good{border-color:color-mix(in srgb,var(--good) 52%,var(--panel-line))}
+
+ul.pts{display:flex;flex-direction:column;gap:15px;max-width:96ch}
+ul.pts li{list-style:none;position:relative;padding-left:27px;font-size:19px;
+  line-height:1.5;color:var(--ink-2)}
+ul.pts li::before{content:"";position:absolute;left:2px;top:.62em;width:8px;height:8px;
+  border-radius:50%;background:var(--acc)}
+ul.pts li b{color:var(--ink);font-weight:660}
+code{font-family:var(--mono);font-size:.9em;background:var(--sheen);
+  border:1px solid var(--line);border-radius:5px;padding:1px 6px}
+
+/* ---- diagram canvas. Width is pinned to the viewBox and the engine class
+   NEVER declares width, or an equal-specificity width:100% silently wins and
+   every wire drifts off its box. Height is the same value as the viewBox
+   height — they move together in one edit. ---- */
+.diag{position:relative;width:1416px;margin:0 auto;flex:none}
+.diag > svg[viewBox]{position:absolute;inset:0;width:100%;height:100%;overflow:visible}
+.node{position:absolute;background:var(--surface);border:1px solid var(--line-hi);
+  border-radius:13px;padding:13px 16px;box-shadow:var(--lift)}
+.node .t{font-size:17px;font-weight:640;line-height:1.22;letter-spacing:-.008em}
+.node .s{margin-top:4px;font-family:var(--label);font-size:12px;font-weight:600;
+  letter-spacing:.05em;color:var(--ink-3)}
+.node.acc{border-color:color-mix(in srgb,var(--acc) 58%,var(--line-hi))}
+.node.acc .s{color:var(--acc)}
+.node.bad{border-color:color-mix(in srgb,var(--crit) 58%,var(--line-hi))}
+.node.bad .s{color:var(--crit)}
+.node.dim{background:var(--panel);opacity:.66}
+.plabel{position:absolute;font-family:var(--label);font-size:12.5px;font-weight:640;
+  letter-spacing:.06em;color:var(--ink-3);text-transform:uppercase}
+
+path.wire{stroke:var(--wire);stroke-width:2;fill:none}
+path.wire.dash{stroke-dasharray:6 6;opacity:.72}
+path.wire.red{stroke:var(--crit)}
+path.flow{stroke:var(--acc);stroke-width:2.6;fill:none;stroke-linecap:round;
+  stroke-dasharray:15 330}
+@keyframes dash{to{stroke-dashoffset:-345}}
+.slide.active path.flow{animation:dash 2.7s linear infinite}
+/* opt-out gate, written once per canvas: an opt-in rule has to be repeated on
+   every animated component and a missed one is invisible. */
+.slide:not(.active) path.flow{animation-play-state:paused}
+
+.foot{position:absolute;left:92px;right:92px;bottom:26px;display:flex;
+  justify-content:space-between;align-items:center;font-family:var(--label);
+  font-size:12px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--ink-3);border-top:1px solid var(--line);padding-top:13px}
+.foot .r{color:var(--acc)}
+
+[data-fx]{opacity:0;transform:translate3d(0,18px,0)}
+[data-fx].shown{opacity:1;transform:none;
+  transition:opacity .5s var(--ease-out),transform .5s var(--ease-out)}
+
+/* left, not right: the slide's own number lives bottom-right in .foot and the two
+   crowd each other there */
+#hud{position:fixed;left:16px;bottom:14px;font-family:var(--mono);font-size:11px;
+  letter-spacing:.06em;color:var(--ink-3);opacity:.45;user-select:none}
+@media (prefers-reduced-motion:reduce){
+  [data-fx]{opacity:1;transform:none}
+  .slide.active path.flow{animation:none}
+}
+</style>
+</head>
+<body>
+
+<!-- Document-level defs, zero-size but NEVER display:none — a marker inside a
+     hidden element renders invisible everywhere it is referenced, and duplicate
+     ids resolve to the first in document order. -->
+<svg id="svgdefs" aria-hidden="true" width="0" height="0"
+     style="position:absolute;width:0;height:0;overflow:hidden"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="8.5" refY="5"
+          markerWidth="6" markerHeight="6" orient="auto">
+    <path d="M0.5 1 L8.5 5 L0.5 9" style="fill:none;stroke:var(--wire);stroke-width:2;
+             stroke-linecap:round;stroke-linejoin:round"/>
+  </marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="8.5" refY="5"
+          markerWidth="6" markerHeight="6" orient="auto">
+    <path d="M0.5 1 L8.5 5 L0.5 9" style="fill:none;stroke:var(--crit);stroke-width:2;
+             stroke-linecap:round;stroke-linejoin:round"/>
+  </marker>
+</defs></svg>
+
+<div id="fit"><div id="stage">
+
+<!-- ═══════════════════════════════ 1 ═══════════════════════════════ -->
+<section class="slide active">
+  <div>
+    <div class="eyebrow" data-fx>Cortex XDR · Release update</div>
+    <h1 data-fx>YARA scanning, and the datasets it leaves behind.</h1>
+    <p class="sub" data-fx>Scanner <b>v3.2.1</b> — a smaller memory footprint, more rules
+    actually running, and a cleaner exit. Plus the piece that was missing: automated
+    lifecycle management for the forensic record the scans produce.</p>
+  </div>
+  <div class="body">
+    <div class="grid g3">
+      <div class="card" data-fx><div class="k">Scanner</div><div class="num">v3.2.1</div>
+        <p>Three releases on from v2.1.0 — memory, rule coverage and shutdown.</p></div>
+      <div class="card" data-fx><div class="k">New</div><div class="word">Dataset<br>management</div>
+        <p>Consolidation and retention, scheduled, with deletion guarded in code.</p></div>
+      <div class="card" data-fx><div class="k">Unchanged</div><div class="word">Deployment<br>model</div>
+        <p>Same three inputs, same agent delivery. No new endpoint infrastructure.</p></div>
+    </div>
+  </div>
+  <div class="foot"><span>YARA Scanner for Cortex XDR</span><span class="r">01</span></div>
+</section>
+
+<!-- ═══════════════════════════════ 2 ═══════════════════════════════ -->
+<section class="slide">
+  <div>
+    <div class="eyebrow" data-fx>What changed in the engine</div>
+    <h2 data-fx>Three defects that were costing you <em>detections and memory</em>.</h2>
+  </div>
+  <div class="body">
+    <div class="grid g3">
+      <div class="card" data-fx>
+        <div class="k">Memory</div><div class="num">15 GB → 224 MB</div>
+        <p>A record was built for every matched <em>offset</em> and held for the whole scan —
+        then never written anywhere. On a match-heavy host that was 15 GB and still climbing.
+        Re-measured with 2.5× more offsets: <b>224 MB peak</b>.</p>
+      </div>
+      <div class="card" data-fx>
+        <div class="k">Rule coverage</div><div class="word">Rules ran that<br>had been skipped</div>
+        <p>A rule was dropped if <em>any other rule in the same file</em> merely mentioned an
+        unavailable module — in a comment, or as a string to hunt for. Classification is now
+        driven by the compiler's own error, not by scanning rule text.</p>
+      </div>
+      <div class="card" data-fx>
+        <div class="k">Exit</div><div class="word">Cancel and<br>clean up</div>
+        <p>Cancelling now drains and reports properly instead of returning early past the
+        delivery check. Optional end-of-run host cleanup reclaims the working directory,
+        gated on confirmed delivery.</p>
+      </div>
+    </div>
+  </div>
+  <div class="foot"><span>Scanner v3.0 → v3.2.1</span><span class="r">02</span></div>
+</section>
+
+<!-- ═══════════════════════════════ 3 ═══════════════════════════════ -->
+<section class="slide">
+  <div>
+    <div class="eyebrow" data-fx>The forensic record</div>
+    <h2 data-fx>One row per <em>finding</em>, not per matched byte.</h2>
+    <p class="sub" data-fx>An unanchored or short pattern can hit thousands of times inside a
+    single file. The old schema wrote a dataset row for every one of them, repeating the same
+    18 columns of file and scan context each time.</p>
+  </div>
+  <div class="body">
+    <div class="grid g2">
+      <div class="card crit" data-fx>
+        <div class="k">Before — one row per offset</div>
+        <div class="num">33,118</div>
+        <p>rows from <b>one rule against one event log</b>. On a fleet scan that exhausted the
+        upload budget before other findings got a turn — three hosts lost data, one lost
+        <b>all</b> of its matches.</p>
+      </div>
+      <div class="card good" data-fx>
+        <div class="k">Now — one row per (rule, file)</div>
+        <div class="num">1</div>
+        <p>row, carrying <code>match_count</code> as the true uncapped total plus a capped
+        sample of offsets and strings. Full per-offset detail still lands on the endpoint and
+        in the evidence ZIP — nothing is lost.</p>
+      </div>
+    </div>
+    <ul class="pts" style="margin-top:22px">
+      <li data-fx><b>Dashboards were corrected with it.</b> Hit counts sum <code>match_count</code>
+      rather than counting rows, so a rule with many string hits per file reports honestly.</li>
+    </ul>
+  </div>
+  <div class="foot"><span>Lookup schema v3</span><span class="r">03</span></div>
+</section>
+
+<!-- ═══════════════════════════════ 4 ═══════════════════════════════ -->
+<section class="slide">
+  <div>
+    <div class="eyebrow" data-fx>Why there are so many datasets</div>
+    <h2 data-fx>Per-host sharding is not tidiness. It works around a <em>server-side race</em>.</h2>
+  </div>
+  <div class="body">
+    <div class="diag" id="d4" style="height:330px" data-fx>
+      <svg viewBox="0 0 1416 330"></svg>
+      <div class="plabel" style="left:0;top:0">One shared dataset</div>
+      <div class="node bad" style="left:0;top:34px;width:196px"><div class="t">4 endpoints</div><div class="s">concurrent writes</div></div>
+      <div class="node bad" style="left:330px;top:34px;width:216px"><div class="t">one dataset</div><div class="s">2 of 8 batches landed</div></div>
+      <div class="plabel" style="left:0;top:176px">Per-host shards</div>
+      <div class="node acc" style="left:0;top:210px;width:196px"><div class="t">4 endpoints</div><div class="s">one writer each</div></div>
+      <div class="node acc" style="left:330px;top:210px;width:216px"><div class="t">4 shards</div><div class="s">8 of 8 landed</div></div>
+      <div class="node dim" style="left:760px;top:34px;width:300px"><div class="t">Rows silently lost</div><div class="s">HTTP 200, no error anywhere</div></div>
+      <div class="node" style="left:760px;top:210px;width:300px"><div class="t">Bounded write time</div><div class="s">merge cost tracks dataset size</div></div>
+    </div>
+    <ul class="pts" style="margin-top:24px">
+      <li data-fx>The platform stages each write through a clone table. Two endpoints writing the
+      same dataset collide, the server returns a transient error, and <b>the rows are gone</b> —
+      not rejected. The retry returns success.</li>
+      <li data-fx><b>The cost we accept:</b> a 500-endpoint fleet, with monthly rotation, creates
+      on the order of a thousand datasets a month. That is what the next slide is for.</li>
+    </ul>
+  </div>
+  <div class="foot"><span>Measured on a live tenant</span><span class="r">04</span></div>
+</section>
+
+<!-- ═══════════════════════════════ 5 ═══════════════════════════════ -->
+<section class="slide">
+  <div>
+    <div class="eyebrow" data-fx>Consolidation</div>
+    <h2 data-fx>Fold each finished scan's shards into <em>one dataset per scan</em>.</h2>
+  </div>
+  <div class="body">
+    <div class="diag" id="d5" style="height:322px" data-fx>
+      <svg viewBox="0 0 1416 322"></svg>
+      <div class="node" style="left:0;top:26px;width:250px"><div class="t">host-a shard</div><div class="s">matches_v3_host-a</div></div>
+      <div class="node" style="left:0;top:122px;width:250px"><div class="t">host-b shard</div><div class="s">matches_v3_host-b</div></div>
+      <div class="node" style="left:0;top:218px;width:250px"><div class="t">host-c shard</div><div class="s">matches_v3_host-c</div></div>
+      <div class="node acc" style="left:508px;top:122px;width:262px"><div class="t">one per-scan dataset</div><div class="s">…_v3_scan_&lt;scan_id&gt;</div></div>
+      <div class="node" style="left:1030px;top:122px;width:290px"><div class="t">shard rows removed</div><div class="s">only after count parity</div></div>
+      <!-- width generous enough to stay ONE line: a wrapped caption grows the box
+           downward and is the one geometry change the wire assertion cannot see -->
+      <div class="plabel" style="left:508px;top:238px;width:470px;text-transform:none;
+        font-family:var(--mono);letter-spacing:0">bounded per scan — write time stays flat</div>
+    </div>
+    <ul class="pts" style="margin-top:22px">
+      <li data-fx><b>A scan is only touched once it is genuinely finished</b> — terminal lifecycle
+      row, or terminal Action Center state, and its newest row older than a settle window.</li>
+      <li data-fx><b>Verify before delete.</b> Sources are removed only once the target's row
+      count equals the sum of the sources. A mismatch keeps everything and reports it.</li>
+      <li data-fx>Dashboards are unaffected — they query <code>yara_scanner_*</code> wildcards, so
+      shards and per-scan datasets fan in identically.</li>
+    </ul>
+  </div>
+  <div class="foot"><span>xdr_consolidate · one sequential writer</span><span class="r">05</span></div>
+</section>
+
+<!-- ═══════════════════════════════ 6 ═══════════════════════════════ -->
+<section class="slide">
+  <div>
+    <div class="eyebrow" data-fx>Retention</div>
+    <h2 data-fx>It deletes datasets. So the guard rails are the <em>feature</em>.</h2>
+    <p class="sub" data-fx>The platform has no undelete and no dataset versioning. Everything
+    below exists because a wrong deletion cannot be walked back.</p>
+  </div>
+  <div class="body">
+    <div class="grid g4">
+      <div class="card" data-fx><div class="k">Rail 1–2</div><h3>Never the current or a future month</h3>
+        <p>A scan may be writing to it; clock skew must not destroy data.</p></div>
+      <div class="card" data-fx><div class="k">Rail 3–4</div><h3>Never unsuffixed, never a newer schema</h3>
+        <p>An unsuffixed dataset holds a host's entire pre-rotation history.</p></div>
+      <div class="card" data-fx><div class="k">Rail 5–6</div><h3>Never foreign, never recently written</h3>
+        <p>A rotation suffix records creation, not last write — a long scan is still writing.</p></div>
+      <div class="card" data-fx><div class="k">Rail 7</div><h3>Never an unconsolidated scan</h3>
+        <p>If consolidation hasn't verified it, the shard is that scan's only copy.</p></div>
+    </div>
+    <ul class="pts" style="margin-top:24px">
+      <li data-fx><b>Dry run by default.</b> A bare invocation reports what it would delete and
+      deletes nothing. Only an explicit affirmative enables deletion; an unrecognised value is
+      rejected rather than guessed in either direction.</li>
+      <li data-fx><b>Both live rails fail closed.</b> If the check query errors, the dataset is
+      kept — the same skip-to-be-safe posture as every rail above it.</li>
+    </ul>
+  </div>
+  <div class="foot"><span>Seven rails · dry run default</span><span class="r">06</span></div>
+</section>
+
+<!-- ═══════════════════════════════ 7 ═══════════════════════════════ -->
+<section class="slide">
+  <div>
+    <div class="eyebrow" data-fx>How it runs</div>
+    <h2 data-fx>A scheduled job, four automations, <em>one shared library</em>.</h2>
+  </div>
+  <div class="body">
+    <div class="diag" id="d7" style="height:344px" data-fx>
+      <svg viewBox="0 0 1416 344"></svg>
+      <div class="node acc" style="left:0;top:130px;width:214px"><div class="t">Scheduled Job</div><div class="s">twice daily</div></div>
+      <div class="node" style="left:470px;top:14px;width:250px"><div class="t">YaraConsolidateStatus</div><div class="s">read-only readiness</div></div>
+      <div class="node" style="left:470px;top:110px;width:250px"><div class="t">YaraConsolidateApply</div><div class="s">performs the merge</div></div>
+      <div class="node" style="left:470px;top:206px;width:250px"><div class="t">YaraReport</div><div class="s">inventory, read-only</div></div>
+      <div class="node" style="left:470px;top:288px;width:250px"><div class="t">YaraCleanup</div><div class="s">retention, dry run default</div></div>
+      <div class="node" style="left:980px;top:130px;width:290px"><div class="t">Tenant lookup datasets</div><div class="s">read · write · delete</div></div>
+    </div>
+    <ul class="pts" style="margin-top:20px">
+      <li data-fx><b>Overlapping runs cannot collide.</b> Any write pass takes a lock first; a
+      second run backs off and reports it rather than writing concurrently to the same target.</li>
+      <li data-fx><b>Every pass leaves a queryable row</b> — including a crash — so "did last
+      night's run work?" has an answer on a dashboard instead of in ephemeral job context.</li>
+    </ul>
+  </div>
+  <div class="foot"><span>Packs/YaraDatasetManagement</span><span class="r">07</span></div>
+</section>
+
+<!-- ═══════════════════════════════ 8 ═══════════════════════════════ -->
+<section class="slide">
+  <div>
+    <div class="eyebrow" data-fx>Where it stands</div>
+    <h2 data-fx>Validated against a live tenant, with the gaps named.</h2>
+  </div>
+  <div class="body">
+    <div class="grid g3">
+      <div class="card good" data-fx><div class="k">Live tenant, today</div><div class="num">0</div>
+        <p>scans blocked across ~180 datasets — no row-count mismatches, nothing stuck. 49 scans
+        are queued and eligible to consolidate.</p></div>
+      <div class="card" data-fx><div class="k">Unit tests</div><div class="num">236</div>
+        <p>All logic runs against an in-memory fake, so correctness does not depend on tenant
+        access. A drift gate keeps the deployed copy honest against the source.</p></div>
+      <div class="card" data-fx><div class="k">Deployed</div><div class="word">5 of 5<br>automations</div>
+        <p>Current versions are on the tenant. Credentials are the remaining step before the
+        first scheduled run.</p></div>
+    </div>
+    <ul class="pts" style="margin-top:26px">
+      <li data-fx><b>Known and documented:</b> verify-before-delete checks row-count parity, not
+      row content — and the platform offers no undelete. Consolidation and pruning are one-way.</li>
+      <li data-fx><b>Not yet exercised live:</b> the scheduled job's own wait-and-retry path. The
+      automations and the underlying logic have both been run against real tenant data.</li>
+    </ul>
+  </div>
+  <div class="foot"><span>EMEA lab tenant · 2026-08-17</span><span class="r">08</span></div>
+</section>
+
+</div></div>
+<div id="hud"><span id="pos">1 / 8</span> &nbsp;·&nbsp; ← → &nbsp;·&nbsp; T theme</div>
+
+<script>
+/* A publishing host can supply its own <html>, dropping data-theme and leaving every
+   token unresolved — an unstyled page with no error. Set it defensively. */
+document.documentElement.dataset.theme ||= 'dark';
+
+var slides = [].slice.call(document.querySelectorAll('.slide'));
+var idx = 0, timers = [];
+
+function fitStage(){
+  var s = document.getElementById('stage');
+  var k = Math.min(innerWidth / 1600, innerHeight / 900);
+  s.style.transform = 'scale(' + k + ')';
+  window.stageScale = k;
+}
+addEventListener('resize', fitStage); fitStage();
+
+/* Wires are derived from MEASURED geometry, never hand-typed: a box outgrows its
+   width the moment a label is a word longer, and a hand-placed x is then inside
+   the box. Both control points share one x at the midpoint of the gap so the
+   tangent is horizontal at each end and the arrowhead points square into the edge. */
+function rectIn(diag, el){
+  var k = window.stageScale || 1;
+  var d = diag.getBoundingClientRect(), r = el.getBoundingClientRect();
+  return { l:(r.left-d.left)/k, r:(r.right-d.left)/k,
+           t:(r.top-d.top)/k,   b:(r.bottom-d.top)/k,
+           mx:(r.left-d.left+r.width/2)/k, my:(r.top-d.top+r.height/2)/k };
+}
+function join(a, b){                       // right edge of a → left edge of b
+  var mx = (a.r + b.l) / 2;
+  return 'M' + a.r + ' ' + a.my + ' C ' + mx + ' ' + a.my + ', ' +
+         mx + ' ' + b.my + ', ' + b.l + ' ' + b.my;
+}
+function wire(svg, d, cls, marker){
+  var p = document.createElementNS('http://www.w3.org/2000/svg','path');
+  p.setAttribute('d', d); p.setAttribute('class', cls || 'wire');
+  if (marker) p.setAttribute('marker-end', 'url(#' + marker + ')');
+  svg.appendChild(p); return p;
+}
+function nodes(diag){ return [].slice.call(diag.querySelectorAll('.node')); }
+
+/* Build a diagram's wires ONLY once its own slide is active. A display:none slide
+   returns all-zero rects, so building every canvas up-front measures nothing and —
+   because the built flag is then set — never self-corrects. `scope` is the slide
+   that just became active; a diagram outside it is left for its own turn. */
+function buildWires(scope){
+  var d4 = scope && scope.querySelector('#d4');
+  if (d4 && !d4.dataset.built){
+    var s = d4.querySelector('svg'), n = nodes(d4).map(function(e){ return rectIn(d4,e); });
+    // 0,1 = shared-dataset row (bad) · 2,3 = shard row (good) · 4,5 = outcomes
+    wire(s, join(n[0], n[1]), 'wire red', 'ahr');
+    wire(s, join(n[1], n[4]), 'wire red dash', 'ahr');
+    wire(s, join(n[2], n[3]), 'wire', 'ah');
+    wire(s, join(n[2], n[3]), 'flow');
+    wire(s, join(n[3], n[5]), 'wire', 'ah');
+    d4.dataset.built = '1';
+  }
+  var d5 = scope && scope.querySelector('#d5');
+  if (d5 && !d5.dataset.built){
+    var s5 = d5.querySelector('svg'), m = nodes(d5).map(function(e){ return rectIn(d5,e); });
+    [0,1,2].forEach(function(i){                       // three shards fan into the target
+      wire(s5, join(m[i], m[3]), 'wire', 'ah');
+      wire(s5, join(m[i], m[3]), 'flow');
+    });
+    wire(s5, join(m[3], m[4]), 'wire', 'ah');
+    d5.dataset.built = '1';
+  }
+  var d7 = scope && scope.querySelector('#d7');
+  if (d7 && !d7.dataset.built){
+    var s7 = d7.querySelector('svg'), q = nodes(d7).map(function(e){ return rectIn(d7,e); });
+    [1,2,3,4].forEach(function(i){ wire(s7, join(q[0], q[i]), 'wire', 'ah'); });
+    [1,2,3,4].forEach(function(i){ wire(s7, join(q[i], q[5]), 'wire dash'); });
+    wire(s7, join(q[0], q[2]), 'flow');
+    d7.dataset.built = '1';
+  }
+}
+
+function show(n){
+  timers.forEach(clearTimeout); timers = [];       // a reveal timer that outlives its
+  slides.forEach(function(s){ s.classList.remove('active'); });   // slide costs a keypress
+  idx = (n + slides.length) % slides.length;
+  var s = slides[idx]; s.classList.add('active');
+  document.getElementById('pos').textContent = (idx+1) + ' / ' + slides.length;
+  var f = [].slice.call(s.querySelectorAll('[data-fx]'));
+  f.forEach(function(e){ e.classList.remove('shown'); });
+  buildWires(s);                                   // measure only an ACTIVE slide
+  f.forEach(function(e, i){
+    timers.push(setTimeout(function(){ e.classList.add('shown'); }, 90 + i*95));
+  });
+}
+addEventListener('keydown', function(e){
+  if (e.key === 'ArrowRight' || e.key === ' ' || e.key === 'PageDown') show(idx+1);
+  else if (e.key === 'ArrowLeft' || e.key === 'PageUp') show(idx-1);
+  else if (e.key === 'Home') show(0);
+  else if (e.key === 'End') show(slides.length-1);
+  else if (e.key === 't' || e.key === 'T'){
+    var r = document.documentElement;
+    r.dataset.theme = r.dataset.theme === 'dark' ? 'light' : 'dark';
+  }
+});
+addEventListener('click', function(e){ if (!e.target.closest('#hud')) show(idx+1); });
+show(0);
+</script>
+</body>
+</html>

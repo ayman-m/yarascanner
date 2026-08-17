@@ -216,14 +216,38 @@ DEFAULT_XDR_API_ID = "replace_with_xdr_advanced_api_id"
 DEFAULT_XDR_API_URL = "replace_with_xdr_api_url"
 ```
 
-Use an **Advanced**-type key and set an expiry — see
-[api-permissions.md](../../.claude/skills/xdr-action-center-api/references/api-permissions.md)
-for the least-privilege recipe used elsewhere in this project (the automation key needs
-script-execution/Action Center/query components; it deliberately should **not** be granted
-Data Management, per that doc — but this pack's `CoreApiClient` does need Data Management,
-since consolidation itself creates/writes/deletes datasets). There is no separate documented
-role recipe scoped to *just* what this pack's key needs (create/read/write/delete lookup
-datasets); treat it as needing Data Management at minimum until a narrower recipe is defined.
+Use an **Advanced**-type key and set an expiry.
+
+### The role this key needs
+
+Custom role — **Data Management** + **Query Center**, nothing else. No endpoint scope, no
+script components, no External Issues Mapping. This is "Key 3" in
+[api-permissions.md](../../.claude/skills/xdr-action-center-api/references/api-permissions.md),
+where the full per-API mapping and the machine keys for `POST /platform/iam/v1/role` live.
+
+Three things about this tenant's RBAC that determine the answer, enumerated live from
+`permission-config` and the built-in role grants on 2026-08-13:
+
+- **Data Management has no read-only tier** — its component is action-only
+  (`view=- action=data_management_action`). There is no way to grant a key that can *read*
+  lookup datasets without also being able to `delete_dataset`.
+- **No built-in role fits.** Only **Admin** carries Data Management; Privileged Responder,
+  Responder and Viewer have Query Center but not Data Management. So it is a custom role or
+  an Admin key, and it should not be an Admin key.
+- **The narrower-sounding dataset permissions cannot be used.** `Create Datasets`,
+  `Dataset Management` and `Datasets Access Control` show up in Admin's grant list but are
+  absent from `permission-config`, so a custom role cannot reference them. A finer-grained
+  dataset role is not constructible on this platform today.
+
+**What that means for safety.** Because the delete capability cannot be withheld at the RBAC
+layer, the protection against a bad delete is not the API key — it is this pack's own code:
+`YaraCleanup` is dry-run by default and requires an explicit affirmative to delete, applies
+all seven safety rails on both selection paths, and takes the consolidation lock first. Read
+the YaraCleanup section above before granting this key to anything.
+
+> **Currently deployed on the lab tenant:** a full-access key, not the scoped role above.
+> That is a deliberate, accepted state for lab work — the scoped role is the target for any
+> non-lab deployment, and nothing in the pack depends on the broader grant.
 
 ## Troubleshooting
 

@@ -219,6 +219,29 @@ def test_legacy_selection_never_takes_a_consolidated_target():
     assert any("consolidated target" in s for s in skipped)
 
 
+def test_legacy_selection_protects_an_unversioned_unsuffixed_shard():
+    """The rails were gated on `parse_dataset_name(...) is not None`, and that parse REQUIRES
+    the _vN segment — so the oldest names inside the yara_scanner_ contract
+    ("yara_scanner_scans_hostA") skipped every rail and went straight onto the delete list,
+    while their versioned sibling ("..._v1_hostA") was correctly protected. That exempted
+    exactly the least replaceable data: an unsuffixed dataset holds ALL of a host's
+    pre-rotation history."""
+    cands, skipped = select_legacy_for_deletion(["yara_scanner_scans_hostA"],
+                                                now_yyyymm="202608")
+    assert cands == []
+    assert any("ALL pre-rotation history" in s for s in skipped)
+
+
+def test_legacy_selection_applies_month_rails_to_unversioned_shards_too():
+    """Same gap, the month half: an unversioned shard dated in the current month is being
+    written to right now, and must not be deletable just because it has no _vN."""
+    cands, skipped = select_legacy_for_deletion(
+        ["yara_scanner_scans_hostA_202608", "yara_scanner_scans_hostA_202601"],
+        now_yyyymm="202608")
+    assert cands == ["yara_scanner_scans_hostA_202601"]   # ancient rotated month still goes
+    assert any("current month" in s for s in skipped)
+
+
 def test_legacy_selection_still_allows_genuinely_ancient_unversioned_names():
     """The rails must not make --delete-legacy vacuous: a pre-versioning name that predates
     the whole naming contract has no month to check and is still a candidate (the live
