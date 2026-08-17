@@ -1,8 +1,8 @@
 # Round 1 results — resource discipline
 
 **Endpoints:** `xsoar` — Ubuntu 20.04, 16 cores, 16.7 GB RAM; `OfficeiMac` — macOS 15  
-**Criteria:** 54  
-**Result:** 54 pass · 0 fail · 0 blocked · 0 not run
+**Criteria:** 55  
+**Result:** 55 pass · 0 fail · 0 blocked · 0 not run
 
 ## Runs
 
@@ -155,6 +155,7 @@ will ever pass.
 | `PERF-042` | Backlog-proportional shutdown drain budget | supporting | ✅ pass | undelivered match=0 telemetry=0 |
 | `PERF-043` | Per-run log/summary retention on the endpoint | supporting | ✅ pass | 1 run_ids retained in logs/ |
 | `PERF-044` | Uploader/log threads are all daemon threads with bounded joins | supporting | ✅ pass | no thread-join timeouts |
+| `PERF-045` | File-descriptor leak sampling (skipped on every matched file, and on every skip… | low | ✅ pass | 500 files all matching (500 matches) -> 10 samples at interval 50 (expected 10); last_fd_count=21 |
 | `PERF-046` | macOS disk-I/O telemetry is structurally zero | supporting | ✅ pass | macOS disk R:0.0MB W:0.0MB with CPU 69.3% mem 24.4MB net S:2.4MB; Linux same field R:937.1MB |
 | `PERF-047` | monitoring_duration_minutes reports host uptime, not scan duration | supporting | ✅ pass | snapshot and summary events both present; scan ran 50.0s |
 | `PERF-048` | Light-profile priority tuning: outer failure emits a message with no data paylo… | supporting | ✅ pass | line 2: [2026-08-17 12:46:12.037] [INFO] Applied light profile process priority tuning |

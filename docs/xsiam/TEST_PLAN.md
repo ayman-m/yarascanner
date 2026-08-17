@@ -56,12 +56,12 @@ These were open; they are settled as follows so execution is unambiguous.
 ## Coverage
 | Round | Title | Capabilities | core | Endpoints | On failure |
 |---|---|---|---|---|---|
-| **1** | Resource discipline | 54 | 6 | `xsoar` | stop-on-fail |
+| **1** | Resource discipline | 55 | 6 | `xsoar` | stop-on-fail |
 | **2** | False-positive flood | 107 | 7 | `xsoar`, `thor` | collect-through |
 | **3** | Precision and resilience | 114 | 18 | `xsoar`, `OfficeiMac`, `thor` | collect-through |
-| — | Not covered | 22 | 0 | — | — |
+| — | Not covered | 21 | 0 | — | — |
 
-**Total 297 / 297.** 272 asserted, 3 reachability probes, 22 not covered.
+**Total 297 / 297.** 273 asserted, 3 reachability probes, 21 not covered.
 
 ---
 
@@ -69,7 +69,7 @@ These were open; they are settled as follows so execution is unambiguous.
 
 **Endpoints:** `xsoar`  
 **On failure:** stop-on-fail  
-**Capabilities:** 54 (6 core)
+**Capabilities:** 55 (6 core)
 
 **Scenario.** A sustained real-filesystem scan on the 8-core Linux host with the CPU governor active. Long enough that monitors, the heartbeat, the worker pool and backpressure all reach steady state rather than finishing in a burst.
 
@@ -103,7 +103,7 @@ These were open; they are settled as follows so execution is unambiguous.
 - **Setup** — Long scan on xsoar with YARA_THREADS=1 and YARA_QUEUE_SIZE=2 so discovery outruns the workers, plus competing CPU load (stress-ng --cpu 6) to keep workers slow.
 - **Evidence** — 'Scan queue saturated (N items) - backing off producer' in /opt/yara_scanner/logs/performance_<run_id>.log (4931-4934); per-target files_found from the 'Target scan completed' statistics records; files_scanned + files_skipped from the final metrics and scan_summary_<run_id>.json. Code: _enqueue_scan_path 4923-4941 (put timeout 1.0s, loop while scan_active).
 
-## Performance (45)
+## Performance (46)
 
 ### `PERF-001` CPU governor policy selection
 
@@ -468,6 +468,14 @@ These were open; they are settled as follows so execution is unambiguous.
 - **Must be true** — Every background thread is joined within its timeout and no thread keeps the payload process alive after the shutdown sequence.
 - **Threshold** — Zero occurrences of any 'did not terminate' / 'did not stop' warning; `m` (timed out) == 0 in the Worker cleanup line; process gone within 5 s of the last terminal event.
 - **Evidence** — uploads_<run_id>.log warnings `Upload thread did not terminate within 60s timeout` (3372), `Upload thread did not stop within 60s timeout` (3538), `WARNING: Webhook thread did not terminate within 60s` (3894); the `Worker cleanup: <k> stopped, <m> timed out in <t>s` performance line; `Threads did not terminate: [...]` error line; and process exit observed with `ps -p <pid>` over SSH after the terminal event lands.
+
+### `PERF-045` File-descriptor leak sampling (skipped on every matched file, and on every skipped file)
+
+*low* · on `xsoar`
+
+- **Must be true** — N/A - the sampling gap cannot be distinguished from a clean sample with the artefacts that exist today.
+- **Threshold** — n/a
+- **Evidence** — None. Verified in the pinned source: the FD block sits at 5062-5085, strictly AFTER the `return True, "Scanned and matched"` at 5060 and after every earlier bail-out, and emits only on threshold breach (`FD usage increased by …` at 5076, `WARNING: High FD usage: …` at 5081). A sample that finds nothing writes nothing, and `self.files_since_fd_check += 1` at 5063 is an unlocked read-modify-write shared by both workers.
 
 ### `PERF-046` macOS disk-I/O telemetry is structurally zero
 
@@ -2582,7 +2590,6 @@ candidate for a follow-up change rather than a test.
 | `TRAV-037` | Second-line skip check inside the worker | `no-artefact` | `Special system file` appearing in `skip_breakdown` from the worker path (distinguishable in the local logs from the walk-loop attribution, which increments the same key at line 5843) |
 | `PERF-010` | Governor fail-open when CPU cannot be read | `unsafe-injection` | One performance log line: `CPU governor disabled - could not read CPU (<err>). Scan continues unthrottled.` and no further `CPU governor \|` lines for the rest of the run. |
 | `PERF-013` | Governor sampling during producer backpressure | `unreachable` | `CPU governor \|` lines continue to appear interleaved with `Scan queue saturated (...)` lines on a scan where discovery outruns the workers. |
-| `PERF-045` | File-descriptor leak sampling (skipped on every matched file, and on every skipped file) | `needs-instrumentation` | UNOBSERVABLE: a sample that finds nothing emits nothing, so you cannot tell whether a sample ran, was skipped by a match/skip path, or was lost to the unlocked increment. The only artefacts are threshold breaches in `<scanner_dir>/logs/system_<run_id>.log` (`logs_dir` built at 2686, SYSTEM file name at 1785): `Initial file descriptors in use: N` once at startup (6160), then `FD usage increased by <n> (current: <n>)` only when growth exceeds 100 (4970-4973) and `WARNING: High FD usage: <n>`… |
 | `DELI-004` | Approximate byte accounting for batch sizing | `no-artefact` | Inspect request sizes at the collector or on the wire: batches stay near but can overshoot the cap by at most one event. A finding carrying an unusually large matched string is the case to test. |
 | `DELI-006` | Circuit breaker on the telemetry channel | `unsafe-injection` | UNOBSERVABLE: With a dead collector, telemetry POSTs stop entirely for ~40 s windows while the queue grows; the per-type `total` in WebhookUploader.get_upload_statistics() (and scan_summary's telemetry_delivery) stays flat during an open window rather than inflating, and undelivered rises at shutdown. To close it: Minimal instrumentation: in CircuitBreaker.on_failure (1202-1210), emit on the two transitions into 'open' (after 1207 and after 1210) `logging.warning(f"Telemetry circuit opened… |
 | `DELI-053` | Critical-path events post single-object JSON, not NDJSON — the only non-NDJSON body the collector sees | `no-artefact` | On the wire: a lone JSON object with `Content-Type: application/json` arriving out of band from the `text/plain` NDJSON batches. Locally, in `uploads_<run_id>.log` (path 1784): on a non-2xx, `Critical log immediate send failed (HTTP <code>): ... - falling back to async queue` (1973-1976); on an exception, `Critical log immediate send raised <ExcType>: ... - falling back to async queue (may deliver a duplicate if the request actually landed)` (1983-1986); if the fallback itself fails or no… |
