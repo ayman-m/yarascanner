@@ -775,7 +775,7 @@ Before workers start, the resolved targeting configuration is emitted as one sta
 `_enqueue_scan_path` blocks with a 1s timeout and retries while `scan_active`, rather than dropping a discovered file when workers are saturated — traversal output and worker input cannot silently diverge. It only returns False on a genuine queue exception or on cancellation, and that False breaks the current directory's file loop.
 
 - **Control:** queue size `YARA_QUEUE_SIZE` (default max_workers * 2, minimum 2, floor 2); backoff `YARA_QUEUE_BACKOFF_SECS` — default `queue size 4 with the default 2 workers; backoff 0.25 (seconds)`
-- **Observe:** performance log `Scan queue saturated (N items) - backing off producer`, emitted on every 25th event (`queue_full_events % 25 == 1`, line 4811); reconcile `files_found` per target against `files_scanned + files_skipped` at the end
+- **Observe:** reconcile `files_found` per target against `files_scanned + files_skipped` at the end — that identity is the no-drop guarantee and it holds on every run. The performance log's `Scan queue saturated (N items) - backing off producer` (`queue_full_events % 25 == 1`, line 4811) is a secondary signal only. **Reachability, measured:** this notice lives inside `except Full`, and `put()` uses a 1.0 s timeout — so it requires the queue to stay full for a whole second. A live run with 1 worker behind a 2-slot queue (the tightest configuration the knobs allow) raised `Full` zero times, because a worker drains a file in ~0.7 ms. Treat this line as a pathological-host signal, not a normal-operation one. The signal that DOES work is queue depth: `queue_size` in Scan Progress events sitting at its configured maximum.
 - **Source:** `YaraScanner._enqueue_scan_path lines 4803-4820; ScanConfig lines 2763-2765, 2789; call site line 5846`
 
 ### Case-folding policy for path matching  <sub>all (policy differs per platform)</sub>
@@ -920,7 +920,7 @@ A governor line is emitted when the sleep ratio moves by >= 0.25 since the last 
 When the scan queue is full the producer calls `_sample_governor()` on each backoff iteration, so CPU readings and the ratio keep updating during phases where no file is being matched by the producer thread.
 
 - **Control:** not configurable — default `always on (subject to the sampling rate limit)`
-- **Observe:** `CPU governor \|` lines continue to appear interleaved with `Scan queue saturated (...)` lines on a scan where discovery outruns the workers.
+- **Observe:** `CPU governor \|` lines continue to appear interleaved with `Scan queue saturated (...)` lines on a scan where discovery outruns the workers. **Not reachable in normal operation:** the `_sample_governor()` call sits inside `except Full`, which a 1.0 s `put()` timeout makes unreachable on any host whose workers keep up — verified with 1 worker and a 2-slot queue, where `Full` was raised zero times.
 - **Source:** `YaraScanner._enqueue_scan_path (`except Full: ... self._sample_governor(); time.sleep(self.config.queue_backoff_secs)`)`
 
 ### Worker thread pool, default 2 and operator-raisable
@@ -955,7 +955,7 @@ File paths are handed to workers through a `Queue` with a fixed maxsize, which i
 `_enqueue_scan_path` blocks with a 1 s put timeout and retries in a loop rather than dropping paths: on `Full` it counts the event, samples the governor, sleeps the backoff interval and retries, exiting only if `scan_active` goes false.
 
 - **Control:** `self.queue_backoff_secs = _env_number("YARA_QUEUE_BACKOFF_SECS", 0.25, minimum=0)`; put timeout 1.0 s is hardcoded — default `0.25 s backoff per retry`
-- **Observe:** Performance log line `Scan queue saturated (N items) - backing off producer`, emitted on the 1st, 26th, 51st... full event (`if self.queue_full_events % 25 == 1`). Correlate with `queue_size` sitting at the configured maximum in Scan Progress events.
+- **Observe:** `queue_size` sitting at the configured maximum in Scan Progress events, with `files_scanned + files_skipped` reconciling exactly (nothing dropped). The performance line `Scan queue saturated (N items) - backing off producer` (1st, 26th, 51st... full event) is emitted only under a sustained stall. **Reachability, measured:** this notice lives inside `except Full`, and `put()` uses a 1.0 s timeout — so it requires the queue to stay full for a whole second. A live run with 1 worker behind a 2-slot queue (the tightest configuration the knobs allow) raised `Full` zero times, because a worker drains a file in ~0.7 ms. Treat this line as a pathological-host signal, not a normal-operation one. The signal that DOES work is queue depth: `queue_size` in Scan Progress events sitting at its configured maximum.
 - **Source:** `YaraScanner._enqueue_scan_path; `self.queue_full_events` counter; ScanConfig.queue_backoff_secs`
 
 ### Worker get timeout / graceful exit checks
@@ -1070,7 +1070,7 @@ Each heartbeat tick reports files scanned/skipped, detections, live queue depth,
 Each heartbeat tick also refreshes the running.json liveness marker. This is done from the timed thread because the discovery loop's `_enqueue_scan_path` blocks while the queue is saturated, so one huge directory could hold the marker past its staleness window and make a live scan look dead to `cancel`.
 
 - **Control:** `RUNNING_MARKER_REFRESH_SECS = 30.0` (self-rate-limited), `RUNNING_MARKER_STALE_SECS = 180.0` — default `refresh 30 s, stale after 180 s`
-- **Observe:** mtime/content of `<scanner_dir>/control/running.json` advancing at ~30 s intervals during a scan, including while `Scan queue saturated` lines are being emitted; file removed at cleanup (`_remove_running_marker`).
+- **Observe:** mtime/content of `<scanner_dir>/control/running.json` advancing at ~30 s intervals during a scan, including under sustained producer backpressure (note `Scan queue saturated` lines themselves need a >=1 s stall and will usually be absent); file removed at cleanup (`_remove_running_marker`).
 - **Source:** `YaraScanner._progress_heartbeat (`self._maybe_refresh_running_marker()`); RUNNING_MARKER_REFRESH_SECS / RUNNING_MARKER_STALE_SECS`
 
 ### ETA and rate estimation
@@ -2392,7 +2392,7 @@ A dedicated daemon thread ('ProgressHeartbeat') calls _log_progress() every log_
 _enqueue_scan_path blocks on a full scan queue (1s put timeout, sleep queue_backoff_secs, retry) rather than dropping the file, counts queue_full_events, samples the CPU governor while waiting, and logs a saturation line on every 25th event. It returns False when scan_active is cleared (cancel) or on an unexpected enqueue error, which breaks the discovery loop for that directory.
 
 - **Control:** config.scan_queue_size (env YARA_QUEUE_SIZE, min 2), config.queue_backoff_secs (env YARA_QUEUE_BACKOFF_SECS, min 0) — default `scan_queue_size = max_workers*2 (i.e. 4 with 2 workers); queue_backoff_secs = 0.25`
-- **Observe:** performance_<run_id>.log 'Scan queue saturated (N items) - backing off producer' (every 25th event); scan_errors log 'Failed to enqueue file for scanning: ...' with file_path.
+- **Observe:** `files_scanned + files_skipped` reconciling against files found, with no 'Failed to enqueue file for scanning: ...' in the scan_errors log. performance_<run_id>.log 'Scan queue saturated (N items) - backing off producer' (every 25th full event) appears only under a sustained stall — see the reachability note on the backpressure entry.
 - **Source:** `YaraScanner._enqueue_scan_path()`
 
 ### Final results log with failure-aware label
