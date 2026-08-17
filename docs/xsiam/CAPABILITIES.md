@@ -45,14 +45,13 @@ Two markers flag work, not documentation:
 | &nbsp;&nbsp;Delivery, Aggregation & Telemetry | 58 |
 | &nbsp;&nbsp;Scan Lifecycle, Control & Error Handling | 65 |
 | ⚠ Control gaps (verified) | 27 |
-| ⚠ Observability gaps | 46 |
+| ⚠ Observability gaps | 17 |
 
-**On the 46 observability gaps.** 40 were found by auditing the original
-inventory and are listed in full at the end of this file; 6 more are among the
-capabilities catalogued since, and are marked inline. Only entries whose *Observe* field
-names the dead call outright carry an inline marker — the rest were found by checking
-whether the stated evidence reaches a log handler at all, which the entry text alone
-does not reveal. Treat the list at the end as the authoritative one.
+**17 open observability gaps**, after triage — down from the 40 this inventory
+originally recorded. The closed ones were never really broken: their evidence was an
+info-level log that reached nothing until root logging gained a disk sink. See
+*Observability status* below for the split between what still needs instrumentation and
+what is believed dead. Inline ⚠ markers are a subset — the section below is authoritative.
 
 ---
 
@@ -73,7 +72,7 @@ The `yarafile` entry-point argument is treated as base64 text, never as a path o
 Rejects a rules blob larger than 50,000,000 characters of base64 before any decode work is attempted.
 
 - **Control:** hardcoded literal `50_000_000` in decode_yara_rules — default `50,000,000 characters`
-- **Observe:** Fires from inside ScanConfig AFTER ErrorLogger is built and has already written its banner plus the `Webhook API Key`, `API Endpoint`, `Default alert severity` and `Using YARA rules from provided parameter` lines to logs/yara_processing_<run_id>.log; that same file then gets `CRITICAL: Failed to decode YARA rules: YARA rules input too large`. main()'s outer `except Exception` catches the ValueError, writes `YARA Scanner Critical Error: Critical scanner error: YARA rules input too large` to stderr and returns `Scan failed: 0 files scanned \| 0 rules failed compilation \| 0 matches found \| Critical error occurred` (printed as `SCAN_RESULT: ...`, exit 1). `Critical startup error:` never appears — it only exists in the `__main__` wrapper, which is not reached because main() does not re-raise.
+- **Observe:** Rewrite Observe to: "Pass a base64 blob longer than 50,000,000 characters. stderr shows `YARA Scanner Critical Error: Critical scanner error: YARA rules input too large` followed by `SCAN_STATUS: ERROR` (main's handler, lines 6651-6656), and the SCAN_RESULT line reads `Scan failed: 0 files scanned \| ... \| Critical error occurred` with exit code 1. logs/yara_processing_<run_id>.log already exists with its 4-line banner and ends with `CRITICAL: Failed to decode YARA rules: YARA rules input too large` (written at line 2797). Do NOT expect `Critical startup error:` - that prefix (line 6851) only fires for exceptions escaping main(), and do not expect an empty logs dir."
 - **Source:** ``decode_yara_rules` (566-567)`
 
 ### Typed rule-input rejection codes
@@ -97,7 +96,7 @@ The script ships with an empty embedded ruleset; if no `yarafile` is supplied th
 All rule/import/include discovery runs off a hand-written top-level tokenizer that tracks brace depth, double-quoted strings (with backslash escapes), `//` line comments and `/* */` block comments. A `rule` keyword inside a comment, inside a string literal, or inside a rule body is therefore never mistaken for a rule declaration.
 
 - **Control:** not configurable — default `always on`
-- **Observe:** Compare the `Found N rule start positions` count (compile path) and the `total_rules_found` field of the `YARA Rules loaded: N rules, M imports` system log/event against a pack deliberately containing `// rule fake` and a string `"rule decoy"` — the decoys must not be counted.
+- **Observe:** Rewrite Observe to: "Read logs/diagnostics_<run_id>.log for the line `Found N rule start positions` (emitted at line 4784) and compare N against `total_rules_found` in the `YARA Rules loaded: N rules, M imports` system event (line 6391, system_<run_id>.log). They must be equal for a pack whose rule keywords appear inside comments or strings. The same file also carries `Found N unique import statements` (4772) and `Rule extraction complete: N successful, M failed` (4808)."
 - **Source:** ``_iter_yara_top_level_words` (376), `_get_yara_top_level_statements` (451)`
 
 ### private / global rule modifier capture
@@ -203,7 +202,7 @@ If a rule body references `math.`, `elf.`, `pe.`, `hash.`, `time.`, `dotnet.`, `
 Every rule is compiled individually (result discarded) to isolate failures, then all survivors are compiled together via `yara.compile(sources={...})` with one namespace per rule, keyed `ns_<index>_<rulename>`. Rules are compiled twice in total.
 
 - **Control:** not configurable — default `always on`
-- **Observe:** `Successfully built ruleset with N rules` (plus ` (M failed)` / ` (K skipped - missing modules)` suffixes); on a large pack, compile wall-time is visible as the gap between the `running.json` marker being written with status `compiling` and the first worker start.
+- **Observe:** Rewrite Observe to: "logs/diagnostics_<run_id>.log contains one line `Successfully built ruleset with N rules` - with ` (M failed)` and ` (K skipped - missing modules)` appended when non-zero - emitted at line 4738. N must equal the number of namespaced sources actually handed to yara.compile at line 4730; cross-check M and K against failed_rules_count / skipped_rules_count on the SCAN_RESULT line and in scan_summary_<run_id>.json."
 - **Source:** ``_compile_yara_rules` (4518-4521, 4607-4618)`
 
 ### Duplicate rule names survive
@@ -484,7 +483,7 @@ As root the default scope is `/` (with an explicit note that SIP still restricts
 On a platform that is neither Windows, Linux nor Darwin, default discovery returns an empty target list; the scanner-side getter then substitutes `["/"]` (or Windows discovery on Windows) so the run still has a target rather than scanning nothing.
 
 - **Control:** not configurable (`_default_discover_targets` else-branch; `YaraScanner._get_scan_targets` fallback) — default `discovery: []; _get_scan_targets fallback: ["/"]`
-- **Observe:** warning log `Unknown platform - manual target specification required` (line 3084) plus `Using default Unix target: ['/']` via logging.info (line 5278)
+- **Observe:** Rewrite Observe to: "Both halves are now checkable: `Unknown platform - manual target specification required` in yara_processing_<run_id>.log (3162), and the exact line `Using default Unix target: ['/']` in <scanner_dir>/logs/diagnostics_<run_id>.log (logging.info at 5423). The sibling `Using default Windows targets: [...]` (5420) and `Using configured scan targets: [...]` (5415) land in the same file, so the branch actually taken is distinguishable."
 - **Source:** `ScanConfig._default_discover_targets lines 3082-3084; YaraScanner._get_scan_targets lines 5267-5279`
 
 ### Excluded-target warning (requested target wholly skipped)
@@ -793,7 +792,7 @@ Path comparison is deliberately case-folded per platform. `_is_special_file` low
 On macOS, every file that gets past scan_file's exists / os.access(R_OK) / _is_special_file pre-checks causes one create+write+exists+unlink of `/tmp/CaSe_TeSt_YaRa_<pid>` on the host being scanned. It is the only PER-FILE write outside scanner_dir (the scanner does make one other out-of-tree write attempt: `_schedule_linux_cleanup` writes `/etc/systemd/system/yara-cleanup.service` at 4185-4186, and the dispatch at 4091-4096 runs that arm on every non-Windows platform including Darwin, where it simply fails and is swallowed). The probe's answer is used only to decide whether to lowercase the resolved path, and the resolved path is then discarded: the dedupe set it feeds is gated on `track_real_paths`, hard-set to False (2782), so on a million-file scan the scanner does ~a million /tmp round-trips for a value nothing consumes. All workers share one probe path (keyed by pid, not thread) and scan_file runs on N worker threads (worker loop 4725-4741), so the race is real; the bare `except:` (619-620) turns any race or failure into "case-insensitive", silently lowercasing paths. Note it is NOT literally every enumerated file: files pruned during the walk (skipped directory 5835-5836, junction skip 5849-5850, special file 5859-5860) never reach scan_file at all.
 
 - **Control:** Not configurable — probe path is a literal at line 612 with no env knob (grep for CaSe_TeSt_YaRa returns only 612). `self.track_real_paths = False` (2782, the only occurrence — no env override anywhere) gates only the dedupe consumer (4892-4894, 4905-4907), NOT the `_get_real_path()` call at 4891, so changing it changes nothing about the /tmp writes. — default `Always on for Darwin scans (Windows short-circuits at 609-610, Linux at 621-622, neither touches disk).`
-- **Observe:** UNOBSERVABLE from the scanner: no log line, no summary field. The two fields that would hint at it — `unique_real_paths` (5367, inside the additional_metrics dict shipped by log_scan_progress at 5372-5375) and `unique_paths_scanned` (5393, in _log_final_results) — are both `len(self.scanned_real_paths)` and are always 0, because the only `.add()` is at 4907 behind track_real_paths. To confirm it, watch the filesystem outside the scanner: `sudo fs_usage -w -f filesys \| grep CaSe_TeSt_YaRa` on the macOS endpoint during a scan, or query the tenant for file-create events on `/tmp/CaSe_TeSt_YaRa_*` from the agent's own file telemetry.
+- **Observe:** UNOBSERVABLE from the scanner: no log line, no summary field. The two fields that would hint at it — `unique_real_paths` (5367, inside the additional_metrics dict shipped by log_scan_progress at 5372-5375) and `unique_paths_scanned` (5393, in _log_final_results) — are both `len(self.scanned_real_paths)` and are always 0, because the only `.add()` is at 4907 behind track_real_paths. To confirm it, watch the filesystem outside the scanner: `sudo fs_usage -w -f filesys \| grep CaSe_TeSt_YaRa` on the macOS endpoint during a scan, or query the tenant for file-create events on `/tmp/CaSe_TeSt_YaRa_*` from the agent's own file telemetry. To close it: Two minimal edits, both small. (1) Memoise and log the probe once: wrap _is_case_sensitive_fs (671) in functools.lru_cache(maxsize=1) and add, just before the Darwin `return not exists_lower` at 682, `logging.info(f"FS case-sensitivity probe: {test_file} -> case_sensitive={not exists_lower}")` (plus a logging.warning in the bare except at 683-684 naming the failure) - both then land in diagnostics_<run_id>.log via the handler at 6057-6061, and the /tmp write drops from once-per-file to once-per-run. (2) Add `"fs_case_sensitive": _is_case_sensitive_fs()` to the write_scan_summary dict in main()'s finally block (near the existing entries at 6765-6790) so the value is recorded per run. Separately note that unique_real_paths (5495) and unique_paths_scanned (5521) are hardcoded-0 telemetry while track_real_paths is False at 2854 - they should be dropped or the flag made configurable, but that is its own item.
 - **Source:** ``_is_case_sensitive_fs()` 607-622 (Windows arm 609-610, Darwin arm 611-620, probe path 612, write 614-615, exists 616, unlink 617, bare except 619-620, Linux arm 621-622); `_get_real_path()` 640-662, calling `_is_case_sensitive_fs()` at 647 (try path) and 657 (except path); sole call site `real_path = _get_real_path(file_path)` in `scan_file` at 4891, reached only after the pre-checks at 4858-4890; `self.track_real_paths = False` 2782; consumers 4892-4894 and 4905-4907; `self.scanned_real_paths = set()` 4279; worker threading 4725-4741; competing out-of-tree write `_schedule_linux_cleanup` 4169-4187 with dispatch 4091-4096.`
 
 ### Undocumented skip_breakdown keys: "Permission denied" and "Junction/symlink duplicate"
@@ -885,10 +884,11 @@ The governor samples immediately before `rules.match()` and paces immediately af
 
 ### Governor sampling cadence (rate limit)
 
+**⚠ OBSERVABILITY GAP**  
 `_sample_governor()` is called on every file (and on every queue-full backoff) but only re-reads CPU once the configured interval has elapsed, so psutil is not sampled per file.
 
 - **Control:** `self.throttle_check_interval_secs = _env_number("YARA_CPU_SAMPLE_SECS", 0.5, minimum=0)` in ScanConfig — default `0.5 seconds`
-- **Observe:** Frequency of `CPU governor \|` performance lines is bounded by this interval combined with the emit policy below; with a debug build, `last_governor_sample` advances at most every 0.5 s. minimum=0 is deliberate — a negative value would make the check always true and sample psutil on every file.
+- **Observe:** UNOBSERVABLE: Frequency of `CPU governor \|` performance lines is bounded by this interval combined with the emit policy below; with a debug build, `last_governor_sample` advances at most every 0.5 s. minimum=0 is deliberate — a negative value would make the check always true and sample psutil on every file. To close it: Instrument _sample_governor (line 4887). Add `self._governor_sample_count = 0` beside line 4408, then immediately after line 4898 insert `self._governor_sample_count += 1` and capture the gap, e.g. `_gap = now - _prev` where `_prev = self.last_governor_sample` is read before line 4898. Add both to the payload already emitted at 4917-4920 by extending `s_` with `{'samples_taken': self._governor_sample_count, 'secs_since_last_sample': round(_gap, 3), 'sample_interval_secs': self.config.throttle_check_interval_secs}`. performance_<run_id>.log then shows sampling cadence directly and the criterion becomes "secs_since_last_sample is never below throttle_check_interval_secs (default 0.5)" - no debug build required.
 - **Source:** `YaraScanner._sample_governor (`if (now - self.last_governor_sample) < self.config.throttle_check_interval_secs: return`); ScanConfig.throttle_check_interval_secs`
 
 ### Governor fail-open when CPU cannot be read
@@ -1181,7 +1181,7 @@ Every background thread in the process (2 scan workers, progress heartbeat, canc
 When FD monitoring is on, the scanner is supposed to re-read its own open-FD count every 1000 files and warn on growth. The check sits near the very end of `scan_file` (def at 4850), after the `if matches: ... return True, "Scanned and matched"` early return at 4956 — so a file that matches a rule never advances the counter. It is also skipped by every earlier bail-out in the same function: "File does not exist" (4860), "No read permission" (4886), "Special system file" (4889), "Junction/symlink duplicate" (4895), "Not a regular file" (4899), "File too large" (4903), and both exception handlers (4987-4990+). Only the terminal "Scanned but not matched" path (4985) increments it. On a noisy ruleset or a storm scan the FD probe therefore fires far less often than every 1000 files, and on a run where nearly everything matches or is skipped it may never fire at all. The counter is also a plain int shared by both worker threads with no lock (`self.lock_files`, created at 4251, is taken only once — at 4931, around the evidence-collector call), so `+=` at 4959 is a read-modify-write that can lose updates and make the interval approximate even without matches. The whole path is off by default and non-Windows only; the inner `platform.system() != "Windows"` re-check at 4963 is redundant with the gate in main() at 6119, which is the only thing that can set `config.monitor_fd_usage = True`.
 
 - **Control:** `ENABLE_FD_MONITOR` at line 202 (env `YARA_ENABLE_FD_MONITOR`) enables the feature; `ScanConfig` copies it to `self.enable_fd_monitoring` at 2781. main() additionally requires non-Windows and `psutil.Process.num_fds` before setting `config.monitor_fd_usage = True` (6119, 6162). The 1000-file interval itself is hardcoded — `self.fd_check_interval = 1000` at line 4218, not configurable (no env var or flag reads it). — default `Disabled (`ENABLE_FD_MONITOR = False`, line 202); interval 1000 files when enabled`
-- **Observe:** UNOBSERVABLE: a sample that finds nothing emits nothing, so you cannot tell whether a sample ran, was skipped by a match/skip path, or was lost to the unlocked increment. The only artefacts are threshold breaches in `<scanner_dir>/logs/system_<run_id>.log` (`logs_dir` built at 2686, SYSTEM file name at 1785): `Initial file descriptors in use: N` once at startup (6160), then `FD usage increased by <n> (current: <n>)` only when growth exceeds 100 (4970-4973) and `WARNING: High FD usage: <n>` only above 900 (4975-4978). The same lines also reach the collector via `_log_with_webhook` (1901-1931) — note the wire field is `type` (value `"system"`), not `log_type`, per `StandardLogEntry.to_dict` at 1042; delivery additionally requires `UPLOAD_RESULTS`/`UPLOAD_NON_MATCH_DATA`/`API_ENDPOINT` and a live webhook thread (1916-1917), all true by default (109-110). Confirming the sampling gap needs added instrumentation — e.g. logging `files_since_fd_check` on every sample, or asserting sample count against a run where every file matches.
+- **Observe:** UNOBSERVABLE: a sample that finds nothing emits nothing, so you cannot tell whether a sample ran, was skipped by a match/skip path, or was lost to the unlocked increment. The only artefacts are threshold breaches in `<scanner_dir>/logs/system_<run_id>.log` (`logs_dir` built at 2686, SYSTEM file name at 1785): `Initial file descriptors in use: N` once at startup (6160), then `FD usage increased by <n> (current: <n>)` only when growth exceeds 100 (4970-4973) and `WARNING: High FD usage: <n>` only above 900 (4975-4978). The same lines also reach the collector via `_log_with_webhook` (1901-1931) — note the wire field is `type` (value `"system"`), not `log_type`, per `StandardLogEntry.to_dict` at 1042; delivery additionally requires `UPLOAD_RESULTS`/`UPLOAD_NON_MATCH_DATA`/`API_ENDPOINT` and a live webhook thread (1916-1917), all true by default (109-110). Confirming the sampling gap needs added instrumentation — e.g. logging `files_since_fd_check` on every sample, or asserting sample count against a run where every file matches. To close it: Rewrite Observe to state the default-off gate first (flip ENABLE_FD_MONITOR at 248 to True in the uploaded script - env vars are not settable via Action Center), then add the missing sample record: in scan_file's FD block, emit one line per sample regardless of thresholds, e.g. immediately after the reset at 5065 add `self.log_manager.log_system(f"FD sample: files_since_check={self.fd_check_interval}, current={current_fds}, delta={fd_increase}")` (move it inside the num_fds try at 5071 so current_fds is bound), and make the increment atomic by taking self.lock_counts around 5063. Also add a `fd_samples_taken` counter incremented at 5065 and surface it in write_scan_summary (dict at 6765-6790) so the sample count can be compared against files_scanned/1000 - that is what proves the matched-file and early-return skips, since a run where every file matches would otherwise show zero samples with no explanation.
 - **Source:** ``YaraScanner.__init__` 4216-4219 (`fd_monitoring_enabled` from `config.monitor_fd_usage`, `initial_fd_count`, `fd_check_interval = 1000`, `files_since_fd_check = 0`); `scan_file` def at 4850 with early returns at 4860/4886/4889/4895/4899/4903 and the matched-file return at 4956; the FD block at 4958-4983; the non-match return at 4985; `self.lock_files` created at 4251 and used only at 4931; setup and gating in main() (def 6025) at 6119-6173 (`config.monitor_fd_usage` True at 6162, False at 6164/6168/6173), which runs before the scanner is constructed at 6238; `ENABLE_FD_MONITOR` at 202, mirrored to `config.enable_fd_monitoring` at 2781; worker count capped at 2 by `self.max_workers` at 2762, threads started at 5767-5770`
 
 ### macOS disk-I/O telemetry is structurally zero  <sub>darwin</sub>
@@ -1339,7 +1339,7 @@ One deflate-compressed archive per run, written into evidence/. It always contai
 Controls whether the evidence ZIP carries copies of the matched files themselves. Off by default because copying is charged entirely to the scanned host's disk — a C:\Windows\System32 scan produced a 2.8 GB archive on the lab host. With it off, only metadata (paths + SHA256 + alert texts) is packaged. A per-config attribute of the same name overrides the module constant if present.
 
 - **Control:** env YARA_COLLECT_MATCHED_FILES (constant COLLECT_MATCHED_FILES); read via getattr(self.config, "collect_matched_files", COLLECT_MATCHED_FILES) — default `False`
-- **Observe:** With the default, the ZIP has no matched_files/ entries and the root logger records `Evidence: COLLECT_MATCHED_FILES=false - packaging metadata only (paths + SHA256 + alert texts, no matched file copies)`. Set YARA_COLLECT_MATCHED_FILES=true and re-run: `unzip -l` now shows matched_files/<sha256> entries and the archive size jumps to roughly the byte total of the matched set.
+- **Observe:** Rewrite Observe to: "With COLLECT_MATCHED_FILES=false, grep <scanner_dir>/logs/system_<run_id>.log for the exact line `Evidence: COLLECT_MATCHED_FILES=false - packaging metadata only (paths + SHA256 + alert texts, no matched file copies)` (emitted at 4007-4010, structured field collect_matched_files=false). The `unzip -l` half of the check - archive contains alerts/ and file_mapping.txt but no matched_files/ members - still applies." Note the sink is system_<run_id>.log, not diagnostics_<run_id>.log.
 - **Source:** `COLLECT_MATCHED_FILES; EvidenceCollector._create_evidence_zip (copy_files branch)`
 
 ### Content-addressed dedupe of packaged matched files
@@ -1347,7 +1347,7 @@ Controls whether the evidence ZIP carries copies of the matched files themselves
 When file copying is on, each matched file is stored under its SHA256 as the archive name (matched_files/<sha256>), so N paths holding identical bytes collapse to one blob. A hash is only marked packaged after a successful write, so a path that vanished mid-scan does not block a same-content sibling. This is correctness, not just size: zipfile only warns on a duplicate arcname and writes the member anyway, so readers could otherwise only ever see the first copy.
 
 - **Control:** not configurable (active whenever COLLECT_MATCHED_FILES is on) — default `always on when copying`
-- **Observe:** `unzip -l` shows entry names that are bare 64-char hex, and the entry count is <= the file_mapping.txt line count. When any duplicate was collapsed, the root logger prints `Evidence ZIP: <N> unique file(s) packaged, <M> duplicate copy(ies) skipped`. A copy failure is logged as `Error adding file to zip <path>: <err>`.
+- **Observe:** Rewrite Observe to: "On a run with duplicate matched content, grep <scanner_dir>/logs/system_<run_id>.log for `Evidence ZIP: N unique file(s) packaged, M duplicate copy(ies) skipped` (4020-4024; structured fields unique_files_packaged / duplicate_copies_skipped). Absence of the line means zero duplicates were seen, not that dedupe is off - it is gated on duplicates_skipped at 4019 - so keep the bare-hex `matched_files/<sha256>` arcnames plus entry-count-vs-file_mapping.txt comparison as the zero-duplicate check. `Error adding file to zip ...` (4005) is logging.error and now lands in both stderr and diagnostics_<run_id>.log."
 - **Source:** `EvidenceCollector._create_evidence_zip (packaged_hashes set, duplicates_skipped counter)`
 
 ### scan_summary_<run_id>.json — machine-readable per-run summary
@@ -1409,10 +1409,11 @@ The scheduled script's only job is to rename every alert/*.txt to *.alert. This 
 
 ### Windows scheduled cleanup task (CleanupScript)  <sub>windows</sub>
 
+**⚠ OBSERVABILITY GAP**  
 On Windows the cleanup script is registered as a one-shot scheduled task running as SYSTEM, one minute in the future, force-overwriting any existing task of the same name.
 
 - **Control:** not configurable (schtasks /create /tn CleanupScript /tr <cleanup_script> /sc once /st <now+1min> /ru SYSTEM /f) — default `task name "CleanupScript", /sc once, /ru SYSTEM, /f`
-- **Observe:** `schtasks /query /tn CleanupScript /v /fo LIST` on the endpoint after a matching scan — shows Task To Run pointing at C:\yara_scanner\cleanup_script.bat, Run As User SYSTEM, Next Run Time = scan time + 1 min. The root logger prints `Windows cleanup task scheduled for HH:MM`; system_<run_id>.log records `Windows cleanup task scheduled successfully`. The task registration persists on the host after the run.
+- **Observe:** Rewrite Observe to: "On Windows, grep <scanner_dir>/logs/diagnostics_<run_id>.log for `Windows cleanup task scheduled for HH:MM` (logging.info at 4264, emitted after the schtasks /create at 4256-4263). `schtasks /query /tn CleanupScript` and the system_<run_id>.log line `Windows cleanup task scheduled successfully` (4197) remain the corroborating checks."
 - **Source:** `CleanupManager._schedule_windows_cleanup`
 
 ### Linux systemd cleanup unit (yara-cleanup.service)  <sub>linux (this branch is also taken on macOS — see the macOS entry)</sub>
@@ -1545,10 +1546,11 @@ A failed batch is retried in-process on transient conditions only: HTTP 408/429/
 
 ### Circuit breaker on the telemetry channel
 
+**⚠ OBSERVABILITY GAP**  
 WebhookUploader (telemetry/logs uploader) is guarded by a CircuitBreaker: after N consecutive failures it opens, and while open every batch is put back on the queue untouched followed by a 2 s sleep — no POST is attempted and no counters move. After the reset timeout it goes half_open and lets exactly one batch probe; failure re-opens it, success closes it. Counting happens AFTER the allow() check specifically so re-queued events are not counted repeatedly (an earlier bug showed total=31/failed=6 when nothing had landed). Note: the match channel (ResultsUploader) has NO circuit breaker — it retries per batch only.
 
 - **Control:** CIRCUIT_FAILURE_THRESHOLD, CIRCUIT_RESET_TIMEOUT_SECS — not env-overridable. — default `CIRCUIT_FAILURE_THRESHOLD = 5, CIRCUIT_RESET_TIMEOUT_SECS = 40`
-- **Observe:** With a dead collector, telemetry POSTs stop entirely for ~40 s windows while the queue grows; the per-type `total` in WebhookUploader.get_upload_statistics() (and scan_summary's telemetry_delivery) stays flat during an open window rather than inflating, and undelivered rises at shutdown.
+- **Observe:** UNOBSERVABLE: With a dead collector, telemetry POSTs stop entirely for ~40 s windows while the queue grows; the per-type `total` in WebhookUploader.get_upload_statistics() (and scan_summary's telemetry_delivery) stays flat during an open window rather than inflating, and undelivered rises at shutdown. To close it: Minimal instrumentation: in CircuitBreaker.on_failure (1202-1210), emit on the two transitions into 'open' (after 1207 and after 1210) `logging.warning(f"Telemetry circuit opened after {self.consecutive_failures} consecutive failures; pausing uploads for {self.reset_timeout}s")`, and in allow() (1188-1189) log the half-open probe — both now land in diagnostics_<run_id>.log; optionally add a `circuit_opens` counter to WebhookUploader.upload_stats so it surfaces in the upload statistics summary. Then rewrite Observe to induce it with a rejected-but-reachable collector (wrong API key → non-2xx outside 408/429/5xx, hitting line 3765) rather than a dead one, and state explicitly that an unreachable collector does NOT open the circuit. Separately flag as a design question — not an observability fix — whether the ConnectionError/Timeout branch at 3767 should call on_failure() once MAX_RETRIES_PER_ITEM (=2, line 157) is exhausted.
 - **Source:** `CircuitBreaker.allow/on_success/on_failure, WebhookUploader._process_standard_batch() (`if not self._circuit.allow(): … time.sleep(2.0)`)`
 
 ### Match finding grain: one upload item per (rule, file)
@@ -1874,10 +1876,11 @@ Every run writes six run-scoped text logs under <scanner_dir>/logs/: alerts_<run
 
 ### Upload channels can be disabled independently
 
+**⚠ OBSERVABILITY GAP**  
 Two module-level switches gate delivery: UPLOAD_RESULTS gates everything (with it False the placeholder-credential abort is also skipped, giving a genuinely local-only scan), and UPLOAD_NON_MATCH_DATA gates telemetry/log/status events only, leaving findings uploading. A missing/empty API_ENDPOINT independently prevents any uploader thread from starting.
 
 - **Control:** UPLOAD_RESULTS, UPLOAD_NON_MATCH_DATA — plain module constants, no env override. — default `Both True`
-- **Observe:** scanner_initialization data.upload_enabled and data.telemetry_upload_enabled echo the two flags. With UPLOAD_RESULTS False, uploads_<run_id>.log ends with "Upload disabled - N matches saved locally"; with API_ENDPOINT empty it logs "API_ENDPOINT not configured - real-time match upload disabled".
+- **Observe:** UNOBSERVABLE: scanner_initialization data.upload_enabled and data.telemetry_upload_enabled echo the two flags. With UPLOAD_RESULTS False, uploads_<run_id>.log ends with "Upload disabled - N matches saved locally"; with API_ENDPOINT empty it logs "API_ENDPOINT not configured - real-time match upload disabled". To close it: Minimal instrumentation for the live half: give ResultsUploader.__init__ a `log_manager=None` parameter (3174) and set `self.log_manager = log_manager` before the `if UPLOAD_RESULTS: self._start_upload_thread()` at 3208-3209, then pass it at the construction site (line 4353 -> `ResultsUploader(config, log_manager=self.log_manager)`) and drop the now-redundant assignment at 4360; lines 3232/3236/3242 then land in uploads_<run_id>.log. Cheaper alternative that needs no wiring: change those three calls to `logging.info(...)`, which now reaches diagnostics_<run_id>.log. Separately, the dead method ResultsUploader.upload_results (3501-3559) — including the 'Upload disabled' line at 3557 — is safe to delete; do not cite it as evidence. The scanner_initialization upload_enabled/telemetry_upload_enabled half of the entry stays as-is.
 - **Source:** `UPLOAD_RESULTS, UPLOAD_NON_MATCH_DATA, ResultsUploader._start_upload_thread(), LogManager.__init__ / _log_with_webhook(), WebhookUploader.__init__, ScanStatusUploader.upload_scan_status()`
 
 ### Queue-full handling on the findings channel
@@ -1885,7 +1888,7 @@ Two module-level switches gate delivery: UPLOAD_RESULTS gates everything (with i
 Queueing a finding uses a 1.0 s put timeout; if the queue cannot accept it the finding's network representation is dropped with an explicit log line rather than blocking the scan thread. The queues themselves are unbounded Queue() instances, so this fires only under pathological conditions — but the drop is logged, never silent.
 
 - **Control:** Not configurable (put timeout=1.0). — default `Unbounded Queue(); 1.0 s put timeout on the match channel, 1.0 s (0.1 s when priority=True) on the telemetry channel`
-- **Observe:** uploads_<run_id>.log line "Upload queue full - skipping real-time upload for finding". Its presence means findings exist locally (in alerts/<rule>.txt) with no corresponding tenant row.
+- **Observe:** There is no bounded findings queue — ResultsUploader.upload_queue (3194) and WebhookUploader.upload_queue (3653) are both unbounded, so the message 'Upload queue full - skipping real-time upload for finding' (3493) cannot be produced by queue pressure and its expected count on any healthy scan is zero; it fires only if event serialization throws. Observe queue backlog instead through the drain-time lines in ResultsUploader.stop(): 'Waiting for N pending match uploads (max Ms)...' (3357) and the leftover/undelivered accounting at 3378-3388." Also reword the message at 3493 to name its real cause (e.g. 'Failed to queue finding for upload (serialization error) - skipping real-time upload').
 - **Source:** `ResultsUploader.add_match() (`self.upload_queue.put(standard_log, timeout=1.0)` / except branch), WebhookUploader._queue_standard_upload()`
 
 ### Host identity (hostname / os_info / ipAddress) stamped on every uploaded event
@@ -2110,7 +2113,7 @@ ResultsUploader.stop() is guarded by _stop_done so main()'s finally-block safety
 Non-terminal phases emitted in order: 'initializing' -> 'starting_workers' -> 'scanning' -> 'finishing'. A terminal value is always emitted after the summary and delivery books have settled: 'completed' or 'cancelled' on the normal path, 'failed' on the fatal-failure path, 'error' on an exception inside scan_system or around scan_system in main, 'interrupted' on KeyboardInterrupt. Initial in-memory value before any emission is 'starting'. The terminal emission is wrapped in try/except so it can never mask the result line.
 
 - **Control:** not configurable; suppressed entirely if UPLOAD_RESULTS/UPLOAD_NON_MATCH_DATA are off or API_ENDPOINT is empty, or before main() wires webhook_uploader onto the status uploader — default `scan_status = "starting"`
-- **Observe:** A scan_status event per transition in the collector (type='scan_status', message='Scan status: <value>'), and the local line 'Scan status changed to: <value>' via the root logger. Test criterion: every run ends with exactly one terminal value in {completed, cancelled, failed, error, interrupted}.
+- **Observe:** Rewrite Observe to: "logs/diagnostics_<run_id>.log carries one `Scan status changed to: <value>` line per transition (emitted at line 3638). Grep it for the ordered sequence initializing -> starting_workers -> scanning -> finishing -> completed (or the terminal cancelled/failed/error/interrupted) and check the last such line matches the SCAN_RESULT outcome. This local trail is unconditional; the uploaded scan_status events remain a second, optional channel gated on UPLOAD_RESULTS + UPLOAD_NON_MATCH_DATA + a non-empty API_ENDPOINT + webhook_uploader wired on by main()."
 - **Source:** `ScanStatusUploader.set_status()/upload_scan_status(); set_status calls at lines 5621/5725/5747/5773/5870/6254/6257/6278/6457`
 
 ### scan_status event payload
@@ -2150,7 +2153,7 @@ Priority-queued end-of-run telemetry carrying scan_duration_seconds, scan_durati
 An unhandled exception escaping a worker's inner loop calls _mark_scan_failed(reason), which under lock_failures sets scan_failed=True, appends the reason to failure_reasons, and clears scan_active (stopping the whole scan). A fatal error inside scan_system's target loop does the same and additionally sets status 'error'. main() then logs 'Scan stopped due to fatal failures' with failure_count, the first 20 failure_reasons, files_scanned, files_skipped and detections, and returns a 'Scan failed: ...' result line.
 
 - **Control:** not configurable — default `scan_failed=False, failure_reasons=[]`
-- **Observe:** scan_errors_<run_id>.log 'Worker <id> fatal error: ...' and 'Scan stopped due to fatal failures'; result line begins 'Scan failed:'; summary outcome='failed' with the reasons in failure_reasons; exit code 1 on CLI.
+- **Observe:** Rewrite Observe to: "Instrumented, but not a live-scan criterion. When it fires, grep <scanner_dir>/logs/scan_errors_<run_id>.log for `Worker <thread-name> fatal error: <exc>` (log_manager.log_error at 4868-4869), followed by `Scan stopped due to fatal failures` (6451), scan_status 'failed' (6462) and outcome='failed' in scan_summary_<run_id>.json (6764). It cannot be provoked by file content - scan_file's blanket handler (5093-5099) and _worker's inner handler (4862-4866) absorb everything from the loop body; only a failure inside the inner handler itself (stderr write 4864 / log_error 4865) escapes to 4867. Verify it by fault injection in a unit harness, not on a scan." No code change required; do not delete the handler - it is the only net under the inner one.
 - **Source:** `YaraScanner._mark_scan_failed(); _worker()'s outer except; scan_system()'s except; main()'s `if scanner.scan_failed:` block`
 
 ### Evidence and terminal telemetry survive a fatal failure
@@ -2543,6 +2546,68 @@ control-loop tuning, not policy, and the policy knobs above them are exposed.
 
 ---
 
+# Observability status
+
+Every entry once marked ⚠ OBSERVABILITY GAP was re-triaged against the current source.
+"Unobservable" turned out to conflate three different problems with three different
+fixes, which is why they are separated here rather than counted as one number.
+
+| Outcome | Count | Meaning |
+|---|---|---|
+| Closed | 25 | Evidence exists. The capability was always observable once root logging had a disk sink; only the wording was stale. |
+| Needs instrumentation | 9 | Runs, records nothing anywhere. Real work, listed below with what would close each. |
+| Unverified-dead | 8 | Believed unreachable — **not deleted, and not safe to delete on this evidence.** See the warning below. |
+
+## Needs instrumentation
+
+These execute and leave no trace at any log level. Each line names the minimal
+change that would make the capability assertable on a live scan.
+
+- **Initial cleanup at scan start** — Minimal fix, no ordering change: in CleanupManager.initial_cleanup, replace the three bare calls with the manager's own channel - line 4120 -> `self._log("Starting initial cleanup of old data...")`, line 4136 -> `self._log(f"Removed: {path}")`, line 4151 -> `self._log("Initial cleanup completed successfully", {"paths_cleaned": len(paths_to_clean)})`. All three then land in logs/system_<run_id>.log, which already exists at that point (LogManager is built before CleanupManager in main). Do NOT rely on diagnostics_<run_id>.log here - setup_logging has not run yet.
+- **Log/summary retention across runs** — Route it through the LogManager that CleanupManager already holds: change line 4110 to `self._log(f"Log retention applied: kept last {keep_count} scans ({len(keep_run_ids)} run IDs including current), removed {removed} files", {"keep_scans": keep_count, "run_ids_kept": len(keep_run_ids), "files_removed": removed, "files_failed": failed})` and line 4114 to `self._log(f"Log retention: {failed} files could not be removed", level="error")`. Both land in system_<run_id>.log / scan_errors_<run_id>.log, which exist before initial_cleanup runs. Moving setup_logging(config) above line 6212 in main() would also work and would fix item 44 at the same time, but it changes startup ordering; the _log route is the lower-risk minimum.
+- **Governor sampling cadence (rate limit)** — Instrument _sample_governor (line 4887). Add `self._governor_sample_count = 0` beside line 4408, then immediately after line 4898 insert `self._governor_sample_count += 1` and capture the gap, e.g. `_gap = now - _prev` where `_prev = self.last_governor_sample` is read before line 4898. Add both to the payload already emitted at 4917-4920 by extending `s_` with `{'samples_taken': self._governor_sample_count, 'secs_since_last_sample': round(_gap, 3), 'sample_interval_secs': self.config.throttle_check_interval_secs}`. performance_<run_id>.log then shows sampling cadence directly and the criterion becomes "secs_since_last_sample is never below throttle_check_interval_secs (default 0.5)" - no debug build required.
+- **Upload channels can be disabled independently** — Minimal instrumentation for the live half: give ResultsUploader.__init__ a `log_manager=None` parameter (3174) and set `self.log_manager = log_manager` before the `if UPLOAD_RESULTS: self._start_upload_thread()` at 3208-3209, then pass it at the construction site (line 4353 -> `ResultsUploader(config, log_manager=self.log_manager)`) and drop the now-redundant assignment at 4360; lines 3232/3236/3242 then land in uploads_<run_id>.log. Cheaper alternative that needs no wiring: change those three calls to `logging.info(...)`, which now reaches diagnostics_<run_id>.log. Separately, the dead method ResultsUploader.upload_results (3501-3559) — including the 'Upload disabled' line at 3557 — is safe to delete; do not cite it as evidence. The scanner_initialization upload_enabled/telemetry_upload_enabled half of the entry stays as-is.
+- **Circuit breaker on the telemetry channel** — Minimal instrumentation: in CircuitBreaker.on_failure (1202-1210), emit on the two transitions into 'open' (after 1207 and after 1210) `logging.warning(f"Telemetry circuit opened after {self.consecutive_failures} consecutive failures; pausing uploads for {self.reset_timeout}s")`, and in allow() (1188-1189) log the half-open probe — both now land in diagnostics_<run_id>.log; optionally add a `circuit_opens` counter to WebhookUploader.upload_stats so it surfaces in the upload statistics summary. Then rewrite Observe to induce it with a rejected-but-reachable collector (wrong API key → non-2xx outside 408/429/5xx, hitting line 3765) rather than a dead one, and state explicitly that an unreachable collector does NOT open the circuit. Separately flag as a design question — not an observability fix — whether the ConnectionError/Timeout branch at 3767 should call on_failure() once MAX_RETRIES_PER_ITEM (=2, line 157) is exhausted.
+- **Log/summary retention across runs** — Minimal fix, either one: (a) in CleanupManager._prune_old_scan_logs, replace the logging.info at 4110-4113 with `self._log(...)` so the same text lands in logs/system_<run_id>.log via the channel already wired at 6211/4039-4050; or (b) move `setup_logging(config)` from 6342 to immediately after `config.log_manager = log_manager` (6206), before `cleanup_manager.initial_cleanup()` at 6213 - safe because _prune_old_scan_logs preserves the current run_id (4063 regex + keep_run_ids), so the just-created diagnostics_<run_id>.log is not pruned. Until then Observe must say: verify retention by listing logs/ and counting distinct run_ids, not by grepping for the message.
+- **Initial cleanup at scan start** — Minimal instrumentation: convert the three logging.info calls in CleanupManager.initial_cleanup (4120, 4136, 4151) to `self._log(...)` - the method already exists at 4039-4054 and routes to log_manager.log_system, and cleanup_manager is constructed with the real log_manager at 6211 - so they land in logs/system_<run_id>.log. Equivalent alternative: hoist `setup_logging(config)` from 6342 to just after 6206 so the diagnostics handler exists before 6213. Until one of those lands, Observe should say only `Some cleanup operations failed - continuing with scan` (stderr) and `Initial cleanup completed` (system_<run_id>.log, emitted by main() at 6214) are checkable.
+- **macOS case-sensitivity probe file written to /tmp for every file that reaches the scan body** — Two minimal edits, both small. (1) Memoise and log the probe once: wrap _is_case_sensitive_fs (671) in functools.lru_cache(maxsize=1) and add, just before the Darwin `return not exists_lower` at 682, `logging.info(f"FS case-sensitivity probe: {test_file} -> case_sensitive={not exists_lower}")` (plus a logging.warning in the bare except at 683-684 naming the failure) - both then land in diagnostics_<run_id>.log via the handler at 6057-6061, and the /tmp write drops from once-per-file to once-per-run. (2) Add `"fs_case_sensitive": _is_case_sensitive_fs()` to the write_scan_summary dict in main()'s finally block (near the existing entries at 6765-6790) so the value is recorded per run. Separately note that unique_real_paths (5495) and unique_paths_scanned (5521) are hardcoded-0 telemetry while track_real_paths is False at 2854 - they should be dropped or the flag made configurable, but that is its own item.
+- **File-descriptor leak sampling (skipped on every matched file, and on every skipped file)** — Rewrite Observe to state the default-off gate first (flip ENABLE_FD_MONITOR at 248 to True in the uploaded script - env vars are not settable via Action Center), then add the missing sample record: in scan_file's FD block, emit one line per sample regardless of thresholds, e.g. immediately after the reset at 5065 add `self.log_manager.log_system(f"FD sample: files_since_check={self.fd_check_interval}, current={current_fds}, delta={fd_increase}")` (move it inside the num_fds try at 5071 so current_fds is bound), and make the increment atomic by taking self.lock_counts around 5063. Also add a `fd_samples_taken` counter incremented at 5065 and surface it in write_scan_summary (dict at 6765-6790) so the sample count can be compared against files_scanned/1000 - that is what proves the matched-file and early-return skips, since a run where every file matches would otherwise show zero samples with no explanation.
+
+## Unverified-dead — do not delete on this evidence
+
+These are believed unreachable. They were **not** removed, and the list should not be
+acted on as-is.
+
+A triage pass classified them, then an independent adversarial pass tried to refute
+each one and overturned 6 of 32 — including `_yara_callback`, which is wired into the
+only `rules.match()` call and is the hottest function in the process, and
+`lock_throttle`, which is taken from two threads on every scan-lifecycle row.
+
+A single manual spot-check of the SURVIVORS then found another false positive:
+"unnamed-rule fallback naming" was marked dead with instructions to delete the
+`else f"rule_{i}"` arms, but `rule { condition: true }` parses to `name=None`, the
+name regex fails against that body, and an unnamed rule is a YARA SyntaxError — so the
+fallback fires on exactly the compile-failure path where naming the offending rule
+matters most. Deleting it would make a malformed pack report a failure with no name.
+
+The methodological reason both passes missed it: they hunted for CALLERS, which is the
+right test for "is this function ever invoked" and the wrong one for a dead BRANCH
+inside a live function. Reachability of a branch is settled by constructing the input
+that drives execution down it, not by grepping for references.
+
+Anything below needs that branch-level check before removal:
+
+- Unnamed-rule fallback naming
+- Rule-count propagation into scan telemetry (valid/failed on scan_status)
+- Scan-rate reporting item (5): scan_rate_files_per_second on scan_status
+- Diagnostic-preserving cleanup suppression
+- $? placeholder for a match with no string ID
+- Rule-count propagation into scan telemetry (scan_status half)
+- Scan-rate reporting item (5) — scan_rate on scan_status
+- Dead cached-hit dict ingestion path in match-field extraction
+
+---
+
 # Known issues in this inventory
 
 Raised by three independent audits of the enumeration.
@@ -2567,7 +2632,7 @@ wording not yet updated" rather than "unobservable".
 
 Two such cases were fixed while writing this file (the evidence-ZIP dedupe and the
 metadata-only packaging line, both now routed through `LogManager`). The remaining
-46 are listed below — they are the single largest blocker to testing this scanner,
+17 are listed below — they are the single largest blocker to testing this scanner,
 because each is a behaviour that works and cannot be proven to have worked.
 
 ### Observability gaps (40)

@@ -72,9 +72,11 @@ not preserved — it was measured to cost up to 65.9x scan time while protecting
 | &nbsp;&nbsp;Local Storage & Host Footprint | 70 |
 | &nbsp;&nbsp;Delivery, Aggregation & Telemetry | 82 |
 | &nbsp;&nbsp;Scan Lifecycle, Control & Error Handling | 81 |
-| ⚠ Observability gaps | 40 |
+| ⚠ Observability gaps | 25 |
 
-**Root cause fixed; the 40 markers below are now stale.** `setup_logging()` used to
+**25 open observability gaps**, after triage — down from the 40 originally recorded (32 entries still carry an inline ⚠ marker).
+
+The closed ones were never really broken. `setup_logging()` used to
 remove every root handler and pin `WARNING`, so all 44 `logging.info(...)` calls in this
 file reached nothing on any host — which is what made these capabilities untestable. Root
 now carries an INFO `FileHandler` writing to `logs/diagnostics_<run_id>.log`, while stdout
@@ -200,7 +202,7 @@ Any module name the submitted pack imports that is not in the hardcoded 8 is app
 _load_or_compile_rules calls _get_available_yara_modules to build the cache key, and then _compile_yara_rules calls it AGAIN for the compile itself. On any cache miss the 8+ probe compiles run twice per scan. Harmless but measurable on slow agents; disabling the cache removes the first call, so the duplication exists only when caching is ON.
 
 - **Control:** RULE_CACHE_ENABLED, line 297 (env YARA_RULE_CACHE) — the first call sits inside its `if` at line 5565 — default `RULE_CACHE_ENABLED=True`
-- **Observe:** UNOBSERVABLE: no artefact distinguishes one probe pass from two. Needed instead: time _load_or_compile_rules with YARA_RULE_CACHE=0 versus enabled-but-cold, or profile the process; `compile_seconds` in logs/scan_summary_<run_id>.json (line 7652) spans both passes and cannot separate them.
+- **Observe:** UNOBSERVABLE: no artefact distinguishes one probe pass from two. Needed instead: time _load_or_compile_rules with YARA_RULE_CACHE=0 versus enabled-but-cold, or profile the process; `compile_seconds` in logs/scan_summary_<run_id>.json (line 7652) spans both passes and cannot separate them. To close it: Add one INFO line inside _get_available_yara_modules immediately before `return available` (line 5459): logging.info(f"YARA module probe: {len(test_modules)} candidates compiled, {len(available)} available"). Two of these lines in logs/diagnostics_<run_id>.log for one run proves the duplicate pass; one line means a cache HIT. (The real fix is to pass the modules computed at 5662 into _compile_yara_rules and drop the second probe — the log line is what makes either state visible.)
 - **Source:** `_load_or_compile_rules line 5567 (inside the RULE_CACHE_ENABLED guard at 5565); _compile_yara_rules line 5607`
 
 ### Cuckoo-module absence warning
@@ -213,11 +215,10 @@ A special-cased warning fires when `cuckoo` is not among the available modules, 
 
 ### Preamble extraction and de-duplication (import/include hoisting)
 
-**⚠ OBSERVABILITY GAP**  
 Every line in the whole file whose stripped form starts with `import ` or `include ` is hoisted into a shared preamble, de-duplicated by that stripped text, and later prepended to EACH individual rule before that rule is compiled. The scan is over all lines, not just the file header, so an `import` line sitting inside a rule body or inside a block comment is hoisted too (and is not removed from the body). The preamble is joined with newlines and stripped at line 5869.
 
 - **Control:** Not configurable — default `-`
-- **Observe:** UNOBSERVABLE: 'Found N unique import statements' is a logging.info call (line 5820), dropped by setup_logging's WARNING pin. Needed instead: a deliberately failed rule — <scanner_dir>/failed_rules/failed_rule_<name>.yar writes the resolved preamble above the rule body (lines 5742-5743), the only on-disk view of what the preamble became.
+- **Observe:** OBSERVABLE: logs/diagnostics_<run_id>.log carries `Found {N} unique import statements` (line 5915) — the count after de-duplication and after unavailable-module filtering. Cross-check the resolved preamble text itself in <scanner_dir>/failed_rules/failed_rule_<name>.yar, which writes it above the rule body (5837-5838). Residual gap: which imports were dropped as unavailable is only `Skipping unavailable module in preamble: {module}` at logging.debug (line 5907), below the INFO handler, so the drop list is still invisible.
 - **Source:** `_split_yara_rules() lines 5798-5820; preamble returned line 5869; reattachment to each rule line 5689`
 
 ### Unavailable preamble imports are stripped from the shared preamble
@@ -258,7 +259,7 @@ The boundary regex at line 5824 requires `rule` as the first non-whitespace toke
 Only hoisted import/include lines survive from the region above the first `rule` line. File-level comments, `private`/`global` rules, and any other preamble construct are dropped without a warning or a dump file — the text simply never enters any rule block, because each block starts at its own rule_starts index.
 
 - **Control:** Not configurable — default `-`
-- **Observe:** UNOBSERVABLE: nothing records the discarded region. Needed instead: compare `total_rules_found` in the logs/system_<run_id>.log line 'YARA Rules loaded: N rules, M imports' (line 7339 — a naive UNANCHORED `rule\s+\w+` count at 7330, so it DOES count `private rule` and inline occurrences) against `valid_rules`+`failed_rules`+`skipped_rules` in logs/scan_summary_<run_id>.json (7641-7643) — a gap is the discarded material.
+- **Observe:** UNOBSERVABLE: nothing records the discarded region. Needed instead: compare `total_rules_found` in the logs/system_<run_id>.log line 'YARA Rules loaded: N rules, M imports' (line 7339 — a naive UNANCHORED `rule\s+\w+` count at 7330, so it DOES count `private rule` and inline occurrences) against `valid_rules`+`failed_rules`+`skipped_rules` in logs/scan_summary_<run_id>.json (7641-7643) — a gap is the discarded material. To close it: In _split_yara_rules, right after the rule_starts loop (insert at line 5924, next to the existing `Found {N} rule start positions` info), emit: `if rule_starts:` compute `dropped = [l for l in lines[:rule_starts[0][0]] if l.strip() and not l.strip().startswith(('import ','include ','//'))]` and, when non-empty, `logging.info(f"Discarded {len(dropped)} non-import line(s) before the first rule declaration")`. That one line in logs/diagnostics_<run_id>.log turns the discard from an inferred count-gap into a direct measurement.
 - **Source:** `_split_yara_rules() lines 5835-5846; raw count lines 7330-7339`
 
 ### Per-block re-validation before compile (_clean_rule_content)
@@ -369,11 +370,10 @@ If splitting produces no rule blocks at all, the ENTIRE decoded rule text is wri
 
 ### Compilation-error forensics (_analyze_compilation_error)
 
-**⚠ OBSERVABILITY GAP**  
 Every compile failure is classified into one of four categories — invalid_pe_field, syntax_error, undefined_identifier, duplicate_definition — each with a severity and canned remediation suggestions, plus extraction of the invalid field name or unexpected token, and (when the error text carries 'line N') the offending source line with flags for condition:/strings:/meta:, its length and its indentation. Unmatched errors keep error_category 'unknown'. The result is COMPUTED AND THROWN AWAY: the only consumer is the log call at 1655-1668, guarded by `hasattr(self.config, 'log_manager')`, and nothing in the file ever assigns config.log_manager (grep: no `config.log_manager =` anywhere) — so no artefact ever carries the analysis.
 
 - **Control:** Not configurable — default `error_category='unknown', severity='medium'`
-- **Observe:** UNOBSERVABLE (dead output): the analysis never reaches logs/scan_errors_<run_id>.log because the config.log_manager guard at 1655 is never satisfied. Needed instead: source inspection, or set config.log_manager in an instrumented build — then the dict would ride LogManager's `data=` payload (serialised at 2172-2178, truncated past 4000 chars) on the line 'YARA rule compilation failed: <rule>'.
+- **Observe:** OBSERVABLE: logs/scan_errors_<run_id>.log now carries `YARA rule compilation failed: {rule_name} \| data={…}` (emitted at 1723-1726, serialised at 2229-2236), where the payload contains error_message, error_type, error_line_number, rule_length_lines, compilation_failure_number and the full error_analysis dict (error_category, severity, suggestions, invalid_field/unexpected_token, problematic_line, line_analysis) built at 1615-1679. Note it lands in scan_errors_<run_id>.log, not diagnostics_<run_id>.log, and the data blob is truncated at 4000 chars. The plain-text fallback (rule body with `<-- ERROR HERE`) remains in yara_processing_<run_id>.log.
 - **Source:** `_analyze_compilation_error() lines 1557-1621; sole (unreachable) consumer lines 1653-1668`
 
 ### Full failed-rule body echoed into the processing log with an error-line marker
@@ -410,11 +410,10 @@ Only the first 10 compile failures emit a truncated (100-char) logging.warning; 
 
 ### Every-50-rules compile progress
 
-**⚠ OBSERVABILITY GAP**  
 A running tally (compiled i/N, valid, failed, skipped) is emitted every 50 rules through the compile loop. Two limits: it sits INSIDE the success branch after the probe compile and the valid-count bump at 5693, so it only fires when rule number i itself compiled cleanly (a skipped or failed rule at i=50 emits nothing), and it goes to logging.info, so on any real host it goes nowhere.
 
 - **Control:** Not configurable (bare literal `50`, line 5695) — default `50`
-- **Observe:** UNOBSERVABLE: logging.info, dropped by setup_logging (lines 6954-6968 remove every root handler and pin WARNING at 6966; called at line 7290, before the scanner is constructed at 7343 and therefore before compilation). Needed instead: a mirrored write into ErrorLogger (which does reach yara_processing_<run_id>.log), or watch the rule_cache/failed_rules directories grow.
+- **Observe:** OBSERVABLE: logs/diagnostics_<run_id>.log carries `✓ Compiled {i}/{total} rules ({valid} valid, {failed} failed, {skipped} skipped)` every 50 rules (line 5791), plus the bracketing `Starting compilation of {N} YARA rules...` (5743) and `Compilation complete: {valid} valid, {failed} failed, {skipped} skipped` (5845). Requires a rule pack of at least 50 rules to emit at all.
 - **Source:** `lines 5695-5696 (inside the try's success path, after line 5693)`
 
 ### Rule-health triage counters (valid / failed / skipped)
@@ -598,11 +597,10 @@ A callback is passed to every rules.match() call, but its body returns yara.CALL
 
 ### _debug_rule_analysis — rule-file structure analysis and brace-mismatch check
 
-**⚠ OBSERVABILITY GAP**  
 Runs on every fresh compile before the split (called at 5615): counts total lines, enumerates rule declarations with their 1-based line numbers, samples the first five and (only when there are more than 10, line 6482) the last five, counts `import ` lines, and totals opening versus closing braces, warning on a mismatch. A brace mismatch is the single most useful early signal that a pack is truncated — and it is almost entirely invisible in practice. It never runs on a cache hit.
 
 - **Control:** Not configurable — default `-`
-- **Observe:** UNOBSERVABLE for everything except the mismatch: every line is logging.info, dropped by setup_logging's WARNING pin (6954-6968, called line 7290). Only 'BRACE MISMATCH DETECTED!' is logging.warning (line 6496), so it alone reaches stderr and the Action Center action output — and it carries no counts, so it says a mismatch exists but not its size. Needed for the rest: mirror the analysis into ErrorLogger.
+- **Observe:** OBSERVABLE: logs/diagnostics_<run_id>.log carries the full block between `=== YARA FILE ANALYSIS ===` (6595) and `=== END ANALYSIS ===` (6629): `Total lines: {N}` (6596), `Found {N} rule declarations` (6605), the first/last five ` Line {n}: rule {name}` samples (6613/6617), `Import statements: {N}` (6621) and `Total braces: {open} opening, {close} closing` (6625). On imbalance, `BRACE MISMATCH DETECTED!` (6628) still also reaches stderr and the Action Center output, and the size of the mismatch is now readable from the counts line immediately above it in the diagnostics log.
 - **Source:** `_debug_rule_analysis() lines 6459-6498; warning at line 6496; call site line 5615`
 
 ### Rule identity in the delivered alert name
@@ -822,11 +820,10 @@ On any platform.system() that is not Windows/Linux/Darwin, _default_discover_tar
 
 ### Runtime scan-target fallback ladder (_get_scan_targets)
 
-**⚠ OBSERVABILITY GAP**  
 At scan time the scanner prefers config.scan_targets; only if that attribute is missing or the list is empty does it re-run Windows discovery or hard-default to ['/'] on any non-Windows host. Because ScanConfig always populates scan_targets and every known platform's discovery returns at least one entry, this ladder is reachable only on an unknown platform — where the result is a full '/' scan that the discovery code just declined to choose.
 
 - **Control:** Not configurable — default `['/'] on non-Windows`
-- **Observe:** UNOBSERVABLE on its own: all three branches log only via bare logging.info (lines 6503/6508/6511), and setup_logging (6954-6967) closes every root handler and pins the root level to WARNING. Infer it from the statistics/system log mismatch described in the "Unknown platform yields an empty default target list" entry.
+- **Observe:** OBSERVABLE: logs/diagnostics_<run_id>.log records exactly which rung fired — `Using configured scan targets: {targets}` (line 6635), `Using default Windows targets: {targets}` (line 6640), or `Using default Unix target: ['/']` (line 6643). No inference from the statistics/system-log mismatch is needed any more. Caveat: if the diagnostics FileHandler itself fails to open, setup_logging reverts to WARNING (7125-7126) and prints `Diagnostics log unavailable (…)`, which is the one case where these three lines vanish again.
 - **Source:** `_get_scan_targets lines 6500-6512; call site scan_system line 6799`
 
 ### Non-root system-path advisory for requested targets  <sub>linux, darwin</sub>
@@ -1030,7 +1027,7 @@ After the directory list, any basename starting with "._" is skipped — the App
 The else-branch of the platform dispatch sets lin_skip_directory=[], mac_skip_directory=[] and skip_paths=set(), and _is_special_file's final else returns False. On any OS that is not Windows/Linux/Darwin only the output_log, filename, extension and cross-platform fragment checks apply — no vendor-directory or pseudo-filesystem protection, and no scanner-dir self-exclusion, on a host that _get_scan_targets will point at '/'.
 
 - **Control:** Not configurable — default `empty lists`
-- **Observe:** UNOBSERVABLE directly. Infer from statistics_<run_id>.log skip_breakdown containing no "Skipped directory" key at all, combined with the yara_processing line "Unknown platform - manual target specification required" (3152).
+- **Observe:** UNOBSERVABLE directly. Infer from statistics_<run_id>.log skip_breakdown containing no "Skipped directory" key at all, combined with the yara_processing line "Unknown platform - manual target specification required" (3152). To close it: Add one field to scan_config_data in scan_system (dict at lines 6934-6942, logged at 6945): `'platform_skip_paths': len(getattr(self.config, 'skip_paths', ()))` (optionally alongside `'platform': platform.system()`). That makes the "Scan configuration established" entry in statistics_<run_id>.log state the skip-list size directly on every run — 0 proves the unknown-platform branch, non-zero proves the platform list loaded — instead of requiring the negative inference from a missing skip_breakdown key.
 - **Source:** `ScanConfig lines 2978-2981; _is_special_file lines 6362-6363`
 
 ### Scanner working-directory self-exclusion (all three platforms)
@@ -1055,7 +1052,7 @@ Windows lowercases normalized_path up front (6246) and its lists are lowercased 
 On Windows it calls kernel32.GetFileAttributesW and tests FILE_ATTRIBUTE_REPARSE_POINT (0x400), which catches junctions that os.path.islink does not; on POSIX it is plain os.path.islink. Any exception, or attrs == -1 (the path is unreadable or missing), yields False — so an inaccessible reparse point is treated as a normal file.
 
 - **Control:** Not configurable — default `-`
-- **Observe:** UNOBSERVABLE alone; visible only through its caller. See 'junction_skips' in the final statistics entry (line 6608) and in each per-interval progress entry (6582).
+- **Observe:** UNOBSERVABLE alone; visible only through its caller. See 'junction_skips' in the final statistics entry (line 6608) and in each per-interval progress entry (6582). To close it: Instrument the pruning site at line 7021 in scan_system: capture the removed entries before filtering, e.g. `pruned = [d for d in dirs if _should_skip_junction(os.path.join(root, d))]`, then `dirs[:] = [d for d in dirs if d not in pruned]` and, under `self.lock_counts`, `self.skip_reasons["Junction/symlink dir prune"] += len(pruned)` plus `self.junction_skip_count += len(pruned)`. That surfaces it in the skip_breakdown of the "Skip reasons" statistics entry (6774-6777) and in the existing junction_skips fields, no new file or field needed.
 - **Source:** `_is_junction_or_symlink lines 480-492`
 
 ### Junction/symlink loop guard with narrow, hard-coded per-platform lists
@@ -1205,11 +1202,10 @@ Every reason returned by scan_file ("File does not exist", "No read permission",
 
 ### Scan status transitions are effectively unobservable (and their uploader is never called)
 
-**⚠ OBSERVABILITY GAP**  
 set_status marks each phase (initializing / starting_workers / scanning / finishing / completed / interrupted / failed / error) but only assigns a field and calls logging.info. Its would-be uploader, upload_scan_status, is never invoked anywhere in the file — and would return immediately anyway because UPLOAD_NON_MATCH_DATA is False — so the phase, including the moment target enumeration begins, never reaches XDR or any file.
 
 - **Control:** UPLOAD_NON_MATCH_DATA module constant, line 105 (bare literal, no env var) — moot, since nothing calls the uploader — default `False → status upload disabled`
-- **Observe:** UNOBSERVABLE: set_status logs via bare logging.info (line 4455) and setup_logging (6954-6967) strips root handlers and pins WARNING. Use the yara_scanner_scans_v3_<shard> lifecycle rows (initiated / running heartbeats / completed\|cancelled\|failed, emitted 5204-5247 and 6748-6757) instead — they are the working equivalent.
+- **Observe:** OBSERVABLE in logs/diagnostics_<run_id>.log — every transition emits `Scan status changed to: <status>` (xdr_yara_scanner.py:4531). A clean run reads initializing → starting_workers → scanning → finishing → completed; interrupted/error/failed appear on the abort paths. Note these statuses are still never transmitted anywhere — ScanStatusUploader.upload_scan_status has no caller — so the tenant-side equivalent remains the yara_scanner_scans_v3_<shard> lifecycle rows (initiated / running heartbeats / completed\|cancelled\|failed).
 - **Source:** `ScanStatusUploader lines 4378-4455; dead gate at line 4395; set_status 4452-4455; call sites 6683, 6797, 6815, 6839, 6939, 7390, 7393, 7433, 7529`
 
 ### Mid-walk exception on a scan target silently abandons the rest of that tree and erases its per-target row
@@ -1843,11 +1839,10 @@ ScanStatusUploader carries a 60s upload interval and a full status payload (elap
 
 ### Scan phase tracking (initializing → … → completed)
 
-**⚠ OBSERVABILITY GAP**  
 A phase label is advanced through the run (initializing, starting_workers, scanning, finishing, completed/failed/error/interrupted) and is the closest thing to a live progress state machine — but set_status only assigns an attribute and calls logging.info, every call site runs after setup_logging has stripped the root handlers and pinned WARNING, and the attribute it sets is read only by the dead upload_scan_status. The state machine therefore has no live consumer at all.
 
 - **Control:** Not configurable — default `-`
-- **Observe:** UNOBSERVABLE: the logging.info at line 4455 reaches nothing on any host once setup_logging (lines 6954-6969, invoked at 7290) has run. To observe phase, the label would have to be written into the scans dataset row or a LogManager file; today the only phase evidence is the lifecycle status column (initiated/running/completed/cancelled/failed) on yara_scanner_scans_v3_* rows (set at lines 5261, 6748-6757, 6778).
+- **Observe:** OBSERVABLE — the full phase sequence is in logs/diagnostics_<run_id>.log, one `Scan status changed to: <phase>` line per transition (xdr_yara_scanner.py:4531): initializing → starting_workers → scanning → finishing → completed, with error / interrupted / failed on the abort paths. Timestamps on those lines give per-phase duration. The tenant-side view stays coarser — the lifecycle status column (initiated/running/completed/cancelled/failed) on yara_scanner_scans_v3_* — because no phase label is written into the dataset row; adding one would mean a new column in _emit_scan_row's row dict (5315+).
 - **Source:** `ScanStatusUploader.set_status (lines 4452-4455), call sites (lines 6683, 6797, 6815, 6839, 6939, 7390, 7393, 7433, 7529)`
 
 ### Final efficiency score and comprehensive report
@@ -2015,7 +2010,7 @@ keep_run_ids.add(self.config.run_id) explicitly re-adds the running scan's run_i
 Retention catches PermissionError separately from OSError and counts them; a Windows agent that still holds a previous run's log open (another scanner process) leaves the file behind and the scan continues. The warning goes through bare logging.warning, which reaches stderr only because root has no handlers (setup_logging strips them at 6963-6965) and Python's lastResort handler applies at WARNING.
 
 - **Control:** Not configurable — default `Always on`
-- **Observe:** UNOBSERVABLE: the 'Cannot remove log file' message uses bare logging.warning, not LogManager, so it reaches only stderr / the Action Center stderr capture and appears in none of the seven log files. To confirm on disk, count leftover run_id groups exceeding LOG_KEEP_SCANS.
+- **Observe:** UNOBSERVABLE: the 'Cannot remove log file' message uses bare logging.warning, not LogManager, so it reaches only stderr / the Action Center stderr capture and appears in none of the seven log files. To confirm on disk, count leftover run_id groups exceeding LOG_KEEP_SCANS. To close it: NEEDS_INSTR, and the minimal fix is a channel swap, not a new log line: in _prune_old_scan_logs replace the bare logging calls with the class's own helper - 4728 -> self._log(f"Cannot remove log file (in use): {path}"), 4731 -> self._log(f"Cannot remove log file {path}: {e}"), 4733-4736 -> self._log("Log retention applied: ..."), 4738 -> self._log(f"Log retention: {failed} log files could not be removed"). Since 7381 passes log_manager in, all four then land in logs/system_<run_id>.log. (Alternative, broader fix: move setup_logging(config) from 7461 to before cleanup_manager.initial_cleanup() at 7383 so the diagnostics handler exists during startup cleanup - that also closes every other pre-7461 logging.info.)
 - **Source:** `lines 4627-4632 (PermissionError/OSError split), 4638-4639 (aggregate warning); setup_logging root strip 6963-6966`
 
 ### Structured log `data` payload capped at 4000 characters per line
@@ -2400,7 +2395,7 @@ scanner_dir is injected into each platform's skip list so the scanner never scan
 _get_real_path calls _is_case_sensitive_fs() on Darwin, and that function creates, writes, stats and removes a probe file in /tmp on every call — with NO caching or memoisation of any kind. _get_real_path has exactly one caller, scan_file line 6132, reached for every file that passed the exists / read-permission / _is_special_file gates, so a macOS scan performs one create + one existence check + one unlink in /tmp for essentially EVERY file it examines. This is host footprint outside scanner_dir entirely, and it is invisible in every log. The PID suffix keeps concurrent processes from colliding. The probe's RESULT is used (a False result lowercases the returned path at 503/513), but because nothing caches it a case-sensitive volume pays exactly the same per-file I/O cost as a case-insensitive one.
 
 - **Control:** Not configurable (path literal line 467) — default `/tmp/CaSe_TeSt_YaRa_<pid>`
-- **Observe:** UNOBSERVABLE: nothing in any of the seven log files records it. Confirm with `fs_usage -f filesys \| grep CaSe_TeSt_YaRa` (or dtrace) on the macOS endpoint during a scan, or by watching /tmp inode churn. There is no artefact left behind, since the probe is unlinked immediately (and any failure is swallowed by the bare except at 474-475, which reports 'not case-sensitive').
+- **Observe:** UNOBSERVABLE: nothing in any of the seven log files records it. Confirm with `fs_usage -f filesys \| grep CaSe_TeSt_YaRa` (or dtrace) on the macOS endpoint during a scan, or by watching /tmp inode churn. There is no artefact left behind, since the probe is unlinked immediately (and any failure is swallowed by the bare except at 474-475, which reports 'not case-sensitive'). To close it: NEEDS_INSTR. Minimal: memoize + log once in _is_case_sensitive_fs - add a module-level cache (e.g. `_CASE_SENSITIVE_FS = None`) and, on the first Darwin evaluation, emit logging.info(f"Case-sensitivity probe (/tmp/CaSe_TeSt_YaRa_{os.getpid()}): case_sensitive={result}") plus logging.info on the except arm at 536-537 recording the probe failure before returning False. Because every caller path runs inside the scanner (after setup_logging at 7461), that line lands in logs/diagnostics_<run_id>.log. Ideally also add a `case_sensitive_fs` boolean to scan_summary so the decision is visible without reading the log.
 - **Source:** `_is_case_sensitive_fs lines 462-477 (Darwin branch 466-475); _get_real_path Darwin branches lines 501-505 and 511-515; sole caller scan_file line 6132 (after gates at 6100, 6103, 6129)`
 
 ### Per-file size ceiling bounds how much the scanner reads off the disk
@@ -3665,11 +3660,10 @@ Runs once, in run()'s finally, ONLY when outcome=="completed" (7694) — a crash
 
 ### Host cleanup refuses to run without a durable summary, and when there is no delivery channel
 
-**⚠ OBSERVABILITY GAP**  
 Three safety gates, not two. run() returns immediately unless summary_path is an existing file (4928) — the audit record that the run happened; a missing summary means the run cannot be attested, so nothing is deleted. on_delivery with BOTH create_alerts and write_dataset off is refused (4901-4909), because an empty shortfall would then mean "nothing was ever attempted", not "everything landed". And an unrecognised CONFIG_HOST_CLEANUP value is treated as off rather than guessed (4896-4898).
 
 - **Control:** Same as host cleanup (CONFIG_HOST_CLEANUP 238, CONFIG_HOST_CLEANUP_KEEP 239) — default `-`
-- **Observe:** UNOBSERVABLE reason text: "Host cleanup skipped: <reason>" uses logging.info (7709), which setup_logging silences — and log_manager is already stopped by then anyway. The real observable is that the artefacts are still present under <scanner_dir> after a completed run with CONFIG_HOST_CLEANUP set. To see the reason one would need it written into the summary JSON, which it is not.
+- **Observe:** Rewrite the Observe field as: "OBSERVABLE in logs/diagnostics_<run_id>.log - the skip reason is emitted by logging.info('Host cleanup skipped: %s' % _reason) at line 7887, and root INFO is file-backed by setup_logging (7113-7121). grep diagnostics_<run_id>.log for 'Host cleanup skipped:' to get should_run's exact refusal (4987 off / 4989-4990 unknown value / 5000-5001 no delivery channel / 5003 delivery incomplete). Note the line is emitted only when CONFIG_HOST_CLEANUP != 'off' (elif at 7886), and that the affirmative counterpart 'Host cleanup removed N path(s)' (7883-7885) is NOT reliably readable on POSIX because HostCleanup.run has already unlinked diagnostics_<run_id>.log itself (5050-5053 matching the run_id regex at 4681) - for the affirmative case, use the surviving scan_summary JSON plus the presence/absence of artefacts under <scanner_dir>."
 - **Source:** `should_run 4890-4912 (off gate 4894-4895, unknown-value 4896-4898, always 4899-4900, no-channel 4901-4909, shortfall 4910-4911); summary-existence check 4927-4929; caller 7699-7709`
 
 ### Log handlers closed BEFORE host cleanup because Windows refuses to delete open files
@@ -3869,6 +3863,76 @@ Only the last two rows still differ. The `options` channel is the larger of the 
 the main remaining reason a knob is easier to reach on XDR than on XSIAM: everything else
 in this table now behaves identically across the editions, so a fix or a tuning value
 carries over without translation.
+
+---
+
+# Observability status
+
+Every entry once marked ⚠ OBSERVABILITY GAP was re-triaged against the current source.
+"Unobservable" turned out to conflate three different problems with three different
+fixes, which is why they are separated here rather than counted as one number.
+
+| Outcome | Count | Meaning |
+|---|---|---|
+| Closed | 10 | Evidence exists. The capability was always observable once root logging had a disk sink; only the wording was stale. |
+| Needs instrumentation | 7 | Runs, records nothing anywhere. Real work, listed below with what would close each. |
+| Unverified-dead | 18 | Believed unreachable — **not deleted, and not safe to delete on this evidence.** See the warning below. |
+
+## Needs instrumentation
+
+These execute and leave no trace at any log level. Each line names the minimal
+change that would make the capability assertable on a live scan.
+
+- **Duplicate module probe on a fresh compile (wasted work)** — Add one INFO line inside _get_available_yara_modules immediately before `return available` (line 5459): logging.info(f"YARA module probe: {len(test_modules)} candidates compiled, {len(available)} available"). Two of these lines in logs/diagnostics_<run_id>.log for one run proves the duplicate pass; one line means a cache HIT. (The real fix is to pass the modules computed at 5662 into _compile_yara_rules and drop the second probe — the log line is what makes either state visible.)
+- **Everything before the first rule declaration is discarded (except imports)** — In _split_yara_rules, right after the rule_starts loop (insert at line 5924, next to the existing `Found {N} rule start positions` info), emit: `if rule_starts:` compute `dropped = [l for l in lines[:rule_starts[0][0]] if l.strip() and not l.strip().startswith(('import ','include ','//'))]` and, when non-empty, `logging.info(f"Discarded {len(dropped)} non-import line(s) before the first rule declaration")`. That one line in logs/diagnostics_<run_id>.log turns the discard from an inferred count-gap into a direct measurement.
+- **Unknown platform has no directory skip list at all** — Add one field to scan_config_data in scan_system (dict at lines 6934-6942, logged at 6945): `'platform_skip_paths': len(getattr(self.config, 'skip_paths', ()))` (optionally alongside `'platform': platform.system()`). That makes the "Scan configuration established" entry in statistics_<run_id>.log state the skip-list size directly on every run — 0 proves the unknown-platform branch, non-zero proves the platform list loaded — instead of requiring the negative inference from a missing skip_breakdown key.
+- **Junction / reparse-point detection (_is_junction_or_symlink)** — Instrument the pruning site at line 7021 in scan_system: capture the removed entries before filtering, e.g. `pruned = [d for d in dirs if _should_skip_junction(os.path.join(root, d))]`, then `dirs[:] = [d for d in dirs if d not in pruned]` and, under `self.lock_counts`, `self.skip_reasons["Junction/symlink dir prune"] += len(pruned)` plus `self.junction_skip_count += len(pruned)`. That surfaces it in the skip_breakdown of the "Skip reasons" statistics entry (6774-6777) and in the existing junction_skips fields, no new file or field needed.
+- **Log-file deletion failures are tolerated, not fatal** — NEEDS_INSTR, and the minimal fix is a channel swap, not a new log line: in _prune_old_scan_logs replace the bare logging calls with the class's own helper - 4728 -> self._log(f"Cannot remove log file (in use): {path}"), 4731 -> self._log(f"Cannot remove log file {path}: {e}"), 4733-4736 -> self._log("Log retention applied: ..."), 4738 -> self._log(f"Log retention: {failed} log files could not be removed"). Since 7381 passes log_manager in, all four then land in logs/system_<run_id>.log. (Alternative, broader fix: move setup_logging(config) from 7461 to before cleanup_manager.initial_cleanup() at 7383 so the diagnostics handler exists during startup cleanup - that also closes every other pre-7461 logging.info.)
+- **macOS case-sensitivity probe writes and deletes /tmp/CaSe_TeSt_YaRa_<pid> per scanned file** — NEEDS_INSTR. Minimal: memoize + log once in _is_case_sensitive_fs - add a module-level cache (e.g. `_CASE_SENSITIVE_FS = None`) and, on the first Darwin evaluation, emit logging.info(f"Case-sensitivity probe (/tmp/CaSe_TeSt_YaRa_{os.getpid()}): case_sensitive={result}") plus logging.info on the except arm at 536-537 recording the probe failure before returning False. Because every caller path runs inside the scanner (after setup_logging at 7461), that line lands in logs/diagnostics_<run_id>.log. Ideally also add a `case_sensitive_fs` boolean to scan_summary so the decision is visible without reading the log.
+- **Alert channel's startup narration is unreachable - uploads log never records whether alerts are on** — NEEDS_INSTR. Minimal: give ResultsUploader.__init__ a `log_manager=None` parameter and pass self.log_manager at the 5112 construction site (mirroring LookupDatasetUploader at 5113), then drop the now-redundant late attach at 5120. Cheaper one-line alternative that needs no signature change: replace the guarded calls at 3290-3291, 3296-3297, 3300-3301, 3307-3308 with plain logging.info(...) - construction at 5112 happens after setup_logging (7461), so those records land in logs/diagnostics_<run_id>.log.
+
+## Unverified-dead — do not delete on this evidence
+
+These are believed unreachable. They were **not** removed, and the list should not be
+acted on as-is.
+
+A triage pass classified them, then an independent adversarial pass tried to refute
+each one and overturned 6 of 32 — including `_yara_callback`, which is wired into the
+only `rules.match()` call and is the hottest function in the process, and
+`lock_throttle`, which is taken from two threads on every scan-lifecycle row.
+
+A single manual spot-check of the SURVIVORS then found another false positive:
+"unnamed-rule fallback naming" was marked dead with instructions to delete the
+`else f"rule_{i}"` arms, but `rule { condition: true }` parses to `name=None`, the
+name regex fails against that body, and an unnamed rule is a YARA SyntaxError — so the
+fallback fires on exactly the compile-failure path where naming the offending rule
+matters most. Deleting it would make a malformed pack report a failure with no name.
+
+The methodological reason both passes missed it: they hunted for CALLERS, which is the
+right test for "is this function ever invoked" and the wrong one for a dead BRANCH
+inside a live function. Reachability of a branch is settled by constructing the input
+that drives execution down it, not by grepping for references.
+
+Anything below needs that branch-level check before removal:
+
+- _is_valid_rule_structure — DEAD CODE
+- _serialize_matches — DEAD CODE
+- Dead hook: _discover_all_targets override branch
+- The scanner's own output log path is excluded from scanning
+- Windows drive-letter exclusion list (present but permanently empty)
+- DEAD CODE: Windows wildcard pattern skip list never matches anything
+- DEAD: total_files_found and files_per_target are computed then discarded
+- DEAD CODE: idle-tier ("os") priority branch
+- DEAD CONSTANT: WORKER_GET_TIMEOUT_SECS
+- DEAD CONSTANT: CANCEL_DRAIN_DEADLINE_SECS
+- DEAD CONFIG: batch_size / performance_log_interval / statistics_upload_interval
+- DEAD CODE: _get_scanner_stats aggregate
+- DEAD CODE: periodic scan-status upload
+- Per-file permission denials accumulate in an unbounded list that nothing ever reads
+- DEAD CODE: ScanStatusUploader.upload_scan_status() is never called and is double-gated off
+- CANCEL_DRAIN_DEADLINE_SECS - dead constant
+- ResultsUploader.upload_results - dead finalisation path
+- CircuitBreaker class - defined, never instantiated
 
 ---
 
