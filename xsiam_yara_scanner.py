@@ -334,6 +334,31 @@ CPU_BUDGET_PCT   = _env_number("YARA_CPU_BUDGET_PCT", 25, minimum=0)
 CPU_FLOOR_PCT    = _env_number("YARA_CPU_FLOOR_PCT", 5, minimum=0)
 GOVERNOR_HEARTBEAT_SECS = _env_number("YARA_GOVERNOR_HEARTBEAT_SECS", 30, minimum=0)
 
+# Per-worker throughput reporting fires every 100 files, which ties log volume to the
+# HOST's file count rather than to anything an operator wants to read. Measured: a
+# 323,261-file scan wrote 3,260 `Worker Performance |` lines - 99.5% of that run's 390 KB
+# performance log - burying the six governor samples that actually diagnose a scan. A
+# 10M-file server would write ~100,000 lines and ~12 MB, per run, on the endpoint's disk.
+# Throughput is a sampled gauge, so it is bounded on the axis that matters: the 100-file
+# trigger stays the sampling point, and this gate decides whether the sample is written,
+# at the same cadence the governor and progress heartbeats already use. 0 disables it.
+WORKER_REPORT_MIN_SECS = _env_number("YARA_WORKER_REPORT_SECS", 30, minimum=0)
+
+
+def _worker_report_due(last_report, now, interval=None):
+    """Whether a worker's throughput sample should be written.
+
+    A worker's FIRST report always lands (last_report == 0), so a scan too short to span
+    one interval still produces a throughput reading rather than none at all.
+    """
+    if interval is None:
+        interval = WORKER_REPORT_MIN_SECS
+    if not interval:
+        return True
+    if not last_report:
+        return True
+    return (now - last_report) >= interval
+
 # minimum=0, so 0 keeps its meaning ("no cap") while a NEGATIVE value falls back to the
 # default instead of being clamped into it. Without the guard, `max(0, -5)` turned a typo
 # into unbounded alert offsets - the precise failure this cap was added to prevent, and
@@ -4822,6 +4847,8 @@ rule test {{
         worker_id = threading.current_thread().name
         files_processed = 0
         errors_encountered = 0
+        # Per-worker, so one busy worker cannot rate-limit another's reporting.
+        last_report_at = 0.0
         
         self.log_manager.log_system(f"Worker {worker_id} started")
         
@@ -4845,10 +4872,12 @@ rule test {{
                             self.skip_reasons[reason] += 1
                         self.last_scanned_file = fp
                     
-                    if files_processed % 100 == 0 and files_processed > 0:
+                    if (files_processed % 100 == 0 and files_processed > 0
+                            and _worker_report_due(last_report_at, time.time())):
+                        last_report_at = time.time()
                         avg_time_ms = sum(self.worker_processing_times[worker_id]) / len(self.worker_processing_times[worker_id]) * 1000
                         error_rate = (errors_encountered / files_processed) * 100
-                        
+
                         self.log_manager.log_worker_performance(
                             worker_id, files_processed, avg_time_ms, error_rate
                         )
