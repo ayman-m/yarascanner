@@ -2507,53 +2507,39 @@ Inside scan_system's per-target loop, an exception raised while processing a tar
 
 # Control gaps — capabilities the customer cannot tune
 
-Verified directly against source. These are ranked by how likely a real deployment is to
-need them, not by how hard they are to add.
+Verified by hand against source. Most of the gaps this file originally recorded have
+since been closed; they are listed as **Closed** rather than deleted, because knowing a
+knob was recently added is as useful as knowing one is missing.
 
-### `YARA_THREADS` is accepted and then discarded
+### Closed
 
-The knob is read, range-validated, and overwritten:
+| Was | Now |
+|---|---|
+| `YARA_THREADS` read, validated, then overwritten by `min(2, ...)` | Honoured. The cap was correct while impact control was the system-CPU pause loop; the CPU governor replaced it, so throughput is no longer welded to impact. |
+| Every skip list hardcoded, no override of any kind | `YARA_EXTRA_SKIP_PATHS` — comma-separated, **additive only**, normalised to bounded `/x/` component matching. |
+| Alert directory total unbounded | `YARA_ALERT_DIR_MAX_MB` (default 256, 0 = off). Degrades detail past the ceiling and keeps counts complete. |
+| Retention a `keep_scans=2` method default | `YARA_LOG_KEEP` (default 10), matching the XDR edition. |
+| Twin cap knobs where `0` meant opposite things | Both mean *no cap*; negatives fall back to the default instead of clamping onto "unbounded". |
 
-```python
-configured_workers = _env_number("YARA_THREADS", default_workers, cast=int, minimum=1)
-self.max_workers = max(1, min(2, configured_workers))
-```
+### Still open
 
-A customer setting `YARA_THREADS=8` on a 32-core server silently gets **2**. The variable
-is listed in the Deployment Guide's tuning table. This is the worst category of gap — a
-control that exists, is documented, accepts input, and does nothing, failing silently at
-both ends. Either honour it (with a sane ceiling) or remove it and document the cap.
+**The built-in skip entries cannot be removed.** `YARA_EXTRA_SKIP_PATHS` only adds. That
+is deliberate — a replace-style knob would let one typo silently drop the Cortex agent
+paths — but a site that genuinely needs to scan inside a default-skipped directory still
+has no supported way to do it.
 
-### Every skip list is hardcoded — no override of any kind
+**The evidence ZIP total is still unbounded.** The alert directory now has a ceiling; the
+evidence ZIP does not. It is content-addressed and defaults to metadata-only
+(`COLLECT_MATCHED_FILES=False`), so the exposure is narrower, but a run with collection
+enabled against a noisy ruleset has no byte budget.
 
-`skip_extensions`, `skip_filenames`, `skip_path_fragments`, `force_scan_fragments`,
-`force_scan_never_under`, and all three per-platform lists (`win_skip_folder`,
-`lin_skip_directory`, `mac_skip_directory`) are Python literals inside `ScanConfig` —
-mid-file, not in the top-of-file config block where a customer would look.
+**No per-run override channel.** The Action Center form carries only this script's three
+declared inputs, so every knob above requires either an endpoint env var or editing a
+constant before upload. The XDR edition has a ten-key `options` string that needs neither;
+porting it is the largest remaining control-surface difference between the editions.
 
-This is the largest practical gap. A customer running a non-Cortex EDR, a large build-
-artifact tree, or an unusual mount layout has **no supported way to add a skip path**. We
-added `/opt/traps` for the Cortex agent; a site running CrowdStrike or SentinelOne cannot
-do the same for theirs without editing the script's internals.
-
-### Total footprint is unbounded
-
-`MAX_ALERT_OFFSETS_PER_FINDING` caps offsets **per finding**, but nothing caps the alert
-directory total or the evidence ZIP total. Per-finding bounds say nothing about the sum, so
-a noisy ruleset on a small endpoint disk has no ceiling. A per-rule or per-scan byte budget
-would close it.
-
-### Log retention is a method default
-
-`_prune_old_scan_logs(keep_scans=2)` — retention is fixed at two runs, set in a signature
-default rather than a constant.
-
-### Governor internals are fixed (deliberate)
-
-`GAIN`, `RATIO_MAX`, `PACE_CAP_SECS` are `CpuGovernor` class constants. Recorded for
-completeness, but correct as-is: these are control-loop tuning, not policy, and the policy
-knobs above them (`CPU_GUARANTEE`, `CPU_HEADROOM_PCT`, `CPU_BUDGET_PCT`, `CPU_FLOOR_PCT`)
-are exposed. Changing them without understanding the loop would destabilise pacing.
+**Governor internals are fixed (deliberate).** `GAIN`, `RATIO_MAX`, `PACE_CAP_SECS` are
+control-loop tuning, not policy, and the policy knobs above them are exposed.
 
 ---
 
@@ -2567,10 +2553,17 @@ was itself wrong — refuted with the deciding line. Audit prose was not trusted
 
 ### The root logger is silent — most `logging.info` evidence does not exist
 
-`setup_logging()` removes every root handler and pins the level to `WARNING`. All 41
-`logging.info(...)` calls in the file therefore reach nothing, on any host. Any capability
-whose only stated evidence is an info-level log is **untestable as written** — that is what
-the ⚠ OBSERVABILITY GAP marker means above.
+**Root cause fixed; the per-entry markers below are now stale.** `setup_logging()` used
+to remove every root handler and pin `WARNING`, so all 40 `logging.info(...)` calls in
+this file reached nothing on any host — which is what made the capabilities below
+untestable. Root now carries an INFO `FileHandler` writing to
+`logs/diagnostics_<run_id>.log`, while stdout stays clean (Action Center truncates stdout
+at 10,240 chars, which is why the original suppression existed).
+
+The entries below therefore still carry ⚠ OBSERVABILITY GAP markers that no longer
+apply. Re-deriving each *Observe* field against the new sink is outstanding work; until
+that pass runs, treat a marked entry as "evidence exists in diagnostics_<run_id>.log,
+wording not yet updated" rather than "unobservable".
 
 Two such cases were fixed while writing this file (the evidence-ZIP dedupe and the
 metadata-only packaging line, both now routed through `LogManager`). The remaining

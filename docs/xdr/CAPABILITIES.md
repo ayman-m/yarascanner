@@ -74,6 +74,17 @@ not preserved — it was measured to cost up to 65.9x scan time while protecting
 | &nbsp;&nbsp;Scan Lifecycle, Control & Error Handling | 81 |
 | ⚠ Observability gaps | 40 |
 
+**Root cause fixed; the 40 markers below are now stale.** `setup_logging()` used to
+remove every root handler and pin `WARNING`, so all 44 `logging.info(...)` calls in this
+file reached nothing on any host — which is what made these capabilities untestable. Root
+now carries an INFO `FileHandler` writing to `logs/diagnostics_<run_id>.log`, while stdout
+stays clean (Action Center truncates stdout at 10,240 chars, which is why the original
+suppression existed).
+
+Re-deriving each *Observe* field against the new sink is outstanding work. Until that pass
+runs, read a marked entry as "evidence exists in diagnostics_<run_id>.log, wording not yet
+updated" rather than "unobservable".
+
 > **Do not compare this total against the XSIAM file's.** That document lists 297
 > capabilities and this one lists 456, but the two were enumerated with
 > different granularity prompts — the difference is mostly how finely behaviour was split
@@ -3809,43 +3820,32 @@ A single 22-field dict (hostname, os_info, ip_addresses, platform, python_versio
 
 # Control gaps — capabilities the customer cannot tune
 
-Verified by hand against the pinned source, and ranked by how likely a real deployment is
-to need them. Fewer than the XSIAM edition has, because the `options` channel covers the
-knobs that matter most at run time.
+Verified by hand against the pinned source. Most of the gaps this file originally
+recorded have since been closed; they are listed as **Closed** rather than deleted,
+because knowing a knob was recently added is as useful as knowing one is missing.
 
-### Every skip list is hardcoded — and XDR lacks XSIAM's safety net
+### Closed
 
-`skip_extensions` (2869), `skip_path_fragments` (2873) and `force_scan_fragments` (2896)
-are Python literals inside the config class — mid-file, not in the `CONFIG_*` block a
-customer would look at, and reachable through none of the three channels. A site running a
-non-Cortex EDR, a large build-artifact tree, or an unusual mount layout has **no supported
-way to add a skip path**.
+| Was | Now |
+|---|---|
+| No `force_scan_never_under` at all — the force-scan allowlist had no backstop and could walk onto mounted media | Ported from XSIAM, with the trailing-separator probe. A Time Machine volume no longer gets scanned once per backup snapshot. |
+| `CONFIG_LOOKUP_ROWS_PER_FINDING_MAX` a bare literal | `YARA_LOOKUP_ROWS_PER_FINDING` |
+| Alert directory total unbounded | `YARA_ALERT_DIR_MAX_MB` (default 256, 0 = off). Degrades detail past the ceiling and keeps counts complete. |
+| Every skip list hardcoded, no override of any kind | `YARA_EXTRA_SKIP_PATHS` — comma-separated, **additive only**, normalised to bounded `/x/` component matching. |
 
-Worse than the XSIAM twin here: XDR has **no `force_scan_never_under`** at all (grep
-returns zero hits; XSIAM defines it and consults it before honouring a force-scan).
-That list is the guard that stops a force-scan fragment from dragging the scanner into a
-directory that must never be walked. Its absence means XDR's force-scan overrides have no
-backstop.
+### Still open
 
-### `CONFIG_LOOKUP_ROWS_PER_FINDING_MAX` is a bare literal
+**The built-in skip entries cannot be removed.** `YARA_EXTRA_SKIP_PATHS` only adds — a
+replace-style knob would let one typo silently drop the Cortex agent paths. A site that
+genuinely needs to scan inside a default-skipped directory still has no supported way to.
 
-The per-finding dataset row cap is `CONFIG_LOOKUP_ROWS_PER_FINDING_MAX = 50` (line 199) —
-not an env var, and not one of the ten `options` keys. The XSIAM twin exposes both of its
-equivalents (`YARA_MAX_MATCH_SAMPLES`, `YARA_MAX_ALERT_OFFSETS`), so this is a place XDR is
-strictly less tunable than XSIAM despite having the richer control model overall.
+**The evidence ZIP total is still unbounded.** The alert directory now has a ceiling; the
+evidence ZIP does not. Content-addressed and metadata-only by default, so the exposure is
+narrower, but a collection-enabled run against a noisy ruleset has no byte budget.
 
-### Total footprint is unbounded
-
-Per-finding caps bound each row and each alert, but nothing caps the alert directory total
-or the evidence ZIP total. Per-finding bounds say nothing about the sum, so a noisy ruleset
-on a small endpoint disk has no ceiling. A per-rule or per-scan byte budget would close it.
-
-### Governor internals are fixed (deliberate)
-
-`GAIN`, `RATIO_MAX` and `PACE_CAP_SECS` are `CpuGovernor` class constants. Recorded for
-completeness but correct as-is: these are control-loop tuning, not policy, and the policy
-knobs above them are exposed through both env vars and `options` keys. Changing them
-without understanding the loop would destabilise pacing.
+**Governor internals are fixed (deliberate).** `GAIN`, `RATIO_MAX` and `PACE_CAP_SECS` are
+control-loop tuning, not policy; the policy knobs above them are exposed through both env
+vars and `options` keys.
 
 ---
 
@@ -3856,16 +3856,19 @@ question is whether the twin needs it.
 
 | Control | XDR | XSIAM |
 |---|---|---|
-| Worker count | **Honoured** — `YARA_THREADS` / `options workers`, no clamp (2838-2839) | **Discarded** — `min(2, ...)` overwrites it |
-| Per-run overrides | **Ten `options` keys**, no script edit | **None** — three declared inputs only |
-| Log retention | `YARA_LOG_KEEP`, default 10 (line 310) | method default `keep_scans=2` |
-| Rule cache | 4 env knobs (297-300) | removed from this edition |
-| Per-finding row/offset cap | bare literal (199) | env-reachable, two knobs |
-| `force_scan_never_under` | **absent** | present, consulted before force-scan |
+| Worker count | Honoured — `YARA_THREADS` / `options workers` | Honoured (the `min(2, ...)` clamp was removed) |
+| Log retention | `YARA_LOG_KEEP`, default 10 | `YARA_LOG_KEEP`, default 10 |
+| Per-finding row/offset cap | `YARA_LOOKUP_ROWS_PER_FINDING` | `YARA_MAX_MATCH_SAMPLES` + `YARA_MAX_ALERT_OFFSETS` |
+| Alert directory ceiling | `YARA_ALERT_DIR_MAX_MB` | `YARA_ALERT_DIR_MAX_MB` |
+| Extra skip paths | `YARA_EXTRA_SKIP_PATHS` | `YARA_EXTRA_SKIP_PATHS` |
+| `force_scan_never_under` | present, consulted before force-scan | present, consulted before force-scan |
+| **Per-run overrides** | **Ten `options` keys**, no script edit | **None** — three declared inputs only |
+| **Rule cache** | 4 env knobs (297-300) | removed from this edition |
 
-The first row is the sharpest: the same env var is honoured here and silently discarded
-there. A customer who tunes `YARA_THREADS` on a mixed fleet gets two different behaviours
-from one setting.
+Only the last two rows still differ. The `options` channel is the larger of the two and
+the main remaining reason a knob is easier to reach on XDR than on XSIAM: everything else
+in this table now behaves identically across the editions, so a fix or a tuning value
+carries over without translation.
 
 ---
 
