@@ -3270,13 +3270,27 @@ class ResultsUploader:
         """Background worker for uploading results.
 
         Drains the queue before exiting so queued match uploads are not dropped
-        at shutdown. Exits only when the sentinel arrives, or when the queue is
-        empty AND stop_upload_thread was flipped True by stop().
+        at shutdown. Exits when stop() has flipped stop_upload_thread, when the
+        sentinel arrives, or when the queue is empty.
         """
         if self.log_manager:
             self.log_manager.log_upload("Upload worker thread started")
 
         while True:
+            # Checked BEFORE taking work, not only on an Empty queue. stop() has already
+            # spent the whole backlog-proportional drain budget by the time it sets this,
+            # so anything still queued is past its window and must be reported undelivered
+            # rather than attempted anyway.
+            #
+            # Consulting the flag only in the `except Empty` branch made it unreachable
+            # under exactly the conditions it exists for: a full queue never raises Empty.
+            # Measured on a cancelled whole-filesystem scan — the sentinel landed behind
+            # 12,146 items, the 60 s join timed out, stop() booked those items
+            # `undelivered`, and this still-running loop then delivered 1,000 of them into
+            # `successful_uploads`. The same item in both buckets, and ok + undelivered
+            # exceeding the number of findings that ever existed.
+            if self.stop_upload_thread:
+                break
             try:
                 standard_log = self.upload_queue.get(timeout=1.0)
 
