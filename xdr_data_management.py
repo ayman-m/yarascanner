@@ -22,7 +22,7 @@ Usage:
     python3 xdr_data_management.py --delete-legacy --yes
 """
 
-__version__ = "2.1.1"   # see repo CHANGELOG.md for what changed since 2.1.0
+__version__ = "2.2.0"   # see repo CHANGELOG.md for what changed since 2.1.1
 import argparse
 import datetime
 import os
@@ -274,20 +274,45 @@ def select_legacy_for_deletion(legacy_names, newer_names=(), now_yyyymm=None):
     candidates, skipped = [], []
     for name in legacy_names or []:
         info = parse_dataset_name(name)
-        if info is not None and info["scan_target"]:
+        # The rails below must NOT be conditional on info being parseable. parse_dataset_name
+        # requires the _vN segment, and the oldest legacy names predate it entirely
+        # ("yara_scanner_scans_hostA"), so gating on `info is not None` silently exempted
+        # exactly the least replaceable data: an unversioned, unsuffixed dataset holding ALL
+        # of a host's pre-rotation history fell straight through to the delete list, while its
+        # versioned sibling ("..._v1_hostA") was correctly protected. Derive the two facts the
+        # rails actually need — is it a per-scan target, and does it carry a month suffix —
+        # from the name itself when the full contract will not parse.
+        if info is not None:
+            is_scan_target, month = info["scan_target"], info["month"]
+        elif str(name).startswith(PREFIX + "_"):
+            # Inside the yara_scanner_* contract but missing the _vN segment: still a shard
+            # whose shape we can read, so the rails apply.
+            is_scan_target = "_scan_" in name
+            m = MONTH_RE.match(name.rsplit("_", 1)[-1]) if "_" in name else None
+            month = m.group("month") if m else None
+        else:
+            # Genuinely pre-contract naming (no yara_scanner_ prefix at all). We cannot read
+            # its shape, so we deliberately do NOT infer an unsuffixed-ness we can't verify —
+            # that would make --delete-legacy vacuous for the oldest data it exists to remove.
+            # filter_recently_written and filter_unconsolidated run after this and remain the
+            # last line of defence for these.
+            candidates.append(name)
+            continue
+
+        if is_scan_target:
             skipped.append("%s: per-scan consolidated target - consolidation OUTPUT, not a "
                            "legacy leftover" % name)
             continue
-        if info is not None and not info["month"]:
+        if not month:
             skipped.append("%s: unsuffixed - holds ALL pre-rotation history for that host, "
                            "so it is never a blanket candidate; delete it by name if you "
                            "really want the space" % name)
             continue
-        if info is not None and now_yyyymm:
-            if info["month"] == now_yyyymm:
+        if now_yyyymm:
+            if month == now_yyyymm:
                 skipped.append("%s: current month - a scan may be writing to it" % name)
                 continue
-            if months_between(info["month"], now_yyyymm) < 0:
+            if months_between(month, now_yyyymm) < 0:
                 skipped.append("%s: dated in the future (clock skew?)" % name)
                 continue
         candidates.append(name)
