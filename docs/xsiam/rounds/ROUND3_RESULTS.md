@@ -2,7 +2,7 @@
 
 **Endpoints:** `xsoar`, `OfficeiMac`, `thor`  
 **Criteria:** 121  
-**Result:** 102 pass · 0 fail · 19 blocked · 0 not run
+**Result:** 104 pass · 0 fail · 17 blocked · 0 not run
 
 ## Runs
 
@@ -90,6 +90,29 @@ backlog left 669,991 undelivered, and the books still balance to the item:
 255,516 + 0 + 669,991 = 925,507 = findings
 ```
 
+### Windows junctions: the skip list is selective, by design
+
+Two junctions were planted pointing at one directory holding a single matching file —
+`jlink` (benign) and `Application Data` (a name on the problematic list). Both are real
+reparse points: `os.path.islink()` returns **False** for a junction while `isdir()`
+returns True, which is precisely why the scanner cannot rely on `islink` and carries its
+own reparse-attribute check.
+
+Three files were scanned, not four: `real/inside.txt`, `plain.txt`, and one copy reached
+through the benign junction, while `Application Data` was pruned before descent.
+
+That the benign junction IS followed is the documented behaviour —
+`_should_skip_junction` prunes only six legacy names (`application data`, `documents and
+settings`, `local settings`, `my documents`, `default user`, `all users`). A first probe
+with only a benign junction read its correct recursion as a missed skip; the pair is what
+distinguishes "the predicate works" from "the predicate always says yes".
+
+**Worth a follow-up.** Because pruning is name-based and real-path deduplication is
+present-but-disabled (TRAV-019), a junction pointing at one of its own ancestors and NOT
+carrying a legacy name has no cycle protection in either mechanism. Not asserted as a
+failure — no catalogued capability claims loop protection beyond the name list — and
+deliberately not probed, since the way to find out on a live endpoint is to hang it.
+
 ### The 500-finding book discrepancy — found, fixed, re-verified
 
 The first cancelled run booked `ok + undelivered = 69,650` against 69,150 findings. The
@@ -126,9 +149,7 @@ reaching them needs something we will not do to a live endpoint.
 | `RULE-027` | failed_rules/ is never pruned | the never-pruned property needs several runs against one scanner dir; each run here uses a fresh directory |
 | `RULE-028` | Un-splittable pack forensics | un-splittable-pack forensics needs a pack the splitter cannot divide at all |
 | `RULE-033` | Combined-compile failure reporting | combined-compile failure cannot be constructed deterministically: it needs rules that pass individually but fail together |
-| `TRAV-016` | Per-platform problematic-junction skip list | per-platform junction skip list needs a planted reparse point |
-| `TRAV-017` | Directory-level junction pruning during the walk | directory-level junction pruning needs a planted reparse point |
-| `TRAV-018` | File-level junction skip, counted | file-level junction skip needs a planted reparse point |
+| `TRAV-018` | File-level junction skip, counted | directory junctions are removed by the `dirs[:]` filter, which increments no counter; the counted file-level branch needs a FILE-type reparse point, not a directory junction. mklink /J creates only the latter. |
 | `TRAV-019` | Real-path deduplication (present but disabled) | real-path deduplication is present but DISABLED by design; no artefact reports it |
 | `TRAV-022` | Skip by bounded path fragment | the seeded tree contains no vendor-agent path; component-boundary matching is covered by tests/test_extra_skip_paths.py |
 | `TRAV-023` | Browser caches deliberately NOT skipped | browser caches are deliberately NOT skipped; observing that needs a host with a browser profile in the scan scope |
@@ -153,9 +174,7 @@ reaching them needs something we will not do to a live endpoint.
 | `RULE-027` | failed_rules/ is never pruned | supporting | ⛔ blocked | the never-pruned property needs several runs against one scanner dir; each run here uses a fresh directory |
 | `RULE-028` | Un-splittable pack forensics | supporting | ⛔ blocked | un-splittable-pack forensics needs a pack the splitter cannot divide at all |
 | `RULE-033` | Combined-compile failure reporting | supporting | ⛔ blocked | combined-compile failure cannot be constructed deterministically: it needs rules that pass individually but fail together |
-| `TRAV-016` | Per-platform problematic-junction skip list | supporting | ⛔ blocked | per-platform junction skip list needs a planted reparse point |
-| `TRAV-017` | Directory-level junction pruning during the walk | supporting | ⛔ blocked | directory-level junction pruning needs a planted reparse point |
-| `TRAV-018` | File-level junction skip, counted | supporting | ⛔ blocked | file-level junction skip needs a planted reparse point |
+| `TRAV-018` | File-level junction skip, counted | supporting | ⛔ blocked | 3 scanned, 0 skipped |
 | `TRAV-019` | Real-path deduplication (present but disabled) | supporting | ⛔ blocked | real-path deduplication is present but DISABLED by design; no artefact reports it |
 | `TRAV-022` | Skip by bounded path fragment | core | ⛔ blocked | the seeded tree contains no vendor-agent path; component-boundary matching is covered by tests/test_extra_skip_paths.py |
 | `TRAV-023` | Browser caches deliberately NOT skipped | supporting | ⛔ blocked | browser caches are deliberately NOT skipped; observing that needs a host with a browser profile in the scan scope |
@@ -252,7 +271,9 @@ reaching them needs something we will not do to a live endpoint.
 | `TRAV-012` | Symlinked directories listed but never recursed | supporting | ✅ pass | symlink planted=True, files_scanned=310 (a recursed loop would multiply this), outcome=completed |
 | `TRAV-013` | Unreadable directory entry demoted to a file | supporting | ✅ pass | skip breakdown: {'File too large': 1} |
 | `TRAV-014` | Unreadable directory tolerated, subtree abandoned | supporting | ✅ pass | unreadable dir planted=True, outcome=completed, skips={'File too large': 1} |
-| `TRAV-015` | Junction / reparse-point detection | supporting | ✅ pass | Windows run completed; no junctions were planted (creating one needs elevation on this host) |
+| `TRAV-015` | Junction / reparse-point detection | supporting | ✅ pass | planted ['jlink', 'Application Data'] — each reparse=True while islink=False, so detection came from the reparse attribute rather than islink |
+| `TRAV-016` | Per-platform problematic-junction skip list | supporting | ✅ pass | 3 files scanned with both junctions present: 2 real files plus one copy through the benign `jlink`, while `Application Data` was pruned (4 would mean it was followed too, 2 that the list is blanket) |
+| `TRAV-017` | Directory-level junction pruning during the walk | supporting | ✅ pass | the problematic junction's subtree was never walked — 3 files scanned, and its contents contributed none |
 | `TRAV-020` | Skip by file extension (disk-image containers) | supporting | ✅ pass | 19 planted (12 filler + .iso/.vmdk/.dmg + .DS_Store/Thumbs.db/desktop.ini + control.txt) -> 13 scanned, 13 matches |
 | `TRAV-021` | Skip by exact filename | supporting | ✅ pass | 6 skip-listed names planted alongside a control.txt carrying the same matching content; 13 of 19 scanned and control.txt was among them |
 | `TRAV-026` | Windows skip folders with component-boundary matching | supporting | ✅ pass | Windows component-boundary matching ran over 310 files without over-skipping (macOS/Linux parity: 310/309/310) |

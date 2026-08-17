@@ -11,9 +11,9 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 |---|---|---|---|---|---|
 | 1 | 53 | 53 | 0 | 0 | 0 |
 | 2 | 109 | 99 | 0 | 10 | 0 |
-| 3 | 121 | 102 | 0 | 19 | 0 |
+| 3 | 121 | 104 | 0 | 17 | 0 |
 
-**254 of 283 executed.**
+**256 of 283 executed.**
 
 ## All capabilities
 
@@ -77,10 +77,10 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 | `TRAV-012` | Symlinked directories listed but never recursed | 3 | supporting | ✅ pass | symlink planted=True, files_scanned=310 (a recursed loop would multiply this), outcome=completed | — |
 | `TRAV-013` | Unreadable directory entry demoted to a file | 3 | supporting | ✅ pass | skip breakdown: {'File too large': 1} | the demote-to-file branch shares a counter with other unreadable entries |
 | `TRAV-014` | Unreadable directory tolerated, subtree abandoned | 3 | supporting | ✅ pass | unreadable dir planted=True, outcome=completed, skips={'File too large': 1} | — |
-| `TRAV-015` | Junction / reparse-point detection | 3 | supporting | ✅ pass | Windows run completed; no junctions were planted (creating one needs elevation on this host) | junction detection needs a planted reparse point |
-| `TRAV-016` | Per-platform problematic-junction skip list | 3 | supporting | ⛔ blocked | — | per-platform junction skip list needs a planted reparse point |
-| `TRAV-017` | Directory-level junction pruning during the walk | 3 | supporting | ⛔ blocked | — | directory-level junction pruning needs a planted reparse point |
-| `TRAV-018` | File-level junction skip, counted | 3 | supporting | ⛔ blocked | — | file-level junction skip needs a planted reparse point |
+| `TRAV-015` | Junction / reparse-point detection | 3 | supporting | ✅ pass | planted ['jlink', 'Application Data'] — each reparse=True while islink=False, so detection came from the reparse attribute rather than islink | — |
+| `TRAV-016` | Per-platform problematic-junction skip list | 3 | supporting | ✅ pass | 3 files scanned with both junctions present: 2 real files plus one copy through the benign `jlink`, while `Application Data` was pruned (4 would mean it was followed too, 2 that the list is blanket) | — |
+| `TRAV-017` | Directory-level junction pruning during the walk | 3 | supporting | ✅ pass | the problematic junction's subtree was never walked — 3 files scanned, and its contents contributed none | — |
+| `TRAV-018` | File-level junction skip, counted | 3 | supporting | ⛔ blocked | 3 scanned, 0 skipped | directory junctions are removed by the `dirs[:]` filter, which increments no counter; the counted file-level branch needs a FILE-type reparse point, not a directory junction. mklink /J creates only… |
 | `TRAV-019` | Real-path deduplication (present but disabled) | 3 | supporting | ⛔ blocked | — | real-path deduplication is present but DISABLED by design; no artefact reports it |
 | `TRAV-020` | Skip by file extension (disk-image containers) | 3 | supporting | ✅ pass | 19 planted (12 filler + .iso/.vmdk/.dmg + .DS_Store/Thumbs.db/desktop.ini + control.txt) -> 13 scanned, 13 matches | — |
 | `TRAV-021` | Skip by exact filename | 3 | supporting | ✅ pass | 6 skip-listed names planted alongside a control.txt carrying the same matching content; 13 of 19 scanned and control.txt was among them | — |
