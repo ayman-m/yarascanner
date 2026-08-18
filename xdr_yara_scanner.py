@@ -177,6 +177,30 @@ CIRCUIT_RESET_TIMEOUT_SECS = 40      # stay open before probing again
 WORKER_GET_TIMEOUT_SECS = 2.0        # queue.get timeout to allow graceful exit checks
 THREAD_CLEANUP_TIMEOUT = 60          # Maximum time to wait for thread cleanup
 
+# Per-worker throughput reporting fires every 100 files PROCESSED, so its volume scales
+# with file count rather than with time. On the XSIAM side one scan wrote 3,260 of these
+# lines, burying the six governor samples that actually diagnose a scan; a 10M-file server
+# would write ~100,000 lines and ~12 MB, per run, on the endpoint's disk. Throughput is a
+# sampled gauge, so it is bounded on the axis that matters: the 100-file trigger stays the
+# sampling point, and this gate decides whether the sample is written, at the same cadence
+# the governor and progress heartbeats already use. 0 disables it.
+WORKER_REPORT_MIN_SECS = _env_number("YARA_WORKER_REPORT_SECS", 30, minimum=0)
+
+
+def _worker_report_due(last_report, now, interval=None):
+    """Whether a worker's throughput sample should be written.
+
+    A worker's FIRST report always lands (last_report == 0), so a scan too short to span
+    one interval still produces a throughput reading rather than none at all.
+    """
+    if interval is None:
+        interval = WORKER_REPORT_MIN_SECS
+    if not interval:
+        return True
+    if not last_report:
+        return True
+    return (now - last_report) >= interval
+
 
 DEFAULT_XDR_API_KEY = "replace_with_xdr_standard_api_key"
 DEFAULT_XDR_API_ID = "replace_with_xdr_standard_api_id"
@@ -1230,6 +1254,9 @@ class CpuGovernor:
         self.sleep_ratio = 0.0
         self.slept_total = 0.0
         self.floor_hits = 0
+        self.samples_taken = 0
+        self.last_sample_at = None
+        self.last_sample_gap = None
         self.last_own = 0.0
         self.last_others = 0.0
         self.last_target = None
@@ -1259,13 +1286,15 @@ class CpuGovernor:
             return self.floor_pct
         return target
 
-    def update(self, own_raw_pct, system_pct):
+    def update(self, own_raw_pct, system_pct, now=None):
         """Recompute the sleep ratio from a fresh pair of CPU readings.
 
         own_raw_pct is psutil's PROCESS reading (percent of one core); system_pct is the
         machine-wide reading. `others` is what everyone else is using - deriving it as
         (system - own) is what makes this immune to the original bug: the scanner reacts
         to external load only by shrinking its own share, never by halting.
+
+        `now` is injectable so the sampling cadence can be tested without sleeping.
 
         Returns the target share, or None when disabled.
         """
@@ -1275,12 +1304,23 @@ class CpuGovernor:
         others = max(0.0, float(system_pct) - own)
         target = self.compute_target(others)
         error = own - target
+        stamp = time.time() if now is None else float(now)
         with self._lock:
             ratio = self.sleep_ratio + (self.GAIN * error)
             self.sleep_ratio = max(0.0, min(self.RATIO_MAX, ratio))
             self.last_own = own
             self.last_others = others
             self.last_target = target
+            # Counted where readings are CONSUMED, not where they are logged. The
+            # `CPU governor |` line is emitted on a change threshold plus a 30 s
+            # heartbeat, so line spacing measures the emission policy and not the
+            # sampling rate; on a steady scan the two diverge completely. Without these
+            # an operator cannot tell "readings are steady so nothing is worth emitting"
+            # from "sampling has stalled" - both simply produce fewer lines.
+            self.last_sample_gap = (None if self.last_sample_at is None
+                                    else round(stamp - self.last_sample_at, 3))
+            self.last_sample_at = stamp
+            self.samples_taken += 1
         return target
 
     def pace(self, work_secs):
@@ -1311,6 +1351,9 @@ class CpuGovernor:
             "ratio": round(self.sleep_ratio, 3),
             "slept_secs": round(self.slept_total, 2),
             "floor_hits": self.floor_hits,
+            # Sampling cadence, distinct from the EMISSION cadence these lines appear at.
+            "samples_taken": self.samples_taken,
+            "secs_since_last_sample": self.last_sample_gap,
         }
 
 
@@ -6024,6 +6067,8 @@ rule test {{
         worker_id = threading.current_thread().name
         files_processed = 0
         errors_encountered = 0
+        # Per-worker, so one busy worker cannot rate-limit another's reporting.
+        last_report_at = 0.0
         
         self.log_manager.log_system(f"Worker {worker_id} started")
         
@@ -6047,7 +6092,9 @@ rule test {{
                             self.skip_reasons[reason] += 1
                         self.last_scanned_file = fp
                     
-                    if files_processed % 100 == 0 and files_processed > 0:
+                    if (files_processed % 100 == 0 and files_processed > 0
+                            and _worker_report_due(last_report_at, time.time())):
+                        last_report_at = time.time()
                         avg_time_ms = sum(self.worker_processing_times[worker_id]) / len(self.worker_processing_times[worker_id]) * 1000
                         error_rate = (errors_encountered / files_processed) * 100
                         

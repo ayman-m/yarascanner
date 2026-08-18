@@ -36,14 +36,14 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-EDITION = "xsiam_yara_scanner"
+EDITIONS = ["xsiam_yara_scanner", "xdr_yara_scanner"]
 
 
-def _mod(env=None):
+def _mod(edition, env=None):
     patcher = mock.patch.dict(os.environ, env or {}, clear=False)
     patcher.start()
     try:
-        return importlib.reload(importlib.import_module(EDITION))
+        return importlib.reload(importlib.import_module(edition))
     finally:
         patcher.stop()
 
@@ -51,12 +51,14 @@ def _mod(env=None):
 @pytest.fixture(autouse=True)
 def _restore():
     yield
-    if EDITION in sys.modules:
-        importlib.reload(sys.modules[EDITION])
+    for name in EDITIONS:
+        if name in sys.modules:
+            importlib.reload(sys.modules[name])
 
 
-def test_knob_exists_with_a_30s_default():
-    m = _mod()
+@pytest.mark.parametrize("edition", EDITIONS)
+def test_knob_exists_with_a_30s_default(edition):
+    m = _mod(edition)
     assert hasattr(m, "WORKER_REPORT_MIN_SECS"), (
         "no time gate on per-worker throughput reporting — log volume still scales with "
         "file count, so a 10M-file host writes ~100,000 lines per run")
@@ -65,13 +67,15 @@ def test_knob_exists_with_a_30s_default():
         f"got {m.WORKER_REPORT_MIN_SECS}")
 
 
-def test_env_override_is_honoured():
-    m = _mod({"YARA_WORKER_REPORT_SECS": "5"})
+@pytest.mark.parametrize("edition", EDITIONS)
+def test_env_override_is_honoured(edition):
+    m = _mod(edition, {"YARA_WORKER_REPORT_SECS": "5"})
     assert m.WORKER_REPORT_MIN_SECS == 5
 
 
-def test_zero_disables_the_gate():
-    m = _mod({"YARA_WORKER_REPORT_SECS": "0"})
+@pytest.mark.parametrize("edition", EDITIONS)
+def test_zero_disables_the_gate(edition):
+    m = _mod(edition, {"YARA_WORKER_REPORT_SECS": "0"})
     assert m.WORKER_REPORT_MIN_SECS == 0, (
         "0 must mean 'no rate limit', matching every other bound in this file")
 
@@ -81,37 +85,42 @@ def _gate(m, last_report, now, interval):
     return m._worker_report_due(last_report, now, interval)
 
 
-def test_first_sample_always_lands():
+@pytest.mark.parametrize("edition", EDITIONS)
+def test_first_sample_always_lands(edition):
     """A short scan must still produce one throughput reading per worker."""
-    m = _mod()
+    m = _mod(edition)
     assert _gate(m, 0.0, 1000.0, 30) is True, (
         "a worker's first report was suppressed — short scans would emit no throughput "
         "sample at all")
 
 
-def test_second_sample_within_the_interval_is_suppressed():
-    m = _mod()
+@pytest.mark.parametrize("edition", EDITIONS)
+def test_second_sample_within_the_interval_is_suppressed(edition):
+    m = _mod(edition)
     assert _gate(m, 1000.0, 1005.0, 30) is False
 
 
-def test_sample_after_the_interval_is_emitted():
-    m = _mod()
+@pytest.mark.parametrize("edition", EDITIONS)
+def test_sample_after_the_interval_is_emitted(edition):
+    m = _mod(edition)
     assert _gate(m, 1000.0, 1031.0, 30) is True
 
 
-def test_zero_interval_emits_every_time():
+@pytest.mark.parametrize("edition", EDITIONS)
+def test_zero_interval_emits_every_time(edition):
     """With the gate off, behaviour is exactly the old every-100-files reporting."""
-    m = _mod()
+    m = _mod(edition)
     assert _gate(m, 1000.0, 1000.01, 0) is True
 
 
-def test_volume_scales_with_duration_not_file_count():
+@pytest.mark.parametrize("edition", EDITIONS)
+def test_volume_scales_with_duration_not_file_count(edition):
     """The property the fix exists for, stated as arithmetic.
 
     Two scans of the same DURATION emit the same number of reports even when one
     processes fifty times as many files.
     """
-    m = _mod()
+    m = _mod(edition)
 
     def emitted(n_files, duration_secs, interval=30):
         last, count, now = 0.0, 0, 0.0

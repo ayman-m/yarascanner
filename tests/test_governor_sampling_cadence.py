@@ -31,14 +31,14 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-EDITION = "xsiam_yara_scanner"
+EDITIONS = ["xsiam_yara_scanner", "xdr_yara_scanner"]
 
 
-@pytest.fixture()
-def mod():
-    m = importlib.reload(importlib.import_module(EDITION))
+@pytest.fixture(params=EDITIONS)
+def mod(request):
+    m = importlib.reload(importlib.import_module(request.param))
     yield m
-    importlib.reload(importlib.import_module(EDITION))
+    importlib.reload(importlib.import_module(request.param))
 
 
 def _gov(mod, **kw):
