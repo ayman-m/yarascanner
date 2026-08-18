@@ -5091,6 +5091,8 @@ class YaraScanner:
         self.initial_fd_count = getattr(config, 'initial_fd_count', 0)
         self.fd_check_interval = 1000
         self.files_since_fd_check = 0
+        self.fd_samples_taken = 0
+        self.last_fd_count = None
 
         self.log_manager = log_manager if log_manager else LogManager(config)
         self.stats_manager = stats_manager if stats_manager else StatisticsManager(config, self.log_manager)
@@ -6183,6 +6185,56 @@ rule test {{
             )
             return None
             
+    def _maybe_sample_fds(self):
+        """Advance the FD sampling counter and take a reading on the interval.
+
+        Called once per file PROCESSED, before any early return. It used to be inlined at
+        the end of scan_file, after the matched and skipped returns, so it only ran on
+        files that were scanned and did not match; on a ruleset matching everything it
+        never ran at all. FD monitoring went quiet exactly when the scanner held the most
+        handles.
+
+        The counter moves under lock_counts. Unlocked, the read-modify-write raced across
+        workers and silently dropped increments, making the effective interval longer than
+        configured and impossible to reason about from the settings.
+
+        A healthy sample records last_fd_count and bumps fd_samples_taken. Previously only
+        threshold breaches emitted anything, so "sampled and fine" and "never sampled"
+        left identical evidence.
+
+        Never raises: a scan is worth more than its FD telemetry, and a failed read is not
+        counted as a sample taken.
+        """
+        if not self.fd_monitoring_enabled:
+            return
+        with self.lock_counts:
+            self.files_since_fd_check += 1
+            if self.files_since_fd_check < self.fd_check_interval:
+                return
+            self.files_since_fd_check = 0
+
+        if platform.system() == "Windows":
+            return
+        try:
+            current_process = psutil.Process()
+            if not hasattr(current_process, "num_fds"):
+                return
+            current_fds = current_process.num_fds()
+        except Exception:
+            return
+
+        with self.lock_counts:
+            self.fd_samples_taken += 1
+            self.last_fd_count = current_fds
+
+        fd_increase = current_fds - self.initial_fd_count
+        if fd_increase > 100:
+            self.log_manager.log_system(
+                f"FD usage increased by {fd_increase} (current: {current_fds})")
+        if current_fds > 900:
+            self.log_manager.log_system(f"WARNING: High FD usage: {current_fds}")
+
+
     def scan_file(self, file_path):
         """Scan single file with YARA rules."""
         worker_start_time = time.time()
@@ -6192,6 +6244,10 @@ rule test {{
         file_creation_time = None
         
         try:
+            # Before every early return: sampling must not depend on a file surviving
+            # to the end of this method.
+            self._maybe_sample_fds()
+
             if not os.path.exists(file_path):
                 return False, "File does not exist"
 
@@ -6280,33 +6336,6 @@ rule test {{
                     }
                 )
                 return True, "Scanned and matched"
-
-            if self.fd_monitoring_enabled:
-                self.files_since_fd_check += 1
-                if self.files_since_fd_check >= self.fd_check_interval:
-                    self.files_since_fd_check = 0
-                    try:
-                        if platform.system() != "Windows":
-                            try:
-                                current_process = psutil.Process()
-                                if hasattr(current_process, 'num_fds'):
-                                    current_fds = current_process.num_fds()
-                                    fd_increase = current_fds - self.initial_fd_count
-                                    
-                                    if fd_increase > 100:
-                                        self.log_manager.log_system(
-                                            f"FD usage increased by {fd_increase} (current: {current_fds})"
-                                        )
-                                        
-                                    if current_fds > 900:
-                                        self.log_manager.log_system(
-                                            f"WARNING: High FD usage: {current_fds}"
-                                        )
-                            except Exception:
-                                pass
-                                    
-                    except Exception:
-                        pass
 
             return True, "Scanned but not matched"
             

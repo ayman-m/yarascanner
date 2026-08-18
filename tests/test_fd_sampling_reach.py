@@ -31,6 +31,15 @@ SILENCE      The only outputs were threshold breaches (>100 growth, >900 open). 
 
 The fix is to sample on files PROCESSED rather than on files that happened to survive to
 the end, under the existing counter lock, and to record that a sample happened.
+
+Both editions carry independent copies of this code and the defect was present in both.
+The line numbers above are the XSIAM ones; XDR had the identical shape:
+
+    6282  return True,  "Scanned and matched"     <- every MATCHED file
+    6284  if self.fd_monitoring_enabled: ...       <- only clean unmatched files reach here
+    6285  self.files_since_fd_check += 1           <- unlocked, same race
+
+Parametrising over both editions is what keeps them from drifting apart again.
 """
 import importlib
 import os
@@ -42,14 +51,14 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-EDITION = "xsiam_yara_scanner"
+EDITIONS = ["xsiam_yara_scanner", "xdr_yara_scanner"]
 
 
-@pytest.fixture()
-def mod():
-    m = importlib.reload(importlib.import_module(EDITION))
+@pytest.fixture(params=EDITIONS)
+def mod(request):
+    m = importlib.reload(importlib.import_module(request.param))
     yield m
-    importlib.reload(importlib.import_module(EDITION))
+    importlib.reload(importlib.import_module(request.param))
 
 
 def _scanner(mod, interval=5):
