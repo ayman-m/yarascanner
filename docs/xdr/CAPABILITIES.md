@@ -72,9 +72,9 @@ not preserved — it was measured to cost up to 65.9x scan time while protecting
 | &nbsp;&nbsp;Local Storage & Host Footprint | 70 |
 | &nbsp;&nbsp;Delivery, Aggregation & Telemetry | 82 |
 | &nbsp;&nbsp;Scan Lifecycle, Control & Error Handling | 81 |
-| ⚠ Observability gaps | 24 |
+| ⚠ Observability gaps | 22 |
 
-**24 open observability gaps**, after triage — down from the 40 originally recorded (33 entries still carry an inline ⚠ marker).
+**22 open observability gaps**, after triage — down from the 40 originally recorded (29 capability entries still carry an inline ⚠ marker; two further occurrences of the marker, in the legend above and under *Observability status*, are not entries). These counts are now derived by parsing this file rather than maintained by hand — see *Provenance*.
 
 The closed ones were never really broken. `setup_logging()` used to
 remove every root handler and pin `WARNING`, so all 44 `logging.info(...)` calls in this
@@ -2392,15 +2392,17 @@ scanner_dir is injected into each platform's skip list so the scanner never scan
 - **Observe:** statistics_<run_id>.log 'Skip reasons: ...' line with its skip_breakdown data (6641-6646) shows the exclusions; no alert ever names a path under scanner_dir. On a targeted scan of scanner_dir itself, the result line carries 'WARNING: N requested target(s) EXCLUDED by the skip list' (7521-7524) and scan_errors_<run_id>.log carries 'Requested scan target is excluded by the skip list...' (6862-6866); scan_summary_<run_id>.json carries excluded_targets (7635).
 - **Source:** `Windows lines 2908-2925 (normalize 2923); Linux lines 2927-2939; Darwin lines 2941-2976; matcher lines 6280-6360 (bare-root tests 6322, 6345); excluded-target reporting lines 6856-6866 and 7514-7524`
 
-### macOS case-sensitivity probe writes and deletes /tmp/CaSe_TeSt_YaRa_<pid> per scanned file  <sub>darwin</sub>
+### macOS case-sensitivity probe, answered once per process  <sub>darwin</sub>
 
-**⚠ OBSERVABILITY GAP**  
-_get_real_path calls _is_case_sensitive_fs() on Darwin, and that function creates, writes, stats and removes a probe file in /tmp on every call — with NO caching or memoisation of any kind. _get_real_path has exactly one caller, scan_file line 6132, reached for every file that passed the exists / read-permission / _is_special_file gates, so a macOS scan performs one create + one existence check + one unlink in /tmp for essentially EVERY file it examines. This is host footprint outside scanner_dir entirely, and it is invisible in every log. The PID suffix keeps concurrent processes from colliding. The probe's RESULT is used (a False result lowercases the returned path at 503/513), but because nothing caches it a case-sensitive volume pays exactly the same per-file I/O cost as a case-insensitive one.
+On macOS the filesystem's case sensitivity is decided by experiment — create `/tmp/CaSe_TeSt_YaRa_<pid>`, write, stat the lowercased name, unlink. The answer is computed ONCE per process and cached.
 
-- **Control:** Not configurable (path literal line 467) — default `/tmp/CaSe_TeSt_YaRa_<pid>`
-- **Observe:** UNOBSERVABLE: nothing in any of the seven log files records it. Confirm with `fs_usage -f filesys \| grep CaSe_TeSt_YaRa` (or dtrace) on the macOS endpoint during a scan, or by watching /tmp inode churn. There is no artefact left behind, since the probe is unlinked immediately (and any failure is swallowed by the bare except at 474-475, which reports 'not case-sensitive'). To close it: NEEDS_INSTR. Minimal: memoize + log once in _is_case_sensitive_fs - add a module-level cache (e.g. `_CASE_SENSITIVE_FS = None`) and, on the first Darwin evaluation, emit logging.info(f"Case-sensitivity probe (/tmp/CaSe_TeSt_YaRa_{os.getpid()}): case_sensitive={result}") plus logging.info on the except arm at 536-537 recording the probe failure before returning False. Because every caller path runs inside the scanner (after setup_logging at 7461), that line lands in logs/diagnostics_<run_id>.log. Ideally also add a `case_sensitive_fs` boolean to scan_summary so the decision is visible without reading the log.
-- **Source:** `_is_case_sensitive_fs lines 462-477 (Darwin branch 466-475); _get_real_path Darwin branches lines 501-505 and 511-515; sole caller scan_file line 6132 (after gates at 6100, 6103, 6129)`
+It used to be computed per file. `_get_real_path()` is called from `scan_file()` for every file past the pre-checks, so a 48,921-file macOS scan performed ~49,000 create/write/stat/unlink cycles in /tmp to re-answer a question whose answer cannot change while the process lives. That was also the scanner's only PER-FILE write outside scanner_dir — a tool reading the disk to look for malware should not leave tens of thousands of file creations behind on the host it is scanning, and another EDR watching /tmp has every reason to find that interesting.
 
+A FAILED probe is cached too: otherwise an unwritable /tmp costs one exception per scanned file, which is the worst case rather than the rare one. The probe runs under a lock so racing workers cannot double-probe. Windows and Linux answer from policy and never touch the disk. The former bare `except:` is now `except Exception:` — on a per-file path it had ~49,000 opportunities per scan to swallow a KeyboardInterrupt.
+
+- **Control:** Not configurable — the probe path is a literal with no env knob. The cache is process-lifetime (`_CASE_SENSITIVE_FS`), guarded by `_CASE_PROBE_LOCK`, and `case_probe_count()` reports how many probes actually touched the filesystem. — default `one probe per process on Darwin; zero on Windows and Linux`
+- **Observe:** `case_probe_count()` after a macOS scan — 1, not one per scanned file — with no leftover `/tmp/CaSe_TeSt_YaRa_*`. Windows and Linux answer from policy and never probe, so the counter stays 0 there; that is what distinguishes 'cached after one run' from 'the platform branch never ran', which both leave zero files on disk.
+- **Source:** `_is_case_sensitive_fs() (Windows arm, Darwin probe, Linux arm); module cache _CASE_SENSITIVE_FS / _CASE_PROBE_COUNT / _CASE_PROBE_LOCK; case_probe_count(); _get_real_path() Darwin branches (try and except paths); sole call site real_path = _get_real_path(file_path) in scan_file, after the pre-checks. Pinned by tests/test_case_probe_cached.py, parametrised over both editions.`
 ### Per-file size ceiling bounds how much the scanner reads off the disk
 
 Files larger than max_file_bytes are rejected before yara.match, so they are never read. The env parser enforces minimum=0 specifically because a NEGATIVE value parsed fine and made max_file_bytes negative — every file then failed the size check and the scan reported success having scanned nothing. 0 legitimately means 'no size cap' (the falsy short-circuit at 2829 and the `if max_bytes` guard at 6143).
@@ -3536,15 +3538,17 @@ On a cache hit the whole per-rule loop is skipped, so valid/failed/skipped count
 - **Observe:** scan_summary_<run_id>.json "compile_source":"cache"\|"fresh" (7651) and "compile_seconds" (7652); logs/system_<run_id>.log "Rule cache HIT rules_<key>.yarac load=N.NNs (valid=… failed=… skipped=…)" (5581-5585) or "Rule cache miss/unusable, compiling fresh: …" (5588-5589) or "Rule compile FRESH N.NNs" (5599); files under <scanner_dir>/rule_cache/ (rules_*.yarac + .meta.json).
 - **Source:** `_load_or_compile_rules 5559-5600 (cache branch gated at 5565); _restore_cache_meta 5478-5497; _save_rule_cache 5499-5525; _prune_rule_cache 5527-5557; _rule_cache_dir 5458-5461`
 
-### setup_logging strips the root logger — every logging.info in the file is dead
+### Root-logger INFO records land in diagnostics_<run_id>.log
 
-**⚠ OBSERVABILITY GAP**  
-setup_logging closes and removes ALL root handlers and pins the level to WARNING. Because no handler is left, WARNING/ERROR records fall through to Python's lastResort handler and still reach stderr, but every logging.info() call in the module — including the entire CleanupManager status trail and host-cleanup's success line — produces nothing on any host. Structured logging must go through LogManager (which owns its own per-category FileHandlers, _setup_logger 2131-2155 with propagate=False at 2155) or ErrorLogger (whose yara_processing handler is set to INFO with propagate=False, so ITS info calls do survive).
+`setup_logging()` closes and removes all inherited root handlers, then installs two of its own: a `StreamHandler` at WARNING (so interactive runs still surface fatal issues on stderr) and a `FileHandler` at INFO writing `logs/diagnostics_<run_id>.log`. stdout stays clean, which is the constraint that shaped this — Action Center truncates a script's stdout at 10,240 characters, and a chatty scan would push the SCAN_RESULT line out of the window entirely.
 
-- **Control:** Not configurable — default `root level WARNING, zero handlers`
-- **Observe:** UNOBSERVABLE for root-logger info-level calls: nothing is written anywhere. To observe those code paths, use the LogManager files (system_/scan_errors_/statistics_<run_id>.log), the ErrorLogger file (yara_processing_<run_id>.log), or the on-disk side effects; only logging.warning/error text appears, on stderr.
-- **Source:** `setup_logging 6954-6968; called at 7290; ErrorLogger's independent INFO FileHandler 1502-1528; LogManager._setup_logger 2131-2155`
+This used to drop every handler and pin WARNING. The side effect was that the ~45 bare `logging.info(...)` calls in this file reached nothing on any host — including the whole CleanupManager status trail and host-cleanup's success line — and for a number of capabilities an info line is the only evidence the behaviour ran at all, which is what made them impossible to verify on a live scan.
 
+The three categorized loggers (error, exception, webhook) set `propagate=False`, so nothing they emit is duplicated into the diagnostics file. Structured, per-category logging still goes through LogManager, which owns its own FileHandlers.
+
+- **Control:** Not configurable — default `root: StreamHandler at WARNING + FileHandler at INFO -> logs/diagnostics_<run_id>.log`
+- **Observe:** `logs/diagnostics_<run_id>.log` exists after any run and carries INFO lines from the bare `logging.*` call sites. Negative control: the same text must NOT appear on stdout, whose budget is reserved for the result line. WARNING and above additionally reach stderr.
+- **Source:** `setup_logging(); the diagnostics FileHandler it installs; ErrorLogger's independent INFO FileHandler; LogManager._setup_logger (propagate=False). Pinned by tests/test_root_logging_sink.py, which covers both editions.`
 ### ScanStatusUploader.set_status — a lifecycle state machine that emits nothing
 
 **⚠ OBSERVABILITY GAP**  
