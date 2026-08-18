@@ -1,14 +1,19 @@
 # `fix/xsiam-evidence-footprint` — what this branch changes
 
-64 commits. 45 files, +15,559 / −2,133. `xsiam_yara_scanner.py` moves +1,033 / −579; the
-rest is tests (20 new files, 460 passing) and the capability/test documentation.
+70 commits. 47 files, +16,146 / −2,210. Tests and the capability/test documentation are
+most of it; 496 tests pass, up from 460 when the rounds closed.
 
-`xdr_yara_scanner.py` also changes on this branch (+902), but entirely from the SIXTEEN
-commits that predate the acceptance rounds — cross-edition fixes that landed in both
-editions together. **No round-driven fix touches it.** That distinction matters below.
+The branch does three things: it **executes every catalogued XSIAM capability against
+live endpoints** for the first time, it **fixes what that found**, and it **ports those
+fixes into the XDR edition**.
 
-The branch does two things: it **executes every catalogued XSIAM capability against live
-endpoints** for the first time, and it **fixes what that found**.
+`xdr_yara_scanner.py` moves +741 / −445 on the branch overall (`xsiam_yara_scanner.py`, +1,033 / −579). Two distinct groups of
+commits touch it, and the distinction matters below:
+
+- **Sixteen commits predating the rounds** — cross-edition fixes that landed in both
+  editions together, unrelated to the acceptance work.
+- **Six commits after the rounds closed** (+207 / −77) — the round findings ported
+  across, each re-derived against the XDR source rather than taken on trust.
 
 ---
 
@@ -45,16 +50,21 @@ these. In rough order of consequence:
 21 not-covered capabilities grouped by reason. This is the document to read if you want
 the findings rather than the diff.
 
-**3. `docs/xsiam/rounds/XDR_PORTING_NOTE.md`** — **two of these defects exist unfixed in
-`xdr_yara_scanner.py` with the identical shape.** The rounds were scoped to XSIAM, so no
-round-driven fix was applied there (the XDR diff on this branch is all pre-round
-cross-edition work). One further defect looks the same there but must not be blind-ported: XDR's
-uploader deliberately holds `stop_upload_thread` false during a rate-limited requeue
-window, so forcing an early break could cause the loss the XSIAM fix prevents.
+**3. `docs/xsiam/rounds/XDR_PORTING_NOTE.md`** — the port, and the three places XDR
+turned out to differ. Every defect above existed in both editions; none was ported on
+the strength of the XSIAM finding alone. Two differences are worth a reviewer's time: the dict-hit path
+had a *producer* in XDR that XSIAM never had (dead code feeding a dead branch, removed
+together), and the stop-flag caveat this note previously carried — that XDR's deliberate
+requeue window made the fix unsafe — inverted on inspection, because that window closes
+before the flag is set. There is now a test that watches the flag during the drain and
+asserts it, rather than leaving it argued.
 
-**4. `tests/`** — 20 new files. Each was written failing first, and the docstrings carry
-the measured numbers that motivated them, so a reviewer can see what real behaviour the
-test is pinning rather than inferring intent from assertions.
+**4. `tests/`** — 25 files, 496 passing. Each was written failing first, and the
+docstrings carry the measured numbers that motivated them, so a reviewer can see what
+real behaviour the test is pinning rather than inferring intent from assertions. Five
+files that were XSIAM-only are now parametrised over both editions: the two scanners
+carry independent copies of this code, and a duplicated test file drifts as easily as
+the code it guards.
 
 ---
 
@@ -90,7 +100,7 @@ is what confirmed that behaviour, not the unit tests.
   ancestor without a legacy name has protection from neither. Verified live that a benign
   junction *is* followed; deliberately not probed further, because confirming it on a live
   endpoint means hanging the endpoint.
-- **XDR port**, per the porting note above.
+XDR port: **closed**, per the porting note above.
 
 ---
 
