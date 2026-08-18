@@ -7213,6 +7213,47 @@ rule test {{
 # MAIN EXECUTION
 # ============================================================================
 
+_DIAGNOSTICS_HANDLER = None      # the root FileHandler setup_logging() installs, if any
+
+
+def close_diagnostics_handler():
+    """Close and detach the root diagnostics FileHandler. Returns whether one was open.
+
+    Windows refuses to delete a file that is still open, so every per-run log handler
+    must be closed before anything tries to remove the logs directory. There are EIGHT:
+    LogManager owns six category handlers, ErrorLogger owns yara_processing, and
+    setup_logging() installs this one on the ROOT logger. Only the first seven were ever
+    closed.
+
+    It is the worst one to leave open, because host cleanup's own messages cannot go
+    through LogManager (already closed by then) and use the plain `logging` module
+    instead - so cleanup writes its progress INTO the file it is about to unlink,
+    guaranteeing the handle is hot at exactly the wrong moment. os.remove() then fails
+    with WinError 32, which is recorded as an error rather than raised, and the endpoint
+    keeps one diagnostics_<run_id>.log per scan forever.
+
+    The WARNING StreamHandler is deliberately left attached: cleanup's warnings still
+    need somewhere to go, and stderr is not the capped resource.
+
+    Idempotent, and never raises - this runs on the shutdown path, where a failure would
+    mask the run's actual result.
+    """
+    global _DIAGNOSTICS_HANDLER
+    handler = _DIAGNOSTICS_HANDLER
+    if handler is None:
+        return False
+    _DIAGNOSTICS_HANDLER = None
+    try:
+        logging.root.removeHandler(handler)
+    except Exception:
+        pass
+    try:
+        handler.close()
+    except Exception:
+        pass
+    return True
+
+
 def setup_logging(config):
     """Keep the root logger off stdout, but give its INFO records somewhere to land.
 
@@ -7249,17 +7290,20 @@ def setup_logging(config):
                 "%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
             logging.root.addHandler(diag)
             logging.root.setLevel(logging.INFO)
+            global _DIAGNOSTICS_HANDLER
+            _DIAGNOSTICS_HANDLER = diag
         except Exception as e:
             # No disk sink is survivable - the scan still runs, it just loses the
             # info-level trail. Keep the old WARNING behaviour rather than failing.
             logging.root.setLevel(logging.WARNING)
-            print(f"Diagnostics log unavailable ({e}); root logging stays at WARNING")
+            print(f"Diagnostics log unavailable ({e}); root logging stays at WARNING",
+                  file=sys.stderr)
 
         # Third-party INFO chatter would bury our own records in that file.
         for noisy in ("urllib3", "requests", "charset_normalizer", "chardet", "yara"):
             logging.getLogger(noisy).setLevel(logging.WARNING)
     except Exception as e:
-        print(f"Error configuring root logger: {e}")
+        print(f"Error configuring root logger: {e}", file=sys.stderr)
 
 
 def upload_final_comprehensive_report(scanner, total_scan_time):
@@ -8004,6 +8048,11 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
                                 log_manager.stop_logging()
                             if _el is not None and hasattr(_el, "close"):
                                 _el.close()
+                            # The eighth handler. setup_logging() put a FileHandler for
+                            # diagnostics_<run_id>.log on the ROOT logger, and the
+                            # `log=logging.warning` below writes through it - into the
+                            # file being deleted. Windows then refuses the unlink.
+                            close_diagnostics_handler()
                             _hc = HostCleanup(config, CONFIG_HOST_CLEANUP, CONFIG_HOST_CLEANUP_KEEP)
                             _delivery_enabled = bool(getattr(config, "create_alerts", False)
                                                      or getattr(config, "write_dataset", False))
