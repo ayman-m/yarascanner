@@ -1362,7 +1362,7 @@ class ErrorLogger:
             error_logger.info("=" * 50)
             
         except Exception as e:
-            print(f"Failed to setup error logger: {e}")
+            print(f"Failed to setup error logger: {e}", file=sys.stderr)
             return logging.getLogger()
         
         return error_logger
@@ -1552,7 +1552,7 @@ class ExceptionLogger:
             exception_logger.error("=" * 60)
 
         except Exception as e:
-            print(f"Failed to setup exception logger: {e}")
+            print(f"Failed to setup exception logger: {e}", file=sys.stderr)
             exception_logger = logging.getLogger()
 
         self.exception_logger = exception_logger
@@ -1969,7 +1969,7 @@ class LogManager:
             return logger
             
         except Exception as e:
-            print(f"Failed to setup logger for {log_type.value}: {e}")
+            print(f"Failed to setup logger for {log_type.value}: {e}", file=sys.stderr)
             return logging.getLogger()
 
     def _start_webhook_thread(self):

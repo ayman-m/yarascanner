@@ -121,3 +121,27 @@ def test_setup_logging_never_writes_to_stdout(mod, tmp_path):
     assert out.getvalue() == "", (
         f"setup_logging wrote {out.getvalue()!r} to stdout; that budget belongs to "
         f"SCAN_RESULT, and a logging failure is exactly the kind that repeats")
+
+
+def test_no_logger_setup_path_writes_to_stdout(mod):
+    """Every logger-setup fallback, not just setup_logging's.
+
+    ErrorLogger, the exception logger and LogManager._setup_logger each announce a failed
+    FileHandler with print(). They share setup_logging's problem and its blast radius: a
+    logging failure is exactly the kind that repeats, and stdout is capped at 10,240
+    characters with the SCAN_RESULT line depending on what is left.
+
+    LogManager._setup_logger is the worst of the three, because its except arm also
+    returns the bare root logger -- so that category silently stops having its own file
+    while its records leak into the root sink.
+    """
+    import inspect
+    src = inspect.getsource(mod)
+    offenders = [ln.strip() for ln in src.split("\n")
+                 if ln.strip().startswith("print(")
+                 and "file=sys.stderr" not in ln
+                 and "SCAN_RESULT" not in ln
+                 and not ln.strip().startswith("print(f\"Diagnostics log unavailable")]
+    assert not offenders, (
+        "these write to stdout, whose budget belongs to SCAN_RESULT:\n  "
+        + "\n  ".join(offenders))
