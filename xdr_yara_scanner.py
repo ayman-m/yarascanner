@@ -3367,6 +3367,27 @@ class ResultsUploader:
             batch.clear()
 
         while True:
+            # Checked BEFORE taking work, not only on an Empty queue. By the time this is
+            # set, stop() has already spent the whole backlog-proportional drain budget
+            # WITH requeue enabled (the flag stays False for that window on purpose), so
+            # anything still queued is past its window and must be reported undelivered
+            # rather than attempted anyway.
+            #
+            # Consulting the flag only in `except Empty` made it unreachable under exactly
+            # the condition it exists for: a full queue never raises Empty. The sentinel
+            # lands at the BACK of the backlog, so the worker chews through everything
+            # ahead of it; the 60 s join times out, stop() books the still-queued items
+            # `undelivered`, and this loop then delivers some of them into
+            # `successful_uploads` -- the same item in two buckets, with
+            # ok + failed + undelivered exceeding the number ever queued.
+            #
+            # Breaking here does not drop the accumulated batch: flush() runs once more
+            # after the loop. Those items are already task_done()'d, so they are not in
+            # qsize() and cannot also be booked undelivered. If that final flush is
+            # rate-limited it can no longer requeue (the requeue test reads this same
+            # flag), so it falls through to failed_uploads -- counted, not leaked.
+            if self.stop_upload_thread:
+                break
             try:
                 standard_log = self.upload_queue.get(timeout=1.0)
                 if standard_log is None:
