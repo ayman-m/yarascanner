@@ -23,6 +23,9 @@ Filesystem case sensitivity is a property of the mount, so a process-lifetime ca
 correct. The counter is kept anyway — it is what distinguishes "cached, ran once" from
 "never ran because the platform branch was skipped", which are different states that both
 show zero probe files on disk.
+
+Both editions carry independent copies of this function and both were uncached, so the
+test is parametrised over the pair rather than duplicated.
 """
 import importlib
 import os
@@ -34,14 +37,14 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-EDITION = "xsiam_yara_scanner"
+EDITIONS = ["xsiam_yara_scanner", "xdr_yara_scanner"]
 
 
-@pytest.fixture()
-def mod():
-    m = importlib.reload(importlib.import_module(EDITION))
+@pytest.fixture(params=EDITIONS)
+def mod(request):
+    m = importlib.reload(importlib.import_module(request.param))
     yield m
-    importlib.reload(importlib.import_module(EDITION))
+    importlib.reload(importlib.import_module(request.param))
 
 
 def test_probe_runs_once_across_many_calls(mod):
@@ -99,9 +102,10 @@ def test_probe_count_is_exposed(mod):
 
 def test_non_darwin_platforms_never_probe(mod):
     """Windows and Linux answer from policy, so they must not touch the disk at all."""
+    name = mod.__name__
     for system, expected in (("Windows", False), ("Linux", True)):
-        importlib.reload(importlib.import_module(EDITION))
-        m = sys.modules[EDITION]
+        importlib.reload(importlib.import_module(name))
+        m = sys.modules[name]
         with mock.patch("platform.system", return_value=system):
             assert m._is_case_sensitive_fs() is expected
         assert m.case_probe_count() == 0, (
