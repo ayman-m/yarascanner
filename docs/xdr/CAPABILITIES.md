@@ -65,19 +65,21 @@ not preserved — it was measured to cost up to 65.9x scan time while protecting
 
 | | Count |
 |---|---|
-| Capabilities catalogued | **456** |
-| &nbsp;&nbsp;Rule Handling | 72 |
-| &nbsp;&nbsp;Scan Targeting, Traversal & Skipping | 65 |
-| &nbsp;&nbsp;Performance & Resource Management | 86 |
-| &nbsp;&nbsp;Local Storage & Host Footprint | 70 |
-| &nbsp;&nbsp;Delivery, Aggregation & Telemetry | 82 |
-| &nbsp;&nbsp;Scan Lifecycle, Control & Error Handling | 81 |
-| ⚠ Observability gaps | 22 |
+| Capabilities catalogued | **467** |
+| &nbsp;&nbsp;Rule Handling | 74 |
+| &nbsp;&nbsp;Scan Targeting, Traversal & Skipping | 67 |
+| &nbsp;&nbsp;Performance & Resource Management | 89 |
+| &nbsp;&nbsp;Local Storage & Host Footprint | 72 |
+| &nbsp;&nbsp;Delivery, Aggregation & Telemetry | 83 |
+| &nbsp;&nbsp;Scan Lifecycle, Control & Error Handling | 82 |
+| ⚠ Observability gaps | 30 |
 
-**22 open observability gaps**, after triage — down from the 40 originally recorded (29 capability entries still carry an inline ⚠ marker; two further occurrences of the marker, in the legend above and under *Observability status*, are not entries). These counts are now derived by parsing this file rather than maintained by hand — see *Provenance*.
+**30 capability entries carry an inline ⚠ OBSERVABILITY GAP marker**, down from the 40 originally recorded. Two further occurrences of the marker — in the legend above and under *Observability status* — are not entries and are not counted here or in the table.
+
+Every number in the table above, and the marker count in this paragraph, is DERIVED by parsing this file. They are not maintained by hand, because hand-maintained totals in this document have drifted repeatedly — most recently by one entry, introduced and caught inside a single working session.
 
 The closed ones were never really broken. `setup_logging()` used to
-remove every root handler and pin `WARNING`, so all 44 `logging.info(...)` calls in this
+remove every root handler and pin `WARNING`, so all 43 `logging.info(...)` calls in this
 file reached nothing on any host — which is what made these capabilities untestable. Root
 now carries an INFO `FileHandler` writing to `logs/diagnostics_<run_id>.log`, while stdout
 stays clean (Action Center truncates stdout at 10,240 chars, which is why the original
@@ -87,12 +89,11 @@ Re-deriving each *Observe* field against the new sink is outstanding work. Until
 runs, read a marked entry as "evidence exists in diagnostics_<run_id>.log, wording not yet
 updated" rather than "unobservable".
 
-> **Do not compare this total against the XSIAM file's.** That document lists 297
-> capabilities and this one lists 456, but the two were enumerated with
+> **Do not compare this total against the XSIAM file's.** The two were enumerated with
 > different granularity prompts — the difference is mostly how finely behaviour was split
-> into entries, not how much each edition does. XDR is genuinely larger (7,785 lines vs
-> 6,681, plus a lookup-dataset delivery subsystem XSIAM has no equivalent of), but nothing
-> like the ratio these two numbers imply. Compare capabilities by name, never by count.
+> into entries, not how much each edition does. XDR is genuinely larger (8,142 lines vs
+> 7,035, plus a lookup-dataset delivery subsystem XSIAM has no equivalent of), but nothing
+> like the ratio the two totals imply. Compare capabilities by name, never by count.
 
 ---
 
@@ -688,6 +689,30 @@ The first five lines ErrorLogger writes are a runtime banner: Python Version, Pl
 
 ---
 
+### Matched-byte rendering for human and wire output (UTF-16 wide → UTF-8 → hex)
+
+`_render_match_data()` turns a matched byte string into something a person can read. It tries UTF-16LE first, detected by every odd byte being zero (`all(b == 0 for b in data[1::2])`) — the shape a wide string leaves, and the reason a PowerShell or registry hit would otherwise render as `p.o.w.e.r.s.h.e.l.l`. Then UTF-8. If the result is not printable (tab excepted) it falls back to `data.hex()`, so binary matches stay legible rather than smearing control characters through an alert file or a dataset row. A non-`bytes` input degrades to `str(data)`.
+
+It has exactly two consumers, and they are the two places a match becomes visible: `ResultsUploader.add_match()`, feeding the `strings` column of the matches dataset row, and `_write_alerts()`, producing the `Data:` line in `alert/<rule>.txt`. So this one function decides how every matched byte looks in both channels.
+
+This is the analogue of the rule-text decode ladder catalogued for the *input* side; nothing described the *output* side.
+
+- **Control:** Not configurable — default `UTF-16LE if wide-shaped, else UTF-8, else hex`
+- **Observe:** Match a rule against a UTF-16 wide string and confirm the `Data:` line in `<scanner_dir>/alert/<rule>.txt` reads as text, not as letters separated by NULs; the same value appears in the `strings` column of the matches dataset row. Negative control: a rule matching non-printable bytes renders as a hex string in both places.
+- **Source:** `_render_match_data(); consumers ResultsUploader.add_match() (dataset strings column) and _write_alerts() (alert-file Data: line)`
+
+### Post-compile rule-health telemetry, with a third success-rate denominator
+
+After compilation, `run()` builds a `compilation_data` dict — `valid_rules_compiled`, `failed_rules_skipped`, and a `compilation_success_rate` computed over `valid + failed` — and emits `Scanner initialized with N valid rules` to the system log, plus `Skipped N failed rules` to the error log when any failed.
+
+Two things make it worth its own entry. It is a *third* site computing that success rate, alongside the comprehensive-report block and `log_compilation_summary()`, and like them its denominator omits SKIPPED rules — so a run where most rules were skipped for unavailable modules still reports a high success rate. And the `Skipped N failed rules` wording conflates *failed* with *skipped*, which the rule-health triage entry documents as a deliberate three-way split.
+
+Unlike the compile-path summary, this block also runs on a cache hit, so it is the one place these counters surface when compilation is skipped entirely.
+
+- **Control:** Not configurable — default `emitted whenever valid_rules_count > 0`
+- **Observe:** `Scanner initialized with N valid rules` in `logs/system_<run_id>.log` with a `data=` payload carrying all three fields; `Skipped N failed rules` in `logs/scan_errors_<run_id>.log` only when failures occurred. Compare `compilation_success_rate` against the SKIPPED count in the same run to see the denominator gap.
+- **Source:** `run() post-compile block; error_logger.valid_rules_count / failed_rules_count; the other two rate sites are upload_final_comprehensive_report() and ErrorLogger.log_compilation_summary()`
+
 # Scan Targeting, Traversal & Skipping
 
 *Deciding what gets opened — and proving what didn’t.*
@@ -1220,6 +1245,30 @@ The per-target body of scan_system is wrapped in a try whose handler logs `Error
 - **Source:** `YaraScanner.scan_system: per-target loop 6842-6933; try opened 6850; walk 6871-6916; files_per_target assignment 6919; 'Target scan completed' statistics event 6921-6929; swallowing handler 6931-6933; outer critical handler that DOES mark failure 6935-6939; targets assigned to self.scan_targets 6800; success reporting 7471-7480 and 7533-7536; scan_summary outcome derivation 7617-7622 and write 7632-7666; caller's try around scan_system 7383-7394`
 
 ---
+
+### Deployer-supplied extra skip fragments (`YARA_EXTRA_SKIP_PATHS`)
+
+`_extra_skip_fragments()` reads a comma-separated list from the environment and appends it to `skip_path_fragments`. It is **additive only** — there is deliberately no replace-style knob, because one typo in a replacing list would silently drop the Cortex agent's own paths and put the scanner back into the vendor directories the built-in list exists to avoid.
+
+Each entry is normalised to bounded `/x/` component matching, so a fragment cannot match a partial path component: `tmp` becomes `/tmp/` and will not match `/var/tmpfiles/`. Duplicates are dropped, and a lone `/` is rejected with a warning — it would otherwise skip the entire filesystem, which is an evasion vector rather than a configuration choice.
+
+This is one of very few customer-reachable controls that changes scan *scope*, which is why it needs an entry rather than only a changelog row.
+
+- **Control:** `YARA_EXTRA_SKIP_PATHS` — comma-separated, additive only — default `unset (built-in fragments only)`
+- **Observe:** Set it to a directory you have seeded with a matching file, then confirm zero findings from that directory while a sibling directory not in the list still produces findings. The sibling is the control: without it, "it skipped something" and "it skipped everything" are indistinguishable. A lone `/` logs a warning to `logs/diagnostics_<run_id>.log` and is discarded.
+- **Source:** `_extra_skip_fragments(); applied in ScanConfig.__init__ as skip_path_fragments + _extra_skip_fragments()`
+
+### Boundary skips the force-scan allowlist may never override (`force_scan_never_under`)
+
+The force-scan allowlist exists so browser-cache directories get scanned despite sitting under skipped paths. `force_scan_never_under` is its backstop: a four-entry tuple (`/volumes/`, `/media/`, `/mnt/`, `/net/`) tested in `_is_special_file()` **before** the allowlist, so no allowlist entry can pull the walk onto mounted or network media.
+
+Without it, a force-scan fragment matching something under a mount point would let the scanner walk external drives, network shares and — the case that motivated it — a Time Machine volume, scanning it once per backup snapshot.
+
+Note the ordering: this is checked first, so it wins. The allowlist can override the platform directory lists and the path-fragment list, but not this.
+
+- **Control:** Not configurable — default `('/volumes/', '/media/', '/mnt/', '/net/')`
+- **Observe:** With a force-scan fragment that would otherwise match, confirm no findings and no scanned-file count from a path under `/Volumes/` (macOS) or `/mnt/` (Linux), while the same fragment still forces scanning of an equivalent path outside those roots.
+- **Source:** `ScanConfig.force_scan_never_under; tested in _is_special_file() ahead of the force_scan_fragments check`
 
 # Performance & Resource Management
 
@@ -1923,6 +1972,42 @@ scan_summary_<run_id>.json carries a "cpu_governor" object straight from CpuGove
 
 ---
 
+### Per-worker throughput reports are time-gated, not file-count-gated
+
+Worker throughput reporting fires every 100 files processed, so its volume scaled with file count rather than with time. `WORKER_REPORT_MIN_SECS` (default 30 s) gates whether that sample is *written*: the 100-file trigger stays the sampling point, and the gate decides emission, at the same cadence the governor and progress heartbeats already use. `0` disables the gate and restores the old every-100-files behaviour.
+
+A worker's FIRST report always lands regardless of the gate, so a scan too short to span one interval still produces a throughput reading rather than none at all. The timestamp is per worker, so one busy worker cannot rate-limit another's reporting.
+
+Measured on the XSIAM side at 3,260 lines from a single scan, burying the six governor samples that actually diagnose a run. A 10M-file host would write ~100,000 lines and ~12 MB per run. On this edition those lines are local-file only — `log_performance` never leaves the endpoint — so the cost is endpoint disk and log legibility rather than tenant ingestion.
+
+- **Control:** `YARA_WORKER_REPORT_SECS` — default `30` (`0` disables the gate)
+- **Observe:** `Worker Performance |` line count in `logs/performance_<run_id>.log` tracks scan DURATION, not file count: two scans of equal wall time emit the same number per worker even when one processes fifty times as many files. At `YARA_WORKER_REPORT_SECS=0` the count returns to files/100.
+- **Source:** `WORKER_REPORT_MIN_SECS; _worker_report_due(); per-worker last_report_at in _worker(). Pinned by tests/test_worker_report_rate.py, parametrised over both editions.`
+
+### Governor sampling-cadence counters (`samples_taken`, `secs_since_last_sample`)
+
+`CpuGovernor.stats()` reports how many CPU readings have actually been consumed and how long since the last one. The counters are incremented in `update()` — where readings are CONSUMED — not where governor lines are logged.
+
+That distinction is the whole point. The `CPU governor |` line is emitted on a change threshold plus a 30 s heartbeat, so line spacing measures the EMISSION policy and not the sampling rate; on a steady scan the two diverge completely (measured at 0.5 s sampling against 30 s logging — 60×). Without these counters, "readings are steady so nothing is worth emitting" and "sampling has stalled" are indistinguishable, because both simply produce fewer lines.
+
+`update()` takes an injectable `now` so the cadence can be tested without sleeping.
+
+- **Control:** Not configurable — default `counted whenever the governor is enabled (headroom or budget)`
+- **Observe:** `samples_taken` in the governor stats block rises far faster than the `CPU governor |` line count in the same run — that ratio IS the divergence. `secs_since_last_sample` stays near the sampling interval; a large or growing value means sampling has stalled, which no line count could have told you. A disabled governor counts nothing.
+- **Source:** `CpuGovernor.__init__ (samples_taken / last_sample_at / last_sample_gap); CpuGovernor.update(now=None); CpuGovernor.stats(). Pinned by tests/test_governor_sampling_cadence.py, parametrised over both editions.`
+
+### FD sampling runs once per file PROCESSED, before every early return
+
+`_maybe_sample_fds()` advances the file-descriptor sampling counter and takes a reading on the interval. It is called at the top of `scan_file()`, before any of the six early returns.
+
+It used to be inlined at the END of `scan_file`, after the matched and skipped returns, so it ran only on files that were scanned and did NOT match — on a ruleset matching everything it never ran at all, and FD monitoring went quiet exactly when the scanner held the most handles. The counter also moved unlocked, so the read-modify-write raced across workers and silently dropped increments, making the effective interval longer than configured and impossible to reason about from the settings.
+
+`fd_samples_taken` and `last_fd_count` exist because the sampler previously emitted output only on a threshold breach: "sampled 40 times, all fine" and "never sampled" left identical evidence, which is why this capability was originally filed unobservable. Windows has no `num_fds`, so it returns before sampling; a failed read is not counted as a sample taken.
+
+- **Control:** Not configurable — default `fd_check_interval = 1000 files, monitor off unless config.monitor_fd_usage`
+- **Observe:** `fd_samples_taken` after a scan ≈ files processed ÷ 1000, INCLUDING files that matched — that is the property the old placement failed. `last_fd_count` is populated on a healthy sample, which is what distinguishes it from never having sampled. On Windows both stay at their initial values.
+- **Source:** `_maybe_sample_fds(), called at the top of scan_file(); counters under lock_counts. Pinned by tests/test_fd_sampling_reach.py, parametrised over both editions.`
+
 # Local Storage & Host Footprint
 
 *Everything written to the machine being scanned.*
@@ -2492,6 +2577,30 @@ collect_evidence() has no match-count gate anywhere, so file_mapping.txt is rewr
 - **Source:** `collect_evidence 4492-4499; call sites in run() at 7437 (scan_failed branch) and 7484 (success path); header-only manifest written at 4503-4510 with rows only inside the loop 4512-4519; _create_evidence_zip 4521-4571 (collect_files gate 4529-4564, alert/*.txt sweep 4566-4569, file_mapping added 4571)`
 
 ---
+
+### Alert-directory byte ceiling degrades detail, never counts (`YARA_ALERT_DIR_MAX_MB`)
+
+Per-finding caps bound each alert record but say nothing about their sum: F files × R rules is unbounded, so a noisy ruleset on a small endpoint disk previously had no ceiling at all. `CONFIG_ALERT_DIR_MAX_BYTES` is a ceiling on the TOTAL bytes a run may add under `alert/`.
+
+The important property is what it sacrifices. Past the ceiling the scanner stops writing per-offset DETAIL but keeps writing the finding and its counts, so the alert file still says what matched and how many times — it just stops enumerating where. A cap that dropped whole findings would corrupt the census; this one degrades resolution instead.
+
+Footprint accounting is guarded by `lock_alert`, and the effective ceiling is recorded in the run summary as `alert_dir_max_bytes` so a truncated run is distinguishable from a quiet one.
+
+- **Control:** `YARA_ALERT_DIR_MAX_MB` — default `256` (`0` disables the ceiling)
+- **Observe:** With a small `YARA_ALERT_DIR_MAX_MB` and a flood ruleset, `du -sh <scanner_dir>/alert` stays under the ceiling, the alert files carry the omission note naming `YARA_ALERT_DIR_MAX_MB`, and per-rule match counts still reconcile against the matches dataset — counts complete, offsets truncated. `alert_dir_max_bytes` in `scan_summary_<run_id>.json` records the ceiling in force.
+- **Source:** `CONFIG_ALERT_DIR_MAX_BYTES; _alert_bytes_written under lock_alert; the over-budget branch in _write_alerts(); alert_dir_max_bytes in the run summary`
+
+### The root diagnostics handler is closed before host cleanup
+
+Windows refuses to delete a file that is still open, so every per-run log handler must be closed before `HostCleanup` runs. There are EIGHT: `LogManager` owns six category handlers, `ErrorLogger` owns `yara_processing`, and `setup_logging()` installs one on the ROOT logger for `diagnostics_<run_id>.log`. `close_diagnostics_handler()` closes the eighth.
+
+It was the worst one to leave open. Host cleanup's own messages cannot go through `LogManager` — already closed by then — so they use the plain `logging` module, which means cleanup wrote its progress INTO the file it was about to unlink, guaranteeing the handle was hot at the moment of the `os.remove`. The failure surfaces as `WinError 32`, which `HostCleanup` records as an error rather than raising, so a Windows endpoint with host cleanup enabled silently kept one `diagnostics_<run_id>.log` per scan.
+
+The WARNING `StreamHandler` is deliberately left attached, so cleanup's own warnings still reach stderr — which is not the capped resource. The closer is idempotent and never raises: it runs on the shutdown path, where a failure would mask the run's actual result.
+
+- **Control:** Not configurable — default `closed alongside LogManager and ErrorLogger, immediately before HostCleanup`
+- **Observe:** On a Windows endpoint with host cleanup enabled and `outcome == "completed"`, `logs/` is empty afterwards — no `diagnostics_<run_id>.log` survives — and the cleanup error count is 0. Before the fix that count was 1 and the file remained. Linux tolerates unlinking an open file, so it never showed the symptom.
+- **Source:** `close_diagnostics_handler(); _DIAGNOSTICS_HANDLER set by setup_logging(); called in main()'s pre-cleanup block beside log_manager.stop_logging() and error_logger.close(). Pinned by tests/test_diagnostics_handler_lifecycle.py, parametrised over both editions.`
 
 # Delivery, Aggregation & Telemetry
 
@@ -3157,6 +3266,20 @@ _upload_alert_batch builds each alert inside a per-item try; a failure logs into
 
 ---
 
+### The alert worker honours the stop flag before dequeuing
+
+`_upload_worker` checks `stop_upload_thread` at the TOP of its loop, before taking work — not only in the `except Empty:` branch, which a full queue never reaches.
+
+Consulting it only on `Empty` made it unreachable under exactly the condition it exists for. The sentinel lands at the BACK of the backlog, so the worker had to chew through everything ahead of it; the 60 s join timed out, `stop()` booked the still-queued items `undelivered`, and the live thread went on delivering some of them into `successful_uploads`. The same item in two buckets, with `ok + failed + undelivered` exceeding the number of findings that ever existed — and the shortfall on the operator's result line computed from a denominator that does not exist.
+
+Reproduced at shrunk windows: `ok=1560 + undelivered=18920 = 20480` from 20,000 ever queued, with `ok` still climbing after the books were published.
+
+This does NOT shorten the deliberate requeue window. `stop()` drains with requeue enabled while the flag is still `False`, and only then sets it, so a flag-gated check falls through for the whole of that window. Breaking early also loses nothing: `flush()` runs once more after the loop, and those items are already `task_done()`'d so they cannot also be booked undelivered.
+
+- **Control:** Not configurable — default `checked once per loop iteration`
+- **Observe:** Cancel a scan carrying a large alert backlog, then check the `Alert delivery final:` line: `ok + failed + undelivered` must be ≤ `alerts_queued`, and `successful_uploads` must not move afterwards. A criterion that only checks the fields are PRESENT passes on a broken build — it has to assert they sum.
+- **Source:** `the stop_upload_thread guard at the top of _upload_worker's loop; stop()'s drain-then-flag ordering; _upload_alert_batch()'s requeue condition, which reads the same flag. Pinned by tests/test_xdr_delivery_books_balance.py.`
+
 # Scan Lifecycle, Control & Error Handling
 
 *Phases, cancellation, outcomes, failure paths.*
@@ -3819,6 +3942,20 @@ A single 22-field dict (hostname, os_info, ip_addresses, platform, python_versio
 
 ---
 
+### A failed category logger silently falls back to the root logger
+
+**⚠ OBSERVABILITY GAP**
+
+`LogManager._setup_logger()` wraps its `FileHandler` creation in a `try`. If it fails — an unwritable `logs_dir` is the realistic case — the `except` arm returns `logging.getLogger()`, the bare ROOT logger, for that category.
+
+Two consequences, neither recorded anywhere durable. That category silently stops having its own file, so `alerts_<run_id>.log` or `system_<run_id>.log` simply never appears while the scan reports success. And because the returned logger is root with default `propagate`, those records leak into `diagnostics_<run_id>.log` mixed in with everything else, where a reader has no way to tell they were displaced.
+
+The failure announcement itself now goes to stderr rather than stdout (stdout is capped at 10,240 characters and its budget belongs to the SCAN_RESULT line), but stderr is not collected as an artefact, so nothing on disk records that a category was downgraded. Changing what the arm RETURNS is a behavioural change that wants its own evidence, so it is catalogued here rather than altered.
+
+- **Control:** Not configurable — default `fall back to the root logger, announce on stderr`
+- **Observe:** UNOBSERVABLE from the artefacts: the only signal is a missing `<category>_<run_id>.log` alongside a run that reports success, and stderr text that is not collected. To close it: record the downgrade in the run summary (e.g. a `degraded_log_categories` list) so a scan that lost a log channel is distinguishable from one that had nothing to say.
+- **Source:** `LogManager._setup_logger()'s except arm returning logging.getLogger(); log_files map; the stderr announcement is guarded by tests/test_diagnostics_handler_lifecycle.py`
+
 # Control gaps — capabilities the customer cannot tune
 
 Verified by hand against the pinned source. Most of the gaps this file originally
@@ -3959,7 +4096,46 @@ The lesson, recorded because it will recur: in a repository whose working tree i
 with another session, **the filesystem is not a stable source of truth**. Pin the version
 (`git show <ref>:<path>`, or a read-only snapshot) before enumerating anything against it.
 
-Of 456 entries, 455 were confirmed line-by-line against the pinned file.
+Of the original 456 entries, 455 were confirmed line-by-line against the pinned file.
+
+## Completeness and accuracy audit
+
+A later pass audited the catalogue against the scanner as it stands, mechanically where
+possible and by a six-way parallel sweep for completeness. What it established:
+
+**Structure is sound.** All entries parse, every one carrying Control, Observe and Source;
+the per-section counts agree with the table above because both come from the same parse.
+
+**Observe fields hold up.** Every quoted literal that looked absent on a first pass turned
+out to be present once f-string placeholders were accounted for. This matters more than
+any other field: acceptance criteria are written from *Observe*.
+
+**Source LINE NUMBERS do not hold up, and it does not matter much.** Of 56 checkable
+`symbol() line N` references, zero were within five lines of the truth and all 56 were
+40+ off, clustering near 194. This is not an XDR defect — the XSIAM catalogue measures
+51 of 56 the same way, and it supported 297 acceptance criteria regardless, because
+criteria come from *Observe* and the symbol NAMES are correct. **New and rewritten entries
+therefore cite symbols and test files rather than line numbers**, which is the only part
+of a reference that survives the next commit. Roughly 2,900 further bare line numbers
+remain in older entries; they should be dropped as those entries are next touched, not
+mass-edited.
+
+**Dead-code claims are still true.** Every symbol-level DEAD CODE / DEAD CONSTANT claim
+was re-checked for call sites and all survived. Branch-level claims were left to a human,
+as the section above insists.
+
+**Eleven capabilities were missing**, found by a six-dimension sweep whose proposals were
+each adversarially refuted before acceptance (21 proposed, 15 confirmed, 6 refuted; the
+15 deduplicated to 11 distinct capabilities seen from several dimensions). Four were
+behaviour added on this branch and not yet written up — the failure this file's closing
+line warns about, committed by its own maintainer. Two were defects rather than
+omissions, and were fixed: the root diagnostics FileHandler was never closed before host
+cleanup, and every logger-setup failure path announced itself on stdout, whose 10,240-char
+budget belongs to the SCAN_RESULT line.
+
+**Counts are now derived, not typed.** The At-a-glance table and the marker count are
+produced by parsing this file. The prompt for that was drift introduced and caught inside
+a single session.
 
 ---
 
