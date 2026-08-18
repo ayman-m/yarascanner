@@ -9,6 +9,21 @@ string yielded wrong bytes silently rather than raising.
 
 These tests pin the surviving contract, so the deletion cannot quietly change what the
 live path produces.
+
+Both editions are covered. XDR reached the same dead end by a different route, so its
+unreachability was re-enumerated rather than assumed:
+
+  * four call sites (the rules_matched comprehension, the _write_alerts loop, the
+    total_string_matches sum, and rules_triggered) all iterate `matches`;
+  * `matches` has one binding, `matches = self.rules.match(...)`;
+  * _write_alerts takes `matches` as a parameter but has a single caller, passing that
+    same local;
+  * nothing outside the file imports _iter_hit_fields.
+
+XDR differed in one way that mattered: it DID contain a producer of the dict shape,
+_serialize_matches(), which XSIAM never had. That producer had zero call sites of its
+own, so it was dead code feeding a dead branch. Both were removed together -- deleting
+the consumer alone would leave a live-looking helper whose output nothing could accept.
 """
 import importlib
 import os
@@ -18,14 +33,14 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-EDITION = "xsiam_yara_scanner"
+EDITIONS = ["xsiam_yara_scanner", "xdr_yara_scanner"]
 
 
-@pytest.fixture()
-def mod():
-    m = importlib.reload(importlib.import_module(EDITION))
+@pytest.fixture(params=EDITIONS)
+def mod(request):
+    m = importlib.reload(importlib.import_module(request.param))
     yield m
-    importlib.reload(importlib.import_module(EDITION))
+    importlib.reload(importlib.import_module(request.param))
 
 
 class _Instance:
@@ -80,3 +95,14 @@ def test_dict_input_is_no_longer_silently_accepted(mod):
     """
     with pytest.raises(AttributeError):
         mod._iter_hit_fields({"rule": "r", "strings": [(0, "$a", "zznothex")]})
+
+
+def test_the_dict_producer_is_gone(mod):
+    """_serialize_matches was the only thing that could build the dict shape.
+
+    XDR carried it with zero call sites; XSIAM never had it. Keeping a producer for a
+    shape the consumer no longer accepts is a trap: the next caller gets an
+    AttributeError from a helper that looks supported.
+    """
+    assert not hasattr(mod, "_serialize_matches"), (
+        "a serialiser for the removed dict shape is still exported")

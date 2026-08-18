@@ -1037,23 +1037,6 @@ MODULE_USAGE_PATTERNS = OrderedDict([
 ])
 
 
-def _serialize_matches(yara_matches):
-    """Convert YARA match objects to JSON-serializable format."""
-    serial = []
-    for m in yara_matches:
-        normalized_strings = _normalize_match_strings(getattr(m, "strings", []) or [])
-        serial.append({
-            "rule": getattr(m, "rule", None),
-            "tags": list(getattr(m, "tags", []) or []),
-            "meta": dict(getattr(m, "meta", {}) or {}),
-            "strings": [
-                (int(o), str(sid), data.hex() if isinstance(data, (bytes, bytearray)) else str(data))
-                for (o, sid, data) in normalized_strings
-            ]
-        })
-    return serial
-
-
 def _normalize_match_strings(raw_strings):
     """Normalize YARA string matches into (offset, string_id, data) tuples."""
     normalized = []
@@ -1376,22 +1359,32 @@ def _render_match_data(data) -> str:
 
 
 def _iter_hit_fields(hit):
-    """Extract fields from YARA match (cached dict or live Match object)."""
-    if isinstance(hit, dict):
-        rule = hit.get("rule")
-        tags = hit.get("tags", [])
-        meta = hit.get("meta", {})
-        strings = []
-        for (o, sid, hx) in hit.get("strings", []):
-            try:
-                data = bytes.fromhex(hx)
-            except Exception:
-                data = hx.encode("utf-8", errors="ignore")
-            strings.append((o, sid, data))
-        return rule, tags, meta, strings
-    else:
-        strings = _normalize_match_strings(list(getattr(hit, "strings", []) or []))
-        return hit.rule, list(getattr(hit, "tags", []) or []), dict(getattr(hit, "meta", {}) or []), strings
+    """Extract rule, tags, meta and normalised strings from a live yara Match object.
+
+    This used to accept a second shape: a plain dict whose `strings` were
+    (offset, id, hex-text) triples, rehydrated with bytes.fromhex. That implied a match
+    CACHE - something that serialised findings and replayed them later. No such cache
+    exists, and the arm was unreachable:
+
+      * four call sites (the rules_matched comprehension, the _write_alerts loop, the
+        total_string_matches sum, and rules_triggered) all iterate `matches`;
+      * `matches` has exactly ONE binding, `matches = self.rules.match(...)`, which
+        returns yara.Match objects and never dicts;
+      * _write_alerts takes `matches` as a parameter but has a single caller, which
+        passes that same local;
+      * no module outside this file imports _iter_hit_fields.
+
+    This edition did have a producer for the dict shape, _serialize_matches(), which the
+    XSIAM edition never had. It had zero call sites of its own - dead code feeding a dead
+    branch - and was removed with this arm rather than left behind.
+
+    It was removed rather than kept for safety, because it was not safe. Its decode
+    fallback was `hx.encode("utf-8", errors="ignore")` on anything bytes.fromhex
+    rejected - so a non-hex string produced WRONG BYTES silently instead of raising, and
+    every offset and matched-data field downstream would have been quietly corrupt.
+    """
+    strings = _normalize_match_strings(list(getattr(hit, "strings", []) or []))
+    return hit.rule, list(getattr(hit, "tags", []) or []), dict(getattr(hit, "meta", {}) or []), strings
 
 
 # ============================================================================

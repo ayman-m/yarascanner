@@ -72,9 +72,9 @@ not preserved — it was measured to cost up to 65.9x scan time while protecting
 | &nbsp;&nbsp;Local Storage & Host Footprint | 70 |
 | &nbsp;&nbsp;Delivery, Aggregation & Telemetry | 82 |
 | &nbsp;&nbsp;Scan Lifecycle, Control & Error Handling | 81 |
-| ⚠ Observability gaps | 25 |
+| ⚠ Observability gaps | 24 |
 
-**25 open observability gaps**, after triage — down from the 40 originally recorded (32 entries still carry an inline ⚠ marker).
+**24 open observability gaps**, after triage — down from the 40 originally recorded (33 entries still carry an inline ⚠ marker).
 
 The closed ones were never really broken. `setup_logging()` used to
 remove every root handler and pin `WARNING`, so all 44 `logging.info(...)` calls in this
@@ -571,20 +571,23 @@ Immediately before the scanner is constructed, a naive count of `rule\s+\w+` and
 ### Per-rule metadata (meta and tags) parsed then discarded
 
 **⚠ OBSERVABILITY GAP**  
-_iter_hit_fields extracts a rule's tags list and meta dict from every match, and _write_alerts unpacks them into local variables at line 6370 — which are then never used anywhere in the function (grep: `tags`/`meta` appear nowhere else between 6100 and 6500). Nothing downstream carries rule meta or tags: not the alert_dir text file, not the yara_scanner_matches row (no meta/tags column in matches_schema, 3890-3913), not the XDR alert. A customer whose rules encode severity, author or reference in `meta:` loses all of it. The Match-object branch also contains `dict(getattr(hit, "meta", {}) or [])` — an `or []` where `or {}` was intended, harmless only because dict([]) succeeds.
+_iter_hit_fields extracts a rule's tags list and meta dict from every match, and _write_alerts unpacks them into local variables at line 6370 — which are then never used anywhere in the function (grep: `tags`/`meta` appear nowhere else between 6100 and 6500). Nothing downstream carries rule meta or tags: not the alert_dir text file, not the yara_scanner_matches row (no meta/tags column in matches_schema, 3890-3913), not the XDR alert. A customer whose rules encode severity, author or reference in `meta:` loses all of it. It also contains `dict(getattr(hit, "meta", {}) or [])` — an `or []` where `or {}` was intended, harmless only because dict([]) succeeds.
 
 - **Control:** Not configurable — default `-`
 - **Observe:** UNOBSERVABLE by design: no artefact carries meta/tags. Confirm negatively — a rule with `meta: author = "x"` produces a yara_scanner_matches_v3_<shard> row and an <scanner_dir>/alert/<rule>.txt entry with no trace of the author value, and XQL over the matches dataset has no meta or tags column.
 - **Source:** `_iter_hit_fields() lines 1280-1296 (the `or []` at line 1296); unused unpack line 6370; matches_schema lines 3890-3913`
 
-### _serialize_matches — DEAD CODE
+### Cached-hit dict ingestion path — REMOVED
 
-**⚠ OBSERVABILITY GAP**  
-A complete JSON-serialisation helper for match objects — rule name, tags, meta and hex-encoded matched data — that is defined and never called (grep: the symbol appears only at line 942). Its existence is what makes _iter_hit_fields dual-mode (dict or live Match); with no producer of the dict form, that entire branch of _iter_hit_fields (1282-1293) is unreachable too.
+`_serialize_matches()` was a complete JSON-serialisation helper for match objects — rule name, tags, meta, hex-encoded matched data — that was defined and never called. Its existence was the only reason `_iter_hit_fields` was dual-mode (dict or live Match), and with no producer of the dict form that consumer branch was unreachable too: dead code feeding a dead branch.
+
+Both were removed. Unreachability was re-enumerated against this edition rather than inherited from the XSIAM finding, because the call sites differ: all four `_iter_hit_fields` callers iterate `matches`; `matches` has one binding, `self.rules.match(...)`; `_write_alerts` takes `matches` as a parameter but has a single caller passing that same local; and nothing outside the file imports the symbol.
+
+The branch was not merely unused, it was unsafe. Its decode fallback was `hx.encode("utf-8", errors="ignore")` on anything `bytes.fromhex` rejected, so a non-hex string produced **wrong bytes silently** instead of raising, and every offset and matched-data field downstream would have been quietly corrupt.
 
 - **Control:** Not configurable — default `-`
-- **Observe:** UNOBSERVABLE (dead): produces no artefact. Needed instead: static confirmation — grep the file for the symbol; it appears only at its definition.
-- **Source:** `_serialize_matches() lines 942-956 (no call sites); orphaned consumer branch _iter_hit_fields lines 1282-1293`
+- **Observe:** N/A — the code no longer exists. `tests/test_hit_field_extraction.py` pins the surviving single-shape contract across both editions, including that a dict now raises rather than being silently decoded, and that the producer is gone.
+- **Source:** removed; contract pinned by `tests/test_hit_field_extraction.py`
 
 ### _yara_callback — inert match callback
 
@@ -657,7 +660,7 @@ Every matched string from libyara is converted to a uniform (offset, string_id, 
 
 - **Control:** Not configurable — default `-`
 - **Observe:** On a yara 3.11.0 Linux endpoint, <scanner_dir>/alert/<rule>.txt must show populated `String ID:` / `Offset:` / `Data:` triples (written at 6428-6430) and 'Hits per string ID: ...' (6417-6418), and the matches-dataset row for that (rule, file) must carry a non-empty `offsets` JSON array and a non-empty `string_ids` JSON object (built at 3677-3679) — XQL `dataset = yara_scanner_matches_v3_*`. Compare the same rule against the same file on a 4.1.0 endpoint: the shape must be identical. `Offset: -1` or `String ID: unknown` means the fallback branch (975-979) fired instead of a recognised API shape.
-- **Source:** `_normalize_match_strings() lines 959-981 (3-tuple branch 963-966; 4.x StringMatch fan-out 968-973; bare-object fallback 975-979); _iter_hit_fields() lines 1280-1296 (live-Match branch 1294-1296); four callers 6184, 6370, 6445, 6452; alert-file triples 6428-6430; (off,sid,data)->(sid,off,data) conversion for the dataset at 6387; row fields 3677-3679`
+- **Source:** `_normalize_match_strings() lines 959-981 (3-tuple branch 963-966; 4.x StringMatch fan-out 968-973; bare-object fallback 975-979); _iter_hit_fields() (single live-Match shape); four callers 6184, 6370, 6445, 6452; alert-file triples 6428-6430; (off,sid,data)->(sid,off,data) conversion for the dataset at 6387; row fields 3677-3679`
 
 ### Rule splitter is comment-blind, string-blind and case-insensitive
 
@@ -3916,7 +3919,6 @@ that drives execution down it, not by grepping for references.
 Anything below needs that branch-level check before removal:
 
 - _is_valid_rule_structure — DEAD CODE
-- _serialize_matches — DEAD CODE
 - Dead hook: _discover_all_targets override branch
 - The scanner's own output log path is excluded from scanning
 - Windows drive-letter exclusion list (present but permanently empty)
