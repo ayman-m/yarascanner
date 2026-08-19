@@ -88,13 +88,47 @@ delete the other run's marker, and the strict flag must change **only** the unre
 if it also made a genuinely stale lock un-takeable, cleanup would deadlock behind any marker
 whose owner died.
 
+## D3.1 / D3.2 — the terminal set was untested in both copies at once
+
+`TERMINAL_LIFECYCLE = {"completed", "cancelled", "failed"}` decides whether a host's shard
+is ever eligible for consolidation. The strings `"cancelled"` and `"failed"` appeared
+nowhere in `tests/test_consolidation.py`. Measured by mutation rather than assumed:
+
+```
+narrow the set to {"completed"} in xdr_consolidate.py alone  ->  1 of 74 tests fails
+narrow it in BOTH copies in tandem                           -> 74 of 74 tests PASS
+```
+
+The single test that fires on the one-sided edit is
+`test_pack_copy_gate_logic_matches_xdr_consolidate`, and it compares the two files'
+**source text**. It guards drift between the copies, so it cannot see an edit applied to
+both. A consistency check proves the copies agree; it never proves that what they agree on
+is correct.
+
+What the passing-suite mutation would have shipped: every cancelled or failed scan is
+permanently non-terminal, so its shard is never consolidated, never cleaned up, and its
+findings sit stranded on a dataset nobody merges. That is the precise outcome this
+subsystem exists to prevent, and it survived the full suite.
+
+Both states are terminal for a reason worth stating plainly. Cancelling a scan does not
+un-find what it already found — a scan stopped 80% through a filesystem holds 80% of a real
+answer. And a scan that *failed* is the case you most want the evidence from.
+
+Now pinned by `tests/test_partial_scans_are_preserved.py`, 28 cases, every one run against
+**both** implementations — the pack copy is what executes on the tenant, so a guarantee
+proven only in `xdr_consolidate.py` is not a guarantee. The negative halves carry the
+weight: `running`, `initiated`, `""` and `None` must stay non-terminal, or "everything is
+terminal" would pass the positive cases just as well and a shard could be merged and
+deleted while its scan was still writing to it. One ordering case is included too — an
+out-of-order `running` row older than the cancellation must not revive a finished scan.
+
 ## Still to run
 
-D1.3 (Action Center state as the independent second check), D1.5, D2.3–D2.6, D3.2, D3.3,
+D1.3 (Action Center state as the independent second check), D1.5, D2.3–D2.6, D3.3,
 D4.1 / D4.3 / D4.4 (live lock contention, isolated delete failure, crash recovery),
 D5.1–D5.3 (clock skew both directions), D6.2–D6.4.
 
 Much of D4 and D5 is already covered by the 74 existing unit tests in
 `tests/test_consolidation.py` — lock, stale, skew, quiet-period and terminality are all
 heavily exercised there. The remaining work is checking which criteria those tests actually
-decide versus which only look covered, which is how D4.2 surfaced.
+decide versus which only look covered, which is how D4.2 and D3.1/D3.2 both surfaced.
