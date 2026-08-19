@@ -1,6 +1,12 @@
 # XDR Round 2 — Delivery, aggregation and telemetry under load
 
-**IN PROGRESS.** Leg A delivered; 9 of 106 criteria scored, all pass.
+**5 legs delivered. 106 of 106 criteria have a check. 0 failures.**
+
+| Status | All (106) | core (44) |
+|---|---|---|
+| pass | 49 | 24 |
+| fail | 0 | 0 |
+| blocked | 57 | 20 |
 
 ## Leg A — the flood
 
@@ -92,11 +98,53 @@ queue_full_events 0            (present — this branch's fix is on Windows too)
 Both platforms cap at exactly 500 per-finding alerts with one rollup per rule, and both
 reconcile to the last row.
 
-## Still to run
+## The check that would catch an XSIAM-style double-count
 
-- **Cancelled flood** — the scenario where the XSIAM double-count appeared: cancel with a
-  large backlog, then check `ok + failed + undelivered` against the finding count. This is
-  the leg that exercises the `stop_upload_thread` fix ported earlier on this branch.
-- **Windows flood** on `xdragent2`.
-- Rate-limit / requeue behaviour under a saturated key.
-- Checks for the remaining 97 criteria.
+`DELI-046` is the one worth reading. It sums the per-batch `added` figures from the uploads
+log and requires the total to equal `records_added` **and** the tenant-side row count —
+1,602 == 1,602 == (1,600 match rows + 2 lifecycle rows). Comparing against the match rows
+alone would be short by exactly 2, and the check says so in its own message rather than
+quietly using the looser number.
+
+That is the shape the XSIAM double-count slipped past: a criterion that asked whether the
+delivery fields were *present* passes cleanly on a build counting the same item twice.
+
+## Falsifiability was proved, not assumed
+
+Several agents built mutation harnesses: copy the evidence, corrupt exactly the one value
+or log line each check keys on, re-run, and confirm the check flips to `fail`. Two chunks
+reported 30/30 and 23/23 mutations caught. One detector was rewritten after its first
+version missed a subscript assignment — the mutation probe is what exposed that.
+
+## A harness trap worth recording
+
+Leg W's evidence landed **in pieces** — `scan_summary` first, the `.log` files later. That
+is dangerous rather than merely awkward: `need("W")` returns None as soon as the summary
+exists, while `Leg.log()` returns `""` for every category, so any grep-based check would
+read an empty file and report a scanner defect that is really a collection race. Leg
+selection is now split into `_healthy()` (summary **and** logs present) and `_summarised()`
+(summary only), and log-reading checks use the former.
+
+## The 57 blocked, and what would decide them
+
+`blocked` is not a pass. These are almost entirely **failure-path** criteria, and the five
+legs are all healthy deliveries plus one cancel. Each blocked check still asserts whatever
+the evidence *does* decide and fails if that breaks — they are not stubs.
+
+What is missing is failure injection:
+
+- an HTTP-500 "Exceeding the rate limit" responder, with `ALERT_MAX_DELIVER_SECS` and
+  `ALERT_REQUEUE_ENABLED=False` controls, for the requeue and drain-budget criteria
+- a hung-peer TCP listener at shipped drain values
+- `write_dataset=false` / `create_alerts=false` single-channel runs
+- `YARA_LOOKUP_ROTATION=none`, and a rebound dataset path for the discovery-failure arm
+- a 22-field XQL projection (the capture carries 4 of them)
+- a pack with duplicate basenames, and a multi-identifier storm rule
+
+## One capability is unexercisable by construction
+
+`DELI-065` (circuit breaker) passes without a blackhole run because `CircuitBreaker` occurs
+exactly **once** in the 8,177-line delivered snippet — its own class definition — and its
+two constants are read only in that `__init__` signature. A class never constructed cannot
+open a circuit on any run, so the check asserts zero `circuit` mentions across all logs on
+both legs, plus that the surviving retry ceilings are the documented ones.
