@@ -56,6 +56,42 @@ that rendered detail was capped at 50. The cap truncates the evidence, never the
 `top_rules` reports 800 per rule, summing to the full 1,600 rather than the capped 500, and
 matches the tenant exactly.
 
+## Legs B, C and W
+
+| Leg | Shape | Result |
+|---|---|---|
+| B | 3,000 files, 6,000 findings | completed in 218.6s; **walk 8.8s, delivery 212s** |
+| C | `/usr`, non-matching rules, **cancelled mid-walk** | cancelled at 57,527 of 93,127 files |
+| W | **Windows Server 2022**, 600 files, 1,200 findings | completed in 78.9s |
+
+**Leg B** is where the cancellation phase limit surfaced — see
+[CANCEL_PHASE_LIMIT.md](CANCEL_PHASE_LIMIT.md). Its books stayed clean throughout:
+findings 500 + suppressed 5,500 == 6,000; queued 502 == ok 502; dataset queued 6,002 ==
+6,000 findings + 2 lifecycle rows, 13 batches, nothing dropped.
+
+**Leg C** is the only leg where delivery did NOT fully succeed, which makes it the only one
+that can prove the shortfall reporting is honest rather than vacuously absent:
+
+```
+dataset rows: 1 of 2 NOT confirmed (1 never sent)
+  - findings are complete in the local logs on this endpoint
+```
+
+The books still balance around that shortfall. A round in which everything succeeds cannot
+distinguish "reports shortfalls correctly" from "never reports anything".
+
+**Leg W** establishes cross-platform parity — the books balance identically on Windows:
+
+```
+findings 500 + suppressed 700  ==  1,200 matches
+alerts_queued 502              ==  ok 502 + failed 0 + undelivered 0
+dataset queued 1,202           ==  1,200 findings + 2 lifecycle rows, all added
+queue_full_events 0            (present — this branch's fix is on Windows too)
+```
+
+Both platforms cap at exactly 500 per-finding alerts with one rollup per rule, and both
+reconcile to the last row.
+
 ## Still to run
 
 - **Cancelled flood** — the scenario where the XSIAM double-count appeared: cancel with a
