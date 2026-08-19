@@ -317,6 +317,40 @@ present.
 
 Second pass: **3 of 3 caught, 0 survivors.**
 
+### Wave 7 — the last three, where the behaviour was already right
+
+D2.4, D3.3 and D4.4 were not gaps in the code. The behaviour was correct; what was missing
+was anything that would notice if it stopped being correct.
+
+**D2.4 is the one that matters.** It is the criterion the entire per-host sharding design
+exists to satisfy: `add_data` is not concurrency-safe, and 8 threads writing one dataset lost
+**87% of 1,601 rows** when measured live. Consolidation is safe only because it is the single
+sequential writer to its target — which is true *by construction*, the write path being a
+plain `for` loop over batches.
+
+"True by construction" is precisely what a well-meant refactor deletes. Parallelising a loop
+of slow network calls is the obvious optimisation, and `_delete_many` right below it *is*
+threaded, which makes the sequential write path look like an oversight rather than a
+decision. Verified by actually making that refactor: the new test fails, while the
+pre-existing suite caught it only through the source-text parity check — the same blind spot
+that opened this whole audit, since applying the refactor to both copies silences it.
+
+The test asserts on the *calls*, not the resulting data: `FakeClient`'s dict extend happens
+to be safe under the GIL, so a fully parallelised writer produces a perfectly correct row
+count. A count-based assertion would pass. This is D2.3's blindness in a second costume.
+
+**D3.3** — an abandoned scan's partial findings are merged, not dropped, with the negative
+half (a scan that reported a minute ago is still protected) included; without it,
+"consolidate every non-terminal scan" would pass the positive case while deleting shards out
+from under live scans.
+
+**D4.4** — both directions of crash recovery. A pass that died mid-write leaves a target with
+some rows: the count does not match, so nothing is deleted and the sources stay available for
+a later pass. A pass that wrote everything and died before deleting is recognised as finished
+and cleaned up rather than re-merged, which is what makes the operation resumable rather than
+merely safe to abandon. The orphaned-lock half is covered by
+`tests/test_lock_takeover_reporting.py`.
+
 ## Still to run
 
 D2.4, D3.3,
