@@ -2424,8 +2424,23 @@ class LogManager:
         self.log_statistics(message, estimate_data)
 
     def get_upload_statistics(self):
-        """Get current log generation statistics."""
-        return self.upload_stats.copy()
+        """Get current log generation statistics. A real snapshot, not a half-live one.
+
+        dict.copy() is SHALLOW: it snapshots total_logs by value but hands back the SAME
+        by_type dict, which every subsequent _log() call keeps mutating. The result was a
+        record whose breakdown did not sum to its own total -- measured live at by_type
+        summing to 69 against total_logs 67, the two records emitted between the snapshot
+        and its serialisation. Worse, the two completion records that are supposed to carry
+        IDENTICAL stats disagreed, because each serialised the shared live dict at a
+        different moment.
+
+        An operator reconciling by_type against total_logs cannot tell which number to
+        trust, and "the counters are inconsistent" is indistinguishable from "logging
+        dropped records".
+        """
+        snap = self.upload_stats.copy()
+        snap["by_type"] = dict(self.upload_stats["by_type"])
+        return snap
 
     def log_final_summary(self):
         """Log comprehensive final summary."""

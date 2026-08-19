@@ -2238,8 +2238,18 @@ class LogManager:
         self.log_statistics(message, estimate_data)
 
     def get_upload_statistics(self):
-        """Get current webhook upload statistics."""
-        return self.upload_stats.copy()
+        """Get current log generation statistics. A real snapshot, not a half-live one.
+
+        dict.copy() is SHALLOW: it snapshots total_logs by value but hands back the SAME
+        by_type dict, which every subsequent _log() call keeps mutating. Measured live on
+        the XDR twin: by_type summed to 69 against its own total_logs of 67 -- exactly the
+        two records emitted between the snapshot and its serialisation -- and the two
+        completion records that are supposed to carry IDENTICAL stats disagreed, because
+        each serialised the shared live dict at a different moment.
+        """
+        snap = self.upload_stats.copy()
+        snap["by_type"] = dict(self.upload_stats["by_type"])
+        return snap
 
     def log_final_summary(self):
         """Log comprehensive final summary."""
