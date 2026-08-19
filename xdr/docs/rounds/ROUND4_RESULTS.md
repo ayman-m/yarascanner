@@ -283,13 +283,47 @@ would stay green with dry-run completely broken.
 
 Second pass: **11 of 11 caught across both waves, 0 survivors.**
 
+### Wave 6 — D2.3, the largest gap in the round
+
+Three corruptions of `_coerce_row`, each leaving the row count exactly right. **All three
+survived the entire suite:**
+
+| Mutation | Effect on counts | Effect on findings |
+|---|---|---|
+| every text value → `""` | none | rule names, file paths, hostnames all emptied |
+| every number → `0` | none | offsets, file sizes, match counts all zeroed |
+| non-`str` text → `None` | none | a text field that read back as a number is lost |
+
+Counts balance under all three, so `plan_consolidation` reports verified and the source
+shards are deleted. The findings that survive are blank, and the only copies that said
+anything have been deleted as "successfully merged" — silent, total, unrecoverable loss of
+content, with every count in the report agreeing that it went perfectly.
+
+This is exactly why the criterion is worded *"not just the count"*. Row-count arithmetic is
+necessary and it was covered thoroughly; it is simply blind to this, because a corrupted row
+is still a row. Six waves of auditing found nothing else with this blast radius.
+
+`_coerce_row` is where the risk concentrates, and not by accident. It exists **to rewrite
+values** — XQL read-back does not round-trip types, so `number` fields return as `'0'` or
+`9.0` and `add_data` silently drops whole rows whose types mismatch. A function whose job is
+changing values is one where "changed it correctly" and "destroyed it" are adjacent edits.
+
+Now pinned by `tests/test_row_content_survives_the_merge.py`, 10 cases across both copies,
+comparing source to target **field by field** for every finding. Two fixture choices carry
+more weight than they look: `file_size=1`, the smallest value still distinguishable from a
+zeroed field, and `offset=0`, which proves the assertion checks the actual value rather than
+truthiness — a zeroing mutation is invisible to any test that only asks whether a field is
+present.
+
+Second pass: **3 of 3 caught, 0 survivors.**
+
 ## Still to run
 
-D2.3, D2.4, D3.3,
+D2.4, D3.3,
 D4.4 (crash recovery).
 
 Decided by the mutation audit above: D1.3, D1.5, D2.1, D2.2, D2.5, D2.6, D3.1, D3.2,
-D4.1, D4.3, D5.1–D5.3, D6.2, D6.3, D6.4.
+D2.3, D4.1, D4.3, D5.1–D5.3, D6.2, D6.3, D6.4.
 
 Much of D4 and D5 is already covered by the 74 existing unit tests in
 `tests/test_consolidation.py` — lock, stale, skew, quiet-period and terminality are all
