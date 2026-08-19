@@ -231,7 +231,7 @@ def test_scanner_closes_log_handles_before_host_cleanup_runs():
     # main()'s finally block. If either ordering regresses, this fails loudly here instead
     # of silently on a customer's Windows fleet.
     src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                            "xdr_yara_scanner.py"), encoding="utf-8").read()
+                            "xdr", "xdr_yara_scanner.py"), encoding="utf-8").read()
     marker = "# End-of-run host cleanup"
     start = src.index(marker)
     end = src.index("if log_manager:\n                log_manager.stop_logging()", start)

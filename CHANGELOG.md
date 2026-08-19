@@ -23,6 +23,319 @@ fixes without changing behaviour you rely on.
 
 ---
 
+## xsiam_yara_scanner.py v4.4.0 — 2026-08-17
+
+Correctness and honesty release. Every finding below was reproduced before being fixed and
+verified afterwards on a real endpoint — Windows (`Windows-11-10.0.26200`, yara 4.1.0) and,
+for the shared paths, Linux (`6.8.0-gcp`, yara 3.11.0). One reported issue was **refuted**
+rather than fixed, and is recorded as such.
+
+### Fixed — a scan that covered nothing reported a clean success
+
+Three separate triggers produced the same shape: `outcome: completed`, 0 scanned, exit 0.
+
+- **A requested target inside the skip list** was dropped silently. An IR lead scanning
+  `AppData\Local\Temp` (covered by `skip_path_fragments`) got a green result and zero
+  coverage; the only signal was a `0`, indistinguishable from an empty directory. The
+  target is now named on the result line and recorded in `excluded_targets`.
+- **Skipped subtrees were counted nowhere.** The directory-level skip incremented nothing
+  while the per-file skip always did, so `files_scanned + files_skipped` could not be
+  reconciled against disk and `skip_rate` read 0%.
+- **A negative `YARA_MAX_MB`** made `max_file_bytes` negative, so every file failed the
+  size check.
+
+### Fixed — a deployer typo killed the scan before anything could report it
+
+Ten knobs read inside `ScanConfig` used bare `int()`/`float()`, and `main()` builds
+`ScanConfig` *before* `LogManager` exists — so `YARA_MAX_MB=128MB` raised `ValueError` and
+the run died with no local log recording why, no telemetry and no dataset row. The guard
+helper that exists precisely for this was applied to the undocumented knobs and withheld
+from six the Deployment Guide tells deployers to set. All reads are now guarded, and
+`_env_number` gained a `minimum` because parsing is not validation.
+
+### Fixed — the skip predicate, four separate defects
+
+- **Prefix over-match:** `startswith("c:\yara_scanner")` also matched
+  `c:\yara_scanner_backup\evil.dll`. Any directory whose name merely began with a skip
+  entry's was permanently unscannable — a blind spot anyone able to create one could use.
+- **Bare directory roots** never matched entries carrying a trailing separator, on all
+  three platforms and in the platform-independent fragment check. The last of these was
+  caught **only by re-verifying on Windows**; it passed on macOS through a Darwin-only
+  fallback list, a pass for the wrong reason.
+- **macOS:** 32 of 58 `mac_skip_directory` entries were relative and could never match an
+  absolute path, and neither side was case-folded despite APFS being case-insensitive.
+- **`win_skip_patterns`** was a glob matcher that never matched anything, confirmed by
+  direct execution. Retired in favour of exact vendor install roots.
+
+### Fixed — evidence and alert artefacts on the scanned host
+
+- A fatally-failed scan **skipped evidence collection entirely**, discarding the alert
+  texts and `file_mapping.txt` a responder needs from a partial run. Verified: 1 match,
+  1 alert text, **0 evidence ZIPs**. Both evidence and a terminal status now run first.
+- `skip_reasons` keys embedded absolute paths, so the dict grew one key per errored file —
+  unbounded, and shipped into telemetry (307 KB for 5,000 errored files). Bounded to the
+  exception type; the per-file detail is still logged.
+- Duplicate content was stored once per **path** rather than once per hash. `zipfile` only
+  warns on a repeated entry name and stores the member anyway.
+
+### Fixed — telemetry that could not be reconciled
+
+`upload_stats['total']` was incremented **before** the circuit-breaker check, so every
+re-queue re-counted the same events (one event bouncing three times reported `total=3`,
+`successful=0`, `failed=0`). Items stranded when the drain expired were computed at
+shutdown, logged, then discarded — so a total delivery outage read as clean.
+`telemetry_delivery` now carries `undelivered`, matching the match channel.
+
+`scan_status` also never reached a terminal value on success — `finishing` was the last
+one emitted, indistinguishable from a scan hung mid-shutdown.
+
+### Changed — the scheduled cleanup task actually does something now
+
+The embedded cleanup scripts targeted `c:\xdr-data\alert` and `/opt/xdr-data/alert`,
+paths this edition never creates, so the `.txt` → `.alert` rotation renamed nothing.
+Verified failing on a live endpoint (`Last Result = 1`) — every scan with alerts created a
+SYSTEM scheduled task that did nothing. Now generated at runtime from `config.alert_dir`,
+with the errorlevel guard that stops a wildcard `ren` running in an unintended directory.
+
+### Changed — Cortex agent install roots are skipped on every platform
+
+Windows and macOS already skipped their vendor roots; **Linux skipped none**. Added
+`/opt/traps/`, confirmed against the official Cortex XDR Agent Administrator Guide, plus
+`/Library/Logs/PaloAltoNetworks/Cortex XDR/` on macOS — a second real vendor location the
+existing entry did not cover.
+
+### Removed — the file-cache subsystem, and other dead weight
+
+`FileCacher` never ran once: `use_cache` was hardcoded `False`, `get`/`put` had no call
+sites, and nothing incremented its counters — so `cache_hit_rate` shipped a permanent `0`
+and the "Cache Performance" event never existed on any host. Removed along with its ~10
+telemetry sites, the parsing-rule extractions, and the guide's claim that it deduplicated
+rescans (it never did). Also removed: seven unreferenced functions, five write-only
+attributes, an unused import.
+
+**Kept deliberately:** XDR's *rule* cache is a different, live subsystem that saves ~90s of
+compile time per run on a large pack.
+
+### Refuted, not fixed
+
+An "unwritable scanner directory still reports success" report **does not reproduce**.
+Tested directly: the run returns `Scan failed: … Critical error occurred` and logs a
+`PermissionError` traceback. No change was made.
+
+### Tests
+
+266 → 311, including parity tests that run the shared paths against **both** editions.
+One caught a real contract difference between them. Also fixed a test bug that had the
+suite silently asserting nothing: pytest's `tmp_path` resolves under
+`/private/var/folders/`, which is itself in the macOS skip list.
+
+---
+
+## xdr_yara_scanner.py v3.3.0 — 2026-08-17
+
+Brings the XDR edition level with XSIAM on everything **shared** — scanning, file capping,
+evidence packaging, match aggregation and skip behaviour. Delivery is deliberately
+untouched: XSIAM streams NDJSON to an HTTP collector, XDR uses Insert Parsed Alerts plus
+lookup datasets, and those paths have nothing in common.
+
+A parity audit found ten shared fixes already present in both editions and two that were
+not. Both missing ones are in this release.
+
+### Fixed — evidence ZIP stored duplicate content once per path
+
+Identical to the XSIAM defect: entries are content-addressed as `matched_files/<sha256>`
+but were iterated by path, so identical bytes at several paths each wrote a full copy under
+one entry name. Gated behind `collect_files` (default off), so it only affected deployers
+who opted in. Measured on the XSIAM side: 22,918 matched paths held 22,213 distinct files —
+705 redundant copies, 506 MB.
+
+### Changed — alert texts sample offsets and report per-string-ID counts in full
+
+`alert/<rule>.txt` rendered **every** offset, unbounded — as XSIAM did before v4.3.0, where
+it produced a 220 MB file on one endpoint. New `CONFIG_ALERT_OFFSETS_PER_FINDING_MAX = 50`
+matches the existing `CONFIG_LOOKUP_ROWS_PER_FINDING_MAX`, so the local file and the dataset
+row show the same sample; `0` renders everything. The per-string-ID census is **uncapped** —
+which string fired and how often is what an analyst works from.
+
+### Also in this release, shared with XSIAM
+
+Env-guard hardening (28 reads, 23 of them at module level where a typo crashed at
+**import**, before anything could report it), the zero-coverage fixes, bounded
+`skip_reasons`, terminal scan status, evidence collection on fatal failure, the full skip
+predicate rework, cache removal, and the Cortex agent install roots.
+
+### Verified on Linux
+
+First live Linux verification of this branch, on the XDR tenant (`6.8.0-gcp`, yara
+**3.11.0** — note the spread against 4.1.0 on the Windows agent and 4.5.4 locally). All
+checks passed: `/opt/traps` skipped with its boundary sibling still scannable, case
+sensitivity correct for the platform, env guards, counters, excluded-target reporting, and
+the cleanup rotation confirmed working (`t.txt` → `t.alert`).
+
+## xsiam_yara_scanner.py v4.3.0 — 2026-08-14
+
+Two independent fixes, both found by measuring rather than reading: a scan blind spot in
+the skip list, and an alert artefact that spent nearly all its bytes on detail nobody uses.
+
+> **Behaviour change:** `alert/<rule>.txt` now samples offsets instead of listing every one,
+> and gains a per-string-ID census. Directories whose names merely *begin with* a skip
+> entry's name are now scanned, where before they were silently skipped.
+
+### Fixed — sibling directories sharing a skip entry's name prefix were unscannable
+
+The Windows skip check was `normalized_path.startswith(skip_folder)`, which treats the entry
+as a **string** prefix rather than a **path** prefix. So `c:\yara_scanner` also matched
+`c:\yara_scanner_backup\evil.dll`, and `c:\programdata\cyvera` matched
+`c:\programdata\cyverabackup\`. Any directory whose name merely began with a skip entry's
+became a permanent scan blind spot — one anyone able to create such a directory could hide in.
+
+Matching is now on whole path components: equal to the entry, or beneath it with a separator.
+Skip entries are additionally stripped of a trailing separator on every platform, because
+`os.path.normpath` only does that on Windows itself — the list previously had two different
+shapes depending on host OS. A drive root is guarded so `c:\` is not reduced to `c:`, which
+would prefix-match the entire drive.
+
+This came out of an adversarial audit of the self-skip (5 investigators, every finding
+attacked by 2 independent refuters). It was the highest-severity survivor, at 7 of 10
+refutations failed. The same audit **confirmed the baseline holds**: the scanner's own
+directory, evidence ZIP, alert texts and logs are still skipped on Windows, and a test now
+pins that so it cannot regress.
+
+### Changed — alert texts sample offsets and report per-string-ID counts in full
+
+The file rendered **every** matched offset at ~95 bytes each. On a live Windows endpoint one
+rule against `C:\Windows\System32` produced 2,433,386 offsets and a **220 MB** file on the
+scanned host — 98.6% of it from four Windows event logs, where a rule hunting PowerShell
+strings legitimately matches thousands of times inside a PowerShell log.
+
+Individual offsets are not what an analyst works from. Which host, which rule, **which string
+in that rule**, and which file are. So the file's byte budget is inverted:
+
+```
+Total string hits: 11087
+Hits per string ID: $enc=1143, $ps=9944
+=========================================================================
+Matched Strings (showing 50 of 11087):
+...
+11037 further offset(s) omitted (YARA_MAX_ALERT_OFFSETS=50). Counts above are complete;
+re-run `yara -s` against this file for every offset.
+```
+
+The census is **uncapped** — it costs one line regardless of hit count, and the old format
+never summarised it at all. Offsets are sampled via:
+
+```python
+MAX_ALERT_OFFSETS_PER_FINDING = _env_number("YARA_MAX_ALERT_OFFSETS", 50, cast=int)
+```
+
+50 matches the tenant's existing `MAX_MATCH_SAMPLES_PER_FINDING`, so the local file and the
+`yara_match` row show the same sample. `0` restores the old behaviour.
+
+**Nothing is lost.** The matched file is never quarantined, moved or deleted, so
+`yara -s <rules> "<path>"` regenerates every offset on demand, and the tenant row already
+carries the exact uncapped `match_count` plus per-string-ID counts.
+
+Measured on the worst real finding (11,087 hits): **4,877 B, down from ~1,053,265 B**.
+Findings under the cap — 99.75% of them — are byte-identical apart from the new census. The
+cap is deliberately **not** applied to the alert event or the `yara_match` row.
+
+### Validated before building — the 220 MB was mostly a test artefact
+
+Worth recording, because it changed the scope of this release. The 220 MB figure came from a
+deliberately broad rule (`"Microsoft"` across System32). Re-running the same target with the
+**realistic 10-rule pack** produced:
+
+| | Synthetic rule | Realistic 10 rules |
+|---|---|---|
+| Matches | 21,622 | 82 |
+| Alert total | 220.29 MB | **3.30 MB** |
+| Evidence ZIP | 11.57 MB | **0.16 MB** |
+
+So there was no general footprint emergency. What *is* real is the shape: even in the
+realistic run, one rule put 3.2 MB into a single file from just **4** event logs. That skew
+is what the cap addresses, and it is why the cap is a bound on the pathological case rather
+than a change anyone with ordinary rules will notice.
+
+### Also verified this release
+
+`v4.2.0`'s dedupe was unit-tested only, because the validation scan ran with copying
+disabled. Exercised live against `System32\DriverStore\en-US`: **475 matched paths → 431 ZIP
+blobs = 431 distinct SHA256, 0 duplicate arcnames**, with the worst duplicate (34 copies)
+collapsed to one. Bytes saved there were only 0.011 MB — `.inf_loc` files are tiny — so the
+correctness is proven while the *savings* remain a function of duplicated file size.
+
+### Tests
+
+`tests/test_skip_predicate.py` (5) and `tests/test_alert_sampling.py` (6). Suite: 240 → 251.
+
+---
+
+## xsiam_yara_scanner.py v4.2.0 — 2026-08-14
+
+Endpoint footprint release. A scan was writing **2.8 GB to the disk of the machine it was
+scanning**, unconditionally and with no way to turn it off. This release stops that by
+default and fixes a packaging bug found alongside it. Numbers below are measured on the
+same live Windows endpoint as v4.1.0 (26,312 files, 22,918 findings).
+
+> **Behaviour change:** the evidence ZIP no longer contains copies of matched files by
+> default. Nothing else about scanning, alerting, or delivery changes. See below for how
+> to restore the old behaviour and what you give up by leaving it off.
+
+### Changed — matched files are no longer copied into the evidence ZIP by default
+
+The evidence collector read every matched file and wrote it into a local archive. That
+work is charged entirely to the **scanned host**: on the lab endpoint it read **7,244 MB**
+of file data and left a **2,867 MB** ZIP behind, for a scan that ran 455 seconds. Because
+the archive is named per run and only cleared at the *start* of the next scan, a host
+scanned once keeps that 2.8 GB indefinitely.
+
+`xdr_yara_scanner.py` already defaults its equivalent `collect_files` option **off, at the
+customer's request**. XSIAM had no such option at all — the copy was unconditional. This
+release closes that gap.
+
+The new top-of-file knob mirrors the XDR default:
+
+```python
+COLLECT_MATCHED_FILES = _env_bool("YARA_COLLECT_MATCHED_FILES", False)
+```
+
+Set it to `True` (or export `YARA_COLLECT_MATCHED_FILES=true`) to restore pre-4.2.0
+behaviour.
+
+**What you still get with it off.** The ZIP keeps `file_mapping.txt` — every matched path
+with its SHA256 — and the per-rule alert texts with every offset. A responder can still
+identify exactly which files matched and fetch any of them on demand. What is dropped is
+only the bulk, up-front copy of files that are by definition already sitting on the host.
+
+### Fixed — duplicate files were stored multiple times in the evidence ZIP
+
+Archive entries are content-addressed (`matched_files/<sha256>`), but the writer iterated
+by *path*, so several paths holding identical bytes each wrote a full copy under the same
+entry name. `zipfile` only emits a warning for a repeated name and stores the member
+anyway, so the archive silently carried N copies while a reader could still only ever
+extract the first.
+
+Measured on the lab endpoint: 22,918 matched paths held **22,213 distinct files**, so
+**705 redundant copies** were being written — **506 MB**, or 7% of the bytes copied. The
+worst single case was `c_usb.inf_loc`, stored **34 times**.
+
+This only affects scans that opt back in via `COLLECT_MATCHED_FILES=true`, but it is fixed
+so that opting in is no longer needlessly expensive.
+
+### Known limitation — alert text files are still unbounded
+
+The per-rule `alert/<rule>.txt` files record every matched offset and are packaged into the
+ZIP regardless of this setting. On the lab endpoint's 2,653,415 offsets they came to
+**240 MB**. With file copying off they are now the largest thing in the archive. Bounding
+them is deferred to a later release; it needs a decision about which offsets to keep.
+
+### Tests
+
+`tests/test_evidence_collector.py` — 6 new tests covering dedupe by content, distinct
+content surviving, mapping completeness after dedupe, resilience to a file deleted
+mid-scan, metadata-only packaging when collection is off, and archive size staying
+independent of matched-file size. Suite total: 234 → 240.
+=======
 ## xdr_data_management.py v2.2.0 — 2026-08-13
 
 ### Fixed — `--delete-legacy`'s rails skipped the oldest, least replaceable datasets
@@ -170,8 +483,25 @@ of 72,484 ingested rows (65%)** at 2.07 events per finding — the single larges
 ingestion, mostly duplication.
 
 They are now **one** event carrying the union of both payloads, plus rule and string-hit
-counts in the message. Expected effect on that scan: ~47,460 alert rows → ~22,918, cutting
-total ingestion roughly a third.
+counts in the message.
+
+**Verified on the tenant** (2026-08-14, alongside the v4.2.0 validation scan), comparing the
+pre-merge run against a post-merge run of the same target and rule:
+
+| Rows by type | Pre-merge (v4.0.0) | Post-merge |
+|---|---|---|
+| `alert` | 45,837 — **2.00** per finding | 21,623 — **1.00** per finding |
+| `yara_match` | 22,918 — 1.00 per finding | 21,622 — 1.00 per finding |
+| all types | 69,124 | 43,602 |
+| **events per finding** | **3.02** | **2.02** |
+
+A **33.1% reduction** in total ingested rows, matching the projection above. Alert rows are
+now exactly one per finding.
+
+The remaining 2.02 comes from `alert` and `yara_match` still being emitted per finding. They
+serve different consumers — `yara_match` backs the dashboards and hunting queries, `alert`
+drives alerting — so they are deliberately not merged. Collapsing them is possible but would
+be a breaking change to both surfaces.
 
 **Check any ad-hoc query matching `"YARA detection event"`** — that message no longer
 exists. No shipped widget, dashboard, or parsing-rule field used either event, so nothing
@@ -1060,7 +1390,7 @@ query built directly against the raw `match` field (rather than through the ship
 dashboards) will need to move to `match_ids` instead.
 
 **Requires updating the XSIAM parsing rule** to extract these fields — now at
-[`parsing_rules/xsiam/parsing_rule.xql`](parsing_rules/xsiam/parsing_rule.xql) (moved out of
+[`parsing_rules/xsiam/parsing_rule.xql`](xsiam/parsing_rules/parsing_rule.xql) (moved out of
 `docs/xsiam/`, see below). This is a manual console step; there is no parsing-rule API.
 Updated the 5 affected dashboard widgets and `dashboards/xsiam/YARA Matches.json` to
 `sum(to_integer(match_count))` instead of `count()`, and to explode the sampled `strings`
@@ -1199,7 +1529,7 @@ columns is a natural follow-up if you build on top of this dashboard.
 ### Upgrading
 
 1. Update the tenant's XSIAM parsing rule from
-   [`parsing_rules/xsiam/parsing_rule.xql`](parsing_rules/xsiam/parsing_rule.xql) (console
+   [`parsing_rules/xsiam/parsing_rule.xql`](xsiam/parsing_rules/parsing_rule.xql) (console
    step, no API).
 2. Re-import or re-add the 5 affected widgets/`YARA Matches.json` dashboard if you've
    customized them locally.
@@ -1369,8 +1699,9 @@ findings gone.
 recreate attempt per batch so a genuinely broken create call can't loop forever.
 
 **Live-reproduced and fixed, not just code-traced.** Deliberately deleted a running scan's
-own lookup dataset mid-flight (twice — once via the abandoned-cutoff race on `xdragent2`,
-once by deleting the dataset directly on `xdr-agent` while tailing its log over SSH) and
+own lookup dataset mid-flight (twice — once via the abandoned-cutoff race on a Windows
+endpoint, once by deleting the dataset directly on a Linux endpoint while tailing its log
+over SSH) and
 confirmed both halves:
 
 - **Pre-fix:** the dataset never reappeared; the scanner kept running but its per-host

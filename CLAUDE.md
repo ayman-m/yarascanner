@@ -3,7 +3,43 @@
 Project-specific notes for working in this repo. See `.claude/skills/` for the
 XDR Action Center API automation skills (scan delivery, live testing).
 
-## Lab tenant test VMs (GCP `cortex-gcp-labs`, zone `us-central1-f`)
+## Test topology — TWO tenants, two completely different environments
+
+Getting this wrong wastes real time: a GCP instance and a tenant endpoint can share a
+name and be different machines. That happened — GCP `xsoar6` (kernel 6.17) was mistaken
+for the XSIAM endpoint `xsoar` (kernel 5.4, Ubuntu 20.04), and the wrong box reported no
+Cortex agent. Match on **kernel/IP**, never on name alone.
+
+| Tenant | API host | Where the machines live | Direct access |
+|---|---|---|---|
+| **XSIAM** | `api-ayman.xdr.eu…` | **LOCAL**, `192.168.20.x` | SSH + password from `.env` |
+| **XDR (EMEA)** | `api-emea-cxdrp.xdr.eu…` | **GCP** `cortex-gcp-labs`, `us-central1-f` | `gcloud compute ssh --tunnel-through-iap` |
+
+### XSIAM tenant — local VMs, reachable directly on 192.168.20.x
+
+| Endpoint | OS | Notes |
+|---|---|---|
+| `OfficeiMac` | macOS 15.1 arm64, yara 4.1.0 | **The only macOS anywhere.** The XDR tenant has none, so the XDR edition's Darwin branch can never be live-verified. |
+| `xsoar` | Ubuntu 20.04.6, kernel 5.4.0-216, yara 3.11.0 | Lab VM, not production. IP `192.168.20.29`. Cortex agent IS installed — `/opt/traps` is root-only, so `du`/`ls` as a normal user returns nothing and looks empty. Confirm via `ps aux \| grep pmd` instead. |
+| `thor` | Windows 11 `10.0.26200`, yara 4.1.0 | Primary Windows target. Big attached disk — never run a recursive `C:\**` glob on it. |
+| `win-workstation`, `dc`, `webserver` | Windows Server `10.0.20348` | Unused so far |
+| `Abdelrahman's MacBook Air` | macOS 15.0 | **Personal machine — do not scan.** |
+
+Credentials in `.env`: `LINUX_USER`/`LINUX_PASS` (xsoar), `THOR_USER`/`THOR_PASS` (thor).
+Paramiko is installed; `sshpass` is NOT, so use paramiko for password SSH.
+
+### Validate through BOTH channels
+
+Action Center alone is not enough. Run the scan via Action Center, then read the artifacts
+off the disk over SSH — that is what catches wrong-host mixups and confirms things the API
+cannot show cleanly (evidence ZIP size and contents, `.txt` → `.alert` rotation actually
+firing, real agent install size).
+
+yara versions differ per agent and matter: **4.5.4** local dev macOS, **4.1.0** Windows and
+macOS agents, **3.11.0** Linux agents. 3.11.0 predates match-API changes the scanner
+normalises around.
+
+## XDR tenant VMs (GCP `cortex-gcp-labs`, zone `us-central1-f`)
 
 The XDR test endpoints (`xdragent`, `xdragent2`, `xdr-agent`, `server2022`, `services`, etc.)
 are GCE instances with no external IP — reachable only via IAP tunneling. Access differs

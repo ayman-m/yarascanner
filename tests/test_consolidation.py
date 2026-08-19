@@ -1263,10 +1263,10 @@ def test_partial_cleanup_failure_does_not_cause_permanent_count_mismatch():
 # precisely because nothing checked this.
 _PACK_COMMON = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "Packs", "YaraDatasetManagement", "Scripts", "YaraConsolidateCommon",
+    "xdr", "Packs", "YaraDatasetManagement", "Scripts", "YaraConsolidateCommon",
     "YaraConsolidateCommon.py")
 _XDR_CONSOLIDATE = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "xdr_consolidate.py")
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "xdr", "xdr_consolidate.py")
 
 # The whole ported core: every gate helper (these decide whether a live scan's shard gets
 # deleted) plus the orchestration around them, which the pack's header calls a verbatim port.

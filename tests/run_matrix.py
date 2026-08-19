@@ -22,7 +22,7 @@ from xdr_action_center import XDRActionCenter  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RULES_DIR = os.path.join(REPO, "tests", "yara_rules")
-SCANNER = os.path.join(REPO, "xdr_yara_scanner.py")
+SCANNER = os.path.join(REPO, "xdr", "xdr_yara_scanner.py")
 RESULTS_DIR = os.path.join(REPO, "tests", "results")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 JSONL = os.path.join(RESULTS_DIR, "matrix.jsonl")
