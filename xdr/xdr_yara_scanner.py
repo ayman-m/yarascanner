@@ -377,7 +377,15 @@ LOOKUP_SCHEMA_VERSION = os.environ.get("YARA_LOOKUP_SCHEMA_VER", "3").strip() or
 # version + externals + module availability + a format tag, so it can never load a stale or
 # cross-version bundle; any load failure falls back to a fresh compile.
 RULE_CACHE_ENABLED = (os.environ.get("YARA_RULE_CACHE", "1").strip().lower() not in ("0", "false", "no", ""))
-RULE_CACHE_FORMAT = os.environ.get("YARA_RULE_CACHE_FORMAT", "1").strip() or "1"  # bump when compile logic changes
+# Bumped to "2" for v3.2.0: that release changed the rule *classification* logic (a rule is
+# skipped only when yara itself raises `undefined identifier`, not when its text mentions a
+# module name). Classification is not one of the key's inputs below, so without this bump a
+# host with a warm cache would take a HIT and keep running the pre-fix bundle — the wrongly
+# skipped rules would stay missing, silently, for as long as the cache entry survived.
+RULE_CACHE_FORMAT = os.environ.get("YARA_RULE_CACHE_FORMAT", "2").strip() or "2"  # bump when compile logic changes
+# The two numeric knobs go through _env_number rather than a bare os.environ read: an
+# unparseable value (YARA_RULE_CACHE_MAX_MB=256MB) used to raise inside ScanConfig, which
+# main() builds BEFORE LogManager exists, so the scan died with nothing recording why.
 RULE_CACHE_MAX_FILES = _env_number("YARA_RULE_CACHE_MAX", 5, cast=int, minimum=0)
 RULE_CACHE_MAX_BYTES = int(_env_number("YARA_RULE_CACHE_MAX_MB", 256, minimum=0) * 1024 * 1024)
 _RULE_CACHE_LOCK = threading.Lock()
@@ -5709,15 +5717,26 @@ rule test {{
                 meta = json.load(f)
             el.valid_rules_count = int(meta.get("valid_rules", 0))
             el.failed_rules_count = int(meta.get("failed_rules", 0))
-            return int(meta.get("skipped", 0))
+            # Assign skipped onto the logger too, not just return it. Returning it only fed the
+            # "Rule cache HIT ..." log line, so on every cache HIT the operator-facing surfaces
+            # (the SCAN_RESULT line's "N rules skipped" segment and scan_summary's
+            # skipped_rules) read el.skipped_rules_count == 0 and stayed silent — the exact
+            # "a pack whose rules mostly could not run reports nothing" failure the skipped
+            # count exists to prevent, and the normal case, since a repeat scan of the same
+            # ruleset always hits the cache.
+            el.skipped_rules_count = int(meta.get("skipped", 0))
+            return el.skipped_rules_count
         except Exception:
             # No/broken sidecar: recover the true valid count from the loaded bundle
-            # (yara.Rules is iterable and yields exactly the compiled rules).
+            # (yara.Rules is iterable and yields exactly the compiled rules). The skipped count
+            # is not recoverable this way — the bundle holds what compiled, not what didn't — so
+            # leave it at 0 rather than inventing one.
             if not getattr(el, "valid_rules_count", 0):
                 try:
                     el.valid_rules_count = sum(1 for _ in rules) if rules is not None else 1
                 except Exception:
                     el.valid_rules_count = 1
+            el.skipped_rules_count = 0
             return 0
 
     def _save_rule_cache(self, rules, cache_path, yara_rule_string):

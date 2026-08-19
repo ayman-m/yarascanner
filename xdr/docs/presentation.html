@@ -738,7 +738,7 @@ svg .flow{stroke:var(--acc);stroke-width:2.5;fill:none;stroke-linecap:round;stro
       <p class="dek" style="margin-top:22px;max-width:80ch"><b>xdr_yara_scanner.py</b> — a multi-threaded YARA scanner that runs as a managed Cortex XDR response script and lands its findings as alerts and lookup datasets, with a CPU governor, cooperative cancellation and per-endpoint sharding.</p>
     </div>
     <div style="display:flex;gap:12px;margin-top:34px" data-fx>
-      <span class="chip koi">v2.0.0</span><span class="chip">Action Center script</span>
+      <span class="chip koi">v3.2.1</span><span class="chip">Action Center script</span>
       <span class="chip">Insert Parsed Alerts</span><span class="chip">Lookup datasets</span>
       <span class="chip">Windows · Linux · macOS</span>
     </div>
@@ -1460,6 +1460,140 @@ svg .flow{stroke:var(--acc);stroke-width:2.5;fill:none;stroke-linecap:round;stro
     </div>
   </div>
 </section>
+<!-- 13b CONSOLIDATION -->
+<section class="slide" data-t="Consolidation" data-sec="Workflows" data-tags="overview deep"
+  data-note="This is the slide that answers &quot;so how many datasets am I going to end up with?&quot; — ask for it before they do. Rotation, from the previous slide, bounds each dataset's SIZE so write time stays flat forever. It deliberately deletes nothing, so the COUNT keeps climbing: one pair per host per month. On a 500-endpoint fleet that is on the order of a thousand datasets a month, and that is a real operational cost, not a rounding error. Consolidation folds every finished scan's per-host shards into a single dataset for that scan and removes the shards, so the count is bounded by how many scans you run rather than by how many machines you own. Two things to stress. First, it is housekeeping, not a reporting fix — dashboards already query the yara_scanner wildcards, so shards and per-scan datasets fan in identically and no query changes. Second, it will not touch a scan that is still running: it needs a terminal lifecycle row and a settle window, and it removes a shard only after the target's row count matches the sources exactly. If the counts disagree it keeps everything and reports it. Nothing is deleted on a guess.">
+  <div class="head">
+    <h2>Rotation bounds each dataset's size. <span class="a">Consolidation bounds how many there are.</span></h2>
+    <p class="dek">One dataset pair per host per month never shrinks on its own. Consolidation folds each finished scan's shards into a single dataset for that scan, so the count tracks <b>scans</b>, not machines.</p>
+  </div>
+  <div class="body" style="gap:18px">
+    <div class="grid" style="grid-template-columns:1fr 1fr;gap:20px;flex:1;min-height:0">
+      <div class="card" data-fx="left" style="display:flex;flex-direction:column;justify-content:center">
+        <div style="display:flex;justify-content:space-between;align-items:baseline">
+          <h3 style="margin:0">Per-host shards</h3>
+          <span class="stat" style="font-size:26px" id="csbefore" data-t0="8">8</span></div>
+        <div class="stat-l" style="margin-top:4px">one pair per host, per month — grows with the fleet</div>
+        <div class="wgrid" style="flex:none;height:132px">
+          <div class="wcol"><div class="wbatch" data-c="1" data-s0="idle" data-s="idle">a</div><div class="wlab">host-a</div></div>
+          <div class="wcol"><div class="wbatch" data-c="2" data-s0="idle" data-s="idle">b</div><div class="wlab">host-b</div></div>
+          <div class="wcol"><div class="wbatch" data-c="3" data-s0="idle" data-s="idle">c</div><div class="wlab">host-c</div></div>
+          <div class="wcol"><div class="wbatch" data-c="4" data-s0="idle" data-s="idle">d</div><div class="wlab">host-d</div></div>
+          <div class="wcol"><div class="wbatch" data-c="5" data-s0="idle" data-s="idle">e</div><div class="wlab">host-e</div></div>
+          <div class="wcol"><div class="wbatch" data-c="6" data-s0="idle" data-s="idle">f</div><div class="wlab">host-f</div></div>
+          <div class="wcol"><div class="wbatch" data-c="7" data-s0="idle" data-s="idle">g</div><div class="wlab">host-g</div></div>
+          <div class="wcol"><div class="wbatch" data-c="8" data-s0="idle" data-s="idle">h</div><div class="wlab">host-h</div></div>
+        </div>
+        <div class="fmeta" style="margin-top:14px">a 500-endpoint fleet creates on the order of <b>a thousand datasets a month</b></div>
+      </div>
+      <div class="card" data-fx="right" style="display:flex;flex-direction:column;justify-content:center;border-color:var(--acc)">
+        <div style="display:flex;justify-content:space-between;align-items:baseline">
+          <h3 style="margin:0">One dataset per scan</h3>
+          <span class="stat koi" style="font-size:26px" id="csafter" data-t0="—">—</span></div>
+        <div class="stat-l" style="margin-top:4px">bounded by scans run, not machines owned</div>
+        <div class="wgrid" style="flex:none;height:132px;grid-template-columns:1fr;
+             max-width:280px;margin-left:auto;margin-right:auto">
+          <div class="wcol"><div class="wbatch" data-tgt="1" data-s0="idle" data-s="idle">scan_&lt;id&gt;</div><div class="wlab">all hosts, one place</div></div>
+        </div>
+        <div class="stat-l" style="text-align:center;margin-top:-4px">
+          count tracks <b>scans run</b>, not machines owned</div>
+        <div class="fmeta" style="margin-top:14px"><b>No query changes.</b> Dashboards match <span class="mono">yara_scanner_matches*</span>, so shards and per-scan datasets fan in identically.</div>
+      </div>
+    </div>
+    <div class="scsay" data-t0="Press play to consolidate one finished scan.">Press play to consolidate one finished scan.</div>
+    <div class="scctl">
+      <button class="btn pri scplay">▶ Play</button><button class="btn screset">Reset</button>
+      <div class="scbar"></div><span class="sccount">0 / 0</span>
+    </div>
+  </div>
+  <script type="application/json" class="scene">[
+    {"say":"Eight hosts finished the same scan. Each wrote into its own shard — eight datasets for one scan."},
+    {"say":"Consolidation only considers a scan that is genuinely finished: a terminal lifecycle row, and its newest row older than a settle window.",
+     "hold":2600},
+    {"say":"Every shard's rows for that scan are copied into one per-scan dataset.",
+     "set":[{"sel":"[data-tgt]","s":"landed"}],
+     "text":{"#csafter":"1"}},
+    {"say":"The shards are removed only after the target's row count matches the sum of the sources exactly. A mismatch keeps everything and reports it.",
+     "set":[{"sel":"[data-c]","s":"landed"}],
+     "text":{"#csbefore":"0"},"hold":2800},
+    {"say":"Eight datasets became one, with nothing deleted on a guess — and no dashboard or saved query had to change."}
+  ]</script>
+</section>
+
+<!-- 13c RETENTION -->
+<section class="slide" data-t="Retention" data-sec="Workflows" data-tags="overview deep"
+  data-note="This is the slide where you say the quiet part out loud: this tool deletes whole datasets, and the platform has no undelete and no dataset versioning. Say it before they ask, because it is the first thing a cautious customer worries about, and the answer is good. Deletion is not guarded by hoping the operator typed the right thing — it is guarded in code. Dry run is the default: a bare run reports exactly what it would remove and removes nothing, and only an explicit affirmative enables deletion. An unrecognised value is rejected rather than guessed in either direction. Then seven independent rails, each of which can only ever move a dataset from the delete list to the skip list, never the reverse: never the current month, never a future-dated month, never an unsuffixed dataset (that one holds a host's entire pre-rotation history), never a newer schema than this code understands, never a name outside the naming contract, never a dataset written to in the last day, and never a dataset still holding a scan that consolidation has not verified. The last two are live checks against the tenant, and if the check itself errors the dataset is KEPT — it fails closed. Every skipped dataset reports the reason it was skipped, so a dataset silently not deleted is never indistinguishable from a bug. If asked what happens on a wrong deletion: nothing recovers it, which is exactly why the rails exist rather than a confirmation prompt.">
+  <div class="head">
+    <h2>Retention deletes whole datasets. <span class="a">So the rails are the feature.</span></h2>
+    <p class="dek">The platform has no undelete and no dataset versioning. Every guard below exists because a wrong deletion cannot be walked back — and each one can only ever <b>keep</b> a dataset, never remove one.</p>
+  </div>
+  <div class="body" style="gap:18px">
+    <div class="grid" style="grid-template-columns:1fr 1fr;gap:20px;flex:1;min-height:0">
+      <div class="card" data-fx="left" style="display:flex;flex-direction:column;justify-content:center">
+        <div style="display:flex;justify-content:space-between;align-items:baseline">
+          <h3 style="margin:0">Candidates by age</h3>
+          <span class="stat" style="font-size:26px" id="rtcand" data-t0="6">6</span></div>
+        <div class="stat-l" style="margin-top:4px">older than the retention window</div>
+        <div class="wgrid" style="flex:none;height:132px;grid-template-columns:repeat(3,1fr)">
+          <div class="wcol"><div class="wbatch" data-r="1" data-s0="idle" data-s="idle">1</div><div class="wlab">202601</div></div>
+          <div class="wcol"><div class="wbatch" data-r="2" data-s0="idle" data-s="idle">2</div><div class="wlab">202602</div></div>
+          <div class="wcol"><div class="wbatch" data-r="3" data-s0="idle" data-s="idle">3</div><div class="wlab">current</div></div>
+          <div class="wcol"><div class="wbatch" data-r="4" data-s0="idle" data-s="idle">4</div><div class="wlab">no month</div></div>
+          <div class="wcol"><div class="wbatch" data-r="5" data-s0="idle" data-s="idle">5</div><div class="wlab">live scan</div></div>
+          <div class="wcol"><div class="wbatch" data-r="6" data-s0="idle" data-s="idle">6</div><div class="wlab">unmerged</div></div>
+        </div>
+        <div class="fmeta" style="margin-top:14px"><b>Dry run by default.</b> A bare run reports what it would remove and removes nothing.</div>
+      </div>
+      <div class="card" data-fx="right" style="display:flex;flex-direction:column;justify-content:center;border-color:var(--acc)">
+        <div style="display:flex;justify-content:space-between;align-items:baseline">
+          <h3 style="margin:0">Kept by a rail</h3>
+          <span class="stat koi" style="font-size:26px" id="rtkept" data-t0="—">—</span></div>
+        <div class="stat-l" style="margin-top:4px">every skip reports its reason</div>
+        <div class="rails" style="display:grid;grid-template-columns:1fr 1fr;gap:5px 14px;margin:12px 0 10px">
+          <div class="stat-l">1 · never the current month</div>
+          <div class="stat-l">5 · never a foreign name</div>
+          <div class="stat-l">2 · never a future month</div>
+          <div class="stat-l">6 · never recently written</div>
+          <div class="stat-l">3 · never unsuffixed</div>
+          <div class="stat-l">7 · never unconsolidated</div>
+          <div class="stat-l">4 · never a newer schema</div>
+          <div class="stat-l" style="color:var(--acc)">↳ 6 &amp; 7 are live checks</div>
+        </div>
+        <div class="sclog" style="flex:none;height:118px;min-height:0"></div>
+        <div class="fmeta" style="margin-top:12px">Both live rails <b>fail closed</b> — if the check query errors, the dataset is kept.</div>
+      </div>
+    </div>
+    <div class="scsay" data-t0="Press play to evaluate six candidates.">Press play to evaluate six candidates.</div>
+    <div class="scctl">
+      <button class="btn pri scplay">▶ Play</button><button class="btn screset">Reset</button>
+      <div class="scbar"></div><span class="sccount">0 / 0</span>
+    </div>
+  </div>
+  <script type="application/json" class="scene">[
+    {"say":"Six datasets are older than the retention window. Age alone is not authority to delete."},
+    {"say":"The current month is never a candidate — a scan may be writing to it right now.",
+     "set":[{"sel":"[data-r='3']","s":"lost"}],
+     "log":"kept  current month — a scan may be writing to it","logk":"warn",
+     "text":{"#rtkept":"1","#rtcand":"5"}},
+    {"say":"An unsuffixed dataset holds that host's entire pre-rotation history. Never a blanket candidate.",
+     "set":[{"sel":"[data-r='4']","s":"lost"}],
+     "log":"kept  unsuffixed — holds ALL pre-rotation history","logk":"warn",
+     "text":{"#rtkept":"2","#rtcand":"4"}},
+    {"say":"A rotation suffix records when a dataset was created, not when it was last written. This one is still being written to.",
+     "set":[{"sel":"[data-r='5']","s":"lost"}],
+     "log":"kept  written to 40 min ago — a scan is still draining","logk":"warn",
+     "text":{"#rtkept":"3","#rtcand":"3"}},
+    {"say":"And this one still holds a scan consolidation has not verified — deleting it would lose that scan's only copy.",
+     "set":[{"sel":"[data-r='6']","s":"lost"}],
+     "log":"kept  unconsolidated scan — would lose data","logk":"warn",
+     "text":{"#rtkept":"4","#rtcand":"2"}},
+    {"say":"Two genuinely old, quiet, fully-consolidated datasets remain. Those are the only ones a real run would remove.",
+     "set":[{"sel":"[data-r='1'],[data-r='2']","s":"landed"}],
+     "log":"delete  2 dataset(s) — age, quiet, verified","logk":"ok","hold":2800},
+    {"say":"Four of six kept, each with a named reason. A dataset silently not deleted is never indistinguishable from a bug."}
+  ]</script>
+</section>
+
 
 <!-- 14 PERFORMANCE -->
 <section class="slide" data-t="Performance" data-sec="Results" data-tags="overview deep"
@@ -1853,6 +1987,11 @@ function presFit(){
   ['pvcur','pvnextbox'].forEach(id=>{
     const box=d.getElementById(id); if(!box)return;
     const el=box.querySelector('.pvfit');
+    /* On the LAST slide presSync fills pvnextbox with #pvend instead of a .pvfit, so
+       this lookup is null and dereferencing it threw — which killed presSync mid-run
+       and left the presenter window blank. Opening the presenter while parked on the
+       final slide is exactly when a presenter does it. */
+    if(!el)return;
     const s=Math.min(box.clientWidth/1600,box.clientHeight/900);
     el.style.transform='translate('+((box.clientWidth-1600*s)/2)+'px,'+
       ((box.clientHeight-900*s)/2)+'px) scale('+s+')';
