@@ -191,7 +191,7 @@ if it dies there, the dataset is orphaned — exactly what `started` exists to p
 Delaying the scan start spreads the tracker write *and* the host CPU load *and* the tenant
 ingestion, which is strictly better.
 
-**But jitter alone is not sufficient, and should not be relied on.** With N hosts spread
+> **MEASURED 2026-08-19, and it refutes the paragraph below.** See §6. With N hosts spread
 over J seconds, writes arrive at roughly N/J per second: 5,000 hosts over 5 minutes is
 ~17/s, over 10 minutes ~8/s. The 87% loss was measured at **8 simultaneous writers**, so
 at fleet scale jitter reduces the collision rate without removing it.
@@ -254,3 +254,71 @@ Round 4 acceptance criteria will be written **against this design**, not against
 playbook, and not until the questions above are settled. The first criterion is (a) above:
 if the tracking dataset cannot take the fleet's concurrent writes, the trigger does not
 work and the rest of the design does not matter.
+
+
+---
+
+## 6. MEASURED — the shared tracker does not work as a lookup
+
+The design above assumed that 2 rows per scan was a mild enough regime that a shared lookup
+could take it. **That assumption is false.** Measured against the live tenant with
+`xdr/simulation/sim_fleet.py`:
+
+| Writers | Rows attempted | Landed | Lost |
+|---|---|---|---|
+| serial, one at a time | 3 | 3 | **0%** |
+| 8 simultaneous | 8 | 2 | **75%** |
+| 24 hosts, no jitter | 48 | 10 | **79.2%** |
+| *(earlier, 8 threads x 200 rows)* | 1,601 | 201 | *87.4%* |
+
+The failure is a server-side **HTTP 500** from `lookups/add_data`:
+
+```
+HTTP 500: {"err_code": 500, "err_msg": "An unexpected error occurred by XDR public API"}
+```
+
+Three things follow, and they change the design:
+
+**1. It is concurrency, not volume.** Two rows per scan collides just as badly as two
+hundred. The "far less traffic" argument for a shared tracker does not survive contact with
+the API — 48 rows lost 79% just as 1,601 rows lost 87%.
+
+**2. Serial writes are flawless.** 3 of 3, and the per-host data lookups have never lost a
+row in any round, because each has exactly one writer. The rule is one writer per lookup
+dataset, full stop.
+
+**3. The errors are RAISED, not silent.** 6 of 8, 37 of 48. That is the one piece of good
+news: a write that fails can be retried, because the caller is told. (An earlier probe run
+appeared to show retry not helping — that was a bug in the probe, which `continue`d past
+its own retry path on error. Corrected; the retry route is still open.)
+
+### What this rules out
+
+A shared **lookup** tracker written directly by every endpoint. At any real fleet size the
+`started` rows would mostly fail, and a missing `started` row is the invisible-orphan case
+this design exists to prevent.
+
+### The alternative worth testing first
+
+**Make the tracker an event, not a lookup row.**
+
+XDR already has an endpoint built for exactly this shape — many agents, writing
+concurrently, at fleet scale: **Insert Parsed Alerts**. The scanner already uses it for
+findings. A "scan started" / "scan completed" alert would be:
+
+- **concurrency-safe by design**, which is the whole problem here
+- **the natural source for a correlation rule** — rules are built to fire on alerts and
+  events, whereas a lookup is *state*, and it is not yet established that a rule can even
+  take a lookup as its source (probe 4, still open)
+
+That would solve the collision and the trigger question with one change, and it removes the
+tracker-pruning problem entirely — there are no tracker rows to retire, only alerts, which
+age out on their own.
+
+The cost is alert volume: two extra alerts per scan per host. That is bounded and
+predictable, and small next to the per-finding alerts the scanner already sends under a
+500-per-scan cap.
+
+**This should be probed before any more design work.** If a correlation rule can fire on a
+scanner-generated alert carrying `scan_id` and the literal dataset names, the rest of the
+design stands unchanged — only the transport for those two rows changes.
