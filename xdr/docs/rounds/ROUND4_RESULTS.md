@@ -351,15 +351,72 @@ and cleaned up rather than re-merged, which is what makes the operation resumabl
 merely safe to abandon. The orphaned-lock half is covered by
 `tests/test_lock_takeover_reporting.py`.
 
-## Still to run
+## Round 4 — closed
 
-D2.4, D3.3,
-D4.4 (crash recovery).
+All 24 criteria are decided. **659 tests pass, 0 outstanding failures.**
 
-Decided by the mutation audit above: D1.3, D1.5, D2.1, D2.2, D2.5, D2.6, D3.1, D3.2,
-D2.3, D4.1, D4.3, D5.1–D5.3, D6.2, D6.3, D6.4.
+| Group | Criteria | How decided |
+|---|---|---|
+| D1 Selection | D1.1–D1.5 | live edge cases (D1.2, D1.4) + mutation audit (D1.3, D1.5) |
+| D2 Merge integrity | D2.1–D2.6 | live (D2.2) + mutation audit (D2.1, D2.3, D2.4, D2.5, D2.6) |
+| D3 Partial scans | D3.1–D3.4 | live (D3.1, D3.4) + mutation audit (D3.1, D3.2, D3.3) |
+| D4 Concurrency | D4.1–D4.4 | mutation audit (D4.1, D4.3) + dedicated tests (D4.2, D4.4) |
+| D5 Clock skew | D5.1–D5.3 | mutation audit — all three already covered |
+| D6 Retention | D6.1–D6.4 | live (D6.1) + mutation audit (D6.2, D6.3, D6.4) |
 
-Much of D4 and D5 is already covered by the 74 existing unit tests in
-`tests/test_consolidation.py` — lock, stale, skew, quiet-period and terminality are all
-heavily exercised there. The remaining work is checking which criteria those tests actually
-decide versus which only look covered, which is how D4.2 and D3.1/D3.2 both surfaced.
+**Seven waves, 33 mutants, 10 survivors — every one now closed.** Each wave was re-run
+after its tests landed and scored 0 survivors against the full consolidation test set
+(`test_consolidation`, `test_pack_data_management`, `test_data_management`,
+`test_lock_takeover_reporting` and the seven files this round added).
+
+A single combined re-run against the entire `tests/` tree was started and killed by the
+background-job time limit partway through wave 1, so it is not evidence of anything. It
+would not have added coverage regardless — the tests it would have pulled in exercise the
+scanner, and no scanner test can catch a consolidation mutant. The scoped set is the
+relevant one. (The killed run left two `.bak` files behind; the sources themselves were
+verified byte-identical to HEAD, since the restore runs before the cleanup.)
+
+### What the round actually found
+
+Not one gap was a missing feature. Every one was a **guarantee that held in the code and
+would have gone on holding right up until someone changed it**, with nothing in 74 existing
+tests to object. The five distinct blind spots, in the order they cost the most:
+
+1. **Counting is not reading.** (D2.3) The suite verified row counts exhaustively and never
+   once checked what a row said. Blank every finding, keep the counts, and the merge reports
+   success and deletes the originals.
+2. **Consistency is not correctness.** (D3.1/D3.2, D2.4) A parity test comparing two copies
+   proves they agree, never that what they agree on is right. Apply the same wrong edit to
+   both and it goes quiet — which is exactly what a refactor does.
+3. **The default is the contract.** (D6.2, and the three constants in wave 1) Every test
+   passed these values explicitly, so the values the tenant actually runs on were never
+   exercised. Nobody passes `quiet_secs` on a real run.
+4. **Verification must be positive evidence.** (D2.1, D2.6) `0 == 0` is not proof a merge
+   happened, and a target holding *more* rows than its sources is a double-merge, not a
+   success.
+5. **True-by-construction is a property, not a guarantee.** (D2.4) The single sequential
+   writer was safe because of how the loop was written, next to a threaded delete path that
+   makes the sequential one look accidental.
+
+### On the method
+
+Three findings came from asking "would the suite go red if this were wrong" rather than "is
+there a test named after this", and that question turned out to be mechanisable. Two things
+it demands, both learned by getting them wrong here:
+
+- **Apply the mutation to both copies.** A one-sided edit trips the parity test for the
+  wrong reason and tells you nothing about behavioural coverage.
+- **Confirm the mutation changes behaviour before believing a survivor.** D1.5 produced two
+  consecutive *equivalent mutants* — dropping `^` from a pattern used with `.match()`, then
+  swapping `.match()` for `.search()` while `^` was still present. Both survived while
+  changing nothing. The gap turned out to be real, but only a third attempt proved it, and
+  the first two would have been reported as findings by a less careful pass.
+
+That second point also produced the one genuinely reassuring result: `^` and `.match()` are
+redundant with each other, so the dataset-ownership check is protected twice over. That is
+only visible from having tried to break it.
+
+The harnesses live in the session scratchpad rather than the repo — they mutate tracked
+source files in place, and a crash mid-run leaves the tree modified. Each restores from a
+backup in a `finally` and verifies by SHA-256, but that is a reason to run them deliberately,
+not a reason to make them convenient.
