@@ -163,11 +163,60 @@ enforced that justification:
 
 Second pass after those tests landed: **8 of 8 caught, 0 survivors.**
 
+### Wave 2 — the gate functions, each mutation mapped to a criterion
+
+Constants were the easy half. The second wave mutated the gate *functions*, choosing each
+mutation so that a survivor would name the criterion it invalidates.
+
+| Criterion | Mutation | Result |
+|---|---|---|
+| D1.3 | `shard_is_terminal` ignores the Action Center state | caught |
+| D1.5 | `parse_shard` anchoring removed | **survived** |
+| D5.1 | `_newest_ms` drops the server stamp (the "DO NOT simplify" case its docstring warns about) | caught |
+| D5.1 | `_max_ms` takes the earlier of the two stamps | caught |
+| D5.2 | guard 1 removed — endpoint stamp ahead of ingest is kept | caught |
+| D5.3 | guard 2 removed — implausible server stamp is kept | caught |
+
+Five criteria decided on evidence rather than assumption: **D1.3, D5.1, D5.2 and D5.3 are
+genuinely covered** by the existing suite. Those tests were not merely named after the
+behaviour, they decide it.
+
+**D1.5 was the survivor, and getting there took two wrong turns worth recording.**
+
+The first mutation dropped the `^` from `_SHARD_RE`. It survived — but `parse_shard` calls
+`.match()`, which anchors at the start whether or not the pattern says so, so that edit was
+an *equivalent mutant*: different source, identical behaviour. A survivor proves nothing
+until the mutation is confirmed to change what the code does. The second attempt swapped
+`.match()` for `.search()` and also survived, for the mirror reason: the `^` was still
+there.
+
+So `^` and `.match()` are redundant with each other, and removing either alone is harmless.
+That is real defence in depth in the code, and it is only visible from having tried.
+
+Removing **both** finally changes behaviour — `customer_yara_scanner_matches_v3_host_abc123`
+parses as ours — and against that mutation the pre-existing suite scored **157 passed**.
+D1.5 was genuinely untested.
+
+The asymmetry is what makes it matter. Failing to select one of our own datasets leaves a
+shard behind and the next pass picks it up. Selecting someone else's *deletes a customer's
+data*, because consolidation deletes sources once it has merged them.
+
+Now pinned by `tests/test_foreign_datasets_are_not_candidates.py`, 42 cases across both
+copies: 4 of our own shard shapes as positive controls (a pattern matching nothing would
+otherwise pass every negative case while silently consolidating nothing), 14 foreign names,
+and two self-protection cases that are easy to miss — the tool's own
+`yara_scanner_consolidation_lock` must not parse as a shard, and neither must a per-scan
+*target*, or a second pass would fold consolidated output back into itself as a source.
+
+Second pass: **6 of 6 caught, 0 survivors.**
+
 ## Still to run
 
-D1.3 (Action Center state as the independent second check), D1.5, D2.3–D2.6, D3.3,
+D2.3–D2.6, D3.3,
 D4.1 / D4.3 / D4.4 (live lock contention, isolated delete failure, crash recovery),
-D5.1–D5.3 (clock skew both directions), D6.2–D6.4.
+D6.2–D6.4.
+
+D1.3, D1.5 and D5.1–D5.3 are now decided — see the mutation audit above.
 
 Much of D4 and D5 is already covered by the 74 existing unit tests in
 `tests/test_consolidation.py` — lock, stale, skew, quiet-period and terminality are all
