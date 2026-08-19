@@ -210,13 +210,49 @@ and two self-protection cases that are easy to miss — the tool's own
 
 Second pass: **6 of 6 caught, 0 survivors.**
 
+### Wave 3 — merge integrity, the "no finding is lost" half
+
+`plan_consolidation` is the last gate before deletion. Everything upstream can afford to be
+conservative; if this returns `ok=True` the sources are deleted, and a deleted lookup
+dataset is gone. Five mutations, **2 survived** — and both survivors are single-character
+edits to the same comparison:
+
+| Criterion | Mutation | Result |
+|---|---|---|
+| D2.2 | sources deleted without verifying the count | caught |
+| D2.1 | `target_count == source_total` → `>=` | **survived** |
+| D2.5 | the row ceiling never refuses | caught |
+| D2.5 | ceiling judged on the target, i.e. after writing | caught |
+| D2.6 | `source_total > 0` → `>= 0` | **survived** |
+
+Neither survivor is a typo review would catch, and each quietly converts "I counted the
+rows into the target and they are all there" into something much weaker:
+
+- **`>=` instead of `==`** accepts a target holding *more* rows than its sources. That is
+  not a success, it is a double-merge — and accepting it deletes the sources, which are the
+  only evidence the duplication ever happened. This is also what D2.6's idempotency
+  guarantee rests on.
+- **`>= 0` instead of `> 0`** makes `0 == 0` count as proof. `run_consolidation` passes
+  `target_count=0` when the target does not exist, so a scan whose sources also count zero —
+  genuinely empty, or a count query that failed — reads as verified and has its shards
+  deleted on the strength of two zeroes agreeing.
+
+Now pinned by `tests/test_merge_verification_is_positive_evidence.py`, 14 cases across both
+copies. The framing that makes them cohere: **verification must be positive evidence that
+rows arrived, not the absence of disagreement.** Includes the tight boundary (one row over
+is still a mismatch, so a loosened comparison cannot hide behind a generous fixture) and the
+ordering case — an oversize job that merged correctly is still refused, because if the count
+check ran first the ceiling would only ever fire on jobs that had already failed.
+
+Second pass: **5 of 5 caught, 0 survivors.**
+
 ## Still to run
 
-D2.3–D2.6, D3.3,
+D2.3, D2.4, D3.3,
 D4.1 / D4.3 / D4.4 (live lock contention, isolated delete failure, crash recovery),
 D6.2–D6.4.
 
-D1.3, D1.5 and D5.1–D5.3 are now decided — see the mutation audit above.
+D1.3, D1.5, D2.1, D2.2, D2.5, D2.6 and D5.1–D5.3 are now decided — see the mutation audit above.
 
 Much of D4 and D5 is already covered by the 74 existing unit tests in
 `tests/test_consolidation.py` — lock, stale, skew, quiet-period and terminality are all
