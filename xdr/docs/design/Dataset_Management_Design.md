@@ -158,19 +158,93 @@ number rather than a surprise.
 
 ---
 
+## 3.4 Answers to the three open design questions
+
+### Q1. Write `started` AND `completed`, or only one?
+
+**Both, and they have different jobs.**
+
+| Row | Job |
+|---|---|
+| `started` | **Registration.** "This dataset now exists." |
+| `completed` | **The trigger.** "It is ready to consolidate." |
+
+The reason is edge case (b). If we wrote only on completion, a scan that dies — host
+offline, crash, console hard-kill — writes **nothing**, so its dataset is orphaned *and
+invisible*. That is the single worst outcome available, and it is also the most likely
+failure on a real fleet.
+
+With a `started` row, the dataset is registered the moment it exists. Even if the
+`completed` row is later lost to a collision, the tracker still knows the dataset is there,
+so reconciliation can find it **from the tracker itself** rather than depending on the REST
+sweep as the only backstop. That converts a silent permanent orphan into a detectable one.
+
+Writing only `started` does not work either: the rule would fire at scan start, when there
+is nothing to consolidate, and the playbook would have to poll.
+
+### Q2. Randomised start delay
+
+**Yes, and it belongs on the scan start, not on the tracker write.**
+
+Delaying only the tracker write leaves a window where the scan is running but unregistered;
+if it dies there, the dataset is orphaned — exactly what `started` exists to prevent.
+Delaying the scan start spreads the tracker write *and* the host CPU load *and* the tenant
+ingestion, which is strictly better.
+
+**But jitter alone is not sufficient, and should not be relied on.** With N hosts spread
+over J seconds, writes arrive at roughly N/J per second: 5,000 hosts over 5 minutes is
+~17/s, over 10 minutes ~8/s. The 87% loss was measured at **8 simultaneous writers**, so
+at fleet scale jitter reduces the collision rate without removing it.
+
+**The actual guarantee is write-then-verify.** After writing the `started` row, the scanner
+reads it back — one row, one cheap query — and retries with backoff if it is absent. That
+turns silent loss into detected-and-retried, which is the property we need. Jitter reduces
+how often the retry is needed; verification is what makes it correct.
+
+If verification shows collisions are still frequent at fleet scale, the fallback is a small
+**fixed** set of tracker shards (say 8, chosen by hash of hostname) with one correlation
+rule per shard. Still no wildcard, since the names are fixed and few.
+
+### Q3. Can the tracker be pruned surgically? **Yes — verified live.**
+
+`POST /public_api/v1/xql/lookups/remove_data/` removes rows by filter. Proven on a
+throwaway dataset:
+
+```
+add 6 rows (3 scans x started/completed)   -> {'rows added': 6}
+remove_lookup_data(ds, [{"scan_id": "scan_2"}])  -> {'deleted': 2}
+survivors: scan_1 started+completed, scan_3 started+completed
+```
+
+So the dump-rewrite-restore workaround is **not needed**. Three constraints from the
+toolkit, which the playbook must respect:
+
+- filters are **OR across blocks, AND within a block**
+- **exact values only** — no ranges, no wildcards, so prune by explicit `scan_id`
+- **not concurrency-safe** — the caller must serialise, which the consolidation lock
+  already provides
+
+Retire a scan's two tracking rows in the same locked section that deletes its shards, after
+the row-count verification passes. Never before: a tracking row removed early is a scan
+forgotten.
+
+---
+
 ## 4. Open questions for the design call
 
-1. **Does the tracker survive fleet-scale concurrent writes?** Needs measuring at realistic
-   host counts before anything else is built. If 2-rows-per-scale still collides badly, the
-   fallback is per-host tracking shards plus a REST-driven sweep — which loses the
-   correlation trigger and returns us to a scheduled model that XDR cannot provide.
-2. **One rule or two?** `completed` is the happy path; the abandoned case
-   (`started` with no `completed` after 24h) may need its own rule, since correlation rules
-   are better at "this happened" than "this did not happen".
-3. **Is the reconciliation sweep in scope for v1**, or accepted as a known gap with the
-   report available manually?
-4. **Retention policy for the tracker** — rows retired at consolidation, or kept as an audit
-   trail with their own window?
+1. **What jitter window, and does write-then-verify hold at fleet scale?** The mechanism is
+   settled (Q2); the numbers are not. Needs measuring at realistic host counts — it is the
+   first Round 4 test.
+2. **One rule or two?** `completed` is the happy path. The abandoned case is `started` with
+   no `completed` after 24h, which is an *absence* — correlation rules handle "this
+   happened" far better than "this did not". This may have to live in the reconciliation
+   sweep rather than in a rule.
+3. **Is the reconciliation sweep in scope for v1?** With `started` rows it is cheaper than
+   before — it can run against the tracker alone, and only fall back to the REST listing to
+   catch a dataset whose `started` row was also lost.
+4. **Tracker retention** — rows retired at consolidation (Q3), or kept as an audit trail
+   with their own window? Retiring is simplest and bounds growth; keeping them costs one
+   more prune policy but gives history.
 
 ---
 
