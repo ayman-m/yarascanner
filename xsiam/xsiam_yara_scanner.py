@@ -1433,8 +1433,18 @@ class ErrorLogger:
         
         return analysis
 
-    def log_rule_compilation_error(self, rule_name, rule_content, error_msg):
-        """Log detailed rule compilation error."""
+    def log_rule_compilation_error(self, rule_name, rule_content, error_msg,
+                                   preamble_lines=0):
+        """Log detailed rule compilation error.
+
+        preamble_lines is how many lines the compiler saw AHEAD of rule_content. The
+        compile site builds `preamble + "\n\n" + rule_content` and hands libyara that,
+        so libyara's "line N" counts from the preamble's first line -- while the echo
+        below enumerates rule_content from 1. Without the offset the `<-- ERROR HERE`
+        marker lands N lines too far down, which on a real pack means past the rule's
+        closing brace and onto a comment belonging to the NEXT rule. Measured on a
+        live 4-import pack: both failed rules had the marker on the wrong rule entirely.
+        """
         self.has_errors = True
         self.failed_rules_count += 1
         
@@ -1447,7 +1457,12 @@ class ErrorLogger:
         try:
             line_match = re.search(r'line (\d+)', str(error_msg))
             if line_match:
-                error_line_num = int(line_match.group(1))
+                error_line_num = int(line_match.group(1)) - int(preamble_lines or 0)
+                # A negative or zero result means the error is IN the shared preamble, not
+                # in this rule's body. Marking a body line then would be actively wrong, so
+                # mark nothing and let the unannotated echo speak for itself.
+                if error_line_num < 1:
+                    error_line_num = None
         except Exception:
             pass
         
@@ -4729,7 +4744,7 @@ rule test {{
                 try:
                     skipped_rule_path = os.path.join(
                         self.config.failed_rules_dir, 
-                        f"skipped_rule_{display_name}_{missing_module}.yar"
+                        f"skipped_rule_{display_name}_{missing_module}_{self.config.run_id}.yar"
                     )
                     with open(skipped_rule_path, "w", encoding="utf-8") as f:
                         f.write(f"// SKIPPED RULE - Module '{missing_module}' not available\n")
@@ -4776,7 +4791,7 @@ rule test {{
                     try:
                         skipped_rule_path = os.path.join(
                             self.config.failed_rules_dir,
-                            f"skipped_rule_{display_name}_{_missing}.yar"
+                            f"skipped_rule_{display_name}_{_missing}_{self.config.run_id}.yar"
                         )
                         with open(skipped_rule_path, "w", encoding="utf-8") as f:
                             f.write(f"// SKIPPED RULE - Module '{_missing}' not available on this agent\n")
@@ -4789,7 +4804,9 @@ rule test {{
                     continue
 
                 compilation_errors.append(f"Rule {display_name}: {str(e)}")
-                error_logger.log_rule_compilation_error(display_name, rule_content, e)
+                error_logger.log_rule_compilation_error(
+                    display_name, rule_content, e,
+                    preamble_lines=(len(preamble.split("\n")) + 2) if preamble else 0)
 
                 if error_logger.failed_rules_count <= 10:
                     logging.warning(f"Failed rule {display_name}: {str(e)[:100]}")
@@ -4797,7 +4814,7 @@ rule test {{
                 try:
                     failed_rule_path = os.path.join(
                         self.config.failed_rules_dir, 
-                        f"failed_rule_{display_name}.yar"
+                        f"failed_rule_{display_name}_{self.config.run_id}.yar"
                     )
                     with open(failed_rule_path, "w", encoding="utf-8") as f:
                         f.write("// FAILED RULE - Compilation Error\n")
