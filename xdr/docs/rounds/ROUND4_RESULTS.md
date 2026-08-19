@@ -122,6 +122,47 @@ terminal" would pass the positive cases just as well and a shard could be merged
 deleted while its scan was still writing to it. One ordering case is included too — an
 out-of-order `running` row older than the cancellation must not revive a finished scan.
 
+## Mutation audit — turning the method into a sweep
+
+D4.2 and D3.1/D3.2 were both found the same way: ask not "is there a test named after this
+gate" but "would the suite go red if this gate were wrong". That question can be asked
+mechanically, so it was — every safety constant mutated to a value that would be a real
+production failure, applied to **both copies at once**, suite re-run, survivors reported.
+
+Applying to both copies is the whole trick. A one-sided edit trips the source-text parity
+test for the wrong reason (drift), which tells you nothing about whether the behaviour is
+covered. Mutating in tandem routes around the parity check and asks the behavioural
+question directly.
+
+First pass, 8 mutants, **3 survived**:
+
+| Mutation | What shipping it would mean |
+|---|---|
+| `DEFAULT_QUIET_SECS` 900 → 0 | shards merged the instant a scan reports done, while its uploader is still draining |
+| `DEFAULT_ABANDONED_SECS` 24h → 10y | nothing is ever abandoned; a crashed host's shard stranded forever |
+| `DEFAULT_ROW_CEILING` 2e6 → 1e15 | no refusal on an implausibly huge merge |
+
+One root cause behind all three: every one of these is overridable per call, and the
+existing tests always pass explicit values. The *logic* is thoroughly covered; the
+*defaults* had never been exercised once. Nobody passes `quiet_secs` on a real run — the
+tenant gets the defaults, so an edit to any of the three reached production behaviour with
+no test in the way.
+
+Now pinned by `tests/test_consolidation_defaults.py`, 11 cases across both copies. Two of
+them assert a **relationship** rather than a literal, because two of these numbers are not
+arbitrary — the source comments justify them against facts outside the module, and nothing
+enforced that justification:
+
+- `DEFAULT_QUIET_SECS >= xdr_yara_scanner.LOOKUP_DRAIN_MAX_SECS` — a scan reports
+  `completed` and then keeps draining queued batches. Raising the scanner's drain budget
+  without raising the quiet period now fails here instead of silently truncating uploads on
+  the tenant.
+- `DEFAULT_ABANDONED_SECS > 6h` — the Action Center's script cap. This is the floor that
+  stops a merely-slow scan being declared abandoned and having its shard deleted underneath
+  a live writer.
+
+Second pass after those tests landed: **8 of 8 caught, 0 survivors.**
+
 ## Still to run
 
 D1.3 (Action Center state as the independent second check), D1.5, D2.3–D2.6, D3.3,
