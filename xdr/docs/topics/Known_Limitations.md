@@ -6,7 +6,7 @@
 A residual-risk ledger for the lower-priority edge cases surfaced during this project's
 systematic edge-case review, kept separate from the higher-tier items that were actually
 fixed (see CHANGELOG.md) or documented in depth ([Datasets and
-Maintenance](Datasets_and_Maintenance.md), [`Packs/YaraDatasetManagement/README.md`](../../../Packs/YaraDatasetManagement/README.md)).
+Maintenance](Datasets_and_Maintenance.md), [`Packs/YaraDatasetManagement/README.md`](../../Packs/YaraDatasetManagement/README.md)).
 
 Each entry is one of three things: an **accepted risk** (real, low-probability or
 low-impact, not worth the engineering cost right now), **confirmed not a gap** (checked

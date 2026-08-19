@@ -4,7 +4,7 @@ Merges each finished YARA scan's per-host lookup dataset shards into one dataset
 — safely, at fleet scale — reports what needs attention, and prunes what has aged out. This
 is the XSOAR-pack delivery of the same logic in [`xdr_consolidate.py`](../../xdr_consolidate.py)
 and [`xdr_data_management.py`](../../xdr_data_management.py) (see
-[Datasets and Maintenance](../../docs/xdr/topics/Datasets_and_Maintenance.md) §5 for the
+[Datasets and Maintenance](../../docs/topics/Datasets_and_Maintenance.md) §5 for the
 underlying design and safety rails); this pack runs it as a scheduled Job instead of a
 manual CLI invocation.
 
@@ -217,7 +217,7 @@ DEFAULT_XDR_API_URL = "replace_with_xdr_api_url"
 ```
 
 Use an **Advanced**-type key and set an expiry — see
-[api-permissions.md](../../.claude/skills/xdr-action-center-api/references/api-permissions.md)
+[api-permissions.md](../../../.claude/skills/xdr-action-center-api/references/api-permissions.md)
 for the least-privilege recipe used elsewhere in this project (the automation key needs
 script-execution/Action Center/query components; it deliberately should **not** be granted
 Data Management, per that doc — but this pack's `CoreApiClient` does need Data Management,

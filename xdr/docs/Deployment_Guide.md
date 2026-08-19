@@ -7,7 +7,7 @@
 # 1. Overview
 
 > **Which edition is this?** This guide covers `xdr_yara_scanner.py` for **Cortex XDR**.
-> For Cortex XSIAM, see the [XSIAM Deployment Guide](../xsiam/Deployment_Guide.md).
+> For Cortex XSIAM, see the [XSIAM Deployment Guide](../../xsiam/docs/Deployment_Guide.md).
 
 This guide explains how to deploy `xdr_yara_scanner.py` as a managed response script in
 **Cortex XDR Action Center** and land its results in XDR as **alerts** and **lookup

@@ -30,7 +30,7 @@ prebuilt dashboards.
 > **XDR vs. XSIAM:** this repository ships two editions. `xsiam_yara_scanner.py` (this
 > guide) streams full telemetry to a **generic HTTP Log Collector / webhook**.
 > `xdr_yara_scanner.py` uses the Cortex XDR **Insert Parsed Alerts API** plus **lookup
-> datasets**, and is covered by the [XDR Deployment Guide](../xdr/Deployment_Guide.md).
+> datasets**, and is covered by the [XDR Deployment Guide](../../xdr/docs/Deployment_Guide.md).
 
 ---
 
@@ -174,7 +174,7 @@ XQL columns.
 
 1. **Settings → Configurations → Data Management → Parsing Rules → New Rule**.
 2. Name it `yara_scans_raw_parsing_rule`.
-3. Paste the full rule body from [`parsing_rule.xql`](../../parsing_rules/xsiam/parsing_rule.xql) in this repo. The header reads:
+3. Paste the full rule body from [`parsing_rule.xql`](../parsing_rules/parsing_rule.xql) in this repo. The header reads:
 
 ```text
 [INGEST:vendor="yara", product="scans", target_dataset="yara_scans_raw", no_hit = keep]

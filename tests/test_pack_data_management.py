@@ -32,9 +32,9 @@ import pytest
 import yaml
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_SCRIPTS = os.path.join(_REPO, "Packs", "YaraDatasetManagement", "Scripts")
+_SCRIPTS = os.path.join(_REPO, "xdr", "Packs", "YaraDatasetManagement", "Scripts")
 _PACK_COMMON = os.path.join(_SCRIPTS, "YaraConsolidateCommon", "YaraConsolidateCommon.py")
-_CLI = os.path.join(_REPO, "xdr_data_management.py")
+_CLI = os.path.join(_REPO, "xdr", "xdr_data_management.py")
 
 sys.path.insert(0, _REPO)
 
@@ -1079,7 +1079,7 @@ def test_the_report_automation_gives_the_two_conditions_opposite_advice():
 
 
 # --------------------------------------------------- the .yml half of the contract
-_PACK = os.path.join(_REPO, "Packs", "YaraDatasetManagement")
+_PACK = os.path.join(_REPO, "xdr", "Packs", "YaraDatasetManagement")
 
 
 def _yml(name):

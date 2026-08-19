@@ -110,7 +110,7 @@ def test_xsiam_no_longer_pauses_on_system_cpu():
     and reasonably believe it still governs anything.
     """
     src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                            "xsiam_yara_scanner.py"), encoding="utf-8").read()
+                            "xsiam", "xsiam_yara_scanner.py"), encoding="utf-8").read()
     assert "_maybe_throttle_scanning" not in src, "the system-CPU pause loop still exists"
     for dead in ("YARA_LIGHT_HIGH_CPU", "YARA_LIGHT_CRITICAL_CPU", "YARA_LIGHT_SLEEP_SECS"):
         assert dead not in src, f"{dead} still present but no longer governs anything"

@@ -1,7 +1,7 @@
 # XSIAM Scanner — Capability Reference
 
 `xsiam_yara_scanner.py` **v4.4.0** · Cortex XSIAM edition (HTTP Log Collector delivery).
-The XDR edition has its own: [`docs/xdr/CAPABILITIES.md`](../xdr/CAPABILITIES.md).
+The XDR edition has its own: [`docs/xdr/CAPABILITIES.md`](../../xdr/docs/CAPABILITIES.md).
 
 ## What this file is
 

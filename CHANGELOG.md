@@ -1186,7 +1186,7 @@ query built directly against the raw `match` field (rather than through the ship
 dashboards) will need to move to `match_ids` instead.
 
 **Requires updating the XSIAM parsing rule** to extract these fields — now at
-[`parsing_rules/xsiam/parsing_rule.xql`](parsing_rules/xsiam/parsing_rule.xql) (moved out of
+[`parsing_rules/xsiam/parsing_rule.xql`](xsiam/parsing_rules/parsing_rule.xql) (moved out of
 `docs/xsiam/`, see below). This is a manual console step; there is no parsing-rule API.
 Updated the 5 affected dashboard widgets and `dashboards/xsiam/YARA Matches.json` to
 `sum(to_integer(match_count))` instead of `count()`, and to explode the sampled `strings`
@@ -1299,7 +1299,7 @@ columns is a natural follow-up if you build on top of this dashboard.
 ### Upgrading
 
 1. Update the tenant's XSIAM parsing rule from
-   [`parsing_rules/xsiam/parsing_rule.xql`](parsing_rules/xsiam/parsing_rule.xql) (console
+   [`parsing_rules/xsiam/parsing_rule.xql`](xsiam/parsing_rules/parsing_rule.xql) (console
    step, no API).
 2. Re-import or re-add the 5 affected widgets/`YARA Matches.json` dashboard if you've
    customized them locally.

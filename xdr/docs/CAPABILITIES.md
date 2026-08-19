@@ -2,7 +2,7 @@
 
 `xdr_yara_scanner.py` **v3.3.0** · Cortex XDR edition (public-API delivery: Insert Parsed
 Alerts + XQL lookup datasets). The XSIAM edition has its own:
-[`docs/xsiam/CAPABILITIES.md`](../xsiam/CAPABILITIES.md).
+[`docs/xsiam/CAPABILITIES.md`](../../xsiam/docs/CAPABILITIES.md).
 
 ## What this file is
 
