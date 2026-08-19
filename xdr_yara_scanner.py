@@ -7995,6 +7995,15 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
                         "alert_dir_max_bytes": CONFIG_ALERT_DIR_MAX_BYTES,
                         "scan_rate_fps": (round(getattr(scanner, "files_scanned", 0) / _dur, 2)
                                           if _dur and _dur > 0 else 0),
+                        # Backpressure, measured. The producer BLOCKS on a full queue
+                        # rather than dropping paths, and until now the only evidence that
+                        # ever happened was a log line gated on put(timeout=1.0) raising
+                        # Full -- i.e. on the producer stalling for a WHOLE SECOND. A live
+                        # run with the queue forced to 8 against 97,430 paths produced zero
+                        # such lines, because 8 workers drain a queue of 8 in ~10ms. The
+                        # counter existed but reached no reader; now it does, so "never
+                        # saturated" and "saturated constantly" are finally distinguishable.
+                        "queue_full_events": getattr(scanner, "queue_full_events", 0),
                         "total_paused_secs": round(
                             getattr(getattr(scanner, "cpu_governor", None), "slept_total", 0) or 0, 2),
                         "throttle_mode": getattr(config, "cpu_guarantee", None),
