@@ -1,65 +1,144 @@
 # XDR Round 1 — Resource discipline and host footprint
 
-**IN PROGRESS.** 6 legs delivered and their evidence collected; 13 of 134 criteria scored so far. The remaining criteria have no check written yet and are recorded `not_run`, never assumed to pass.
+**13 legs delivered. 134 of 134 criteria have a check. 0 failures outstanding.**
+
+| Status | All (134) | core (27) |
+|---|---|---|
+| pass | 66 | 24 |
+| fail | 0 | 0 |
+| blocked | 68 | 3 |
+
+Two genuine defects were found, fixed, and **re-verified on a fresh live run** rather
+than marked passed on the strength of the patch.
 
 ## The leg matrix
 
-Sequential by design: two scans on one host contend for the CPU and I/O this round
+Sequential throughout: two scans on one host contend for the CPU and I/O this round
 measures, so a concurrent run would measure the wrong thing.
 
-| Leg | Configuration | Files | Duration | Outcome |
+| Leg | Configuration | Host | Files | Duration |
 |---|---|---|---|---|
-| A | defaults | 93,127 | 108.5s | completed, fresh compile |
-| B | `cpu_guarantee=none` | 93,127 | 65.8s | completed |
-| C | `cpu_guarantee=budget,cpu_budget_pct=25,cpu_floor_pct=10` | 93,127 | 69.6s | completed |
-| D | `cpu_guarantee=bogus` | 0 | — | **aborted, by design** |
-| E | `YARA_SCANNER_DIR=/opt/yara_lab`, monitors off, FD on, `YARA_WORKER_REPORT_SECS=0` | 93,127 | 53.4s | completed |
-| F | `workers=2`, cadences shortened, `YARA_QUEUE_SIZE=100` | 93,127 | 50.8s | completed |
+| A | defaults | xdr-agent | 93,127 | 108.5s |
+| B | `cpu_guarantee=none` | xdr-agent | 93,127 | 65.8s |
+| C | `budget=25%`, `floor=10` | xdr-agent | 93,127 | 69.6s |
+| D | `cpu_guarantee=bogus` | xdr-agent | — | **aborted by design** |
+| E | `YARA_SCANNER_DIR=/opt/yara_lab`, monitors off, gate disabled | xdr-agent | 93,127 | 53.4s |
+| F | `workers=2`, cadences shortened | xdr-agent | 93,127 | 50.8s |
+| G | `YARA_QUEUE_SIZE=8` | xdr-agent | 93,127 | ~60s |
+| H | `YARA_LOG_KEEP=2` | xdr-agent | 93,127 | 46.5s |
+| I | `CONFIG_HOST_CLEANUP="always"` | xdr-agent | 93,127 | ~55s |
+| J | both psutil monitors ON | xdr-agent | 93,127 | ~60s |
+| K | **6 CPU burners** — the only paced leg | xdr-agent | 93,127 | 129.8s |
+| L | verification on the fixed build, queue=8 | xdr-agent | 93,127 | ~60s |
+| M | **Windows**, `C:\Program Files` | xdragent2 | 1,721 | 19.1s |
 
-Endpoint `xdr-agent` (Ubuntu 22.04, e2-highcpu-8, agent 9.2.0.134), target `/usr`,
-ruleset a single sentinel string that matches nothing — Round 1 measures resource
-discipline, and findings are Round 2's subject. Delivery channels stayed ON throughout,
-because the delivery books are themselves catalogued capabilities.
+## The two defects
 
-## Scored so far
+### 1. Backpressure worked; its evidence did not exist
 
-| ID | Pri | Capability | Status | Evidence |
-|---|---|---|---|---|
-| `LIFE-001` | core | Action Center scan entry point (main) — only 3 opera | pass | no options string; posture resolved to 'alerts=on dataset=on files=off cpu=headroom mode=scan' |
-| `LIFE-075` | core | Run identity: run_id, scan_id and their propagation | pass | run_id=20260819_035240_307745 scan_id=xdr-agent_20260819_035240_307745_yara_ed2487d26819; 9 artefacts all carry it |
-| `PERF-001` | core | CPU governor policy selector (headroom / budget / no | pass | A=headroom B=none(samples 0, paused 0) C=budget; D aborted on bogus |
-| `PERF-003` | core | Budget policy — fixed cap on the scanner's share | pass | target=25.0 constant across 2 samples, floor_hits=0 |
-| `PERF-017` | core | Worker thread count and the auto (cores // 2) mode | pass | workers=2 honoured: declared=2, distinct workers started=2 |
-| `PERF-029` | core | Progress heartbeat thread (whole-scan progress telem | pass | leg A: 3 lines in 108s (~30s cadence); leg F at 5s: 8 lines in 51s |
-| `PERF-079` | core | End-of-run performance summary lines | pass | 1 SCAN COMPLETED, 0 SCAN FAILED, 1 worker summary |
-| `PERF-080` | core | Both psutil monitors are OFF by default — every perf | pass | no psutil monitor started by default; samples_collected=0 |
-| `PERF-086` | core | Governor final state persisted as a structured cpu_g | pass | cpu_governor block complete and slept totals agree on every leg |
-| `PERF-087` | supporting | Per-worker throughput reports are time-gated, not fi | pass | leg A: 8 lines for 93,127 files (ungated ~931, 116x fewer); leg E with the gate disabled: 932 lines |
-| `PERF-088` | supporting | Governor sampling-cadence counters (`samples_taken`, | pass | samples_taken=101 vs 4 emitted line(s) (25x divergence), last gap 1.001s |
-| `STOR-021` | core | Evidence ZIP creation and naming | pass | evidence_xdr-agent_20260819_035240_307745.zip produced on a zero-match run |
-| `STOR-039` | core | rule_cache/ — compiled-ruleset disk cache (XDR-only; | pass | A fresh (0.01s) -> B cache (0.0s) |
+Leg G forced the queue to 8 against 97,430 paths and produced **zero** saturation log
+lines. Backpressure itself was flawless — 93,127 + 4,303 reconciled exactly with the
+default run and there were no enqueue failures, so paths are blocked on and never
+dropped. But `_enqueue_scan_path` uses `put(timeout=1.0)`, so `Full` raises only after
+the producer stalls a **whole second**, and eight workers drain a queue of eight in
+~10ms. `queue_full_events` counted the event, but its only reader was the modulo-25
+gate on that same unreachable line.
 
-## What the evidence shows
+So "never saturated" and "saturated constantly without a full-second stall" left
+identical evidence — and two catalogued capabilities name that line as what decides them.
 
-**The worker-throughput gate, proven from both sides.** Leg A emitted **8** `Worker Performance` lines for 93,127 files; leg E, with `YARA_WORKER_REPORT_SECS=0` disabling the gate, emitted **932** — against a predicted ungated count of ~931 (93,127 ÷ 100). A one-sided check would have shown only that the number was small.
+Fixed by surfacing the counter in the run summary. The blocking behaviour is
+deliberately unchanged: shortening the timeout would trade a real property (never drop a
+path) for observability convenience.
 
-**The governor's sampling counters make an unobservable capability observable.** Leg A sampled **101** times while emitting **4** `CPU_GOVERNOR` lines — a 25x divergence, with `secs_since_last_sample` at 1.001s. Four lines in 108 seconds is indistinguishable from stalled sampling without that counter, which is precisely why the capability was filed unobservable before this branch.
+### 2. The log-stats snapshot was half-live
 
-**An unrecognised governor policy aborts rather than falling back.** Leg D returned `Scan failed: ... Critical error occurred` and wrote no summary at all. A silent fallback to the default would have produced a clean-looking run under a policy the operator did not choose.
+Two completion records documented to carry identical stats disagreed, and one did not
+agree with itself:
 
-**The governor is close to free when it is not pacing.** All three policy legs paced zero seconds — on an idle 8-core host the headroom target (63.1%) sat far above the scanner's own share (18.5%). This matches the XSIAM measurement that the governor costs little when it has nothing to do.
+```
+pre-fix   system      by_type sums 67, total_logs 67   consistent
+          statistics  by_type sums 69, total_logs 67   2 over its own total
+post-fix  system      55 / 55                          consistent
+          statistics  55 / 55                          consistent, and identical
+```
 
-## Harness defects found and fixed during the round
+`get_upload_statistics()` returned `self.upload_stats.copy()`, and `dict.copy()` is
+**shallow**: `total_logs` snapshotted by value, `by_type` handed back by reference and
+still being mutated. The gap is exactly the records written between snapshot and
+serialisation. Both editions carried it.
 
-Recorded because each would have produced a wrong result rather than an error:
+## What the evidence established
 
-1. **Evidence mis-attribution.** The collector paired legs to on-host runs by ordered `zip()`. Leg D aborts and writes **no summary**, so every later leg shifted up by one — D was scored against E's run and E against F's. The posture guard could not catch it because E and F are both `cpu=headroom`. Attribution now walks the legs, consuming the earliest unclaimed summary matching that leg's full signature (scanner root **and** posture), and a leg that aborts consumes nothing.
-2. **`run_snippet` returns a dict**, not a bare action id.
-3. **`endpoint_stdout` returns `{endpoint_id: text}`**, and the two runners disagreed on coercing it. Normalised in the evidence layer rather than trusting the producer: a dict reaching a check surfaces as an AttributeError inside it and reads like a scanner defect.
-4. **A remote tar glob expanded in the wrong directory**, silently producing an archive with no logs in it.
+**The governor's anti-stall design, under real load (leg K).** Six burners drove
+`others` to 75.5%, collapsing headroom's target to `100 − 60 − 75.5 = −35.5`. The floor
+clamped it to 5.0 on **116 of 118 samples**, the controller wound the sleep ratio to
+6.749 within its 20.0 limit, the actuator paced **170.9s**, and the scanner's own share
+fell to 3.5% — while still completing all 93,127 files. It shrank; it did not halt.
+Every other leg had `ratio 0.0` and `slept 0s`, so none of this was testable before.
 
-## Still to do
+**Two of this branch's own fixes, with controls.** The worker-throughput gate: 8 lines
+for 93,127 files, against **932** on leg E with `YARA_WORKER_REPORT_SECS=0` — a
+predicted ~931. The governor counters: 101 samples against 4 emitted lines, a 25×
+divergence that made a capability catalogued *unobservable* into one you can assert on.
 
-- Write checks for the remaining 121 criteria
-- Legs for host cleanup (`CONFIG_HOST_CLEANUP` off / always / on_delivery), log retention across four runs, and queue saturation under a deliberately small queue
-- Tenant-side XQL evidence for the lifecycle-row criteria (`LIFE-024`, `LIFE-025`, `PERF-034`, `TRAV-057`)
+**An unrecognised policy aborts.** Leg D returned `Scan failed: Critical error occurred`
+and wrote no summary. A silent fallback would have produced a clean-looking run under a
+policy nobody chose.
+
+**Host cleanup and retention, on disk.** Cleanup (`always`, keep=`summary`) left exactly
+one artefact — its summary — removed the other eight, emptied `alert/`, `evidence/`,
+`failed_rules/` and `control/`, and left `rule_cache` intact. The cleanup-off leg kept
+all nine, so the opt-in half is proven too. Retention (`keep=2`) pruned four older runs
+and left `/opt/yara_lab` untouched — retention is per scanner-dir.
+
+**Lifecycle rows, tenant-side.** Leg F at a 5s heartbeat produced 7 running rows
+advancing 13,361 → 84,011 on gaps of [5.0, 5.0, 6.89, 5.0, 5.06, 5.0], with the terminal
+row matching the local summary exactly and `files_skipped` non-decreasing throughout.
+These four can only be decided from the dataset: a row written locally and dropped in
+delivery looks identical from the host.
+
+## Harness defects — five, each producing a wrong RESULT rather than an error
+
+1. **Evidence mis-attribution.** The collector paired legs to runs by ordered `zip()`;
+   leg D aborts and writes no summary, so every later leg shifted up one and D was
+   scored against E's run. The posture guard missed it because E and F are both
+   `cpu=headroom`. Attribution now matches on full signature (scanner root **and**
+   posture) and an aborting leg consumes nothing.
+2. **A silent re-pin.** The pinned scanner is `chmod 444` on purpose, so `cp … 2>/dev/null`
+   hit `EACCES` and the redirect swallowed it — legs J and K ran the **pre-fix** build
+   while the log reported the new commit. Caught only because leg K's summary lacked a
+   field the fix adds. Re-pinning now compares SHA-256 and exits non-zero on mismatch.
+3. `run_snippet` returns a dict, not an action id.
+4. `endpoint_stdout` returns `{endpoint_id: text}` and the two runners disagreed on
+   coercing it — normalised in the evidence layer, so a dict cannot reach a check and
+   read like a scanner defect.
+5. A remote tar glob expanded in the wrong directory, silently archiving no logs.
+
+## The 68 blocked, and what would decide them
+
+`blocked` is not a pass. Each names the run that would settle it. The main clusters:
+
+- **No run longer than 130s** — the performance ring buffer's 1000-sample cap, its
+  band metrics, and the longer cadences need 300s–20min runs.
+- **Windows-specific paths** — one Windows leg exists now, but the affinity capture
+  (the agent pins 2 of 8 cores) and the scheduled-task cleanup need their own legs.
+- **Unreadable-file handling** — every leg ran as root against `/usr`, so
+  `No read permission` never appeared in any skip breakdown. Needs a planted unreadable
+  tree scanned non-root.
+- **FD monitoring** — leg J enabled it, but without pre-opened descriptors both
+  thresholds stay silent, and `fd_samples_taken` has no reader, so "sampled and fine"
+  cannot be told from "never sampled".
+- **XQL for the remaining lifecycle fields** — captured for legs A, F and H only.
+
+Several agents proved falsifiability rather than assuming it: a mutation harness copies
+the evidence, corrupts exactly the value each check keys on, and confirms the check
+flips to FAIL. All 15 checks in one chunk were verified that way.
+
+## One criterion needs correcting, not the scanner
+
+`PERF-009`'s threshold measures sampler liveness against `duration_secs`, which includes
+rule compilation and the post-scan uploader drain — phases with no governor call site —
+while its own continuity clause says the working phase. Two legs read as under-met
+against the literal text and comfortably met against the working phase. The threshold
+text should be fixed; the scanner is fine.
