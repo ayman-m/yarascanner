@@ -246,13 +246,50 @@ check ran first the ceiling would only ever fire on jobs that had already failed
 
 Second pass: **5 of 5 caught, 0 survivors.**
 
+### Waves 4 and 5 — retention, dry-run, locking, failure isolation
+
+**Wave 4 (retention, `xdr_data_management.py`): 6 mutants, 0 survived.** Every guard is
+verified — current-month, future-dated and unsuffixed protection on both the rotated and
+legacy paths, plus the quiet-window recency filter that catches the case where a dataset's
+calendar age and its real liveness disagree. **D6.3 and D6.4 are covered as they stand.**
+
+**Wave 5: 5 mutants, 1 survived.**
+
+| Criterion | Mutation | Result |
+|---|---|---|
+| D6.2 | `run_consolidation` defaults to writing | **survived** |
+| D6.2 | the report pass no longer forces dry-run | caught |
+| D4.1 | a live lock stops blocking a second pass | caught |
+| D4.2 | an unreadable lock marker reads as free | caught |
+| D4.3 | one delete failure aborts the whole pass | caught |
+
+The survivor is the same shape as wave 3's: `dry_run=True` flipped to `False` with the
+suite green, because **every existing test passes the flag explicitly, so the default was
+never exercised once.**
+
+The default is the protection. A caller passing `dry_run=False` has decided to write; a
+caller passing nothing has not decided anything, and the only safe reading of "not decided"
+is "do not touch the tenant". A dry run that writes is worse than no dry run at all, since
+it is the mode people reach for precisely when they are unsure.
+
+Now pinned by `tests/test_dry_run_is_the_default.py`, 8 cases across both copies, driven
+through the existing `SpyClient` so the assertion is "no mutating call was made", not
+"the final state looks unchanged" — those differ when a write and a delete cancel out.
+
+The first test in that file is a **positive control** proving the fixture genuinely
+consolidates 65 rows when told to write. Without it, every "nothing was mutated" assertion
+would pass just as well against a fixture that was never going to do anything, and the file
+would stay green with dry-run completely broken.
+
+Second pass: **11 of 11 caught across both waves, 0 survivors.**
+
 ## Still to run
 
 D2.3, D2.4, D3.3,
-D4.1 / D4.3 / D4.4 (live lock contention, isolated delete failure, crash recovery),
-D6.2–D6.4.
+D4.4 (crash recovery).
 
-D1.3, D1.5, D2.1, D2.2, D2.5, D2.6 and D5.1–D5.3 are now decided — see the mutation audit above.
+Decided by the mutation audit above: D1.3, D1.5, D2.1, D2.2, D2.5, D2.6, D3.1, D3.2,
+D4.1, D4.3, D5.1–D5.3, D6.2, D6.3, D6.4.
 
 Much of D4 and D5 is already covered by the 74 existing unit tests in
 `tests/test_consolidation.py` — lock, stale, skew, quiet-period and terminality are all
