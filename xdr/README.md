@@ -35,6 +35,9 @@ finished scan's shards into a single per-scan dataset.
 ## Start here
 
 1. **[docs/Deployment_Guide.md](docs/Deployment_Guide.md)** — install and first scan.
+1. **[docs/Dataset_Management_Overview.md](docs/Dataset_Management_Overview.md)** — why
+   this edition writes one dataset per host, and how they get merged back into one per
+   scan. Start here if you are asking "why are there so many datasets?".
 2. **[docs/Troubleshooting.md](docs/Troubleshooting.md)** — when something looks wrong.
 3. **[docs/topics/](docs/topics/)** — CPU impact, cancellation, datasets and maintenance,
    rule compatibility, known limitations.
