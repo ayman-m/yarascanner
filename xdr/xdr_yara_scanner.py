@@ -5870,7 +5870,15 @@ rule test {{
             error_logger.has_errors = True
             error_logger.error_logger.error(f"COMPILATION_ERROR: {error_msg}")
             try:
-                debug_file = os.path.join(self.config.failed_rules_dir, "raw_yara_content.yar")
+                # run_id-scoped like every other artefact in failed_rules/. That directory
+                # is deliberately never pruned, so a fixed name is not "the latest copy" --
+                # it is the only copy, silently replaced on every run. The rule content that
+                # failed to split is the whole point of the file, and the case it exists for
+                # (a pack that produces no parseable rules) is exactly the case someone
+                # re-runs while trying to fix it, overwriting the evidence each time.
+                debug_file = os.path.join(
+                    self.config.failed_rules_dir,
+                    f"raw_yara_content_{self.config.run_id}.yar")
                 with open(debug_file, "w", encoding="utf-8") as f:
                     f.write("// RAW YARA CONTENT - Failed to split into individual rules\n")
                     f.write("// " + "="*70 + "\n\n")
@@ -7844,37 +7852,66 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
         
         scan_total_time = time.time() - scan_start_time
 
-        final_performance_stats = stats_manager.get_current_stats_for_upload()
-        final_log_stats = log_manager.get_upload_statistics()
+        # Everything from here to the end of this block is REPORTING, and it is wrapped for
+        # one specific reason: the terminal lifecycle row has already been written.
+        #
+        # _perform_enhanced_cleanup emits it from scan_system's `finally` (see
+        # _emit_scan_row(_term_status, ...)), and at that point scan_failed was False, so the
+        # dataset row says "completed" and the tenant has already been told the scan finished.
+        # This block used to be unguarded while both its neighbours -- the failure-path
+        # evidence collection above and the evidence collection below -- were not. A raise in
+        # here therefore escaped to run()'s outer handler, which sets scanner.scan_failed =
+        # True so the finally-block derives outcome="failed".
+        #
+        # The result was two records of the same scan that disagree: scan_summary_<run_id>.json
+        # and the operator's result line say "failed", while the yara_scanner_scans row that
+        # consolidation reads says "completed". Nothing reconciles them, and the dataset row is
+        # the one the playbook gates on -- so a scan that reported failure to a human would be
+        # consolidated as an ordinary success, and anyone comparing the two would be chasing a
+        # contradiction with no cause.
+        #
+        # A statistics call or a report upload failing does not un-scan the files. The scan
+        # genuinely completed; only its epilogue did not. So log it and keep the outcome that
+        # the dataset already committed to.
+        try:
+            final_performance_stats = stats_manager.get_current_stats_for_upload()
+            final_log_stats = log_manager.get_upload_statistics()
 
-        comprehensive_final_stats = {
-            'scan_duration_seconds': scan_total_time,
-            'scan_duration_formatted': str(datetime.timedelta(seconds=int(scan_total_time))),
-            'files_processed': scanner.files_scanned + scanner.files_skipped,
-            'files_scanned': scanner.files_scanned,
-            'files_skipped': scanner.files_skipped,
-            'total_detections': scanner.total_detections,
-            'unique_rules_triggered': len(scanner.detection_counts),
-            'performance_metrics': final_performance_stats,
-            'log_generation_stats': final_log_stats,
-            'error_summary': {
-                'compilation_errors': error_logger.failed_rules_count,
-                'scan_errors': sum(count for reason, count in scanner.skip_reasons.items()
-                                   if 'error' in reason.lower())
+            comprehensive_final_stats = {
+                'scan_duration_seconds': scan_total_time,
+                'scan_duration_formatted': str(datetime.timedelta(seconds=int(scan_total_time))),
+                'files_processed': scanner.files_scanned + scanner.files_skipped,
+                'files_scanned': scanner.files_scanned,
+                'files_skipped': scanner.files_skipped,
+                'total_detections': scanner.total_detections,
+                'unique_rules_triggered': len(scanner.detection_counts),
+                'performance_metrics': final_performance_stats,
+                'log_generation_stats': final_log_stats,
+                'error_summary': {
+                    'compilation_errors': error_logger.failed_rules_count,
+                    'scan_errors': sum(count for reason, count in scanner.skip_reasons.items()
+                                       if 'error' in reason.lower())
+                }
             }
-        }
 
-        log_manager.log_system(
-            f"Scan completed successfully in {datetime.timedelta(seconds=int(scan_total_time))}",
-            comprehensive_final_stats
-        )
+            log_manager.log_system(
+                f"Scan completed successfully in {datetime.timedelta(seconds=int(scan_total_time))}",
+                comprehensive_final_stats
+            )
 
-        upload_final_comprehensive_report(scanner, scan_total_time)
-        
-        log_manager.log_statistics(
-            f"SCAN COMPLETED SUCCESSFULLY in {datetime.timedelta(seconds=int(scan_total_time))}",
-            comprehensive_final_stats
-        )
+            upload_final_comprehensive_report(scanner, scan_total_time)
+
+            log_manager.log_statistics(
+                f"SCAN COMPLETED SUCCESSFULLY in {datetime.timedelta(seconds=int(scan_total_time))}",
+                comprehensive_final_stats
+            )
+        except Exception as e:
+            # Deliberately not re-raised and deliberately not setting scan_failed: see above.
+            log_manager.log_error(
+                f"Final reporting failed after a completed scan: {e}. The scan itself "
+                f"finished and its terminal lifecycle row already says 'completed'; only "
+                f"the closing statistics/report step failed."
+            )
         
         try:
             scanner.evidence_collector.collect_evidence()
