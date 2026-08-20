@@ -7,13 +7,19 @@ each round; `TEST_PLAN.md` holds the criteria themselves.
 
 ## Progress
 
-| Round | Total | pass | fail | blocked | not_run |
-|---|---|---|---|---|---|
-| 1 | 134 | 0 | 0 | 0 | 134 |
-| 2 | 106 | 0 | 0 | 0 | 106 |
-| 3 | 204 | 0 | 0 | 0 | 204 |
+| Round | Total | pass | fail | blocked | not_run | not_covered |
+|---|---|---|---|---|---|---|
+| 1 | 134 | 66 | 0 | 68 | 0 | 0 |
+| 2 | 106 | 0 | 0 | 0 | 106 | 0 |
+| 3 | 204 | 0 | 0 | 0 | 204 | 0 |
+| not_covered | 23 | 0 | 0 | 0 | 0 | 23 |
+| **All rows** | **467** | **66** | **0** | **68** | **310** | **23** |
 
-**0 of 444 executed.**
+**134 of 444 testable criteria executed.** 23 further capabilities are `not_covered` and are counted in the table above; 467 rows in total.
+
+Every number above is counted from the rows below by `tools/gen_tracking.py`:
+each row's Total is the sum of the status cells beside it, and **All rows** is
+the number of rows in the table. Do not edit this block by hand; run the generator.
 
 ## All capabilities
 
@@ -71,7 +77,7 @@ each round; `TEST_PLAN.md` holds the criteria themselves.
 | `RULE-050` | Counts sidecar (.meta.json) restored on a cache hit — and the skipped count lost there | 3 | core | not_run | — | — |
 | `RULE-051` | Sidecar-missing fallback: recount from the loaded bundle | 3 | supporting | not_run | — | — |
 | `RULE-052` | Atomic cache save under a process-wide lock | 3 | supporting | not_run | — | — |
-| `RULE-053` | Cache pruning by file count and total bytes (LRU) | 1 | supporting | blocked | cache sits at 5/5 entries, 5 sidecars, 0 orphans, 448,472/268,435,456 bytes — consistent with the cap but not  | — |
+| `RULE-053` | Cache pruning by file count and total bytes (LRU) | 1 | supporting | blocked | cache sits at 5/5 entries, 5 sidecars, 0 orphans, 448,472/268,435,456 bytes — consistent with the cap but not | — |
 | `RULE-054` | Orphaned cache temp sweep with a 1-hour age gate | 1 | low | blocked | no save-temp was ever planted, so the gate was exercised in neither direction: the sweep ran on leg A's save ( | — |
 | `RULE-055` | compile_source / compile_seconds telemetry | 3 | supporting | not_run | — | — |
 | `RULE-056` | rule_cache survives end-of-run host cleanup | 1 | core | pass | 5 compiled ruleset(s) survived host cleanup in rule_cache/ | — |
@@ -120,7 +126,7 @@ each round; `TEST_PLAN.md` holds the criteria themselves.
 | `TRAV-025` | Producer backpressure: files are blocked on, never dropped | 1 | core | pass | 97,430 paths reconcile identically across every leg including queue=8, 0 enqueue failures | — |
 | `TRAV-026` | Per-directory heartbeat call during the walk (rate-limited to YARA_HEARTBEAT_SECS) | 1 | supporting | blocked | control/ captured and empty after the run (marker removed), but the cadence is undecidable: longest leg is A a | — |
 | `TRAV-027` | The skip predicate runs at four separate points per scan | 3 | supporting | not_run | — | — |
-| `TRAV-028` | The scanner's own output log path is excluded from scanning | not_covered | low | — not_covered | — | Not decidable on a live run. config.output_log is always <scanner_dir>/logs/scanner_<run_id>.log, and ScanConfig unconditionally appends the scanner_dir itself  |
+| `TRAV-028` | The scanner's own output log path is excluded from scanning | not_covered | low | — not_covered | — | Not decidable on a live run. config.output_log is always <scanner_dir>/logs/scanner_<run_id>.log, and ScanConfig unconditionally appends the scanner_dir itself |
 | `TRAV-029` | Filename skip list (OS metadata droppings) | 3 | supporting | not_run | — | — |
 | `TRAV-030` | Extension skip list (disk images and VM disks) | 3 | supporting | not_run | — | — |
 | `TRAV-031` | Force-scan allowlist for browser caches (overrides all path-based skips)  <sub>darwin</sub> | not_covered | core | — not_covered | — | No macOS endpoint exists on the XDR lab tenant — it has two GCP VMs, xdr-agent (Ubuntu 22.04) and xdragent2 (Windows Server 2022). This capability's code path i |
@@ -134,7 +140,7 @@ each round; `TEST_PLAN.md` holds the criteria themselves.
 | `TRAV-039` | macOS skip list with three distinct match semantics  <sub>darwin</sub> | not_covered | core | — not_covered | — | No macOS endpoint exists on the XDR lab tenant — it has two GCP VMs, xdr-agent (Ubuntu 22.04) and xdragent2 (Windows Server 2022). This capability's code path i |
 | `TRAV-040` | macOS /Volumes/ exclusion removes all mounted external and network volumes  <sub>darwin</sub> | not_covered | core | — not_covered | — | No macOS endpoint exists on the XDR lab tenant — it has two GCP VMs, xdr-agent (Ubuntu 22.04) and xdragent2 (Windows Server 2022). This capability's code path i |
 | `TRAV-041` | macOS AppleDouble resource-fork file skip  <sub>darwin</sub> | not_covered | supporting | — not_covered | — | No macOS endpoint exists on the XDR lab tenant — it has two GCP VMs, xdr-agent (Ubuntu 22.04) and xdragent2 (Windows Server 2022). This capability's code path i |
-| `TRAV-042` | Unknown platform has no directory skip list at all | not_covered | low | — not_covered | — | Not decidable on a live run. The empty-skip-list branch is guarded by `platform.system()` not being Windows, Linux or Darwin; every Cortex XDR endpoint reports  |
+| `TRAV-042` | Unknown platform has no directory skip list at all | not_covered | low | — not_covered | — | Not decidable on a live run. The empty-skip-list branch is guarded by `platform.system()` not being Windows, Linux or Darwin; every Cortex XDR endpoint reports |
 | `TRAV-043` | Scanner working-directory self-exclusion (all three platforms) | 3 | core | not_run | — | — |
 | `TRAV-044` | Per-platform case-folding policy in the skip predicate | 3 | supporting | not_run | — | — |
 | `TRAV-045` | Junction / reparse-point detection (_is_junction_or_symlink) | 3 | supporting | not_run | — | — |
@@ -178,7 +184,7 @@ each round; `TEST_PLAN.md` holds the criteria themselves.
 | `PERF-016` | host_cores recorded outside the affinity try-block | 1 | supporting | blocked | Linux arm HOLDS on all 5 legs (A:host_cores=8, B:host_cores=8, C:host_cores=8, E:host_cores=8, F:host_cores=8; | — |
 | `PERF-017` | Worker thread count and the auto (cores // 2) mode | 1 | core | pass | workers=2 honoured: declared=2, distinct workers started=2 | — |
 | `PERF-018` | Worker pool startup and naming | 1 | supporting | pass | (workers_started, max_workers, startup_secs) per leg {'A': (2, 2, 0.0026), 'B': (2, 2, 0.0026), 'C': (2, 2, 0. | — |
-| `PERF-019` | Bounded scan queue (the memory ceiling for file discovery) | 1 | supporting | blocked | bound and derivation verified: A: workers=2 queue=4 depths=[4]; B: workers=2 queue=4 depths=[4]; C: workers=2  | — |
+| `PERF-019` | Bounded scan queue (the memory ceiling for file discovery) | 1 | supporting | blocked | bound and derivation verified: A: workers=2 queue=4 depths=[4]; B: workers=2 queue=4 depths=[4]; C: workers=2 | — |
 | `PERF-020` | Producer backpressure — block, never drop | 1 | core | pass | queue forced to 8: 93127+4303=97430 identical to the default run, 0 enqueue failures | — |
 | `PERF-021` | Queue-saturation event counter with 1-in-25 log sampling | 1 | low | pass | queue_full_events=0 now readable in the summary (was absent on the identically-configured pre-fix leg G); 0 sa | — |
 | `PERF-022` | Governor sampling from the blocked producer | 1 | supporting | blocked | the queue was never driven to Full: 0 'Scan queue saturated' lines across legs A/B/C/E/F, and every leg ran to | — |
@@ -189,28 +195,28 @@ each round; `TEST_PLAN.md` holds the criteria themselves.
 | `PERF-027` | Per-worker throughput logging every 100 files — and why its Error Rate is structurally 0.0% | 1 | low | pass | leg A: all 8 Worker Performance lines report Error Rate 0.0% (files_processed all exact multiples of 100, per- | — |
 | `PERF-028` | Per-worker timing ring buffer capped at 100 samples — and the end-of-run summary that reports its length as a file count | 1 | supporting | pass | leg A: 'Worker performance summary' reports {'ScanWorker-1': 100, 'ScanWorker-2': 100} against stop-record tru | — |
 | `PERF-029` | Progress heartbeat thread (whole-scan progress telemetry) | 1 | core | pass | leg A: 3 lines in 108s (~30s cadence); leg F at 5s: 8 lines in 51s | — |
-| `PERF-030` | Progress snapshot holds lock_counts across psutil calls | 1 | supporting | pass | 14/14 paired ticks satisfy files_remaining == files_skipped + 2*queue_size exactly, 0 mismatches (A:3 ticks/2  | — |
+| `PERF-030` | Progress snapshot holds lock_counts across psutil calls | 1 | supporting | pass | 14/14 paired ticks satisfy files_remaining == files_skipped + 2*queue_size exactly, 0 mismatches (A:3 ticks/2 | — |
 | `PERF-031` | Progress sampler reuses the primed psutil handle | 1 | supporting | pass | A: 3 ticks, first cpu=118.5%, min=118.5%, max=155.3%, min mem=57.4609375MB, 0 metric errors; F: 8 ticks, first | — |
 | `PERF-032` | Per-tick disk I/O guarded for macOS  <sub>darwin</sub> | not_covered | supporting | — not_covered | — | No macOS endpoint exists on the XDR lab tenant — it has two GCP VMs, xdr-agent (Ubuntu 22.04) and xdragent2 (Windows Server 2022). This capability's code path i |
 | `PERF-033` | ETA and completion-time estimation | 1 | supporting | pass | 14 'Time Estimates' records across all legs, every one internally consistent (worst \|eta - remaining/rate\| = | — |
 | `PERF-034` | Scan-lifecycle heartbeat thread (dataset 'running' rows) | 1 | core | pass | 7 running rows, gaps [5.0, 5.0, 6.89, 5.0, 5.06, 5.0] against a 5s setting, counters advancing 13361->84011; t | — |
-| `PERF-035` | Heartbeat gate is lock-protected against duplicate rows | 1 | supporting | blocked | the only decidable bound HOLDS: leg F added 9 rows on a 50.8s scan with YARA_HEARTBEAT_SECS=5, i.e. 7 running  | — |
+| `PERF-035` | Heartbeat gate is lock-protected against duplicate rows | 1 | supporting | blocked | the only decidable bound HOLDS: leg F added 9 rows on a 50.8s scan with YARA_HEARTBEAT_SECS=5, i.e. 7 running | — |
 | `PERF-036` | Paused-seconds accounting on every lifecycle row | 1 | supporting | pass | leg K paused 170.86s and the summary records it; leg H independently carried 0.18s to its terminal row. Reachi | — |
 | `PERF-037` | Vestigial lock_throttle | not_covered | low | — not_covered | — | Not decidable on a live run. threading.Lock lock_throttle is created in YaraScanner.__init__ and acquired in exactly one place — _emit_scan_row's paused snapsho |
 | `PERF-038` | Cancel-flag watcher poll thread | 3 | core | not_run | — | — |
 | `PERF-039` | Stack-driven cancellable directory walk | 3 | core | not_run | — | — |
 | `PERF-040` | StatisticsManager background performance sampler | 1 | supporting | blocked | default half verified on every leg (A: off x2, started 0, snapshots 0; B: off x2, started 0, snapshots 0; C: o | — |
-| `PERF-041` | Performance history ring buffer and peak/average metrics | 1 | low | blocked | the ZERO CONTROL holds on every leg (5 of them: A: monitor off, samples_collected=0, all four metrics 0.0, no  | — |
+| `PERF-041` | Performance history ring buffer and peak/average metrics | 1 | low | blocked | the ZERO CONTROL holds on every leg (5 of them: A: monitor off, samples_collected=0, all four metrics 0.0, no | — |
 | `PERF-042` | Sampled performance-detail logging (1 in 6 snapshots) | 1 | low | blocked | no leg ran with the performance monitor on — (perf_monitoring_enabled, snapshot lines, worker-start lines) per | — |
-| `PERF-043` | Snapshot enrichment with live scanner counters | 1 | low | blocked | default half verified (A: null/null, 0 snapshots, scan_errors 0 lines; B: null/null, 0 snapshots, scan_errors  | — |
+| `PERF-043` | Snapshot enrichment with live scanner counters | 1 | low | blocked | default half verified (A: null/null, 0 snapshots, scan_errors 0 lines; B: null/null, 0 snapshots, scan_errors | — |
 | `PERF-044` | SystemResourceMonitor thread (host-level resource sampling) | 1 | supporting | blocked | the OFF arm is proved POSITIVELY (not by absence) on all 5 legs — 'All monitoring systems activated' carries r | — |
 | `PERF-045` | Resource alert thresholds (CPU / memory / disk) | 1 | supporting | blocked | no leg ran with YARA_ENABLE_RESOURCE_MONITOR=true — (resource_monitoring_enabled, RESOURCE ALERT entries, 'Res | — |
 | `PERF-046` | Resource and alert history ring buffers | 1 | supporting | blocked | SystemResourceMonitor was never constructed — resource_monitoring is false on every leg (A:False, B:False, C:F | — |
 | `PERF-047` | Resource trend classification | 1 | low | blocked | UNREACHED: no 'System resources - CPU:' record exists on any leg, because no leg ran with YARA_ENABLE_RESOURCE | — |
-| `PERF-048` | Resource monitor stopped AFTER worker join, not at discovery end | 1 | supporting | blocked | no leg emitted a 'Resource monitoring completed:' record — the resource monitor was off on every run — so the  | — |
-| `PERF-049` | File-descriptor sampling every 1000 CLEAN scanned files  <sub>linux, darwin</sub> | 1 | low | blocked | leg E ran with YARA_ENABLE_FD_MONITOR=true and emitted 0 'WARNING: High FD usage: ' and 0 'FD usage increased  | — |
+| `PERF-048` | Resource monitor stopped AFTER worker join, not at discovery end | 1 | supporting | blocked | no leg emitted a 'Resource monitoring completed:' record — the resource monitor was off on every run — so the | — |
+| `PERF-049` | File-descriptor sampling every 1000 CLEAN scanned files  <sub>linux, darwin</sub> | 1 | low | blocked | leg E ran with YARA_ENABLE_FD_MONITOR=true and emitted 0 'WARNING: High FD usage: ' and 0 'FD usage increased | — |
 | `PERF-050` | Startup file-descriptor limit probe  <sub>linux, darwin</sub> | 1 | supporting | blocked | the HEALTHY-HOST arm holds on leg E: exactly 1 'Current file descriptor limit: 16384', exactly 1 'Initial file | — |
-| `PERF-051` | FD monitoring flag plumbing (two-name handoff)  <sub>linux, darwin</sub> | 1 | supporting | blocked | the enabled run's probe fired exactly once ('Current file descriptor limit: 16384', 'Initial file descriptors  | — |
+| `PERF-051` | FD monitoring flag plumbing (two-name handoff)  <sub>linux, darwin</sub> | 1 | supporting | blocked | the enabled run's probe fired exactly once ('Current file descriptor limit: 16384', 'Initial file descriptors | — |
 | `PERF-052` | Per-file size cap (bounds YARA memory and time per file) | 3 | supporting | not_run | — | — |
 | `PERF-053` | Chunked hashing of matched files | 2 | supporting | not_run | — | — |
 | `PERF-054` | Hash only on match (no full read per scanned file) | 2 | supporting | not_run | — | — |
@@ -234,14 +240,14 @@ each round; `TEST_PLAN.md` holds the criteria themselves.
 | `PERF-072` | CPU percentage inputs are unvalidated (the clamp helper is dead) | 3 | low | not_run | — | — |
 | `PERF-073` | Retired throttle options are translated, not rejected | 3 | supporting | not_run | — | — |
 | `PERF-074` | DEAD CONFIG: batch_size / performance_log_interval / statistics_upload_interval | 2 | low | not_run | — | — |
-| `PERF-075` | DEAD CODE: _get_scanner_stats aggregate | 1 | low | blocked | 0 occurrences of 'performance_snapshots' and 'resource_alerts' across all 45 log artefacts and scan_summaries  | — |
+| `PERF-075` | DEAD CODE: _get_scanner_stats aggregate | 1 | low | blocked | 0 occurrences of 'performance_snapshots' and 'resource_alerts' across all 45 log artefacts and scan_summaries | — |
 | `PERF-076` | DEAD CODE: periodic scan-status upload | 1 | low | blocked | on all 5 legs the two upload lines are absent while 'Scan status changed to: ' is present, so the sink is demo | — |
 | `PERF-077` | Scan phase tracking (initializing → … → completed) | 3 | supporting | not_run | — | — |
 | `PERF-078` | Final efficiency score and comprehensive report | 3 | supporting | not_run | — | — |
 | `PERF-079` | End-of-run performance summary lines | 1 | core | pass | 1 SCAN COMPLETED, 0 SCAN FAILED, 1 worker summary | — |
 | `PERF-080` | Both psutil monitors are OFF by default — every performance figure in the final report is structurally zero | 1 | core | pass | no psutil monitor started by default; samples_collected=0 | — |
 | `PERF-081` | Per-file permission denials accumulate in an unbounded list that nothing ever reads | 1 | supporting | blocked | no leg encountered a single unreadable file ({'A': 0, 'B': 0, 'C': 0, 'E': 0, 'F': 0}) — every run executed as | — |
-| `PERF-082` | Unthrottled 'Permission denied' system-log line — one record per unreadable file | 1 | supporting | blocked | negative control verified — A: 35 system-log lines total, skip_breakdown={'Skipped directory': 4221, 'Special  | — |
+| `PERF-082` | Unthrottled 'Permission denied' system-log line — one record per unreadable file | 1 | supporting | blocked | negative control verified — A: 35 system-log lines total, skip_breakdown={'Skipped directory': 4221, 'Special | — |
 | `PERF-083` | Mislabelled resource-monitor telemetry: monitoring_duration_minutes is host uptime | 1 | low | blocked | UNREACHED: no 'System resources - CPU:' record and no 'Resource monitoring completed:' record exists on any le | — |
 | `PERF-084` | Per-tick 'Network: X MB' is the whole host's traffic since boot, not the scanner's uploads | 1 | low | pass | first heartbeat of each separate scanner process, in delivery order: [('A', 3696.9), ('B', 3698.2), ('C', 3698 | — |
 | `PERF-085` | Env vars outrank the options string for cpu_guarantee and workers (documented precedence is reversed) | 3 | core | not_run | — | — |
@@ -256,14 +262,14 @@ each round; `TEST_PLAN.md` holds the criteria themselves.
 | `STOR-005` | yara_processing_<run_id>.log — the rule-compilation audit trail | 3 | supporting | not_run | — | — |
 | `STOR-006` | script_exceptions_<run_id>.log — lazily created, so a clean run leaves no empty file | 3 | supporting | not_run | — | — |
 | `STOR-007` | scan_summary_<run_id>.json — the machine-readable per-run record, written atomically | 3 | core | not_run | — | — |
-| `STOR-008` | Orphaned scan_summary *.tmp sweep at scan start | 1 | low | blocked | no .tmp was ever planted. All six legs ran back-to-back on a shared /opt/yara_scanner/logs with no pre-seeded  | — |
+| `STOR-008` | Orphaned scan_summary *.tmp sweep at scan start | 1 | low | blocked | no .tmp was ever planted. All six legs ran back-to-back on a shared /opt/yara_scanner/logs with no pre-seeded | — |
 | `STOR-009` | Log retention — keep only the last N scans' logs and summaries | 1 | supporting | blocked | not collected: retention needs a whole-directory listing of logs/ before and after a run, and the collector pu | — |
 | `STOR-010` | Current run is force-protected from retention | 1 | supporting | blocked | the discriminating setup was never run. Every leg used the default LOG_KEEP_SCANS and the current run_id sorte | — |
 | `STOR-011` | Log-file deletion failures are tolerated, not fatal | 1 | low | blocked | not collected: no undeletable entry was ever planted, so the OSError branch in _prune_old_scan_logs never exec | — |
 | `STOR-012` | Structured log `data` payload capped at 4000 characters per line | 2 | low | not_run | — | — |
 | `STOR-013` | Upload-log volume suppression (_throttled_log buckets) | 2 | supporting | not_run | — | — |
 | `STOR-014` | Progress-heartbeat writes to statistics AND performance logs on a fixed cadence for the whole scan | 1 | supporting | pass | leg A: 3 Scan Progress records in 108.5s (floor(D/30)-2 = 1), max consecutive gap 30.005s <= 45s, System Resou | — |
-| `STOR-015` | config.output_log (scanner_<run_id>.log) — DEAD as a log file, but load-bearing as a path | 1 | low | pass | 0 scanner_*.log across 5 completed legs (A/B/C/E/F); each lists exactly the 8 real logs including system_ and  | — |
+| `STOR-015` | config.output_log (scanner_<run_id>.log) — DEAD as a log file, but load-bearing as a path | 1 | low | pass | 0 scanner_*.log across 5 completed legs (A/B/C/E/F); each lists exactly the 8 real logs including system_ and | — |
 | `STOR-016` | initial_cleanup wipes the previous run's alert/ and evidence/ directories wholesale | 1 | supporting | blocked | the alert/ half is undecidable and the two-run design was not run. Verified after leg A: evidence/ holds exact | — |
 | `STOR-017` | failed_rules/ is NOT wiped by initial_cleanup — asymmetry with alert/ and evidence/ | 3 | low | not_run | — | — |
 | `STOR-018` | alert/<rule>.txt — one append-only text file per matching rule, uncapped in file count | 2 | core | not_run | — | — |
@@ -272,11 +278,11 @@ each round; `TEST_PLAN.md` holds the criteria themselves.
 | `STOR-021` | Evidence ZIP creation and naming | 1 | core | pass | evidence_xdr-agent_20260819_035240_307745.zip produced on a zero-match run | — |
 | `STOR-022` | Content-addressed evidence entries: matched_files/<sha256> | 3 | supporting | not_run | — | — |
 | `STOR-023` | Evidence ZIP de-duplicates identical content across paths | 3 | supporting | not_run | — | — |
-| `STOR-024` | Metadata-only evidence ZIP is the default (collect_files=false) | 1 | supporting | pass | 1 decision record with data collect_files=false; ZIP has 1 member(s) (file_mapping.txt) and 0 matched_files/;  | — |
-| `STOR-025` | Evidence ZIP bundles only alert/*.txt — .alert files are excluded by design | 1 | low | blocked | decidable only on a run that produces an alert. Verified: evidence_xdr-agent_20260819_035240_307745.zip holds  | — |
+| `STOR-024` | Metadata-only evidence ZIP is the default (collect_files=false) | 1 | supporting | pass | 1 decision record with data collect_files=false; ZIP has 1 member(s) (file_mapping.txt) and 0 matched_files/; | — |
+| `STOR-025` | Evidence ZIP bundles only alert/*.txt — .alert files are excluded by design | 1 | low | blocked | decidable only on a run that produces an alert. Verified: evidence_xdr-agent_20260819_035240_307745.zip holds | — |
 | `STOR-026` | Evidence is collected on the fatal-failure path too | 3 | supporting | not_run | — | — |
 | `STOR-027` | Cancelled scans produce NO evidence ZIP and NO cleanup scheduling — surprising asymmetry | 3 | core | not_run | — | — |
-| `STOR-028` | Runtime-generated cleanup script (cleanup_script.sh / .bat) in scanner_dir root | 1 | supporting | blocked | not collected: the script only exists once alert/ holds a .txt, and all six legs matched 0 (leg A matches=0),  | — |
+| `STOR-028` | Runtime-generated cleanup script (cleanup_script.sh / .bat) in scanner_dir root | 1 | supporting | blocked | not collected: the script only exists once alert/ holds a .txt, and all six legs matched 0 (leg A matches=0), | — |
 | `STOR-029` | Alert rotation: .txt → .alert, executed by the scheduled task, not by the scan | 1 | supporting | blocked | no alert file ever existed to rotate. Leg A matched 0 files, alert/ is empty in the post-run tarball, and syst | — |
 | `STOR-030` | Windows scheduled task 'CleanupScript' registered as SYSTEM  <sub>windows</sub> | 1 | supporting | blocked | not collected: every leg ran on the Linux endpoint xdr-agent (Linux 6.8.0-1063-gcp [x86_64]), where _schedule_ | — |
 | `STOR-031` | Linux (and any non-Windows/non-Darwin) systemd unit /etc/systemd/system/yara-cleanup.service — written, ENABLED, never removed  <sub>linux</sub> | 1 | supporting | blocked | Observed on leg A, and it is exactly what this criterion's negative control warns about: system log emits 'Cle | — |
@@ -301,7 +307,7 @@ each round; `TEST_PLAN.md` holds the criteria themselves.
 | `STOR-050` | HostCleanup — opt-in end-of-run removal of this run's on-host working files | 1 | core | pass | cleanup OFF kept 9 artefacts, cleanup ALWAYS kept 1 (the summary) — opt-in and effective | — |
 | `STOR-051` | HostCleanup KEEP tiers (nothing / summary / evidence) | 1 | supporting | blocked | not collected: all 9 artefacts carrying run_id 20260819_035240_307745 survive, and the evidence ZIP is still o | — |
 | `STOR-052` | HostCleanup refuses to delete unless the summary JSON durably exists | 1 | core | blocked | the failure was never induced. Across all 5 completed legs the summary write succeeded (0 'Failed to write sca | — |
-| `STOR-053` | HostCleanup on_delivery gate — refuses when there is no delivery channel to verify | 1 | core | blocked | not collected on two counts: all 9 artefacts carrying run_id 20260819_035240_307745 survive, and the evidence  | — |
+| `STOR-053` | HostCleanup on_delivery gate — refuses when there is no delivery channel to verify | 1 | core | blocked | not collected on two counts: all 9 artefacts carrying run_id 20260819_035240_307745 survive, and the evidence | — |
 | `STOR-054` | HostCleanup runs only on outcome=='completed' | 3 | core | not_run | — | — |
 | `STOR-055` | HostCleanup closes log FileHandlers before deleting (Windows WinError 32) | 1 | supporting | blocked | no Windows leg and no cleaned run. All 5 completed legs report os_info=['Linux 6.8.0-1063-gcp [x86_64]'] on xd | — |
 | `STOR-056` | HostCleanup recreates alert/evidence/failed_rules empty after wiping | 1 | supporting | blocked | not collected: all 9 artefacts carrying run_id 20260819_035240_307745 survive, and the evidence ZIP is still o | — |
@@ -318,7 +324,7 @@ each round; `TEST_PLAN.md` holds the criteria themselves.
 | `STOR-067` | Resolved tenant/credential/posture block and scan-target validation warnings — written to yara_processing_<run_id>.log and nowhere else | 3 | supporting | not_run | — | — |
 | `STOR-068` | StatisticsManager bypasses LogManager and writes raw, multi-line blocks into statistics_/performance_<run_id>.log | 1 | low | pass | 1 COMPREHENSIVE STATISTICS SUMMARY; line after 'Worker Summary: {' is '  "ScanWorker-2": {' (indent=2, not a n | — |
 | `STOR-069` | Logging counters under-report by construction, and yara_processing_<run_id>.log is missing from log_files_created | 1 | low | blocked | check raised NameError: name 'need' is not defined | — |
-| `STOR-070` | Evidence ZIP is produced on every completed scan, including zero-match runs — its existence proves nothing | 1 | core | pass | outcome=completed, matches=0, unique_rules_triggered=0 -> evidence_xdr-agent_20260819_035240_307745.zip still  | — |
+| `STOR-070` | Evidence ZIP is produced on every completed scan, including zero-match runs — its existence proves nothing | 1 | core | pass | outcome=completed, matches=0, unique_rules_triggered=0 -> evidence_xdr-agent_20260819_035240_307745.zip still | — |
 | `STOR-071` | Alert-directory byte ceiling degrades detail, never counts (`YARA_ALERT_DIR_MAX_MB`) | 2 | core | not_run | — | — |
 | `STOR-072` | The root diagnostics handler is closed before host cleanup | 1 | supporting | blocked | the off-run control exists, the cleaned run does not, and neither is on Windows. Verified: with CONFIG_HOST_CL | — |
 | `DELI-001` | Master upload kill-switch (UPLOAD_RESULTS) | 2 | core | not_run | — | — |
@@ -384,13 +390,13 @@ each round; `TEST_PLAN.md` holds the criteria themselves.
 | `DELI-061` | Tenant identity tagging on every alert and every row | 2 | supporting | not_run | — | — |
 | `DELI-062` | Idempotent endpoint URL construction | 2 | supporting | not_run | — | — |
 | `DELI-063` | uploads_<run_id>.log — the delivery observability artefact | 2 | core | not_run | — | — |
-| `DELI-064` | CPU governor telemetry heartbeat (CPU_GOVERNOR lines) | 1 | supporting | pass | leg A: 4 CPU_GOVERNOR lines over a 90.1s span (>= 3 required), max gap 30.042s <= 31.5s, gaps=[30.02, 30.035,  | — |
+| `DELI-064` | CPU governor telemetry heartbeat (CPU_GOVERNOR lines) | 1 | supporting | pass | leg A: 4 CPU_GOVERNOR lines over a 90.1s span (>= 3 required), max gap 30.042s <= 31.5s, gaps=[30.02, 30.035, | — |
 | `DELI-065` | DEAD CODE: CircuitBreaker class is never instantiated | 2 | low | not_run | — | — |
 | `DELI-066` | DEAD CODE: ResultsUploader.upload_results() is never called | 2 | low | not_run | — | — |
 | `DELI-067` | DEAD CODE: ScanStatusUploader.upload_scan_status() is never called and is double-gated off | 2 | low | not_run | — | — |
 | `DELI-068` | DORMANT: _build_xdr_parsed_alert single-alert payload builder | 2 | low | not_run | — | — |
 | `DELI-069` | DEAD BRANCH: 'Upload queue full' / 'Lookup dataset queue full' handlers | 2 | low | not_run | — | — |
-| `DELI-070` | Log retention across runs (delivery diagnostics window) | 1 | supporting | pass | YARA_LOG_KEEP=2 honoured exactly: 6 run_ids existed in /opt/yara_scanner/logs when leg H pruned, the 4 oldest  | — |
+| `DELI-070` | Log retention across runs (delivery diagnostics window) | 1 | supporting | pass | YARA_LOG_KEEP=2 honoured exactly: 6 run_ids existed in /opt/yara_scanner/logs when leg H pruned, the 4 oldest | — |
 | `DELI-071` | Comprehensive final report (statistics log only, never uploaded) | 3 | low | not_run | — | — |
 | `DELI-072` | Options-string surface for delivery knobs (and what is deliberately excluded) | 3 | core | not_run | — | — |
 | `DELI-073` | records_skipped counted as DELIVERED in the delivery verdict | 2 | core | not_run | — | — |
@@ -426,7 +432,7 @@ each round; `TEST_PLAN.md` holds the criteria themselves.
 | `LIFE-020` | Delivery-shortfall reporting on the cancelled path | 3 | supporting | not_run | — | — |
 | `LIFE-021` | running.json liveness marker — write, heartbeat refresh, removal | 1 | supporting | blocked | post-exit half PROVEN: leg A's scanner_dir snapshot holds control/ with 0 entries (no running.json, no running | — |
 | `LIFE-022` | CANCEL_DRAIN_DEADLINE_SECS — dead constant | 3 | low | not_run | — | — |
-| `LIFE-023` | Scan phase ordering in scan_system | 1 | supporting | blocked | log half verified on 7 completed legs (leg A offsets [12, 15, 19, 21, 26], compile at 11, each banner exactly  | — |
+| `LIFE-023` | Scan phase ordering in scan_system | 1 | supporting | blocked | log half verified on 7 completed legs (leg A offsets [12, 15, 19, 21, 26], compile at 11, each banner exactly | — |
 | `LIFE-024` | Scan-lifecycle rows in the yara_scanner_scans dataset | 1 | core | pass | 9 rows: 1 initiated, 7 running, 1 terminal; single host xdr-agent | — |
 | `LIFE-025` | Terminal lifecycle row emitted after workers drain but before uploaders stop | 1 | core | pass | terminal row scanned=93127 skipped=4303 matches the local summary exactly, and is >= every running row | — |
 | `LIFE-026` | Heartbeat lifecycle row and its independent thread | 1 | supporting | blocked | the cadence itself is undecidable here: per-row event_timestamp_ms lives only in yara_scanner_scans_v3_xdr_age | — |
