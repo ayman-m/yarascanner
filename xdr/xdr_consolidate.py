@@ -416,9 +416,14 @@ def plan_consolidation(scan_id, source_counts, target_count, row_ceiling=DEFAULT
 
 
 # ---- live orchestration -----------------------------------------------------
-# v2: one row per matched string offset. Superseded by v3 (scanner v3.0.0) — one row per
-# (rule, file) finding, offsets/strings/string_ids folded into the row — but v2 shards may
-# still exist on a tenant from before the upgrade, so both stay consolidatable.
+# Every matches-dataset shape a tenant can still be holding. None of these are removed when a
+# newer one lands: a fleet mid-rollout writes two shapes at once, and an un-consolidated shard is
+# its scan's only copy, so a shape this module cannot resolve is a shard it cannot merge.
+#   v2: one row per matched string OFFSET.
+#   v3 (scanner v3.0.0): one row per (rule, file) FINDING — offsets/strings/string_ids folded in.
+#   v4 (current): one row per matched FILE — every rule that hit it folded into `rules`, and
+#       run_id/scan_date/scan_folder/date_of_scan dropped as derivable or scan-constant. See
+#       xdr_yara_scanner.MATCHES_SCHEMA_V4, which this must stay in step with.
 MATCHES_SCHEMA = {
     "tenant_id": "text", "scan_id": "text", "run_id": "text", "scan_date": "text",
     "hostname": "text", "os_info": "text", "os_type": "text", "ip_address": "text",
@@ -436,7 +441,18 @@ MATCHES_SCHEMA_V3 = {
     "truncated": "bool", "severity": "text",
     "event_timestamp_ms": "number", "date_of_scan": "text",
 }
-_MATCHES_SCHEMAS_BY_VER = {"2": MATCHES_SCHEMA, "3": MATCHES_SCHEMA_V3}
+MATCHES_SCHEMA_V4 = {
+    "tenant_id": "text", "scan_id": "text",
+    "hostname": "text", "os_info": "text", "os_type": "text", "ip_address": "text",
+    "filename": "text", "file_size": "number", "file_sha256": "text",
+    "file_creation_time": "text",
+    "rules": "text",            # JSON array of {rule,match_count,offsets,strings,string_ids,truncated,severity}
+    "rule_count": "number", "match_total": "number",
+    "severity": "text",         # highest across the file's rules
+    "truncated": "bool",        # true when ANY rule's embedded sample was capped
+    "event_timestamp_ms": "number",
+}
+_MATCHES_SCHEMAS_BY_VER = {"2": MATCHES_SCHEMA, "3": MATCHES_SCHEMA_V3, "4": MATCHES_SCHEMA_V4}
 # Versions run_consolidation/check_consolidation_status/consolidate_all cover by default when
 # no explicit version is requested — every schema version this tool knows how to read.
 KNOWN_MATCHES_SCHEMA_VERSIONS = tuple(sorted(_MATCHES_SCHEMAS_BY_VER))
@@ -446,7 +462,7 @@ def matches_schema_for(ver):
     """The matches-dataset schema for a given version tag. Unknown versions fall back to the
     latest known schema rather than raising — a consolidation run should degrade to 'best
     effort against an unrecognised newer shard', not hard-fail the whole pass."""
-    return _MATCHES_SCHEMAS_BY_VER.get(str(ver), MATCHES_SCHEMA_V3)
+    return _MATCHES_SCHEMAS_BY_VER.get(str(ver), MATCHES_SCHEMA_V4)
 
 
 SCANS_SCHEMA = {

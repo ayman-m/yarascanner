@@ -67,9 +67,14 @@ _WRITE_BATCH = 500
 SKEW_TOLERANCE_MS = 5 * 60 * 1000
 DEFAULT_SKEW_BACKSTOP_SECS = 7 * 24 * 3600
 
-# v2: one row per matched string offset (pre-3.0.0 scanner). v3: one row per (rule, file)
-# finding — see xdr_yara_scanner.py's add_match docstring for why. Both stay consolidatable
-# so a tenant mid-rollout of scanner v3.0.0 can still process leftover v2 shards.
+# Every matches-dataset shape a tenant can still be holding. None is removed when a newer one
+# lands: a fleet mid-rollout writes two shapes at once, and an un-consolidated shard is its
+# scan's only copy, so a shape this file cannot resolve is a shard it cannot merge.
+#   v2: one row per matched string OFFSET (pre-3.0.0 scanner).
+#   v3: one row per (rule, file) FINDING — offsets/strings/string_ids folded into the row.
+#   v4: one row per matched FILE — every rule that hit it folded into `rules`, and
+#       run_id/scan_date/scan_folder/date_of_scan dropped as derivable or scan-constant.
+#       See xdr_yara_scanner.MATCHES_SCHEMA_V4, which this must stay in step with.
 MATCHES_SCHEMA = {
     "tenant_id": "text", "scan_id": "text", "run_id": "text", "scan_date": "text",
     "hostname": "text", "os_info": "text", "os_type": "text", "ip_address": "text",
@@ -87,12 +92,23 @@ MATCHES_SCHEMA_V3 = {
     "truncated": "bool", "severity": "text",
     "event_timestamp_ms": "number", "date_of_scan": "text",
 }
-_MATCHES_SCHEMAS_BY_VER = {"2": MATCHES_SCHEMA, "3": MATCHES_SCHEMA_V3}
+MATCHES_SCHEMA_V4 = {
+    "tenant_id": "text", "scan_id": "text",
+    "hostname": "text", "os_info": "text", "os_type": "text", "ip_address": "text",
+    "filename": "text", "file_size": "number", "file_sha256": "text",
+    "file_creation_time": "text",
+    "rules": "text",            # JSON array of {rule,match_count,offsets,strings,string_ids,truncated,severity}
+    "rule_count": "number", "match_total": "number",
+    "severity": "text",         # highest across the file's rules
+    "truncated": "bool",        # true when ANY rule's embedded sample was capped
+    "event_timestamp_ms": "number",
+}
+_MATCHES_SCHEMAS_BY_VER = {"2": MATCHES_SCHEMA, "3": MATCHES_SCHEMA_V3, "4": MATCHES_SCHEMA_V4}
 KNOWN_MATCHES_SCHEMA_VERSIONS = tuple(sorted(_MATCHES_SCHEMAS_BY_VER))
 
 
 def matches_schema_for(ver):
-    return _MATCHES_SCHEMAS_BY_VER.get(str(ver), MATCHES_SCHEMA_V3)
+    return _MATCHES_SCHEMAS_BY_VER.get(str(ver), MATCHES_SCHEMA_V4)
 
 
 SCANS_SCHEMA = {

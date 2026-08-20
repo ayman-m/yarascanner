@@ -369,7 +369,9 @@ LOOKUP_DATASET_SHARD = os.environ.get("YARA_LOOKUP_SHARD", "endpoint").strip() o
 # tag the dataset name with a schema version and bump it whenever the row shape changes. A fresh
 # version = a fresh dataset with the new schema; old-version datasets remain queryable (the
 # dashboards' `yara_scanner_matches*` wildcard spans every version). Bump this on any schema edit.
-LOOKUP_SCHEMA_VERSION = os.environ.get("YARA_LOOKUP_SCHEMA_VER", "3").strip() or "3"
+# v4 (current): one row per matched FILE. See MATCHES_SCHEMA_V4 for the shape, and for the reason
+# each v3 column was kept per-row, folded into `rules`, or dropped as derivable.
+LOOKUP_SCHEMA_VERSION = os.environ.get("YARA_LOOKUP_SCHEMA_VER", "4").strip() or "4"
 # Rule-compilation DISK cache. Compiling a large pack (~500 rules) costs ~90s and is repeated on
 # every run because the scanner is a fresh process per action. yara-python's rules.save()/load()
 # lets us persist the compiled ruleset on the endpoint and skip the whole per-rule compile loop on
@@ -390,8 +392,9 @@ RULE_CACHE_MAX_FILES = _env_number("YARA_RULE_CACHE_MAX", 5, cast=int, minimum=0
 RULE_CACHE_MAX_BYTES = int(_env_number("YARA_RULE_CACHE_MAX_MB", 256, minimum=0) * 1024 * 1024)
 _RULE_CACHE_LOCK = threading.Lock()
 # Fixed lookup-dataset base name (stable so dashboards can reference literally):
-#   <prefix>_matches -> one row per (rule, file) FINDING (v3 grain; match_count carries
-#                       the true hit total, offsets/strings a capped sample)
+#   <prefix>_matches -> one row per matched FILE (v4 grain; `rules` carries every rule that hit
+#                       the file, rule_count/match_total the file-level totals, and each rule's
+#                       offsets/strings a capped sample)
 #   <prefix>_scans   -> scan-lifecycle rows (initiated/running/completed/cancelled/failed)
 LOOKUP_DATASET_PREFIX = "yara_scanner"
 SCANS_HEARTBEAT_SECS = _env_number("YARA_HEARTBEAT_SECS", 600, minimum=0)  # running-row cadence
@@ -3818,83 +3821,87 @@ class ResultsUploader:
                 self.log_manager.log_error(f"Error stopping results uploader: {e}")
 
     def add_match(self, filename, rule, match_data, file_sha256=None, file_creation_time=None):
-        """Add YARA match and queue for upload.
+        """Aggregate ONE (rule, file) finding: fire its alert, return its dataset detail.
 
-        Grain split: the LOOKUP DATASET gets ONE ROW PER (rule, file) finding — same grain as the
-        ALERT channel below — with every matched offset folded into that row rather than emitted as
-        its own row. Earlier versions (schema v2) wrote one dataset row per matched string offset;
-        that grain repeats every per-file column (hostname, filename, sha256, scan context - ~18 of
-        20 fields) unchanged on every row, and an unanchored/short pattern hitting one large file
-        can multiply that into tens of thousands of near-duplicate rows (measured live: 33,118 rows
-        from one rule against one .evtx log), enough to exhaust a scan's whole upload budget before
-        other findings in the same scan get a turn. Folding offsets into one row keeps that fixed
-        per-file cost paid ONCE per finding instead of once per offset.
+        Grain split, and the two channels no longer share one:
+
+        * ALERT channel (below) — ONE alert per FINDING (file x rule), unchanged. The storm cap
+          CONFIG_ALERT_MAX_PER_SCAN is measured against that grain and its rollup accounting
+          depends on it, so this method still runs once per rule and still queues one alert.
+        * LOOKUP DATASET — ONE row per FILE (schema v4). This method therefore no longer writes
+          a dataset row at all; it returns this rule's contribution, and the caller — which is
+          _write_alerts, and which already receives every rule that matched the file in a single
+          call — passes the collected list to add_file_matches().
+
+        History of the dataset grain. v2 wrote one row per matched string OFFSET: that repeats
+        every per-file column (hostname, filename, sha256, scan context — ~18 of 20 fields)
+        unchanged on every row, and an unanchored/short pattern hitting one large file multiplies
+        it into tens of thousands of near-duplicate rows (measured live: 33,118 rows from one rule
+        against one .evtx log), enough to exhaust a scan's whole upload budget before genuinely
+        distinct findings elsewhere get a turn. v3 folded the offsets into the finding. v4 folds
+        the findings into the FILE, because the same per-file columns were still being repeated
+        once per rule — measured on a real /etc scan, 1.93 times for the average matched file.
 
         Per-offset detail is not retained here at all (alert_dir/<rule>.txt already records
-        every offset) — only the
-        NETWORK/dataset representation is aggregated+sampled here."""
+        every offset) — only the NETWORK/dataset representation is aggregated+sampled here."""
         match_count = 0
         _first_offset = None
         _hit_samples = []      # first few "string_id@offset" pairs for the alert description
         _string_sample = ""    # first rendered matched string for the alert description
-        _offsets_sample = []   # capped sample embedded in the aggregated row
-        _strings_sample = []   # aligned 1:1 with _offsets_sample
+        _offsets_sample = []   # capped sample embedded in this rule's entry in the file's row
+        _strings_distinct = [] # DISTINCT rendered values — NOT aligned 1:1 with _offsets_sample
+        _strings_seen = set()
         _string_id_counts = {} # TRUE per-string-identifier counts across every offset, uncapped
+        # Cap semantics, restated because the grain moved under it: this knob used to bound how
+        # many ROWS one (rule, file) finding could put on the wire. Under v4 a finding produces
+        # no rows of its own, so the SAME number now bounds the offsets/strings sample carried
+        # for that rule INSIDE its file's single row. Same knob, same job — bounding what one
+        # pathological finding can push onto the network — applied one level down. <= 0 disables.
         _row_cap = CONFIG_LOOKUP_ROWS_PER_FINDING_MAX
-        # Resolve per-file context once (not per matched string).
-        try:
-            _file_size = int(os.path.getsize(filename))
-        except Exception:
-            _file_size = -1
-        _scan_folder = str(getattr(self.config, "scan_folder", None) or "system")
         for string_id, offset, string_data in match_data:
             string_data = _render_match_data(string_data)
 
-
+            # Normalise the identifier the same way the local alert census does: yara reports
+            # None for an anonymous string, and a None key would both sort-compare against str
+            # (TypeError) and serialise to JSON as "null".
+            _sid = "$?" if string_id is None else str(string_id)
             self.upload_stats['total_matches'] += 1
             match_count += 1
-            _string_id_counts[string_id] = _string_id_counts.get(string_id, 0) + 1
+            _string_id_counts[_sid] = _string_id_counts.get(_sid, 0) + 1
             if _first_offset is None:
                 _first_offset = offset
                 _string_sample = string_data
             if len(_hit_samples) < 3:
-                _hit_samples.append(f"{string_id}@{offset}")
+                _hit_samples.append(f"{_sid}@{offset}")
             if _row_cap <= 0 or len(_offsets_sample) < _row_cap:
                 _offsets_sample.append(offset)
-                _strings_sample.append(string_data)
+            # DISTINCT values only. v3 stored the same literal once per offset (measured:
+            # ["127.0.0.1"] repeated 50 times) — repetition that carried no information, because
+            # the counts already live in match_count and string_ids. Scanned across EVERY offset
+            # rather than only the capped offset window, so the sample is strictly more
+            # informative than v3's, and bounded by the same cap.
+            if (string_data not in _strings_seen
+                    and (_row_cap <= 0 or len(_strings_distinct) < _row_cap)):
+                _strings_seen.add(string_data)
+                _strings_distinct.append(string_data)
 
-        lookup_uploader = getattr(self, "lookup_uploader", None)
-        if lookup_uploader is not None and match_count > 0:
-            severity_map = {"critical": "High", "high": "High", "medium": "Medium", "low": "Low", "info": "Low"}
-            default_level = getattr(self.config, "alert_severity", "low")
-            severity = severity_map.get(str(default_level).lower(), "Low")
+        # This rule's contribution to its FILE's single dataset row. The row itself is assembled
+        # and queued by add_file_matches() once every rule for the file has been through here.
+        finding = None
+        if match_count > 0:
             truncated = bool(_row_cap > 0 and match_count > len(_offsets_sample))
-            lookup_record = {
-                "tenant_id": getattr(self.config, "tenant_id", "unknown"),
-                "scan_id": self.scan_id,
-                "run_id": getattr(self.config, "run_id", "") or "",
-                "scan_date": (getattr(self.config, "run_id", "") or "").split("_", 1)[0],
-                "hostname": self.hostname,
-                "os_info": self.os_info,
-                "os_type": _os_type(),
-                "ip_address": self.ip_address,
+            finding = {
                 "rule": rule,
-                "filename": filename,
-                "file_size": _file_size,
-                "file_sha256": file_sha256 or "",
-                "file_creation_time": file_creation_time or "",
-                "scan_folder": _scan_folder,
-                "match_count": match_count,
-                "offsets": json.dumps([str(o) for o in _offsets_sample]),
-                "strings": json.dumps(_strings_sample),
-                "string_ids": json.dumps(_string_id_counts),
+                "match_count": match_count,   # TRUE total, even when the sample below is capped
+                "offsets": [str(o) for o in _offsets_sample],
+                "strings": _strings_distinct,
+                # ARRAY of {id, count}, not an object keyed by the identifier: YARA string ids
+                # start with '$', and json_extract_scalar(x, "$.$ip") is not a valid JSONPath, so
+                # v3's {"$ip": 50} shape could be stored but never queried in XQL.
+                "string_ids": [{"id": k, "count": v} for k, v in sorted(_string_id_counts.items())],
                 "truncated": truncated,
-                "severity": severity,
-                "event_timestamp_ms": int(time.time() * 1000),
-                "date_of_scan": self.date_of_scan,
             }
-            lookup_uploader.add(lookup_record)
-            if truncated and hasattr(self, "log_manager") and self.log_manager:
+            if truncated and getattr(self, "log_manager", None):
                 self.log_manager.log_upload(
                     f"Rule '{rule}' matched {filename} at {match_count} offsets; embedded a sample "
                     f"of {len(_offsets_sample)} in the dataset row (truncated=true; full detail "
@@ -3953,6 +3960,71 @@ class ResultsUploader:
 
         self._throttled_log("added_matches",
                             f"Added {match_count} matches for rule '{rule}' in file: {filename}", level="upload")
+        return finding
+
+    def add_file_matches(self, filename, findings, file_sha256=None, file_creation_time=None):
+        """Queue ONE lookup-dataset row for one matched FILE (schema v4).
+
+        `findings` is the list of per-rule detail dicts add_match() returned for this file — every
+        rule that hit it. The file-level columns (tenant/scan/host/os/ip, filename, size, sha256,
+        creation time) are written ONCE here instead of once per rule, and the per-rule detail
+        rides along in the `rules` JSON array. Measured on a real /etc scan, that collapses 5,240
+        (rule, file) rows into 2,713 file rows.
+
+        `rules` is TEXT holding a JSON array because XDR lookup columns have no array or nested
+        type. That keeps it queryable rather than opaque — XQL expands a JSON array held in a
+        text field (verified live on the tenant):
+            | alter r = json_extract_array(rules, "$") | arrayexpand r
+            | alter rule = json_extract_scalar(r, "$.rule")
+            | comp sum(to_integer(json_extract_scalar(r, "$.match_count"))) as hits by rule
+        """
+        lookup_uploader = getattr(self, "lookup_uploader", None)
+        findings = [f for f in (findings or []) if f]
+        if lookup_uploader is None or not findings:
+            return
+        try:
+            _file_size = int(os.path.getsize(filename))
+        except Exception:
+            _file_size = -1
+        severity_map = {"critical": "High", "high": "High", "medium": "Medium", "low": "Low", "info": "Low"}
+        default_level = getattr(self.config, "alert_severity", "low")
+        severity = severity_map.get(str(default_level).lower(), "Low")
+
+        rules = []
+        match_total = 0
+        truncated_any = False
+        for f in findings:
+            match_total += int(f.get("match_count") or 0)
+            truncated_any = truncated_any or bool(f.get("truncated"))
+            entry = dict(f)
+            # Per-rule severity. Today every rule inherits the scan's configured alert severity,
+            # so this is scan-constant — it is still written per rule because the file-level
+            # `severity` below is defined as the MAX across the file's rules, which only means
+            # anything if the per-rule value is the one that can vary.
+            entry["severity"] = severity
+            rules.append(entry)
+
+        record = {
+            "tenant_id": getattr(self.config, "tenant_id", "unknown"),
+            "scan_id": self.scan_id,
+            "hostname": self.hostname,
+            "os_info": self.os_info,
+            "os_type": _os_type(),
+            "ip_address": self.ip_address,
+            "filename": filename,
+            "file_size": _file_size,
+            "file_sha256": file_sha256 or "",
+            "file_creation_time": file_creation_time or "",
+            # Compact separators: at ~2 rules per file this is a few bytes, but on a file matched
+            # by many rules the ", " padding is paid once per key of every rule object.
+            "rules": json.dumps(rules, separators=(",", ":")),
+            "rule_count": len(rules),
+            "match_total": match_total,
+            "severity": _max_severity([e["severity"] for e in rules], default=severity),
+            "truncated": truncated_any,
+            "event_timestamp_ms": int(time.time() * 1000),
+        }
+        lookup_uploader.add(record)
 
     def upload_results(self):
         """Finalize upload process with timeout protection."""
@@ -4017,6 +4089,121 @@ class ResultsUploader:
         stats = self.upload_stats.copy()
         stats['requeued'] = self._requeued_total
         return stats
+
+
+# ---- matches-dataset schemas ------------------------------------------------------------
+# A lookup dataset's schema is FIXED at creation and XDR silently SKIPS rows carrying fields the
+# dataset doesn't know about, so a row-shape change is a new schema VERSION with a new dataset
+# name (LOOKUP_SCHEMA_VERSION), never an in-place edit. Older versions are kept here rather than
+# deleted: a fleet mid-rollout writes both shapes at once, xdr_consolidate.py resolves a schema
+# by version to merge older shards, and the dashboards' `yara_scanner_matches*` wildcard spans
+# every version. v2 (one row per matched OFFSET) predates this module's constants and lives only
+# in xdr_consolidate.MATCHES_SCHEMA, which is the module that still has to read it.
+#
+# v3: one row per (rule, file) FINDING; offsets/strings/string_ids folded into the row.
+MATCHES_SCHEMA_V3 = {
+    "tenant_id": "text",
+    "scan_id": "text",
+    "run_id": "text",
+    "scan_date": "text",
+    "hostname": "text",
+    "os_info": "text",
+    "os_type": "text",          # coarse family (windows/linux/macos) for dashboard segmentation
+    "ip_address": "text",
+    "rule": "text",
+    "filename": "text",
+    "file_size": "number",      # size of the matched file in bytes
+    "file_sha256": "text",
+    "file_creation_time": "text",
+    "scan_folder": "text",      # the target that was scanned (context for the hit)
+    "match_count": "number",    # TRUE total matched offsets for this (rule, file), even if capped
+    "offsets": "text",          # JSON array: sample of offsets (up to CONFIG_LOOKUP_ROWS_PER_FINDING_MAX)
+    "strings": "text",          # JSON array: rendered matched strings, aligned 1:1 with offsets
+    "string_ids": "text",       # JSON object: per-string-identifier counts, e.g. {"$ext2": 12}
+    "truncated": "bool",        # true when match_count exceeds the embedded offsets/strings sample
+    "severity": "text",
+    "event_timestamp_ms": "number",
+    "date_of_scan": "text",
+}
+# v4 (current): one row per matched FILE, carrying every rule that hit it.
+#
+# Why: measured on a real /etc scan (2,713 matched files, 5,240 findings -> 1.93 rules per file),
+# v3 repeated ~11 of its 22 columns — hostname/os/ip/filename/sha256/size/creation-time/scan
+# context — once per rule per file, for 838 B/row and 4.19 MB from ONE endpoint. A lookup dataset
+# is capped at 50 MB by the platform, which is what bounds how many hosts a consolidated dataset
+# can hold. v4 pays the file-level cost once and moves the per-rule detail into `rules`.
+#
+# Dropped from v3, and where each remains recoverable:
+#   run_id       -> already embedded verbatim inside scan_id (<host>_<run_id>_yara_<hash>)
+#   scan_date    -> the leading YYYYMMDD of that same run_id segment
+#   date_of_scan -> event_timestamp_ms is the same instant: to_timestamp(event_timestamp_ms,"MILLIS")
+#   scan_folder  -> scan-constant, and the yara_scanner_scans* lifecycle row for this scan_id
+#                   still carries it (that dataset is 2 rows/scan and was deliberately untouched)
+#   rule, match_count, offsets, strings, string_ids, and the per-rule truncated flag
+#                -> folded into the `rules` array below
+# Kept per-row because they genuinely VARY across a consolidated multi-host dataset: hostname,
+# os_info, os_type, ip_address, scan_id, event_timestamp_ms, and every file-level field.
+# tenant_id is kept although it is constant per tenant: the shipped widget headers state that
+# every row carries it for multi-tenant views, so dropping it would break that contract.
+MATCHES_SCHEMA_V4 = {
+    "tenant_id": "text",
+    "scan_id": "text",
+    "hostname": "text",
+    "os_info": "text",
+    "os_type": "text",           # coarse family (windows/linux/macos) for dashboard segmentation
+    "ip_address": "text",
+    "filename": "text",
+    "file_size": "number",       # size of the matched file in bytes
+    "file_sha256": "text",
+    "file_creation_time": "text",
+    # JSON ARRAY of per-rule objects, one per rule that matched this file:
+    #   {"rule","match_count","offsets","strings","string_ids","truncated","severity"}
+    # TEXT because XDR lookup columns have no array/nested type. It stays queryable — XQL can
+    # expand a JSON array held in a text field (verified live on the tenant):
+    #   | alter r = json_extract_array(rules, "$") | arrayexpand r
+    #   | alter rule = json_extract_scalar(r, "$.rule") | comp count() as n by rule
+    # string_ids is an ARRAY of {id, count} rather than an object keyed by the identifier
+    # precisely so it stays reachable that way: YARA string identifiers begin with '$', and
+    # json_extract_scalar(x, "$.$ip") is not a valid JSONPath — the v3 object shape
+    # ({"$ip": 50}) could be stored but never queried.
+    "rules": "text",
+    "rule_count": "number",      # len(rules); how many distinct rules hit this file
+    "match_total": "number",     # TRUE total string hits across every rule, even where sampled
+    "severity": "text",          # HIGHEST severity across this file's rules
+    "truncated": "bool",         # true when ANY rule's embedded sample was capped
+    "event_timestamp_ms": "number",
+}
+# Version tag -> schema. Mirrors xdr_consolidate._MATCHES_SCHEMAS_BY_VER, which must know the
+# same shapes to consolidate shards written by any scanner version still in the fleet.
+MATCHES_SCHEMAS_BY_VER = {"3": MATCHES_SCHEMA_V3, "4": MATCHES_SCHEMA_V4}
+# The shape this build actually EMITS (ResultsUploader.add_file_matches). LOOKUP_SCHEMA_VERSION
+# only tags the dataset NAME and an operator can pin it; the schema a dataset is CREATED with is
+# always this one, because a dataset created from an older schema would silently swallow every
+# row we send (XDR skips unknown fields without an error).
+MATCHES_ROW_SCHEMA_VERSION = "4"
+
+
+def matches_schema_for(ver):
+    """The matches-dataset schema for a version tag, defaulting to the emitted (current) shape.
+
+    An unrecognised tag falls back to MATCHES_SCHEMA_V4 rather than raising: the caller is about
+    to create a dataset for rows this build emits, and the emitted shape is the only one those
+    rows can land in."""
+    return MATCHES_SCHEMAS_BY_VER.get(str(ver).strip(), MATCHES_SCHEMA_V4)
+
+
+# Severity ranking for the file-level `severity` column: the highest across the file's rules.
+_SEVERITY_RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+
+
+def _max_severity(values, default="Low"):
+    """Highest severity among `values`, comparing on _SEVERITY_RANK and preserving the original
+    spelling. Unknown labels rank 0 so a typo can never outrank a real "High"."""
+    best = None
+    for v in values:
+        if best is None or _SEVERITY_RANK.get(str(v).lower(), 0) > _SEVERITY_RANK.get(str(best).lower(), 0):
+            best = v
+    return default if best is None else best
 
 
 class LookupDatasetUploader:
@@ -4091,37 +4278,19 @@ class LookupDatasetUploader:
         self._stop_done = False
         self._drain_budget = None    # scaled at stop(): backlog-aware, capped by LOOKUP_DRAIN_MAX_SECS
 
-        # Matches schema — must match keys produced by ResultsUploader.add_match.
+        # Matches schema — must match the keys produced by ResultsUploader.add_file_matches.
         # XDR add_dataset supports: text, number, datetime, bool.
-        # v3: one row per (rule, file) finding, not one row per matched offset (see add_match's
-        # docstring for why — v2's per-offset grain let one pathological finding exhaust a scan's
-        # upload budget). offsets/strings/string_ids are JSON-encoded text (XDR has no array/nested
-        # column type); match_count + truncated make the true total queryable even when the
-        # embedded sample is capped, instead of only visible in a local per-endpoint log.
-        self.matches_schema = {
-            "tenant_id": "text",
-            "scan_id": "text",
-            "run_id": "text",
-            "scan_date": "text",
-            "hostname": "text",
-            "os_info": "text",
-            "os_type": "text",          # coarse family (windows/linux/macos) for dashboard segmentation
-            "ip_address": "text",
-            "rule": "text",
-            "filename": "text",
-            "file_size": "number",      # size of the matched file in bytes
-            "file_sha256": "text",
-            "file_creation_time": "text",
-            "scan_folder": "text",      # the target that was scanned (context for the hit)
-            "match_count": "number",    # TRUE total matched offsets for this (rule, file), even if capped
-            "offsets": "text",          # JSON array: sample of offsets (up to CONFIG_LOOKUP_ROWS_PER_FINDING_MAX)
-            "strings": "text",          # JSON array: rendered matched strings, aligned 1:1 with offsets
-            "string_ids": "text",       # JSON object: per-string-identifier counts, e.g. {"$ext2": 12, "$note1": 3}
-            "truncated": "bool",        # true when match_count exceeds the embedded offsets/strings sample
-            "severity": "text",
-            "event_timestamp_ms": "number",
-            "date_of_scan": "text",
-        }
+        # Always the EMITTED shape, never one resolved from the (operator-pinnable) name tag: a
+        # dataset created from an older schema accepts the POST and silently drops every row
+        # whose fields it doesn't recognise, so a mismatch would lose whole scans without error.
+        self.matches_schema = matches_schema_for(MATCHES_ROW_SCHEMA_VERSION)
+        if str(LOOKUP_SCHEMA_VERSION).strip() != MATCHES_ROW_SCHEMA_VERSION and self.log_manager:
+            self.log_manager.log_error(
+                f"YARA_LOOKUP_SCHEMA_VER={LOOKUP_SCHEMA_VERSION} tags the dataset name, but this "
+                f"build emits v{MATCHES_ROW_SCHEMA_VERSION} rows; '{self.matches_dataset}' will be "
+                f"created with the v{MATCHES_ROW_SCHEMA_VERSION} schema. If a dataset by that name "
+                f"already exists on an older schema, XDR will silently skip every row."
+            )
         # Scans lifecycle schema — one row per lifecycle transition/heartbeat.
         self.scans_schema = {
             "tenant_id": "text",
@@ -6661,106 +6830,128 @@ rule test {{
             return False
 
     def _write_alerts(self, matches, file_path, file_sha256=None, file_creation_time=None):
-        """Write alerts for YARA matches."""
+        """Write alerts for YARA matches, and queue this file's single dataset row.
+
+        `matches` is every rule that hit ONE file, which is why the schema-v4 lookup row — one
+        row per FILE carrying all of them — is assembled here: each add_match() call below returns
+        that rule's contribution, and the collected list goes to add_file_matches() once. The
+        alert channel is untouched by that: it stays one alert per (rule, file) finding."""
         file_detections = []
+        _rule_findings = []   # per-rule detail dicts for this file's single dataset row
 
-        for m in matches:
-            rule, tags, meta, strings = _iter_hit_fields(m)
+        # finally, not just fall-through: under the v3 grain each rule's dataset row was queued
+        # inside this loop, so a later rule raising (e.g. a TOCTOU OSError on a file deleted
+        # mid-scan, which getsize below can still raise) cost only the rules not yet reached.
+        # Aggregating must not make that worse — whatever detail was gathered still ships.
+        try:
+            for m in matches:
+                rule, tags, meta, strings = _iter_hit_fields(m)
 
-            with self.lock_counts:
-                self.detection_counts[rule] += 1
-                self.total_detections += 1
+                with self.lock_counts:
+                    self.detection_counts[rule] += 1
+                    self.total_detections += 1
 
-            detection_data = {
-                'rule_name': rule,
-                'file_path': file_path,
-                'match_count': len(strings),
-                'file_size': os.path.getsize(file_path) if os.path.exists(file_path) else 0,
-                'file_sha256': file_sha256,
-                'file_creation_time': file_creation_time
-            }
-            file_detections.append(detection_data)
+                detection_data = {
+                    'rule_name': rule,
+                    'file_path': file_path,
+                    'match_count': len(strings),
+                    'file_size': os.path.getsize(file_path) if os.path.exists(file_path) else 0,
+                    'file_sha256': file_sha256,
+                    'file_creation_time': file_creation_time
+                }
+                file_detections.append(detection_data)
 
-            if UPLOAD_RESULTS:
-                converted = [(sid, off, data) for (off, sid, data) in strings]
-                self.results_uploader.add_match(
+                if UPLOAD_RESULTS:
+                    converted = [(sid, off, data) for (off, sid, data) in strings]
+                    _finding = self.results_uploader.add_match(
+                        file_path,
+                        rule,
+                        converted,
+                        file_sha256=file_sha256,
+                        file_creation_time=file_creation_time
+                    )
+                    if _finding:
+                        _rule_findings.append(_finding)
+
+                alert_path = os.path.join(self.config.alert_dir, f"{rule}.txt")
+                with self.lock_alert:
+                    try:
+                        _over_budget = (CONFIG_ALERT_DIR_MAX_BYTES > 0
+                                        and getattr(self, "_alert_bytes_written", 0) >= CONFIG_ALERT_DIR_MAX_BYTES)
+                        try:
+                            _size_before = os.path.getsize(alert_path)
+                        except OSError:
+                            _size_before = 0
+                        with open(alert_path, "a", encoding="utf-8") as f:
+                            f.write(f"\nYARA rule '{rule}' matched file: {file_path}\n")
+                            if file_sha256:
+                                f.write(f"File SHA256: {file_sha256}\n")
+                            if file_creation_time:
+                                f.write(f"File Creation Time: {file_creation_time}\n")
+                            f.write("=" * 80 + "\n")
+                            if strings and not _over_budget:
+                                # Census first, and deliberately UNCAPPED: which string in
+                                # the rule fired and how many times is what an analyst works
+                                # from, and it costs one line no matter how many offsets there
+                                # are. The offsets below are sampled precisely so this can be
+                                # complete.
+                                id_counts = {}
+                                for (_o, _sid, _d) in strings:
+                                    key = "$?" if _sid is None else str(_sid)
+                                    id_counts[key] = id_counts.get(key, 0) + 1
+                                f.write(f"Total string hits: {len(strings)}\n")
+                                f.write("Hits per string ID: " + ", ".join(
+                                    f"{k}={v}" for k, v in sorted(id_counts.items())) + "\n")
+                                f.write("=" * 80 + "\n")
+
+                                _cap = CONFIG_ALERT_OFFSETS_PER_FINDING_MAX
+                                shown = strings if _cap <= 0 else strings[:_cap]
+                                f.write(
+                                    f"Matched Strings (showing {len(shown)} of {len(strings)}):\n")
+                                f.write("-" * 40 + "\n")
+                                for (off, sid, data) in shown:
+                                    string_repr = _render_match_data(data)
+                                    f.write(f"String ID: {sid}\n")
+                                    f.write(f"Offset: {off}\n")
+                                    f.write(f"Data: {string_repr}\n")
+                                    f.write("-" * 40 + "\n")
+                                if len(shown) < len(strings):
+                                    f.write(
+                                        f"{len(strings) - len(shown)} further offset(s) omitted "
+                                        f"(CONFIG_ALERT_OFFSETS_PER_FINDING_MAX={_cap}). Counts "
+                                        f"above are complete; re-run `yara -s` against this file "
+                                        f"for every offset.\n")
+                                    f.write("-" * 40 + "\n")
+                            elif strings:
+                                # Past the byte ceiling. The COUNT still ships - it is what the
+                                # dataset totals reconcile against - only per-offset detail goes.
+                                f.write(f"Total string hits: {len(strings)}\n")
+                                f.write(
+                                    f"Offset detail omitted: alert directory byte budget "
+                                    f"reached (YARA_ALERT_DIR_MAX_MB). Counts above and in the "
+                                    f"lookup dataset remain complete; re-run `yara -s` against "
+                                    f"this file for offsets.\n")
+                                f.write("-" * 40 + "\n")
+                                self._alert_detail_suppressed = getattr(
+                                    self, "_alert_detail_suppressed", 0) + 1
+                            f.flush()
+                        try:
+                            self._alert_bytes_written = getattr(self, "_alert_bytes_written", 0) + max(
+                                0, os.path.getsize(alert_path) - _size_before)
+                        except OSError:
+                            pass
+                    except (IOError, OSError) as e:
+                        if hasattr(self, 'log_manager'):
+                            self.log_manager.log_error(f"Failed to write alert file: {e}")
+
+        finally:
+            if UPLOAD_RESULTS and _rule_findings:
+                self.results_uploader.add_file_matches(
                     file_path,
-                    rule,
-                    converted,
+                    _rule_findings,
                     file_sha256=file_sha256,
                     file_creation_time=file_creation_time
                 )
-
-            alert_path = os.path.join(self.config.alert_dir, f"{rule}.txt")
-            with self.lock_alert:
-                try:
-                    _over_budget = (CONFIG_ALERT_DIR_MAX_BYTES > 0
-                                    and getattr(self, "_alert_bytes_written", 0) >= CONFIG_ALERT_DIR_MAX_BYTES)
-                    try:
-                        _size_before = os.path.getsize(alert_path)
-                    except OSError:
-                        _size_before = 0
-                    with open(alert_path, "a", encoding="utf-8") as f:
-                        f.write(f"\nYARA rule '{rule}' matched file: {file_path}\n")
-                        if file_sha256:
-                            f.write(f"File SHA256: {file_sha256}\n")
-                        if file_creation_time:
-                            f.write(f"File Creation Time: {file_creation_time}\n")
-                        f.write("=" * 80 + "\n")
-                        if strings and not _over_budget:
-                            # Census first, and deliberately UNCAPPED: which string in
-                            # the rule fired and how many times is what an analyst works
-                            # from, and it costs one line no matter how many offsets there
-                            # are. The offsets below are sampled precisely so this can be
-                            # complete.
-                            id_counts = {}
-                            for (_o, _sid, _d) in strings:
-                                key = "$?" if _sid is None else str(_sid)
-                                id_counts[key] = id_counts.get(key, 0) + 1
-                            f.write(f"Total string hits: {len(strings)}\n")
-                            f.write("Hits per string ID: " + ", ".join(
-                                f"{k}={v}" for k, v in sorted(id_counts.items())) + "\n")
-                            f.write("=" * 80 + "\n")
-
-                            _cap = CONFIG_ALERT_OFFSETS_PER_FINDING_MAX
-                            shown = strings if _cap <= 0 else strings[:_cap]
-                            f.write(
-                                f"Matched Strings (showing {len(shown)} of {len(strings)}):\n")
-                            f.write("-" * 40 + "\n")
-                            for (off, sid, data) in shown:
-                                string_repr = _render_match_data(data)
-                                f.write(f"String ID: {sid}\n")
-                                f.write(f"Offset: {off}\n")
-                                f.write(f"Data: {string_repr}\n")
-                                f.write("-" * 40 + "\n")
-                            if len(shown) < len(strings):
-                                f.write(
-                                    f"{len(strings) - len(shown)} further offset(s) omitted "
-                                    f"(CONFIG_ALERT_OFFSETS_PER_FINDING_MAX={_cap}). Counts "
-                                    f"above are complete; re-run `yara -s` against this file "
-                                    f"for every offset.\n")
-                                f.write("-" * 40 + "\n")
-                        elif strings:
-                            # Past the byte ceiling. The COUNT still ships - it is what the
-                            # dataset totals reconcile against - only per-offset detail goes.
-                            f.write(f"Total string hits: {len(strings)}\n")
-                            f.write(
-                                f"Offset detail omitted: alert directory byte budget "
-                                f"reached (YARA_ALERT_DIR_MAX_MB). Counts above and in the "
-                                f"lookup dataset remain complete; re-run `yara -s` against "
-                                f"this file for offsets.\n")
-                            f.write("-" * 40 + "\n")
-                            self._alert_detail_suppressed = getattr(
-                                self, "_alert_detail_suppressed", 0) + 1
-                        f.flush()
-                    try:
-                        self._alert_bytes_written = getattr(self, "_alert_bytes_written", 0) + max(
-                            0, os.path.getsize(alert_path) - _size_before)
-                    except OSError:
-                        pass
-                except (IOError, OSError) as e:
-                    if hasattr(self, 'log_manager'):
-                        self.log_manager.log_error(f"Failed to write alert file: {e}")
 
         if hasattr(self, 'log_manager'):
             total_strings = sum(len(_iter_hit_fields(m)[3]) for m in matches)

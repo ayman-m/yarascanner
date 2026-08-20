@@ -1,14 +1,55 @@
-"""YaraConsolidateApply — perform the actual per-scan dataset merge.
+"""YaraConsolidateFast - cheap consolidation. Merge findings, retire the rest, no verify.
 
-STANDALONE: this file carries everything it needs. It imports no other automation, and
-relies only on the demisto / CommonServerPython names the platform injects at runtime.
+STANDALONE: carries everything it needs. Imports no other automation and neither
+demistomock nor CommonServerPython - the tenant injects demisto and the CommonServerPython
+helpers implicitly.
 
-Mutating: creates per-scan target datasets, writes rows, deletes fully-verified
-source shards (see YaraConsolidateCommon.consolidate_all / run_consolidation).
-Internally idempotent per scan (an already-complete target is verified, not
-rewritten), so a duplicate invocation cannot double-write — but it still re-reads
-tenant-wide state each call, so it is not free. The playbook should call this once
-per pass, not speculatively.
+This is the deliberately cheaper sibling of YaraConsolidateApply, offered alongside it
+rather than replacing it. The two differ in one decision only: whether to prove the merge
+before deleting the source.
+
+  YaraConsolidateApply  counts every row into the target and refuses to delete unless the
+                        totals agree. Many queries, minutes on a large tenant, and a
+                        guarantee you can show an auditor.
+  YaraConsolidateFast   merges and deletes without that proof. A small fraction of the
+                        queries. Duplicate rows are possible and accepted.
+
+WHAT MAKES IT CHEAP. Three costs were removed, all of them decision-making rather than work:
+
+  1. Lifecycle state now comes from ONE `comp ... by scan_id` aggregate per scans shard.
+     The verified path calls _rows_of() - `dataset = X` with limit=50000 - pulling every
+     lifecycle row from every shard purely to read a status field. On the live tenant that
+     is a full-table read per dataset, repeated across four kind x version passes.
+  2. filter_unconsolidated is not called at all. It costs two XQL per candidate and exists
+     to prove a scan already reached its target, which is exactly the proof this variant is
+     choosing not to buy.
+  3. No target row-count, no source/target comparison.
+
+Reading rows in order to MERGE them is unavoidable and remains. The saving is entirely in
+not reading rows to DECIDE things.
+
+THE TWO KINDS ARE TREATED DIFFERENTLY, and the asymmetry is the design:
+
+  matches shards hold FINDINGS - the thing worth keeping. Merged into the per-scan target,
+                  then deleted.
+  scans shards   hold LIFECYCLE ROWS - start/heartbeat/terminal markers. Worth nothing once
+                  the scan is over, so they are never merged: just retained for
+                  retention_hours and then deleted outright.
+
+ORDERING IS LOAD-BEARING. The scans shards are the only record of whether a scan finished,
+so this reads lifecycle state FIRST, decides every matches shard, and only THEN deletes the
+aged-out scans shards. Deleting a scans shard before its matches sibling is decided destroys
+the input that decision depends on. It stays self-consistent because once a scans shard is
+gone, any surviving matches shard is necessarily older than the retention window and
+qualifies on age alone.
+
+THE ONE SAFETY RULE KEPT. A matches shard is deleted only if EVERY write that merged its
+rows returned success. That is not a count comparison and costs no extra query - it is
+simply not ignoring an error return. Duplicates are survivable; silent loss is not.
+
+RESIDUAL RISK, stated plainly: if the same scan is processed twice, its rows land in the
+target twice. Searches show the finding twice. Nothing is lost, and the merged dataset is
+not a provably exact copy of what the endpoints wrote.
 """
 
 # ============================================================================
@@ -46,6 +87,9 @@ DEFAULT_ROW_CEILING = 2_000_000
 DEFAULT_ABANDONED_SECS = 24 * 3600
 DELETE_CONCURRENCY = 12
 _WRITE_BATCH = 500
+# Read cap for a single scan's merge. A scan larger than this is refused by the fast path
+# rather than silently truncated - see the truncation guard in main().
+_READ_LIMIT = 50000
 # Endpoint-clock-skew tolerances (edge case #6) — kept in sync with xdr_consolidate.py, see
 # that module for the reasoning and the live measurements behind both numbers.
 SKEW_TOLERANCE_MS = 5 * 60 * 1000
@@ -1576,80 +1620,228 @@ class CoreApiClient:
 
 
 # ============================================================================
-# YaraConsolidateApply entry point
+# YaraConsolidateFast entry point
 # ============================================================================
+
+
+def _lifecycle_state(client, scans_shards, log, qcount):
+    """scan_id -> {"terminal": bool, "newest_ms": int} from ONE aggregate per shard.
+
+    The expensive path reads every lifecycle row to learn this. A comp stage returns one
+    row per (scan_id, status) instead, which is the entire cost saving in one function.
+    """
+    state = {}
+    for ds in scans_shards:
+        try:
+            rows = client.xql("dataset = %s | comp count() as n, "
+                              "max(event_timestamp_ms) as newest by scan_id, status" % ds,
+                              limit=10000) or []
+            qcount[0] += 1
+        except Exception as e:
+            # Unreadable lifecycle means UNKNOWN, never "finished". Skipping the shard is
+            # the safe direction: it survives to the next run.
+            log("  ! lifecycle unreadable for %s (%s) - its scans stay untouched" % (ds, e))
+            continue
+        for r in rows:
+            sid = r.get("scan_id")
+            if not sid:
+                continue
+            newest = _as_ms(r.get("newest")) or 0
+            cur = state.setdefault(sid, {"terminal": False, "newest_ms": 0})
+            cur["newest_ms"] = max(cur["newest_ms"], newest)
+            st = str(r.get("status") or "").lower()
+            if st in TERMINAL_LIFECYCLE:
+                cur["terminal"] = True
+    return state
+
+
 def main():
     args = demisto.args()
-    scan_ids = argToList(args.get("scan_id")) or None
-    quiet_secs = args.get("quiet_secs")
-    row_ceiling = args.get("row_ceiling")
-    abandoned_after_hours = args.get("abandoned_after_hours")
-
-    kwargs = {"only_scan_ids": scan_ids, "dry_run": False}
-    if quiet_secs:
-        kwargs["quiet_secs"] = int(quiet_secs)
-    if row_ceiling:
-        kwargs["row_ceiling"] = int(row_ceiling)
-    if abandoned_after_hours:
-        kwargs["abandoned_after_secs"] = int(float(abandoned_after_hours) * 3600)
-
+    only = argToList(args.get("scan_id")) or None
+    retention_hours = float(args.get("retention_hours") or 24)
+    execute = argToBoolean(args.get("execute") or "false")
+    dry = not execute
     log_lines = []
-    client = None
+
+    def log(m):
+        log_lines.append(str(m))
+
     try:
-        client = CoreApiClient()
-        result = consolidate_all(client, log=lambda m: log_lines.append(m), **kwargs)
+        set_schema_version(args.get("schema_version") or DEFAULT_SCHEMA_VERSION)
     except Exception as ex:
-        # Record the crash as a queryable row (best-effort — see record_consolidation_run)
-        # BEFORE calling return_error, since return_error halts this task and the playbook's
-        # own Task 8 "needs attention" flag is never reached from here (edge case #36/#53:
-        # a total execution crash is exactly the failure mode Task 8 cannot record). Only
-        # possible if CoreApiClient() itself constructed successfully — if credentials are
-        # still placeholders, client is None and there is nothing to write with.
-        if client is not None:
-            record_consolidation_run(client, "crashed", error_message=str(ex), log=lambda *a: None)
-        return_error("YaraConsolidateApply failed: {}".format(ex))
+        return_error("YaraConsolidateFast: invalid argument (%s)." % ex)
         return
 
-    record_consolidation_run(
-        client, "partial_failure" if result["failed_count"] else "success",
-        result=result, log=lambda *a: None)
+    ver = str(YARA_SCHEMA_VERSION)
+    cutoff_ms = retention_hours * 3600 * 1000
+    now_ms = int(time.time() * 1000)
+    qcount = [0]
+    merged, deleted, skipped, failed = [], [], [], []
 
-    if result.get("lock_held_by_other_run"):
-        lines = ["Skipped this pass — consolidation lock is held by another concurrent run "
-                 "(CLI or another Job execution)."]
-    else:
-        lines = ["{} scan(s) consolidated".format(result["consolidated_count"])]
-        if result["deferred_count"]:
-            lines.append("{} scan(s) deferred (became active mid-run): {}".format(
-                result["deferred_count"], ", ".join(result["deferred_scan_ids"][:10])))
-        if result["failed_count"]:
-            reasons = result.get("failed_reasons", {})
-            detail = ", ".join("{} ({})".format(sid, reasons.get(sid, "unknown"))
-                               for sid in result["failed_scan_ids"][:10])
-            lines.append("{} scan(s) FAILED — needs attention: {}".format(result["failed_count"], detail))
+    client = CoreApiClient()
 
-    # Lock events exist ONLY in the library's log stream, never in the structured result:
-    # acquire_consolidation_lock's "stale or unreadable — taking over" (which precedes
-    # force-deleting another run's marker) and release_consolidation_lock's "could not
-    # release" (which parks every following pass until the marker goes stale). Both are
-    # otherwise invisible to the operator.
-    lock_log = [m for m in log_lines if "lock" in m.lower()]
-    if lock_log:
-        lines.append("")
-        lines.append("lock events:")
-        lines += ["  {}".format(m) for m in lock_log]
+    # Writing runs take the same lock the verified path uses. Two passes mutating the same
+    # shards is the collision the lock exists for, and being the cheap variant does not
+    # make that collision cheaper.
+    if execute and not acquire_consolidation_lock(client, log=log, holder="YaraConsolidateFast"):
+        return_results(CommandResults(
+            readable_output="Another consolidation run holds the lock - nothing was touched.",
+            outputs_prefix="Yara.Fast", outputs={"status": "lock_held_by_other_run"}))
+        return
 
-    # Same context-accumulation risk as YaraConsolidateStatus (see its comment) - clear
-    # before writing so consolidated/deferred/failed lists never carry stale entries from
-    # a prior call to the same investigation.
-    demisto.executeCommand("DeleteContext", {"key": "Yara.ConsolidateApply"})
+    try:
+        names = _list_yara_datasets(client)
+        qcount[0] += 1
+        shards = {}
+        for n in names:
+            p = parse_shard(n)
+            if p and str(p.get("ver")) == ver:
+                shards[n] = p
+        scans_ds = [n for n, p in shards.items() if p["kind"] == "scans"]
+        match_ds = [n for n, p in shards.items() if p["kind"] == "matches"]
+        log("schema v%s: %d matches shard(s), %d scans shard(s)" % (ver, len(match_ds), len(scans_ds)))
 
-    return_results(CommandResults(
-        readable_output="\n".join(lines),
-        outputs_prefix="Yara.ConsolidateApply",
-        outputs=result,
-        raw_response=result,
-    ))
+        # ---- 1. lifecycle FIRST, before anything is deleted --------------------------
+        state = _lifecycle_state(client, scans_ds, log, qcount)
+        log("lifecycle: %d scan(s) known" % len(state))
+
+        # ---- 2. decide and merge every matches shard --------------------------------
+        schema = matches_schema_for(ver)
+        for ds in sorted(match_ds):
+            try:
+                rows = client.xql("dataset = %s | comp count() as n by scan_id" % ds, limit=10000) or []
+                qcount[0] += 1
+            except Exception as e:
+                skipped.append("%s: unreadable (%s)" % (ds, e))
+                continue
+            all_sids = [r.get("scan_id") for r in rows if r.get("scan_id")]
+            sids = [s for s in all_sids if s in only] if only else list(all_sids)
+            # A shard holds MANY scans. Deleting it is only safe when every scan it holds
+            # was handled in this run -- not merely every scan we were asked to handle.
+            # Without this, scoping to one scan_id and succeeding would delete the whole
+            # shard and take every other scan in it, including ones still running.
+            scoped_out = [s for s in all_sids if s not in sids]
+            if not sids:
+                skipped.append("%s: no scans in scope" % ds)
+                continue
+
+            all_done = True
+            for sid in sids:
+                st = state.get(sid) or {}
+                terminal = bool(st.get("terminal"))
+                newest = st.get("newest_ms") or 0
+                aged = bool(newest) and (now_ms - newest) >= cutoff_ms
+                if not terminal and not aged:
+                    # Still running, or too new to call abandoned. Leave it entirely alone.
+                    skipped.append("%s [%s]: scan still in progress" % (ds, sid[:34]))
+                    all_done = False
+                    continue
+                why = "completed" if terminal else "older than %gh" % retention_hours
+                if dry:
+                    merged.append("%s [%s]: WOULD merge (%s)" % (ds, sid[:34], why))
+                    continue
+                target = target_name("matches", ver, sid)
+                try:
+                    src = _rows_for_scan(client, ds, sid, limit=_READ_LIMIT)
+                    qcount[0] += 1
+                    # TRUNCATION GUARD. _rows_for_scan caps the read. Getting back exactly
+                    # the cap means the read may have been cut short, and we cannot tell a
+                    # scan of exactly N rows from one of N+1 without another query -- which
+                    # is the query this variant exists to avoid.
+                    #
+                    # The verified path is immune to this: it compares source and target
+                    # counts, so a short read shows up as a mismatch and nothing is deleted.
+                    # Dropping that comparison is precisely what exposes the cap, so the cap
+                    # needs its own guard or the two decisions combine into silent loss:
+                    # merge 50,000 of 60,000 rows, then delete the only copy of the other
+                    # 10,000. Duplicates are survivable; this would not be.
+                    if len(src) >= _READ_LIMIT:
+                        failed.append("%s [%s]: read hit the %d-row cap - shard KEPT, use "
+                                      "YaraConsolidateApply for this scan"
+                                      % (ds, sid[:34], _READ_LIMIT))
+                        all_done = False
+                        continue
+                    payload = [_coerce_row(r, schema) for r in src]
+                    ok = True
+                    if payload:
+                        client.create_lookup_dataset(target, schema)
+                        for i in range(0, len(payload), _WRITE_BATCH):
+                            reply = client.add_lookup_data(target, payload[i:i + _WRITE_BATCH])
+                            if _added(reply) <= 0:
+                                # A batch that added nothing is a failed write. Keeping the
+                                # shard is the whole safety rule; do not delete on this path.
+                                ok = False
+                                break
+                    if ok:
+                        merged.append("%s [%s]: merged %d row(s) -> %s (%s)"
+                                      % (ds, sid[:34], len(payload), target, why))
+                    else:
+                        failed.append("%s [%s]: write failed - shard KEPT" % (ds, sid[:34]))
+                        all_done = False
+                except Exception as e:
+                    failed.append("%s [%s]: %s - shard KEPT" % (ds, sid[:34], e))
+                    all_done = False
+
+            # Delete the shard only when every scan it holds was dealt with successfully
+            # AND none were left out of scope by a scan_id filter.
+            if scoped_out:
+                skipped.append("%s: kept - %d other scan(s) in it were not in scope"
+                               % (ds, len(scoped_out)))
+            elif all_done and not dry:
+                deleted.append(ds)
+            elif all_done and dry:
+                deleted.append("%s (WOULD delete)" % ds)
+
+        # ---- 3. only NOW retire aged-out scans shards -------------------------------
+        scans_to_delete = []
+        for ds in sorted(scans_ds):
+            sids = [s for s, v in state.items() if v.get("newest_ms")]
+            try:
+                rows = client.xql("dataset = %s | comp max(event_timestamp_ms) as newest" % ds, limit=5) or []
+                qcount[0] += 1
+                newest = _as_ms(rows[0].get("newest")) if rows else None
+            except Exception as e:
+                skipped.append("%s: recency unreadable (%s)" % (ds, e))
+                continue
+            if newest and (now_ms - newest) >= cutoff_ms:
+                scans_to_delete.append(ds)
+            else:
+                skipped.append("%s: lifecycle newer than %gh - kept" % (ds, retention_hours))
+
+        if not dry:
+            to_del = [d for d in deleted if " " not in d] + scans_to_delete
+            if to_del:
+                _delete_many(client, to_del, log)
+        else:
+            deleted += ["%s (WOULD delete - aged lifecycle)" % d for d in scans_to_delete]
+
+    finally:
+        if execute:
+            try:
+                release_consolidation_lock(client, log=log)
+            except Exception as e:
+                log("lock release failed: %s" % e)
+
+    head = "DRY RUN - nothing was changed." if dry else "EXECUTED."
+    out = ["%s  XQL calls: %d" % (head, qcount[0]),
+           "merged: %d | deleted: %d | skipped: %d | failed: %d"
+           % (len(merged), len(deleted), len(skipped), len(failed))]
+    for label, items in (("MERGED", merged), ("DELETED", deleted),
+                         ("SKIPPED", skipped), ("FAILED", failed)):
+        if items:
+            out.append("")
+            out.append("%s:" % label)
+            out += ["  " + s for s in items[:60]]
+            if len(items) > 60:
+                out.append("  ... and %d more" % (len(items) - 60))
+
+    demisto.executeCommand("DeleteContext", {"key": "Yara.Fast"})
+    result = {"dry_run": dry, "xql_calls": qcount[0], "merged": merged,
+              "deleted": deleted, "skipped": skipped, "failed": failed,
+              "schema_version": ver, "retention_hours": retention_hours}
+    return_results(CommandResults(readable_output="\n".join(out),
+                                  outputs_prefix="Yara.Fast", outputs=result,
+                                  raw_response=result))
 
 
 if __name__ in ("__main__", "__builtin__", "builtins"):
