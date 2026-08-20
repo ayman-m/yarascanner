@@ -66,7 +66,12 @@ def build(scanner_path, env, rules_b64, scan_folder, severity, mode, options, se
     else:
         prelude = ""
         target_expr = repr(scan_folder) if scan_folder else "None"
-        if seed_files is not None:
+        # `0` means DO NOT SEED -- scan the real folder. The old test was
+        # `is not None`, and argparse defaults --seed-files to 0, so every
+        # invocation seeded a temp dir and silently ignored --scan-folder.
+        # That made it impossible to scan a real path, contradicting the
+        # skill's own documented example (`--seed-files 0` with a real folder).
+        if seed_files:
             # Seed a folder with guaranteed-match content (and optional bulk decoys to
             # make the scan long enough to exercise cancellation).
             prelude = (
@@ -112,7 +117,7 @@ def main():
     here = os.path.dirname(os.path.abspath(__file__))
     repo_default = os.path.abspath(os.path.join(here, "..", "..", "..", ".."))
     ap = argparse.ArgumentParser()
-    ap.add_argument("--scanner", default=os.path.join(repo_default, "xdr_yara_scanner.py"))
+    ap.add_argument("--scanner", default=os.path.join(repo_default, "xdr", "xdr_yara_scanner.py"))
     ap.add_argument("--env", default=None)
     ap.add_argument("--rules", default=os.path.join(repo_default, "test_rules.yar"))
     ap.add_argument("--scan-folder", default="default")

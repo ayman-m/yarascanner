@@ -22,7 +22,7 @@ def main():
     repo = os.path.abspath(os.path.join(here, "..", "..", "..", ".."))
     ap = argparse.ArgumentParser()
     ap.add_argument("--hostname", default="WINSERVER01")
-    ap.add_argument("--scanner", default=os.path.join(repo, "xdr_yara_scanner.py"))
+    ap.add_argument("--scanner", default=os.path.join(repo, "xdr", "xdr_yara_scanner.py"))
     ap.add_argument("--timeout", type=int, default=120)
     ap.add_argument("--out", default=os.path.join(repo, "local_test", "cancel_snippet.py"))
     args = ap.parse_args()

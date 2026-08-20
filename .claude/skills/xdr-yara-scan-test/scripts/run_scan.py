@@ -28,7 +28,7 @@ def main():
     ap.add_argument("--seed-files", type=int, default=0,
                     help="seed a temp folder with N benign files + guaranteed-match content")
     ap.add_argument("--rules", default=os.path.join(repo, "test_rules.yar"))
-    ap.add_argument("--scanner", default=os.path.join(repo, "xdr_yara_scanner.py"))
+    ap.add_argument("--scanner", default=os.path.join(repo, "xdr", "xdr_yara_scanner.py"))
     ap.add_argument("--timeout", type=int, default=600)
     ap.add_argument("--poll-secs", type=int, default=6)
     ap.add_argument("--max-polls", type=int, default=60)
