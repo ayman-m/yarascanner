@@ -7,13 +7,19 @@ after each round; `TEST_PLAN.md` holds the criteria themselves.
 
 ## Progress
 
-| Round | Total | pass | fail | blocked | not_run |
-|---|---|---|---|---|---|
-| 1 | 55 | 55 | 0 | 0 | 0 |
-| 2 | 107 | 107 | 0 | 0 | 0 |
-| 3 | 114 | 114 | 0 | 0 | 0 |
+| Round | Total | pass | fail | blocked | not_run | not_covered |
+|---|---|---|---|---|---|---|
+| 1 | 55 | 55 | 0 | 0 | 0 | 0 |
+| 2 | 107 | 107 | 0 | 0 | 0 | 0 |
+| 3 | 114 | 114 | 0 | 0 | 0 | 0 |
+| not_covered | 21 | 0 | 0 | 0 | 0 | 21 |
+| **All rows** | **297** | **276** | **0** | **0** | **0** | **21** |
 
-**276 of 276 executed.**
+**276 of 276 testable criteria executed.** 21 further capabilities are `not_covered` and are counted in the table above; 297 rows in total.
+
+Every number above is counted from the rows below by `tools/gen_tracking.py`:
+each row's Total is the sum of the status cells beside it, and **All rows** is
+the number of rows in the table. Do not edit this block by hand; run the generator.
 
 ## All capabilities
 
