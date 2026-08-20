@@ -4,7 +4,7 @@ STANDALONE: this file carries everything it needs. It imports no other automatio
 relies only on the demisto / CommonServerPython names the platform injects at runtime.
 
 Mutating: creates per-scan target datasets, writes rows, deletes fully-verified
-source shards (see YaraConsolidateCommon.consolidate_all / run_consolidation).
+source shards (see consolidate_all() / run_consolidation() below).
 Internally idempotent per scan (an already-complete target is verified, not
 rewritten), so a duplicate invocation cannot double-write — but it still re-reads
 tenant-wide state each call, so it is not free. The playbook should call this once

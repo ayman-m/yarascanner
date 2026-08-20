@@ -57,7 +57,7 @@ script: |
   STANDALONE: this file carries everything it needs. It imports no other automation, and
   relies only on the demisto / CommonServerPython names the platform injects at runtime.
 
-  Never writes or deletes anything (see YaraConsolidateCommon.check_consolidation_status).
+  Never writes or deletes anything (see check_consolidation_status() below).
   Safe to call repeatedly, including from inside the playbook's wait/retry poll loop. The
   playbook's condition task branches directly on the outputs this writes to context.
   """

@@ -5,7 +5,7 @@ moved after seeing results is not a bar.
 
 Round 4 decided all 26 D-criteria, but it decided them against `FakeClient` and against
 `xdr/simulation/sim_edge.py`. That simulator imports `argparse`, `time` and `simlib` and
-**nothing from `xdr_consolidate` or `YaraConsolidateCommon`** (`sim_edge.py:12-16`); it
+**nothing from `xdr_consolidate` or from any shipped pack automation** (`sim_edge.py:12-16`); it
 seeds a shared tracker dataset named `yara_sim_matches_<host>` (`simlib.py:69-74`), which
 `parse_shard` rejects and the shipped discovery path (`_list_yara_datasets` +
 `_SHARD_RE`, `xdr_consolidate.py:46-48`, `:954`) can never see. Round 4 therefore validated
@@ -539,7 +539,7 @@ If E7 shows loss, it is a design finding, not a test failure, and it changes the
 on this tenant is **unverified and currently unknown**, and the cost model says it is close:
 `consolidate_all` runs four passes (`for ver in ("2","3"): for kind in ("matches","scans")`,
 `:849-851`); the settle sleep is up to 30s *per scan* (`:746`); an XQL can take up to 180s
-(`poll_secs=3 × max_polls=60`, `YaraConsolidateCommon.py:1429-1431`); deletes are ~60s each
+(`poll_secs=3 × max_polls=60`, `YaraConsolidateApply.py:1446`); deletes are ~60s each
 at 12-wide. If the container is killed at 900s, `consolidate_all`'s
 `finally: release_consolidation_lock` never runs, the marker persists for
 `DEFAULT_LOCK_STALE_SECS = 2h` (`xdr_consolidate.py:101`), and every Apply in that window
@@ -571,7 +571,8 @@ any shipped path, for two reasons, and E9 exists to demonstrate the gate works *
 while making that unreachability the actual finding:
 
 - No production caller supplies `action_state_for` (grep result above).
-- `CoreApiClient` (`YaraConsolidateCommon.py:1424-1541`) exposes `xql`, `get_datasets`,
+- `CoreApiClient` (`YaraConsolidateApply.py:1441-1575`, and the same class inlined in each of
+  the other five automations) exposes `xql`, `get_datasets`,
   `create_lookup_dataset`, `add_lookup_data`, `remove_lookup_data`, `delete_dataset` — no
   action-status method at all — and the pack's RBAC key is **Data Management + Query Center
   only** (`Packs/YaraDatasetManagement/README.md:226-232`), which deliberately lacks the
@@ -691,7 +692,7 @@ untestable before that date.
 | 3 | Baseline inventory captured | `xdr_data_management.py --report > baseline.txt` | the only before-picture of dataset count |
 | 4 | No stale consolidation lock | `xql 'dataset = yara_scanner_consolidation_lock'` | a leftover row parks every **write** pass for up to 2h while Status keeps looking healthy |
 | 5 | Per-shard scan census, **with endpoint ages** | `comp count() as n, max(event_timestamp_ms) as ep by scan_id` per named dataset | anything >7 days old is `settled` and consolidates unconditionally — see E4 |
-| 6 | Pack credentials are real | `YaraConsolidateCommon.py:1419-1421` ships `replace_with_*`; `CoreApiClient.__init__` raises on them | confirm the *uploaded* copy was edited, not the repo copy |
+| 6 | Pack credentials are real | Every automation ships its own `replace_with_*` block (`YaraConsolidateApply.py:1436-1438`, and the equivalent in the other five); `CoreApiClient.__init__` raises on them (`:1452`) | confirm the *uploaded* copy was edited, not the repo copy — and that **all six** were, since each carries its own credentials |
 | 7 | `python3 tools/gen_tracking.py --edition xdr --check` baseline recorded **before** the round starts | today: `file matches`, 10 findings, **2 pre-existing DRIFT** (round 2 claims 49 pass / 57 blocked, generated rows 0), **exit 1** | exit 1 is the current baseline, not a Round 5 regression — record it so any *new* finding afterwards is attributable |
 
 **Rule 0, applying to every invocation in this round: always pass `scan_id` / `--scan-id`.**

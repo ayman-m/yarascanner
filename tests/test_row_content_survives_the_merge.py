@@ -23,16 +23,17 @@ correctly" and "destroyed the value" adjacent edits.
 import pytest
 
 # Installs the XSOAR stubs and puts the pack scripts on sys.path.
-import test_pack_data_management  # noqa: F401
+import test_pack_data_management
 from test_consolidation import NOW, FakeClient, _s, _seed
 
-import YaraConsolidateCommon as pack_common
 import xdr_consolidate as xc
 
-IMPLS = [
-    pytest.param(xc, id="xdr_consolidate"),
-    pytest.param(pack_common, id="pack"),
-]
+# xdr_consolidate.py plus ALL SIX automations that ship (test_pack_data_management.SHIPPING).
+# Each of the six inlines this logic verbatim -- the tenant does not resolve cross-script
+# imports, so an automation has to be self-contained -- and it is those six copies, not
+# xdr_consolidate.py, that execute. A behaviour proven only in the CLI is not a guarantee, and
+# a behaviour proven in five of six is not one either.
+IMPLS = test_pack_data_management.impls(xc)
 
 TARGET = "yara_scanner_matches_v2_scan_s1"
 

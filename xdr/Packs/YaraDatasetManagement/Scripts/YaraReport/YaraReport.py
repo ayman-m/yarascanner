@@ -3,7 +3,7 @@
 STANDALONE: this file carries everything it needs. It imports no other automation, and
 relies only on the demisto / CommonServerPython names the platform injects at runtime.
 
-Never writes or deletes anything (see YaraConsolidateCommon.report_datasets, which issues
+Never writes or deletes anything (see report_datasets() below, which issues
 exactly one API call: the dataset listing). Safe to call repeatedly, including from inside
 a poll loop, and safe to run concurrently with a consolidation or cleanup pass.
 

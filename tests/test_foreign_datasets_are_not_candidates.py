@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Only datasets this tool owns may be read, merged or deleted. Criterion D1.5.
 
-Found by mutation audit. Dropping the `^` anchor from `_SHARD_RE` in both copies left the
+Found by mutation audit. Dropping the `^` anchor from `_SHARD_RE` in every copy left the
 entire suite green -- and an unanchored pattern makes any dataset whose name merely
 CONTAINS the scanner prefix a candidate:
 
@@ -19,15 +19,16 @@ this file is negative cases.
 import pytest
 
 # Installs the XSOAR stubs and puts the pack scripts on sys.path.
-import test_pack_data_management  # noqa: F401
+import test_pack_data_management
 
-import YaraConsolidateCommon as pack_common
 import xdr_consolidate as xc
 
-IMPLS = [
-    pytest.param(xc, id="xdr_consolidate"),
-    pytest.param(pack_common, id="pack"),
-]
+# xdr_consolidate.py plus ALL SIX automations that ship (test_pack_data_management.SHIPPING).
+# Each of the six inlines this logic verbatim -- the tenant does not resolve cross-script
+# imports, so an automation has to be self-contained -- and it is those six copies, not
+# xdr_consolidate.py, that execute. A behaviour proven only in the CLI is not a guarantee, and
+# a behaviour proven in five of six is not one either.
+IMPLS = test_pack_data_management.impls(xc)
 
 OURS = [
     ("yara_scanner_matches_v3_host_abc123", "matches", "host_abc123", None),

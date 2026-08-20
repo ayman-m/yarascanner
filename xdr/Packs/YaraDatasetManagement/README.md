@@ -22,7 +22,6 @@ manual CLI invocation.
 | `YaraConsolidateFast` | Automation | Mode A without the row-count verification pass — a small fraction of the queries, duplicate rows possible and accepted. Deletes the source. Dry run unless `execute=true`. |
 | `YaraReport` | Automation | Read-only inventory of every `yara_scanner_*` lookup dataset (kind, host, age, plus the legacy / newer-schema / consolidated buckets). One API call, no writes — safe any time. Writes to `Yara.Report.*`. |
 | `YaraCleanup` | Automation | Retention pruning — **deletes whole datasets**. Dry run by default; see below. |
-| `YaraConsolidateCommon` | Automation (library only) | Never invoked directly, and **nothing imports it any more** — every automation above is standalone and inlines the whole library, because each must run on a tenant that injects `demisto` and the `CommonServerPython` helpers implicitly and resolves no cross-script import. It ships as a content item in its own right so the drift gates below have one canonical copy to compare against, and so an older pinned automation that *did* import it still resolves. A verbatim port of `xdr_consolidate.py`'s core logic and `xdr_data_management.py`'s retention logic, kept in sync by `tests/test_consolidation.py::test_pack_copy_gate_logic_matches_xdr_consolidate` and `tests/test_pack_data_management.py::test_pack_data_management_logic_matches_the_cli` (both compare the two files' ported functions and constants statement-by-statement and fail on any drift), plus `CoreApiClient` — a direct, signed-HTTPS client for this tenant's own public API. |
 
 ## The overwrite model — one permanent matches dataset per host
 
@@ -363,10 +362,19 @@ fact is the only review it gets.
 
 ## Credentials
 
-`YaraConsolidateCommon.py`'s `CoreApiClient` calls this tenant's own public API directly over
+Each automation's own `CoreApiClient` calls this tenant's own public API directly over
 signed Advanced (HMAC) HTTPS — the design-rationale comment above the class explains why (the
 originally-planned "Cortex Core - IR" generic REST bridge is not registered on this tenant).
-Before uploading, edit the three placeholder constants at the top of the file:
+
+**This is six edits, not one.** Every automation in this pack is self-contained: it inlines
+the whole shared library, including its own copy of `CoreApiClient` and its own copy of the
+three constants below. That is not duplication for its own sake — the tenant resolves no
+cross-script import, so a shared library automation could not be imported at runtime even if
+one shipped, and each file must therefore carry everything it needs. Before uploading, edit
+the three placeholder constants near the top of **each of the six** automations
+(`YaraConsolidateStatus`, `YaraConsolidateApply`, `YaraConsolidateSummary`,
+`YaraConsolidateFast`, `YaraReport`, `YaraCleanup`) — in `Scripts/<Name>/<Name>.py` if you
+are regenerating, or directly in the `unified/<Name>.yml` you import:
 
 ```python
 DEFAULT_XDR_API_KEY = "replace_with_xdr_advanced_api_key"
@@ -419,7 +427,7 @@ the YaraCleanup section above before granting this key to anything.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `YaraConsolidateStatus failed: ... HTTP 401: ...` or `YaraConsolidateApply failed: ... HTTP 401: ...` in the Job's task error / War Room | The embedded `DEFAULT_XDR_API_KEY`/`DEFAULT_XDR_API_ID` were rotated, revoked, or hit their `expiration` on the tenant. The identical generic 401 also covers a mistyped key/ID and a Standard/Advanced type mismatch — the response body alone cannot tell you which. | Regenerate an Advanced-type key for this pack's role (see Credentials above), edit the three `DEFAULT_XDR_*` constants in `YaraConsolidateCommon.py`, and re-deliver the pack (editing the repo file alone does nothing until it's re-imported/re-installed — see Deployment above). Confirm with `YaraConsolidateStatus` — it's read-only and safe to run any time. |
+| `YaraConsolidateStatus failed: ... HTTP 401: ...` or `YaraConsolidateApply failed: ... HTTP 401: ...` in the Job's task error / War Room | The embedded `DEFAULT_XDR_API_KEY`/`DEFAULT_XDR_API_ID` were rotated, revoked, or hit their `expiration` on the tenant. The identical generic 401 also covers a mistyped key/ID and a Standard/Advanced type mismatch — the response body alone cannot tell you which. | Regenerate an Advanced-type key for this pack's role (see Credentials above), edit the three `DEFAULT_XDR_*` constants in **all six** automations — each one carries its own credential block, because the tenant resolves no cross-script import and every automation is therefore self-contained — and re-deliver the pack (editing the repo file alone does nothing until it's re-imported/re-installed — see Deployment above). Confirm with `YaraConsolidateStatus` — it's read-only and safe to run any time. |
 | Every scheduled Job run fails at task "Check consolidation status" (or "Apply consolidation") and task 8 ("Flag failures for attention") never lights up | `return_error` halts the whole playbook run at the failing task, before task 8's condition is ever evaluated — task 8 only reports data-level `failed_count` from a *completed* run, not a total execution error. | Watch the Job's own run history, not just the task-8 context flag — a dead key (or any other uncaught exception) is a hard failure, not a soft one. The `yara_scanner_consolidation_runs` dataset (see Monitoring below) also gets a `status="crashed"` row for a mid-run `YaraConsolidateApply` crash specifically (not for a `YaraConsolidateStatus` crash — that one never reaches `YaraConsolidateApply` at all). |
 | Job history shows "0 scan(s) consolidated" every run, nothing actually being merged | Consolidation lock held by another concurrent run (the CLI's `xdr_data_management.py --consolidate --yes`, or an overlapping Job execution) | Check `Yara.ConsolidateApply.lock_held_by_other_run` in context, or just read the readable output — it now says "Skipped this pass — consolidation lock is held by another concurrent run" instead of looking identical to a genuinely-empty pass. Confirm the Job's Queue Handling is set to "Don't trigger a new job instance" and that no one is running the CLI `--consolidate --yes` concurrently. |
 | The playbook run ends at **"Unrecognised consolidation_mode - nothing done"** and nothing was merged or written | `consolidation_mode` is neither exactly `full` nor exactly `summary` — a typo, a capitalised value, or an empty one. This is the designed fail-safe, not a bug: an unrecognised mode must never fall through to the branch that deletes per-host shards. | Set the input to exactly `full` or exactly `summary` and re-run. If it is already one of those, the `isEqualString` condition in task 11 is the thing to verify against the live tenant (see the playbook description's NOTE ON VERIFICATION) — it has no local precedent in this repo. |

@@ -8,13 +8,13 @@ strings "cancelled" and "failed" appeared NOWHERE in tests/test_consolidation.py
 Measured, not assumed:
 
   narrow it in xdr_consolidate.py alone  -> 1 of 74 existing tests fails
-  narrow it in BOTH copies in tandem     -> 74 of 74 existing tests PASS
+  narrow it in EVERY copy in tandem      -> 74 of 74 existing tests PASS
 
 The one test that fires on the single-copy edit is
 `test_pack_copy_gate_logic_matches_xdr_consolidate`, which compares the source TEXT of the
-two copies. It guards DRIFT between them, so it cannot see a change applied to both -- and
-a consistency check can only ever prove the copies agree, never that what they agree on is
-correct. So the behaviour itself was untested in both copies at once.
+copies. It guards DRIFT between them, so it cannot see a change applied to all of them --
+and a consistency check can only ever prove the copies agree, never that what they agree on
+is correct. So the behaviour itself was untested in every copy at once.
 
 The consequence of that mutation: every cancelled or failed scan is permanently
 non-terminal, so its per-host shard is never consolidated, never cleaned up, and its
@@ -27,8 +27,9 @@ Why these two states are terminal at all, and must stay so:
              cancelled 80% through a filesystem has 80% of a real answer in it.
   failed     a scan that died is the case you MOST want the evidence from.
 
-Every test here runs against BOTH implementations. The pack copy is the one that executes
-on the tenant, so a guarantee proven only in xdr_consolidate.py is not a guarantee.
+Every test here runs against xdr_consolidate.py AND all six shipping automations. Those six
+are what execute on the tenant, so a guarantee proven only in xdr_consolidate.py is not a
+guarantee -- and one proven in five of the six is not one either.
 
 The abandoned path (a scan that never reports any terminal state) is covered separately by
 test_consolidation.py's cutoff tests; this file is about scans that DID report, with a
@@ -39,15 +40,16 @@ import pytest
 # Importing this module installs the XSOAR stubs (demistomock / CommonServerPython) and
 # puts the pack's script dirs on sys.path. Reused rather than restubbed here: a second
 # stub is one more thing that can drift from the platform surface it stands in for.
-import test_pack_data_management  # noqa: F401
+import test_pack_data_management
 
-import YaraConsolidateCommon as pack_common
 import xdr_consolidate as xc
 
-IMPLS = [
-    pytest.param(xc, id="xdr_consolidate"),
-    pytest.param(pack_common, id="pack"),
-]
+# xdr_consolidate.py plus ALL SIX automations that ship (test_pack_data_management.SHIPPING).
+# Each of the six inlines this logic verbatim -- the tenant does not resolve cross-script
+# imports, so an automation has to be self-contained -- and it is those six copies, not
+# xdr_consolidate.py, that execute. A behaviour proven only in the CLI is not a guarantee, and
+# a behaviour proven in five of six is not one either.
+IMPLS = test_pack_data_management.impls(xc)
 
 
 @pytest.mark.parametrize("impl", IMPLS)

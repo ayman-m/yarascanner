@@ -11,8 +11,6 @@ source, and the second one is the one the tenant actually runs.
 
 It had already drifted, silently, and in the worst possible direction:
 
-    Scripts/YaraConsolidateFast/YaraConsolidateFast.yml   (embedded copy, shipped)
-    Scripts/YaraConsolidateFast/YaraConsolidateFast.py    (reviewed, tested)
 
 differed by exactly the `_READ_LIMIT = 50000` truncation guard -- the guard that stops the
 fast path merging 50,000 of a scan's 60,000 rows and then deleting the only copy of the
@@ -126,6 +124,25 @@ def main(argv=None):
         os.makedirs(UNIFIED)
 
     stale, wrote = [], []
+
+    # `unified/` is the console-Import set: an operator uploads everything in it. A yml with
+    # no `Scripts/<Name>/` behind it is therefore worse than clutter -- it implies the tenant
+    # needs a content item this pack no longer builds, and nothing else in the repo compares
+    # the two directories, so it would sit there indefinitely. (It did: `YaraConsolidateCommon`
+    # stayed in the delivery set after nothing imported it any more.) Regenerating cannot
+    # notice an orphan, because regeneration only ever walks `Scripts/`.
+    expected = set("%s.yml" % n for n, _, _ in automations())
+    orphans = sorted(f for f in os.listdir(UNIFIED)
+                     if f.endswith(".yml") and f not in expected) if os.path.isdir(UNIFIED) else []
+    if orphans:
+        sys.stderr.write(
+            "ORPHAN - these are in unified/ but no longer built from Scripts/:\n%s\n"
+            "An operator imports everything in that directory. Delete them, or restore the\n"
+            "Scripts/<Name>/ they came from.\n"
+            % "\n".join("  " + os.path.relpath(os.path.join(UNIFIED, f)) for f in orphans))
+        if a.check:
+            return 1
+
     for name, ymlp, pyp in automations():
         text = render(ymlp, pyp)
         _write_if_changed(os.path.join(UNIFIED, "%s.yml" % name), text, a.check, stale, wrote)

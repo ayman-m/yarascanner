@@ -4,8 +4,6 @@ An XSOAR automation IS its yml: the tenant runs whatever sits under that file's 
 key, never `Scripts/<Name>/<Name>.py`. Every embedded copy is therefore a second copy of
 the source, and this repo already proved it can drift silently and in the worst direction:
 
-    Scripts/YaraConsolidateFast/YaraConsolidateFast.yml   shipped
-    Scripts/YaraConsolidateFast/YaraConsolidateFast.py    reviewed, tested, compiled
 
 differed by exactly the `_READ_LIMIT = 50000` truncation guard, i.e. the guard that stops
 the fast path merging 50,000 of a 60,000-row scan and then deleting the only copy of the
@@ -58,7 +56,7 @@ def test_the_generator_reports_no_drift():
 @pytest.mark.parametrize("name", _names())
 def test_every_automation_ships_a_unified_yml(name):
     """`unified/` is the console-Import set. An automation missing from it is one the
-    operator cannot deliver that way at all — which is how YaraConsolidateFast stood
+    operator cannot deliver that way at all — which is how YaraConsolidateFast stood (before it was removed)
     before the summary variant was packaged."""
     assert os.path.exists(os.path.join(_UNIFIED, "%s.yml" % name))
 
@@ -74,7 +72,7 @@ def test_the_unified_script_is_byte_identical_to_the_python(name):
 
 @pytest.mark.parametrize("name", _names())
 def test_an_embedded_scripts_side_yml_is_the_same_file_as_the_unified_one(name):
-    """Two of these (`YaraConsolidateFast`, `YaraConsolidateSummary`) are self-contained on
+    """`YaraConsolidateSummary` is self-contained on
     the Scripts side as well, so they are uploadable without a `.py` beside them. Three
     copies of one script only stay honest if two of them are generated from the third."""
     side = os.path.join(_SCRIPTS, name, "%s.yml" % name)

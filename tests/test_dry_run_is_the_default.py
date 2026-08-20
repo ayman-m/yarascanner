@@ -2,7 +2,7 @@
 """Omitting `dry_run` must not mutate the tenant. Criterion D6.2.
 
 Found by mutation audit. Flipping `run_consolidation`'s default from `dry_run=True` to
-`dry_run=False` in both copies left the whole suite green -- because every existing test
+`dry_run=False` in every copy left the whole suite green -- because every existing test
 passes the flag explicitly, so the default itself was never once exercised.
 
 The default IS the protection. A caller that passes `dry_run=False` has decided to write;
@@ -18,16 +18,17 @@ this file passing vacuously against a fixture that would never have consolidated
 import pytest
 
 # Installs the XSOAR stubs and puts the pack scripts on sys.path.
-import test_pack_data_management  # noqa: F401
+import test_pack_data_management
 from test_consolidation import NOW, FakeClient, SpyClient, _m, _s, _seed
 
-import YaraConsolidateCommon as pack_common
 import xdr_consolidate as xc
 
-IMPLS = [
-    pytest.param(xc, id="xdr_consolidate"),
-    pytest.param(pack_common, id="pack"),
-]
+# xdr_consolidate.py plus ALL SIX automations that ship (test_pack_data_management.SHIPPING).
+# Each of the six inlines this logic verbatim -- the tenant does not resolve cross-script
+# imports, so an automation has to be self-contained -- and it is those six copies, not
+# xdr_consolidate.py, that execute. A behaviour proven only in the CLI is not a guarantee, and
+# a behaviour proven in five of six is not one either.
+IMPLS = test_pack_data_management.impls(xc)
 
 MATCHES_A = "yara_scanner_matches_v2_hosta_aa0001"
 MATCHES_B = "yara_scanner_matches_v2_hostb_bb0002"

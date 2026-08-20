@@ -377,6 +377,12 @@ xdr_consolidate.py                parameter definitions, defaulting None
 YaraConsolidateCommon.py          parameter definitions, defaulting None
 ```
 
+> **Note, 2026-08-20.** `YaraConsolidateCommon.py` has since been deleted — nothing imported it
+> and the tenant could not resolve it. The grep above is left as it was recorded. Re-running it
+> today returns `xdr_consolidate.py` plus the six shipping automations under
+> `Packs/YaraDatasetManagement/Scripts/`, all still parameter definitions defaulting `None`, and
+> `tests/test_consolidation.py` still the only supplier. **The finding is unchanged.**
+
 Not `YaraConsolidateApply.py`, not `YaraConsolidateStatus.py`, not
 `xdr_data_management._run_consolidate`, not the playbook. So `astate` at
 `xdr_consolidate.py:373` is `None` on every path that runs on the tenant, and Gate B never

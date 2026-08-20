@@ -11,6 +11,8 @@ import os
 import re
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from xdr_consolidate import (  # noqa: E402
     parse_shard, group_shards_by_scan, shard_is_terminal, newest_row_age_ok,
@@ -1253,18 +1255,22 @@ def test_partial_cleanup_failure_does_not_cause_permanent_count_mismatch():
         "it must still become whole-deletable")
 
 
-# ---------------- pack copy must not drift from this module (edge case #6 follow-up) -------
-# Packs/YaraDatasetManagement/.../YaraConsolidateCommon.py hand-carries a copy of this core
-# logic (it must be self-contained to run as an XSOAR automation), and that copy — not
-# xdr_consolidate.py — is what the scheduled Job actually runs on the tenant. It cannot be
-# imported here (it does `import demistomock` / `from CommonServerPython import *`), so compare
-# the two files' gate logic structurally instead: same signature, same statements, ignoring
-# comments and docstrings. Edge case #6 shipped fixed in one copy and unfixed in the other
-# precisely because nothing checked this.
-_PACK_COMMON = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "xdr", "Packs", "YaraDatasetManagement", "Scripts", "YaraConsolidateCommon",
-    "YaraConsolidateCommon.py")
+# ---------------- shipping copies must not drift from this module (edge case #6 follow-up) --
+# Each of the six automations under Packs/YaraDatasetManagement/Scripts/ hand-carries a copy
+# of this core logic — it has to, because an automation must be self-contained: the tenant
+# does not resolve cross-script imports. Those six files, not xdr_consolidate.py, are what
+# actually executes on the tenant, and none of them can be imported here as a plain module
+# without the platform globals, so compare their gate logic structurally instead: same
+# signature, same statements, ignoring comments and docstrings.
+#
+# Edge case #6 shipped fixed in one copy and unfixed in another precisely because nothing
+# checked this. The gate used to compare xdr_consolidate.py against ONE library file that no
+# tenant executes, which left the same hazard open six ways over: a fix could land in the CLI,
+# be faithfully copied into that library, and still miss every file that runs. SHIPPING is
+# imported rather than restated so this gate and the data-management gate can never disagree
+# about what "ships" means.
+from test_pack_data_management import SHIPPING, SHIPPING_PATHS  # noqa: E402
+
 _XDR_CONSOLIDATE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "xdr", "xdr_consolidate.py")
 
@@ -1309,36 +1315,48 @@ def _logic_index(path):
     return out
 
 
-def test_pack_copy_gate_logic_matches_xdr_consolidate():
+@pytest.mark.parametrize("automation", SHIPPING)
+def test_pack_copy_gate_logic_matches_xdr_consolidate(automation):
+    """THE DRIFT GATE, one case per shipping automation.
+
+    47 names — every gate helper that decides whether a live scan's shard gets deleted, plus
+    the orchestration around them, plus the constants they read — compared statement by
+    statement against xdr_consolidate.py in all six files that run on the tenant. A fix that
+    lands in the CLI and misses even one automation fails here, naming that automation.
+    """
     mine = _logic_index(_XDR_CONSOLIDATE)
-    pack = _logic_index(_PACK_COMMON)
+    pack = _logic_index(SHIPPING_PATHS[automation])
     missing = sorted(set(_SHARED_GATE_FUNCS + _SHARED_CONSTS) - set(mine))
     assert not missing, "test is stale — not found in xdr_consolidate.py: %s" % missing
     for name in sorted(mine):
         assert name in pack, (
-            "%s is missing from the pack copy (%s) — the scheduled Job runs THAT file, so a "
-            "fix that lands only in xdr_consolidate.py does nothing on the tenant"
-            % (name, _PACK_COMMON))
+            "%s is missing from %s — the tenant runs THAT file, so a fix that lands only in "
+            "xdr_consolidate.py does nothing on the tenant"
+            % (name, SHIPPING_PATHS[automation]))
         assert pack[name] == mine[name], (
-            "%s has drifted between xdr_consolidate.py and the pack copy:\n--- xdr_consolidate\n%s"
-            "\n--- pack\n%s" % (name, mine[name], pack[name]))
+            "%s has drifted between xdr_consolidate.py and %s:\n--- xdr_consolidate\n%s"
+            "\n--- %s\n%s" % (name, automation, mine[name], automation, pack[name]))
 
 
-def test_pack_copy_uses_the_same_scan_stat_shape():
-    # _ScanStat's field ORDER is load-bearing in both copies (run_consolidation unpacks it by
+def _scanstat_src(path):
+    with open(path) as fh:
+        tree = ast.parse(fh.read())
+    for node in tree.body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == "_ScanStat"):
+            return ast.unparse(node)
+    return None
+
+
+@pytest.mark.parametrize("automation", SHIPPING)
+def test_pack_copy_uses_the_same_scan_stat_shape(automation):
+    # _ScanStat's field ORDER is load-bearing in every copy (run_consolidation unpacks it by
     # attribute, _gate_scan's backstop reads ep_newest), and it is a call, not a def, so the
     # comparison above does not cover it.
-    def _scanstat_src(path):
-        with open(path) as fh:
-            tree = ast.parse(fh.read())
-        for node in tree.body:
-            if (isinstance(node, ast.Assign) and len(node.targets) == 1
-                    and isinstance(node.targets[0], ast.Name)
-                    and node.targets[0].id == "_ScanStat"):
-                return ast.unparse(node)
-        return None
     assert _scanstat_src(_XDR_CONSOLIDATE) is not None
-    assert _scanstat_src(_PACK_COMMON) == _scanstat_src(_XDR_CONSOLIDATE)
+    assert _scanstat_src(SHIPPING_PATHS[automation]) == _scanstat_src(_XDR_CONSOLIDATE), (
+        "_ScanStat has drifted between xdr_consolidate.py and %s" % automation)
 
 
 if __name__ == "__main__":

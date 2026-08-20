@@ -23,6 +23,50 @@ fixes without changing behaviour you rely on.
 
 ---
 
+## YARA Dataset Management pack — removed `YaraConsolidateCommon` — 2026-08-20
+
+### Removed — the shared library that nothing shared
+
+`Scripts/YaraConsolidateCommon/` (both the `.py` and the `.yml`) and
+`unified/YaraConsolidateCommon.yml` are deleted. The pack now ships exactly six automations,
+and `unified/` — the set imported through the console — contains exactly those six.
+
+It was dead. No automation imported it (each of the six is standalone and inlines the whole
+library, because the tenant resolves no cross-script import, so a library automation cannot be
+imported there even in principle), and the consolidation playbook never named it. Its `.yml`
+in `unified/` was the actively harmful part: it sat among the files a customer uploads and
+implied the tenant needed it.
+
+Its second job was to be the thing the drift gates compared against — and that was the reason
+to remove it rather than leave it. Both gates were watching `xdr_consolidate.py` against
+`YaraConsolidateCommon.py`, **neither of which runs on the tenant**, so a fix landing in one
+copy and not in what actually ships was exactly what they could not catch. The gates now
+compare the CLI against all six shipping automations
+(`tests/test_consolidation.py:1319`, `tests/test_pack_data_management.py:382`): 12 live
+comparisons in place of 2 dead ones. Widening them found zero drift — all six were already
+byte-identical to the CLI after normalisation.
+
+### Fixed — documentation that sent operators to the deleted file
+
+- **`Packs/YaraDatasetManagement/README.md` told you to edit the credentials in one place.**
+  Both the Credentials section and the `HTTP 401` troubleshooting row said to edit the three
+  `DEFAULT_XDR_*` constants in `YaraConsolidateCommon.py`. That was wrong even before the
+  deletion: each of the six automations carries its own `CoreApiClient` and its own credential
+  block, so rotating a key is **six edits, not one**. Both now say so, and say why it is six.
+- Four automations' module docstrings pointed at `YaraConsolidateCommon.<func>` for logic that
+  is in fact defined in the same file, two lines under a header claiming `STANDALONE`. They now
+  point at the local function.
+- `xdr/README.md`, `docs/design/Dataset_Management_v2_Design.md` and
+  `docs/rounds/ROUND5_CRITERIA.md` had pointers into the deleted file, including a Round 5
+  pre-flight check. Repointed to live files. `docs/rounds/ROUND4_RESULTS.md` is a dated record
+  and is annotated rather than rewritten; its finding is unchanged.
+
+`tools/build_pack_unified.py` needed no change — it discovers automations from the filesystem,
+so it stopped emitting the unified yml the moment the directory went. `xdr/xdr_consolidate.py`
+and `xdr/xdr_data_management.py` are untouched: they are the CLI and the gates' reference.
+
+---
+
 ## xsiam_yara_scanner.py v4.4.0 — 2026-08-17
 
 Correctness and honesty release. Every finding below was reproduced before being fixed and

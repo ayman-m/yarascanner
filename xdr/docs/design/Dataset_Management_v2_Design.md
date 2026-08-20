@@ -110,13 +110,20 @@ we test, which is the opposite of what the tool advertises.
 
 ### 1.6 Two facts about our own tooling that no design had noticed.
 
-**(a) The drift gate covers 1 of 12 copies.** `parse_shard` exists in **12** files in this repo —
-`xdr/xdr_consolidate.py`, six `Packs/YaraDatasetManagement/Scripts/*/*.py`, and five embedded
-`.yml` copies (`Scripts/YaraConsolidateFast/YaraConsolidateFast.yml` and the four under
-`unified/`). `parse_dataset_name` exists in 11. Both drift gates —
-`tests/test_consolidation.py:1313` and `tests/test_pack_data_management.py:36` — compare only
-`YaraConsolidateCommon.py`. None of the six pack automations imports it; each carries its own
-copy. The gate is ~9% as strong as it reads.
+**(a) The drift gate covers 1 of 12 copies. — RESOLVED.** This said, correctly, that both gates
+compared only `YaraConsolidateCommon.py`, a copy that no automation imported and that the tenant
+never ran, making the gate ~9% as strong as it read. Both gates are now parametrised over all six
+shipping automations (`tests/test_consolidation.py:1319` and `tests/test_pack_data_management.py:382`,
+against `SHIPPING` at `tests/test_pack_data_management.py:50`), and `YaraConsolidateCommon` has been
+deleted outright — Scripts dir, yml, and its entry in the `unified/` import set.
+
+`parse_shard` and `parse_dataset_name` now each exist in 15 files: `xdr/xdr_consolidate.py`, the six
+`Packs/YaraDatasetManagement/Scripts/*/*.py` automations, and eight generated `.yml` copies (the six
+under `unified/`, plus the self-contained `Scripts/` yml for `YaraConsolidateFast` and
+`YaraConsolidateSummary`). Only the first seven are hand-maintained and they are exactly what the
+gates compare; every `.yml` copy is generated from its `.py` by `tools/build_pack_unified.py` and
+held byte-identical to it by `tests/test_pack_unified_yaml_is_in_sync.py`. There is no longer any
+copy of this logic that some test does not cover.
 
 **(b) The consolidation lock leases for 2 hours; a fleet merge takes 53.** `DEFAULT_LOCK_STALE_SECS
 = 2 * 3600` (`xdr_consolidate.py:110`), commented *"generous: real runs take minutes, not hours."*
@@ -414,10 +421,13 @@ differ — and it matches `run_consolidation`'s existing per-version discipline.
 #### The pack — twelve copies, one gate
 
 Every logic change above must land in all six `Packs/YaraDatasetManagement/Scripts/*/*.py`
-automations and the five embedded `.yml` copies. **Widening `_SHARED_GATE_FUNCS` coverage
-(`tests/test_consolidation.py:1273-1287`) from `YaraConsolidateCommon.py` to all of them is a
-prerequisite commit, not cleanup** (§1.6a) — it is cheap, it is a pure no-op today, and it is the
-only thing that makes the rest of this tractable rather than a drift hazard.
+automations; the `.yml` copies follow automatically from `tools/build_pack_unified.py`.
+**Widening `_SHARED_GATE_FUNCS` coverage (`tests/test_consolidation.py:1279`) from
+`YaraConsolidateCommon.py` to all of them was a prerequisite commit, not cleanup** (§1.6a) — and it
+is now done: it was a pure no-op, all six were already byte-identical to the CLI after
+normalisation, and `YaraConsolidateCommon` has since been deleted. The rest of this plan is
+therefore tractable rather than a drift hazard: a logic change that misses one automation now fails
+a named test case.
 
 `YaraConsolidateFast` keeps its documented asymmetry (matches merged, scans retention-only) and
 needs one extra decision: it buys no verification, so it cannot use the per-part filtered count.

@@ -3,7 +3,7 @@
 
 Found by mutation audit. Every one of these constants can be overridden per call, and the
 existing suite always passes explicit values -- so the LOGIC is well covered while the
-DEFAULTS were never exercised once. Mutating all three in both copies at once left the
+DEFAULTS were never exercised once. Mutating all three in every copy at once left the
 whole suite green:
 
     DEFAULT_QUIET_SECS     900     -> 0            suite still green
@@ -22,16 +22,17 @@ tenant.
 import pytest
 
 # Installs the XSOAR stubs and puts the pack scripts on sys.path.
-import test_pack_data_management  # noqa: F401
+import test_pack_data_management
 
-import YaraConsolidateCommon as pack_common
 import xdr_consolidate as xc
 import xdr_yara_scanner as scanner
 
-IMPLS = [
-    pytest.param(xc, id="xdr_consolidate"),
-    pytest.param(pack_common, id="pack"),
-]
+# xdr_consolidate.py plus ALL SIX automations that ship (test_pack_data_management.SHIPPING).
+# Each of the six inlines this logic verbatim -- the tenant does not resolve cross-script
+# imports, so an automation has to be self-contained -- and it is those six copies, not
+# xdr_consolidate.py, that execute. A behaviour proven only in the CLI is not a guarantee, and
+# a behaviour proven in five of six is not one either.
+IMPLS = test_pack_data_management.impls(xc)
 
 # The Action Center caps a script run at 6 hours. This is a platform fact with no constant
 # to import -- it is named here so the abandoned-cutoff test states what it depends on.
@@ -119,9 +120,17 @@ def test_row_ceiling_is_a_real_ceiling(impl):
         f"fleet-wide merge")
 
 
-def test_both_copies_agree_on_all_three_defaults():
-    """Belt and braces: the parity test compares source text, this compares live values."""
+@pytest.mark.parametrize("impl", test_pack_data_management.SHIPPING_IMPLS)
+def test_every_shipping_copy_agrees_on_all_three_defaults(impl):
+    """Belt and braces: the drift gate compares source TEXT, this compares live VALUES.
+
+    Worth keeping separate from the gate even though all six copies are text-identical
+    today. These three are resolved at import, and a copy that computed the same literal by
+    a different route -- or read it from an environment the tenant does not have -- would
+    pass a text diff of the constant's own assignment and still run on a different number.
+    """
     for name in ("DEFAULT_QUIET_SECS", "DEFAULT_ABANDONED_SECS", "DEFAULT_ROW_CEILING"):
-        assert getattr(xc, name) == getattr(pack_common, name), (
-            f"{name} differs between xdr_consolidate ({getattr(xc, name)}) and the pack copy "
-            f"({getattr(pack_common, name)}) -- the pack copy is what runs on the tenant")
+        assert getattr(xc, name) == getattr(impl, name), (
+            f"{name} differs between xdr_consolidate ({getattr(xc, name)}) and "
+            f"{impl.__name__} ({getattr(impl, name)}) -- {impl.__name__} is what runs on "
+            f"the tenant")

@@ -2,11 +2,13 @@
 
 Three jobs here:
 
-1. Prove the PORT agrees with the canonical CLI. `YaraConsolidateCommon.py` is a hand-kept
-   verbatim copy of `xdr_data_management.py` (XSOAR scripts cannot import arbitrary repo
-   files at runtime), so the same drift hazard that motivated
-   test_consolidation.py::test_pack_copy_gate_logic_matches_xdr_consolidate applies here:
-   a fix that lands only in the CLI does nothing on the tenant, and nothing would notice.
+1. Prove the PORT agrees with the canonical CLI — in EVERY file that ships. The six
+   automations under Scripts/ are standalone: the tenant does not resolve cross-script
+   imports, so each one hand-carries a verbatim copy of `xdr_data_management.py`'s
+   selection logic. That is six independent chances for a fix to land in the CLI and not on
+   the tenant, so the gate below (and its sibling in test_consolidation.py) compares the CLI
+   against all six, one parametrised case each — a fix that misses even one automation names
+   that automation when it fails.
 
 2. Prove the DELETION path is safe. YaraCleanup deletes whole datasets, so every one of the
    seven safety rails is exercised independently on BOTH selection paths (retention window
@@ -33,8 +35,20 @@ import yaml
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SCRIPTS = os.path.join(_REPO, "xdr", "Packs", "YaraDatasetManagement", "Scripts")
-_PACK_COMMON = os.path.join(_SCRIPTS, "YaraConsolidateCommon", "YaraConsolidateCommon.py")
 _CLI = os.path.join(_REPO, "xdr", "xdr_data_management.py")
+
+# ------------------------------------------------------- the files that SHIP
+# The six automations the tenant actually runs. Each is STANDALONE: it inlines the whole
+# shared library, imports no other automation and neither demistomock nor
+# CommonServerPython, because the tenant does not resolve cross-script imports and injects
+# `demisto` / `return_error` / `CommandResults` implicitly.
+#
+# This tuple is the single definition of "what ships" for the whole tests/ tree —
+# test_consolidation.py's drift gate and the six behavioural files import it from here.
+# Adding a seventh automation is a one-line change that widens every one of them at once,
+# and test_no_automation_escapes_the_gate below fails if someone adds one without doing so.
+SHIPPING = ("YaraReport", "YaraConsolidateStatus", "YaraConsolidateApply", "YaraConsolidateSummary", "YaraCleanup")
+SHIPPING_PATHS = {n: os.path.join(_SCRIPTS, n, "%s.py" % n) for n in SHIPPING}
 
 sys.path.insert(0, _REPO)
 
@@ -72,12 +86,12 @@ def _install_xsoar_stubs():
     csp.CommandResults = _CommandResults
 
     # The real CommonServerPython does `from datetime import datetime, timedelta` and
-    # declares no __all__, so `from CommonServerPython import *` LEAKS these names into the
-    # importing script — binding the bare name `datetime` to the datetime CLASS, not the
-    # module. YaraConsolidateCommon depends on re-importing the module afterwards to undo
-    # that. Without these here the stub could not express the hazard at all, and moving the
-    # pack's `import datetime` above its star-import would break the tenant with every unit
-    # test still green.
+    # declares no __all__, so on a tenant those names arrive in an automation's global scope
+    # ALREADY BOUND — the bare name `datetime` is the datetime CLASS, not the module — which
+    # is why each automation re-imports `datetime` for itself rather than trusting what is
+    # in scope. Stubbed here so the harness reproduces that hazard instead of hiding it:
+    # without these, a copy that dropped its own `import datetime` would break the tenant
+    # with every unit test still green.
     import datetime as _datetime_module
     import json as _json_module
     csp.datetime = _datetime_module.datetime
@@ -137,7 +151,7 @@ def _install_xsoar_stubs():
 
     # Inject the platform-provided names as BUILTINS, because that is what the tenant does.
     #
-    # The four automations are now standalone: they carry all their logic inline and import
+    # The six automations are now standalone: they carry all their logic inline and import
     # neither demistomock nor CommonServerPython, because on a Cortex tenant both are already
     # in scope -- an automation just uses `demisto`, `return_error`, `CommandResults` and so
     # on without importing anything. That is correct for the tenant and it is what the pack
@@ -165,16 +179,54 @@ def _install_xsoar_stubs():
 
 demistomock, CommonServerPython = _install_xsoar_stubs()
 
-for _d in ("YaraConsolidateCommon", "YaraReport", "YaraCleanup"):
+for _d in SHIPPING:
     _p = os.path.join(_SCRIPTS, _d)
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import YaraConsolidateCommon as K  # noqa: E402
-# Imported at module scope, before any test can call set_schema_version() — that function
-# writes YARA_LOOKUP_SCHEMA_VER into os.environ, and xdr_action_center reads it at IMPORT
-# time, so a later import would pick up whichever version ran last.
+# All six imported at module scope, before any test can call set_schema_version() — that
+# function writes YARA_LOOKUP_SCHEMA_VER into os.environ, and every one of these files (like
+# xdr_action_center) resolves its own YARA_SCHEMA_VERSION from that variable at IMPORT time,
+# so a later import would pick up whichever version ran last.
+import YaraReport               # noqa: E402
+import YaraConsolidateStatus    # noqa: E402
+import YaraConsolidateApply     # noqa: E402
+import YaraConsolidateSummary   # noqa: E402
+import YaraCleanup              # noqa: E402
 import xdr_action_center as AC  # noqa: E402
+
+SHIPPING_MODULES = {
+    "YaraReport": YaraReport,
+    "YaraConsolidateStatus": YaraConsolidateStatus,
+    "YaraConsolidateApply": YaraConsolidateApply,
+    "YaraConsolidateSummary": YaraConsolidateSummary,
+    "YaraCleanup": YaraCleanup,
+}
+assert tuple(SHIPPING_MODULES) == SHIPPING
+
+# The parametrisation the six cross-copy behavioural files reuse. Defined once, here, so
+# that widening SHIPPING widens all of them together.
+SHIPPING_IMPLS = [pytest.param(_m, id=_n) for _n, _m in SHIPPING_MODULES.items()]
+
+
+def impls(*canonical):
+    """`[canonical modules...] + all six shipping automations`, as pytest params.
+
+    The canonical module (xdr_consolidate.py) is the one with the readable history and the
+    one a developer edits; the six are what the tenant executes. A behaviour proven only in
+    the canonical copy is not a guarantee, which is why every one of these files runs its
+    assertions against all seven.
+    """
+    return ([pytest.param(m, id=m.__name__) for m in canonical] + list(SHIPPING_IMPLS))
+
+
+# The library surface these tests drive directly, bound to the automation that actually
+# ships the behaviour: retention/pruning and the lock are YaraCleanup's job, the read-only
+# inventory is YaraReport's. (Both files carry the identical inlined library — the gates
+# below are what prove that — but a test should name the automation whose behaviour it is
+# describing, so a failure points at the thing an operator runs.)
+K = YaraCleanup
+R = YaraReport
 
 
 # --------------------------------------------------------------- fake tenant
@@ -295,7 +347,7 @@ def _logic_index(path):
 
     One normalisation, and only one: the CLI's filter_unconsolidated does
     `import xdr_consolidate as C` and calls `C.target_name(...)`. An XSOAR script cannot
-    import a repo module at runtime, and the pack copy already carries target_name itself
+    import a repo module at runtime, and each automation already carries target_name itself
     (it is part of the xdr_consolidate port above it), so that import is dropped and the
     `C.` qualifier removed. Everything else must match character for character.
     """
@@ -323,37 +375,134 @@ def _logic_index(path):
     return out
 
 
-def test_pack_data_management_logic_matches_the_cli():
+@pytest.mark.parametrize("automation", SHIPPING)
+def test_pack_data_management_logic_matches_the_cli(automation):
+    """THE DRIFT GATE, one case per shipping automation.
+
+    Previously this compared the CLI against a single library file that no tenant ever
+    executes, which meant a fix could land in xdr_data_management.py, be faithfully copied
+    into that library, and still miss every automation that actually runs. Six cases now: a
+    fix that misses even one names it in the failure.
+    """
     mine = _logic_index(_CLI)
-    pack = _logic_index(_PACK_COMMON)
+    pack = _logic_index(SHIPPING_PATHS[automation])
     missing = sorted(set(_PORTED_FUNCS + _PORTED_CONSTS) - set(mine))
     assert not missing, "test is stale — not found in xdr_data_management.py: %s" % missing
     for name in sorted(mine):
         assert name in pack, (
-            "%s is missing from the pack copy (%s) — the scheduled Job runs THAT file, so a "
-            "fix that lands only in xdr_data_management.py does nothing on the tenant"
-            % (name, _PACK_COMMON))
+            "%s is missing from %s — the tenant runs THAT file, so a fix that lands only in "
+            "xdr_data_management.py does nothing on the tenant"
+            % (name, SHIPPING_PATHS[automation]))
         assert pack[name] == mine[name], (
-            "%s has drifted between xdr_data_management.py and the pack copy:\n"
-            "--- xdr_data_management\n%s\n--- pack\n%s" % (name, mine[name], pack[name]))
+            "%s has drifted between xdr_data_management.py and %s:\n"
+            "--- xdr_data_management\n%s\n--- %s\n%s"
+            % (name, automation, mine[name], automation, pack[name]))
 
 
-def test_pack_name_regexes_compile_to_the_same_patterns_as_the_cli():
-    # NAME_RE is built from PREFIX, which the pack aliases to its own _PREFIX — the source
-    # comparison above cannot see that the two literals still agree. YARA_OWNED_RE/CURRENT_RE
-    # come from xdr_action_center.py instead, and were previously covered only behaviourally
-    # by one seven-name fixture.
+def _pack_script_dirs():
+    """Every script directory in the pack that is a real content item.
+
+    A directory counts iff it ships BOTH `<name>.py` and `<name>.yml`: the yml is what makes
+    it a content item (see test_every_script_directory_ships_a_yml) and a bare .py is
+    delivered by no upload path at all.
+    """
+    found = set()
+    for d in sorted(os.listdir(_SCRIPTS)):
+        script_dir = os.path.join(_SCRIPTS, d)
+        if not os.path.isdir(script_dir) or d.startswith("__"):
+            continue
+        if (os.path.exists(os.path.join(script_dir, "%s.yml" % d))
+                and os.path.exists(os.path.join(script_dir, "%s.py" % d))):
+            found.add(d)
+    return found
+
+
+# There are no exemptions from the gate, and that is the point. This pack used to carry one
+# library script, YaraConsolidateCommon — a seventh content item that no automation imported
+# and no playbook task reached, exempted from the gate because a file that never runs cannot
+# usefully be gated. It was deleted once the gate was widened from that dead copy to the six
+# that actually run on the tenant. Every script directory left is a shipping automation, so
+# `found - set(SHIPPING)` below is now the whole test, with nothing subtracted from it.
+# Both were removed deliberately: the shared library because every automation is now
+# standalone and nothing imported it, and the Fast variant because Summary superseded it
+# as the cheap option -- leaving three overlapping consolidation modes was the confusion.
+_DELETED_LIBRARY = "YaraConsolidateCommon"
+_DELETED_AUTOMATIONS = ("YaraConsolidateCommon",)
+
+
+def test_no_automation_escapes_the_gate():
+    """SHIPPING is hand-maintained, and the gate is only as wide as that tuple. A seventh
+    automation added to the pack without being added there would ship ungated — invisibly,
+    because every existing case would still pass. So discover the pack from the filesystem
+    and require the two to agree."""
+    found = _pack_script_dirs()
+    ungated = sorted(found - set(SHIPPING))
+    assert not ungated, (
+        "these automations ship but are not in SHIPPING, so no drift gate covers them: %s "
+        "— add them to SHIPPING in %s" % (ungated, os.path.abspath(__file__)))
+    vanished = sorted(set(SHIPPING) - found)
+    assert not vanished, "SHIPPING names automations that are no longer in the pack: %s" % vanished
+
+
+def test_the_deleted_library_stays_deleted():
+    """The dead library is gone; this keeps it gone, rather than passing vacuously.
+
+    Re-adding it would not be caught by anything else: it would arrive as an ungated seventh
+    content item (test_no_automation_escapes_the_gate would fail, but the obvious way to
+    quieten that is to re-add an exemption), and shipping it in `unified/` would put a file
+    a customer imports back among the six that are actually required. So assert the two
+    artifacts are absent, and assert the two things that would make it live again — an
+    automation importing it, or a playbook task naming it — still are not true.
+    """
+    dead = _DELETED_LIBRARY
+    assert not os.path.isdir(os.path.join(_SCRIPTS, dead)), (
+        "%s is back in Scripts/. Nothing imports it and the tenant resolves no cross-script "
+        "import, so it can only ship as a content item that never runs." % dead)
+    unified = os.path.join(_REPO, "xdr", "Packs", "YaraDatasetManagement", "unified",
+                           "%s.yml" % dead)
+    assert not os.path.exists(unified), (
+        "%s is back in unified/, which is the set a customer imports — its presence there "
+        "implies the tenant needs it, and the tenant cannot even resolve it." % unified)
+
+    for automation in SHIPPING:
+        with open(SHIPPING_PATHS[automation]) as fh:
+            tree = ast.parse(fh.read())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                assert all(a.name != dead for a in node.names), (
+                    "%s imports %s — the tenant cannot resolve that import, and no drift "
+                    "gate covers %s" % (automation, dead, dead))
+            elif isinstance(node, ast.ImportFrom):
+                assert node.module != dead, (
+                    "%s does `from %s import ...` — the tenant cannot resolve that import, "
+                    "and no drift gate covers %s" % (automation, dead, dead))
+
+    playbook = os.path.join(_REPO, "xdr", "Packs", "YaraDatasetManagement", "Playbooks",
+                            "playbook-YARA_Dataset_Consolidation.yml")
+    assert os.path.exists(playbook), playbook
+    with open(playbook) as fh:
+        assert dead not in fh.read(), (
+            "%s names %s, so it is reachable on the tenant after all" % (playbook, dead))
+
+
+@pytest.mark.parametrize("impl", SHIPPING_IMPLS)
+def test_pack_name_regexes_compile_to_the_same_patterns_as_the_cli(impl):
+    # NAME_RE is built from PREFIX, which each automation aliases to its own _PREFIX — the
+    # source comparison above cannot see that the two literals still agree.
+    # YARA_OWNED_RE/CURRENT_RE come from xdr_action_center.py instead, and were previously
+    # covered only behaviourally by one seven-name fixture.
     import xdr_data_management as CLI
-    K.set_schema_version(K.DEFAULT_SCHEMA_VERSION)
-    assert K.PREFIX == CLI.PREFIX
-    assert K.NAME_RE.pattern == CLI.NAME_RE.pattern
-    assert K.MONTH_RE.pattern == CLI.MONTH_RE.pattern
-    assert K.DEFAULT_MIN_QUIET_HOURS == CLI.DEFAULT_MIN_QUIET_HOURS
-    assert K.YARA_OWNED_RE.pattern == AC.YARA_OWNED_RE.pattern
-    assert K.CURRENT_RE.pattern == AC.CURRENT_RE.pattern
+    impl.set_schema_version(impl.DEFAULT_SCHEMA_VERSION)
+    assert impl.PREFIX == CLI.PREFIX
+    assert impl.NAME_RE.pattern == CLI.NAME_RE.pattern
+    assert impl.MONTH_RE.pattern == CLI.MONTH_RE.pattern
+    assert impl.DEFAULT_MIN_QUIET_HOURS == CLI.DEFAULT_MIN_QUIET_HOURS
+    assert impl.YARA_OWNED_RE.pattern == AC.YARA_OWNED_RE.pattern
+    assert impl.CURRENT_RE.pattern == AC.CURRENT_RE.pattern
 
 
-def test_pack_classify_yara_datasets_matches_xdr_action_center():
+@pytest.mark.parametrize("impl", SHIPPING_IMPLS)
+def test_pack_classify_yara_datasets_matches_xdr_action_center(impl):
     """classify_yara_datasets is ported from a METHOD (XDRActionCenter), so it cannot be
     diffed statement-by-statement. Prove it behaviourally instead, on one dataset list."""
     names = ["yara_scanner_matches_v2_h_202607", "yara_scanner_scans_v2_h_202607",
@@ -363,33 +512,35 @@ def test_pack_classify_yara_datasets_matches_xdr_action_center():
 
     ac = AC.XDRActionCenter.__new__(AC.XDRActionCenter)     # no creds, no network
     ac.get_datasets = lambda: raw
-    K.set_schema_version(K.DEFAULT_SCHEMA_VERSION)
-    assert K.classify_yara_datasets(FakeTenant(names)) == ac.classify_yara_datasets()
+    impl.set_schema_version(impl.DEFAULT_SCHEMA_VERSION)
+    assert impl.classify_yara_datasets(FakeTenant(names)) == ac.classify_yara_datasets()
 
 
-def test_set_schema_version_moves_newer_datasets_into_current():
+@pytest.mark.parametrize("impl", SHIPPING_IMPLS)
+def test_set_schema_version_moves_newer_datasets_into_current(impl):
     """XSOAR containers have no YARA_LOOKUP_SCHEMA_VER env var, so the version the CLI
     reads from the environment has to be passable as an argument instead."""
     names = ["yara_scanner_matches_v3_h_202601"]
     try:
-        cur, legacy, newer = K.classify_yara_datasets(FakeTenant(names))
+        cur, legacy, newer = impl.classify_yara_datasets(FakeTenant(names))
         assert (cur, newer) == ([], names)            # v3 > assumed v2 -> never pruned
-        K.set_schema_version("3")
-        cur, legacy, newer = K.classify_yara_datasets(FakeTenant(names))
+        impl.set_schema_version("3")
+        cur, legacy, newer = impl.classify_yara_datasets(FakeTenant(names))
         assert (cur, newer) == (names, [])
     finally:
-        K.set_schema_version("2")
+        impl.set_schema_version("2")
 
 
-def test_set_schema_version_refuses_a_non_numeric_version():
+@pytest.mark.parametrize("impl", SHIPPING_IMPLS)
+def test_set_schema_version_refuses_a_non_numeric_version(impl):
     """The single highest-blast-radius argument in the pack. "v3"/"abc" makes CURRENT_RE
     match nothing AND cur_ver None, so rail 4's `v > cur_ver` guard can never fire and every
     live dataset on the tenant falls into `legacy`. Refusing here is the only point at which
     that is still distinguishable from a genuine legacy tenant."""
     for bad in ("v3", "abc", "", "  ", "3.0", "-1"):
         with pytest.raises(ValueError):
-            K.set_schema_version(bad)
-    assert K.YARA_SCHEMA_VERSION == "2"               # unchanged by the rejected calls
+            impl.set_schema_version(bad)
+    assert impl.YARA_SCHEMA_VERSION == "2"            # unchanged by the rejected calls
 
 
 # --------------------------------------------------------------------- rails
@@ -558,7 +709,7 @@ def test_a_timestamp_shaped_slug_does_not_crash_either_automation():
     t = FakeTenant([target])
     r = _prune(t, older_than_months=6, execute=True)
     assert r["deleted"] == [] and target in t.names
-    rep = K.report_datasets(FakeTenant([target]), now_yyyymm=NOW_YYYYMM)
+    rep = R.report_datasets(FakeTenant([target]), now_yyyymm=NOW_YYYYMM)
     assert rep["consolidated"] == [target]
 
 
@@ -1029,7 +1180,7 @@ def test_a_failure_to_record_never_masks_the_runs_real_outcome():
 # -------------------------------------------------------------------- report
 def test_the_report_is_genuinely_read_only():
     t = FakeTenant(["yara_scanner_matches_v2_h_202601", "yara_scanner_matches_v1_h"])
-    K.report_datasets(t, now_yyyymm=NOW_YYYYMM)
+    R.report_datasets(t, now_yyyymm=NOW_YYYYMM)
     assert t.mutating_calls() == []
     assert t.calls == ["get_datasets"]                  # not even a row-count query
 
@@ -1040,7 +1191,7 @@ def test_the_report_flags_frozen_separately_from_not_rotated():
     frozen = "yara_scanner_matches_v2_hostA"
     sibling = "yara_scanner_matches_v2_hostA_202601"
     lonely = "yara_scanner_matches_v2_hostB"
-    r = K.report_datasets(FakeTenant([frozen, sibling, lonely]), now_yyyymm=NOW_YYYYMM)
+    r = R.report_datasets(FakeTenant([frozen, sibling, lonely]), now_yyyymm=NOW_YYYYMM)
     assert r["frozen"] == [frozen] and r["not_rotated"] == [lonely]
     assert r["frozen_count"] == 1 and r["not_rotated_count"] == 1
     states = {d["name"]: d["state"] for d in r["datasets"]}
@@ -1054,9 +1205,9 @@ def test_consolidated_targets_are_not_reported_as_unrotated():
     scanner setting that is already correct, and on a tenant with hundreds of consolidated
     scans it buries the one genuinely-unrotated dataset the bucket exists to surface."""
     shard = "yara_scanner_matches_v2_hostA_202601"
-    t1 = K.target_name("matches", "2", "scan_2026_07_01_a1b2")
-    t2 = K.target_name("scans", "2", "scan_2026_07_01_a1b2")
-    r = K.report_datasets(FakeTenant([shard, t1, t2]), now_yyyymm=NOW_YYYYMM)
+    t1 = R.target_name("matches", "2", "scan_2026_07_01_a1b2")
+    t2 = R.target_name("scans", "2", "scan_2026_07_01_a1b2")
+    r = R.report_datasets(FakeTenant([shard, t1, t2]), now_yyyymm=NOW_YYYYMM)
     assert r["not_rotated_count"] == 0 and r["not_rotated"] == []
     assert r["frozen_count"] == 0
     assert sorted(r["consolidated"]) == sorted([t1, t2])
@@ -1068,7 +1219,7 @@ def test_the_report_carries_age_kind_host_and_the_other_schema_buckets():
     rotated = "yara_scanner_scans_v2_hostA_202601"
     legacy = "yara_scanner_matches_v1_hostA"
     newer = "yara_scanner_matches_v9_hostA"
-    r = K.report_datasets(FakeTenant([rotated, legacy, newer]), now_yyyymm=NOW_YYYYMM)
+    r = R.report_datasets(FakeTenant([rotated, legacy, newer]), now_yyyymm=NOW_YYYYMM)
     row = [d for d in r["datasets"] if d["name"] == rotated][0]
     assert row["kind"] == "scans" and row["host"] == "hostA"
     assert row["month"] == "202601" and row["age_months"] == 6
@@ -1141,8 +1292,8 @@ def _args_read_by(module_name):
 def test_every_script_directory_ships_a_yml():
     """An XSOAR automation IS its yml: demisto-sdk detects content items by yml, and a pack
     install enumerates yml-backed items. A directory holding a bare .py is delivered by no
-    upload path — and every automation here does `from YaraConsolidateCommon import ...`,
-    which XSOAR resolves against an automation of that name ON THE SERVER."""
+    upload path, so it does not exist on the tenant at all — which is also why every
+    automation here is standalone rather than importing a shared library script."""
     for d in sorted(os.listdir(_SCRIPTS)):
         script_dir = os.path.join(_SCRIPTS, d)
         if not os.path.isdir(script_dir) or d.startswith("__"):
@@ -1197,7 +1348,7 @@ def test_every_declared_output_is_actually_produced():
     for module_name, result in (
             ("YaraCleanup", _prune(FakeTenant(["yara_scanner_matches_v2_h_202601"]),
                                    older_than_months=0, delete_legacy=True, execute=True)),
-            ("YaraReport", K.report_datasets(FakeTenant(["yara_scanner_matches_v2_h_202601"]),
+            ("YaraReport", R.report_datasets(FakeTenant(["yara_scanner_matches_v2_h_202601"]),
                                              now_yyyymm=NOW_YYYYMM))):
         doc = _yml(module_name)
         prefix = doc["outputs"][0]["contextPath"].rsplit(".", 1)[0]

@@ -7,7 +7,7 @@ DRY RUN BY DEFAULT: without `execute=true` this reports what it WOULD delete and
 nothing, so an operator who runs it with no arguments can never lose data. The readable
 output states which mode the run was in.
 
-The seven safety rails live in YaraConsolidateCommon.prune_datasets and the functions it
+The seven safety rails live in prune_datasets() below and the functions it
 calls (never the current month, never a future month, never an unsuffixed dataset, never a
 newer schema version, never a name outside the yara_scanner_* contract, never a dataset
 written to within min_quiet_hours, never a dataset still holding an unconsolidated scan).
