@@ -1,6 +1,7 @@
 # XDR Round 4 — Dataset management
 
-**CLOSED.** All 26 criteria decided, 659 tests pass, 0 outstanding failures. Criteria in
+**CLOSED.** All 26 criteria decided, 659 tests pass. **D1.3 is decided as NOT MET** -- see
+[D1.3 is unwired](#d13-is-unwired-a-correction-to-this-document) below. Criteria in
 [ROUND4_CRITERIA.md](ROUND4_CRITERIA.md), written before this round ran.
 
 ## The full cycle works
@@ -170,15 +171,18 @@ mutation so that a survivor would name the criterion it invalidates.
 
 | Criterion | Mutation | Result |
 |---|---|---|
-| D1.3 | `shard_is_terminal` ignores the Action Center state | caught |
+| D1.3 | `shard_is_terminal` ignores the Action Center state | caught -- but see the correction below; the test that caught it injects a value no shipped caller supplies |
 | D1.5 | `parse_shard` anchoring removed | **survived** |
 | D5.1 | `_newest_ms` drops the server stamp (the "DO NOT simplify" case its docstring warns about) | caught |
 | D5.1 | `_max_ms` takes the earlier of the two stamps | caught |
 | D5.2 | guard 1 removed — endpoint stamp ahead of ingest is kept | caught |
 | D5.3 | guard 2 removed — implausible server stamp is kept | caught |
 
-Five criteria decided on evidence rather than assumption: **D1.3, D5.1, D5.2 and D5.3 are
-genuinely covered** by the existing suite. Those tests were not merely named after the
+Four criteria decided on evidence rather than assumption: **D5.1, D5.2 and D5.3 are
+genuinely covered**. D1.3's mutation was caught too, but by a test that injects
+`action_state_for` -- which no shipped caller does. See the correction below. That the
+mutation was caught proves the FUNCTION is tested; it does not prove the CAPABILITY is
+reachable, and I originally reported the first as if it were the second by the existing suite. Those tests were not merely named after the
 behaviour, they decide it.
 
 **D1.5 was the survivor, and getting there took two wrong turns worth recording.**
@@ -351,13 +355,71 @@ and cleaned up rather than re-merged, which is what makes the operation resumabl
 merely safe to abandon. The orphaned-lock half is covered by
 `tests/test_lock_takeover_reporting.py`.
 
+
+## D1.3 is unwired — a correction to this document
+
+Found while designing Round 5, after this round was reported closed.
+
+**D1.3 requires that terminality be established two independent ways** — the scanner's own
+lifecycle row *and* the Action Center action state — so that "a host whose lifecycle row says
+`running` but whose action terminated is still selected".
+
+`shard_is_terminal` implements exactly that (`xdr_consolidate.py:220-233`), and the
+`action_state_for` callback is threaded through every layer of **both** copies. The mutation
+audit removed the Action-Center branch and a test failed, which is why this document
+originally recorded D1.3 as covered.
+
+**But no shipped caller ever supplies `action_state_for`.** Every reference in the repo:
+
+```
+tests/test_consolidation.py:144   action_state_for=lambda h: "ABORTED"   <- the only one
+xdr_consolidate.py                parameter definitions, defaulting None
+YaraConsolidateCommon.py          parameter definitions, defaulting None
+```
+
+Not `YaraConsolidateApply.py`, not `YaraConsolidateStatus.py`, not
+`xdr_data_management._run_consolidate`, not the playbook. So `astate` at
+`xdr_consolidate.py:373` is `None` on every path that runs on the tenant, and Gate B never
+evaluates. On the live system, terminality rests on the lifecycle row **alone**.
+
+The consequence is the exact scenario D1.3 was written for. A console-Cancel hard-kills the
+payload and orphans the lifecycle at `running` (this repo's own measured behaviour) while the
+*action* goes terminal. D1.3 says that host is still selected. Shipped, it is not: it waits
+out the full 24h abandoned cutoff instead — a day of a shard sitting unconsolidated, for a
+case the code already knows how to recognise.
+
+The CHANGELOG makes the cost concrete. A previous fix added `COMPLETED_WITH_ERRORS` and
+`COMPLETED_PARTIAL` to `TERMINAL_ACTION`, mirrored the constant into the pack copy "so the
+console automations get the same fix", and verified it with a unit test. That fix is inert.
+It corrected a set that nothing on a shipped path reads.
+
+**Why the mutation audit did not catch this, and what that means for the method.** The audit
+asks "would the suite go red if this were wrong". For D1.3 the answer was yes — because a
+test injects the callback. The question the audit cannot ask is "does anything in production
+call this at all". Mutation testing verifies the code *under test*; it is blind to code that
+is tested but unreachable. That is the same failure mode this document already names as
+*consistency is not correctness*, arriving from a new direction: there, two copies agreed
+with each other; here, a function agrees with its test while nothing calls it.
+
+A dead-code check would have caught it — and this repo has one, in
+`docs/CAPABILITIES.md`, whose own notes record that an adversarial pass overturned 6 of 32
+such classifications. That check was never pointed at the consolidation subsystem, because
+the subsystem is absent from the capability catalogue entirely (`grep -c consolidate
+TEST_TRACKING.md` → 0).
+
+**Disposition:** D1.3 is decided as **NOT MET**. It is not a regression and not a broken
+test; it is a capability that was implemented, mirrored, fixed once, unit-tested, and never
+wired up. Round 5 covers it two ways: E3 observes the real orphan behaviour on the tenant,
+and E9 demonstrates by injection that the logic is correct once a caller supplies it —
+recorded as a demonstration, never as evidence for a shipped path.
+
 ## Round 4 — closed
 
 All 26 criteria are decided. **659 tests pass, 0 outstanding failures.**
 
 | Group | Criteria | How decided |
 |---|---|---|
-| D1 Selection | D1.1–D1.5 | live edge cases (D1.2, D1.4) + mutation audit (D1.3, D1.5) |
+| D1 Selection | D1.1–D1.5 | live edge cases (D1.2, D1.4) + mutation audit (D1.5). **D1.3 NOT MET** |
 | D2 Merge integrity | D2.1–D2.6 | live (D2.2) + mutation audit (D2.1, D2.3, D2.4, D2.5, D2.6) |
 | D3 Partial scans | D3.1–D3.4 | live (D3.1, D3.4) + mutation audit (D3.1, D3.2, D3.3) |
 | D4 Concurrency | D4.1–D4.4 | mutation audit (D4.1, D4.3) + dedicated tests (D4.2, D4.4) |
