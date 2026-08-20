@@ -134,6 +134,32 @@ def _install_xsoar_stubs():
 
     sys.modules["demistomock"] = dm
     sys.modules["CommonServerPython"] = csp
+
+    # Inject the platform-provided names as BUILTINS, because that is what the tenant does.
+    #
+    # The four automations are now standalone: they carry all their logic inline and import
+    # neither demistomock nor CommonServerPython, because on a Cortex tenant both are already
+    # in scope -- an automation just uses `demisto`, `return_error`, `CommandResults` and so
+    # on without importing anything. That is correct for the tenant and it is what the pack
+    # owner requires.
+    #
+    # It also means that importing one of those files as an ordinary Python module -- which is
+    # exactly what these tests do -- leaves every one of those names unbound, and the first
+    # call fails with `NameError: name 'demisto' is not defined`. Registering the stub modules
+    # in sys.modules above does nothing for them, because nothing imports those modules any more.
+    #
+    # So the harness has to stand in for the platform's injection, not for its import system.
+    # builtins is the honest place for it: it makes the names resolve from any module's global
+    # scope without that module importing them, which is precisely the runtime contract the
+    # scripts are written against.
+    import builtins
+    builtins.demisto = dm
+    builtins.CommandResults = _CommandResults
+    builtins.argToList = argToList
+    builtins.argToBoolean = argToBoolean
+    builtins.return_results = return_results
+    builtins.return_error = return_error
+
     return dm, csp
 
 
