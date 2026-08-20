@@ -17,7 +17,13 @@ import sys
 import threading
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# xdr_action_center lives in xdr/ since the per-edition reorganisation. conftest.py puts
+# that directory on sys.path for the test suite, but conftest only runs under pytest and
+# these are standalone CLIs -- which is why the suite stayed green while they broke.
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _p in (os.path.join(_ROOT, "xdr"), _ROOT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 from xdr_action_center import XDRActionCenter  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
