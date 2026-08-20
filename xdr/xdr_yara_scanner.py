@@ -220,9 +220,9 @@ DEFAULT_XDR_API_URL = "replace_with_xdr_standard_api_url"
 # CONFIG_ALERT_MAX_PER_SCAN, CONFIG_HOST_CLEANUP and CONFIG_HOST_CLEANUP_KEEP have NO
 # options equivalent and can be changed only here — passing them in an options string
 # is rejected as an unknown key. All four are deployment-wide by nature: rotation
-# decides dataset naming (mixing rotated and unrotated runs on one host splits its
-# history across two datasets), the alert cap protects a per-API-key ceiling that is
-# shared across every concurrent scan, and host cleanup deletes files on the endpoint
+# decides the SCANS dataset's naming (mixing rotated and unrotated runs on one host splits
+# its lifecycle history across two datasets), the alert cap protects a per-API-key ceiling
+# that is shared across every concurrent scan, and host cleanup deletes files on the endpoint
 # — none of these should be one accidental options-string typo away from a different
 # behaviour on a single run.
 # ============================================================================
@@ -290,12 +290,31 @@ CONFIG_ALERT_DIR_MAX_BYTES = int(_env_number("YARA_ALERT_DIR_MAX_MB", 256, minim
 # CONFIG_LOOKUP_ROWS_PER_FINDING_MAX above, so the local file and the dataset row show the
 # same sample. 0 renders everything, as it does there.
 CONFIG_ALERT_OFFSETS_PER_FINDING_MAX = 50
-# Lookup dataset rotation: add_data merge time grows with DATASET SIZE (measured on-tenant: ~13s at
-# 15k rows, ~31s at 77k rows), so an ever-growing dataset eventually outlives any client timeout.
-# "monthly" starts a fresh _<YYYYMM> dataset each month -> bounded size -> bounded merge time,
-# forever. Dashboards need no change (they match yara_scanner_matches* wildcards); prune old months
-# with xdr_action_center.py prune-datasets. "none" = single unrotated dataset (legacy behaviour).
-CONFIG_LOOKUP_ROTATION = "monthly"      # "monthly" (recommended) | "none"
+# Lookup dataset rotation — SCANS DATASET ONLY. It no longer has any effect on the matches
+# dataset; see the resolution note below.
+#
+# Why rotation exists: add_data merge time grows with DATASET SIZE (measured on-tenant: ~13s at
+# 15k rows, ~31s at 77k rows), so an ever-growing dataset eventually outlives any client timeout
+# and goes write-dead. "monthly" starts a fresh _<YYYYMM> dataset each month -> bounded size ->
+# bounded merge time, forever. Dashboards need no change (they match yara_scanner_scans*
+# wildcards); prune old months with xdr_action_center.py prune-datasets. "none" = single
+# unrotated dataset (legacy behaviour).
+#
+# RESOLVED (matches is now permanent + overwritten): the matches dataset is one per host,
+# created once and OVERWRITTEN at the start of every scan (LookupDatasetUploader._flush_stale_
+# matches), so it can never grow past a single scan's rows and has nothing for rotation to
+# bound. Worse, leaving rotation on it would have been actively contradictory: it would mint a
+# NEW dataset every month regardless, so "permanent, one per host" would silently become
+# "twelve per host per year", the deep-dive source's name would change under every dashboard
+# and consolidation caller pinned to it, and last month's dataset would keep its final scan's
+# rows forever with nothing left that ever overwrites them. So rotation is applied to exactly
+# one of the two datasets now, not half-applied to both:
+#   matches -> NEVER rotated. Permanent name, bounded by the per-scan overwrite.
+#   scans   -> STILL rotated by this setting. It is 2 rows/scan and append-only — nothing
+#              overwrites it — so it is the one that still grows without bound, which is
+#              precisely the case rotation was built for. Its behaviour is unchanged.
+# The YARA_LOOKUP_ROTATION env override has the same scans-only meaning.
+CONFIG_LOOKUP_ROTATION = "monthly"      # "monthly" (recommended) | "none" — SCANS dataset only
 # End-of-run host cleanup. The scanner already manages its footprint ACROSS repeat scans
 # (initial_cleanup clears the previous run's alert/evidence dirs, logs keep the last 10
 # scans) but does nothing at the END of a run. On a one-off fleet sweep the host is never
@@ -397,6 +416,37 @@ _RULE_CACHE_LOCK = threading.Lock()
 #                       offsets/strings a capped sample)
 #   <prefix>_scans   -> scan-lifecycle rows (initiated/running/completed/cancelled/failed)
 LOOKUP_DATASET_PREFIX = "yara_scanner"
+# The matches dataset is PERMANENT and OVERWRITTEN per scan (see LookupDatasetUploader.
+# _flush_stale_matches): every scan starts by deleting the rows the PREVIOUS scan left there,
+# so the dataset always holds exactly one scan per host and never accumulates.
+#
+# Two constraints shape how that is done, both measured on this tenant (2026-08-19):
+#   * remove_data filter flush = 10.0s for ~550 rows; delete_dataset + recreate = 190.2s.
+#     19x. So the overwrite is a filtered row delete, never a dataset delete — and it also
+#     keeps the dataset OBJECT (and therefore its schema, and anything pinned to its name)
+#     alive across the overwrite.
+#   * remove_data takes EXACT-VALUE filters only, so "everything that is not this scan" is
+#     not expressible: the stale scan_ids must be enumerated first (one XQL) and then removed
+#     one exact value at a time.
+LOOKUP_FLUSH_POLL_SECS = _env_number("YARA_LOOKUP_FLUSH_POLL_SECS", 3, minimum=0)
+LOOKUP_FLUSH_MAX_POLLS = _env_number("YARA_LOOKUP_FLUSH_MAX_POLLS", 20, cast=int, minimum=1)
+# Read timeout for the results poll and for remove_data. 200s on the delete matches the proven
+# caller (xdr_action_center.py:449) and is 20x the measured 10.0s flush, so a fleet-scale
+# dataset has room; fail fast on CONNECT, stay patient on the read, exactly as the add_data
+# path does (LOOKUP_POST_TIMEOUT).
+LOOKUP_FLUSH_QUERY_TIMEOUT = (5, _env_number("YARA_LOOKUP_FLUSH_QUERY_TIMEOUT", 90, minimum=1))
+# Whole-flush wall-clock budget. This runs on the critical path of EVERY scan start on every
+# host, and it is the least important thing a run does — so a pathological tenant (each poll
+# hanging to its read timeout) must cost the fleet one bounded delay and a log line, not
+# max_polls x read_timeout before a single file is scanned. Measured cost to beat: 10.0s for
+# the delete plus a few seconds of query; 300s is 20x that. <= 0 disables the budget.
+LOOKUP_FLUSH_BUDGET_SECS = _env_number("YARA_LOOKUP_FLUSH_BUDGET", 300, minimum=0)
+LOOKUP_FLUSH_REMOVE_TIMEOUT = (5, _env_number("YARA_LOOKUP_FLUSH_REMOVE_TIMEOUT", 200, minimum=1))
+# Only a dataset this scanner itself owns may be interpolated into an XQL string or handed to
+# remove_data. Mirrors YARA_OWNED_RE (xdr_action_center.py:44) for the same reason: the shard
+# suffix is derived from a hostname, and a name that does not round-trip to the shape we mint
+# is a name we must not delete rows from.
+_YARA_OWNED_DATASET_RE = re.compile(r"^yara_scanner_(matches|scans)_v\d+(?:_[a-z0-9_]+)?$")
 SCANS_HEARTBEAT_SECS = _env_number("YARA_HEARTBEAT_SECS", 600, minimum=0)  # running-row cadence
 # How many past scans' logs (+ their JSON summary) to keep on the endpoint. The old value (2)
 # wiped diagnostics too aggressively under frequent scans; keep more by default, configurable.
@@ -729,6 +779,14 @@ XDR_INSERT_PARSED_ALERTS_PATH = "/public_api/v1/alerts/insert_parsed_alerts"
 XDR_LOOKUPS_ADD_DATA_PATH = "/public_api/v1/xql/lookups/add_data"
 XDR_GET_DATASETS_PATH = "/public_api/v1/xql/get_datasets"
 XDR_ADD_DATASET_PATH = "/public_api/v1/xql/add_dataset"
+# The three endpoints the start-of-scan overwrite needs. Trailing slashes are kept here
+# (unlike the four above, whose slashless form is proven live by every scan) because these
+# exact strings are the ones exercised against this tenant by xdr_action_center.py —
+# remove_data at xdr_action_center.py:449, start/poll at :315 and :324. Same API either
+# way; matching the proven caller is cheaper than re-verifying the variant.
+XDR_LOOKUPS_REMOVE_DATA_PATH = "/public_api/v1/xql/lookups/remove_data/"
+XDR_START_XQL_QUERY_PATH = "/public_api/v1/xql/start_xql_query/"
+XDR_GET_QUERY_RESULTS_PATH = "/public_api/v1/xql/get_query_results/"
 
 
 def _build_xdr_insert_alerts_url(api_url: str) -> str:
@@ -769,6 +827,36 @@ def _build_xdr_add_dataset_url(api_url: str) -> str:
     if base.endswith(XDR_ADD_DATASET_PATH):
         return base
     return f"{base}{XDR_ADD_DATASET_PATH}"
+
+
+def _build_xdr_url(api_url: str, path: str) -> str:
+    """Build a full endpoint URL for `path` from a base or already-full URL.
+
+    Same contract as the four builders above (idempotent when handed a full URL), but
+    parameterised — the overwrite step needs three more endpoints and four more
+    copy-pasted builders would be four more places for a path typo to hide.
+    """
+    base = (api_url or "").strip().rstrip("/")
+    if not base:
+        return ""
+    if base.endswith(path) or base.endswith(path.rstrip("/")):
+        return base
+    return f"{base}{path}"
+
+
+def _xql_says_missing(text: str) -> bool:
+    """True when an API error body means "that dataset isn't there".
+
+    A first-ever scan on a host has no dataset to overwrite, and the start-of-scan flush must
+    treat that as a no-op rather than an error. "not found" is the wording this tenant returns
+    for a missing lookup dataset (the same signature _ensure_one already relies on from
+    add_data's HTTP 400 "Dataset not found"); the other two are conservative synonyms.
+
+    Matching too eagerly is safe in this one direction only: every caller responds by deleting
+    NOTHING and letting the scan proceed.
+    """
+    low = (text or "").lower()
+    return "not found" in low or "does not exist" in low or "no such dataset" in low
 
 
 # ============================================================================
@@ -2498,6 +2586,9 @@ class LogManager:
             "ip_address": self.ip_address,
             "matches_dataset": getattr(self.config, "_matches_dataset", ""),
             "scans_dataset": getattr(self.config, "_scans_dataset", ""),
+            # What the start-of-scan overwrite removed from the matches dataset before this
+            # scan wrote a row: dataset, stale scan_ids, rows deleted, seconds, outcome.
+            "matches_flush": getattr(self.config, "_matches_flush", {}),
             "posture": getattr(self.config, "posture", ""),
         }
         record.update(summary or {})
@@ -4207,12 +4298,24 @@ def _max_severity(values, default="Low"):
 
 
 class LookupDatasetUploader:
-    """Append YARA matches to a Cortex XDR Lookup Dataset (one row per matched string).
+    """Write this scan's rows to the two Cortex XDR lookup datasets for this host.
 
-    Dataset name is derived from the run_id, e.g. ``yara_matches_20260518_143015_123456``.
-    The dataset is created implicitly on the first ``add_data`` POST, so no separate
-    create step is required. An upfront ``get_datasets`` call is made to log whether
-    we are creating fresh or appending to an existing dataset.
+    Two datasets, two different lifetimes — the difference is the whole design:
+
+      ``yara_scanner_matches_v<N>_<host>_<6hex>``   one row per matched FILE
+          PERMANENT and OVERWRITTEN. One per host, no scan_id and no month in the name, so
+          dashboards and the consolidation automations can pin it literally. Every scan
+          begins by deleting the rows the previous scan left in it (_flush_stale_matches),
+          so it holds exactly one scan and never accumulates. It is the deep-dive source.
+
+      ``yara_scanner_scans_v<N>_<host>_<6hex>[_<YYYYMM>]``   scan-lifecycle rows
+          APPEND-ONLY, 2 rows/scan, nothing ever overwrites it — so it is the one that still
+          needs CONFIG_LOOKUP_ROTATION's monthly size bound.
+
+    Neither is created implicitly: add_data returns HTTP 400 "Dataset not found" against a
+    name that does not exist, so _ensure_datasets creates both up front (and reports whether
+    matches pre-existed, which is what tells the overwrite whether there can be anything to
+    delete).
 
     Matches are batched (LOOKUP_DATASET_BATCH_SIZE rows per POST) to stay under XDR's
     ~1000 entries / 10s rate limit AND to minimise the number of POSTs (each POST is one
@@ -4242,13 +4345,19 @@ class LookupDatasetUploader:
             self.dataset_shard = _dataset_shard_suffix(shard_cfg)
         _suffix = f"_{self.dataset_shard}" if self.dataset_shard else ""
         _ver = f"_v{LOOKUP_SCHEMA_VERSION}"  # schema-version tag; bump when the row shape changes
-        # Monthly rotation bounds every dataset's SIZE, and therefore its add_data merge time,
-        # forever (merge time scales with dataset size; an unrotated shard eventually outgrows any
-        # client timeout and goes write-dead). Dashboards fan in via wildcard, so a new month's
-        # dataset joins them automatically; prune old months with the prune-datasets tooling.
+        # Monthly rotation bounds a dataset's SIZE, and therefore its add_data merge time, forever
+        # (merge time scales with dataset size; an unrotated APPEND-ONLY shard eventually outgrows
+        # any client timeout and goes write-dead). It applies to the SCANS dataset only — see
+        # CONFIG_LOOKUP_ROTATION for why it is now meaningless-to-harmful on matches. Dashboards
+        # fan in via wildcard, so a new month's scans dataset joins them automatically; prune old
+        # months with the prune-datasets tooling.
         _rot_cfg = str(os.environ.get("YARA_LOOKUP_ROTATION", "") or CONFIG_LOOKUP_ROTATION).strip().lower()
         _rot = f"_{self.scan_date[:6]}" if _rot_cfg == "monthly" and len(self.scan_date) >= 6 else ""
-        self.matches_dataset = f"{LOOKUP_DATASET_PREFIX}_matches{_ver}{_suffix}{_rot}"
+        # matches: PERMANENT name, one per host, no scan_id and no month. It is the deep-dive
+        # source, so its name must stay stable for dashboards and for the consolidation
+        # automations that read it; its size is bounded by the start-of-scan overwrite below,
+        # not by rotation.
+        self.matches_dataset = f"{LOOKUP_DATASET_PREFIX}_matches{_ver}{_suffix}"
         self.scans_dataset = f"{LOOKUP_DATASET_PREFIX}_scans{_ver}{_suffix}{_rot}"
         # Surface the resolved (sharded) dataset names so the scan-summary JSON and logs can
         # tell the operator exactly where this scan's rows landed.
@@ -4277,6 +4386,20 @@ class LookupDatasetUploader:
         }
         self._stop_done = False
         self._drain_budget = None    # scaled at stop(): backlog-aware, capped by LOOKUP_DRAIN_MAX_SECS
+        # Start-of-scan overwrite bookkeeping (see _flush_stale_matches). Always a dict, even
+        # when the flush is skipped or fails, so the summary JSON has a shape to read.
+        # _matches_pre_existed is set by _ensure_datasets; default False so a flush that
+        # somehow runs without it skips (deletes nothing) rather than raising.
+        self._matches_pre_existed = False
+        self.flush_stats = {
+            "dataset": self.matches_dataset,
+            "attempted": False,
+            "scan_ids_removed": [],
+            "rows_deleted": 0,
+            "seconds": 0.0,
+            "outcome": "not_attempted",   # ok | partial | no_stale_rows | skipped_* | failed
+            "error": "",
+        }
 
         # Matches schema — must match the keys produced by ResultsUploader.add_file_matches.
         # XDR add_dataset supports: text, number, datetime, bool.
@@ -4319,6 +4442,12 @@ class LookupDatasetUploader:
 
         if UPLOAD_RESULTS and getattr(config, "write_dataset", True) and self._xdr_configured():
             self._ensure_datasets()
+            # OVERWRITE, not append: clear any previous scan's rows from this host's matches
+            # dataset BEFORE the writer thread exists, so no row this scan produces can be
+            # deleted by its own tidy-up. Deliberately synchronous and inline — one flush per
+            # host, never parallelised (remove_data is not concurrency-safe), and it must be
+            # finished before the first add_data POST can be issued.
+            self._flush_stale_matches()
             self._start_thread()
         elif self.log_manager:
             self.log_manager.log_upload(
@@ -4329,8 +4458,13 @@ class LookupDatasetUploader:
         return bool(XDR_API_URL) and "replace_with" not in (XDR_API_URL or "")
 
     def _ensure_datasets(self):
-        """Ensure both the matches and scans lookup datasets exist."""
-        self._ensure_one(self.matches_dataset, self.matches_schema)
+        """Ensure both the matches and scans lookup datasets exist.
+
+        Records whether the matches dataset PRE-EXISTED: a dataset this call just created
+        holds no rows at all, so the start-of-scan overwrite has nothing to look for and can
+        skip an XQL round trip entirely.
+        """
+        self._matches_pre_existed = bool(self._ensure_one(self.matches_dataset, self.matches_schema))
         self._ensure_one(self.scans_dataset, self.scans_schema)
 
     def _ensure_one(self, dataset_name, dataset_schema):
@@ -4338,6 +4472,11 @@ class LookupDatasetUploader:
 
         XDR's add_data endpoint returns HTTP 400 "Dataset not found" when the lookup
         dataset hasn't been created, so creation is a hard prerequisite — not implicit.
+
+        Returns True when the dataset already existed before this call, False when we created
+        it (or could not tell). Callers may use it only as an optimisation — never as proof:
+        False can also mean the create failed, and the flush is written to survive a wrong
+        guess in either direction.
         """
         found = False
         try:
@@ -4382,7 +4521,7 @@ class LookupDatasetUploader:
                 self.log_manager.log_upload(
                     f"Lookup dataset '{dataset_name}' already exists - will append rows"
                 )
-            return
+            return True
 
         # Create
         try:
@@ -4404,7 +4543,7 @@ class LookupDatasetUploader:
                         f"Lookup dataset '{dataset_name}' created "
                         f"(schema fields: {len(dataset_schema)})"
                     )
-                return
+                return False
             # XDR returns HTTP 500 with err_extra "Dataset X already exists" when the
             # dataset is in fact already there (often when our get_datasets probe
             # missed it for any reason). Treat that as success, not error.
@@ -4423,7 +4562,7 @@ class LookupDatasetUploader:
                         f"Lookup dataset '{dataset_name}' already exists "
                         f"(reported via add_dataset 500) - will append rows"
                     )
-                return
+                return True
             if self.log_manager:
                 self.log_manager.log_error(
                     f"Lookup dataset create failed (HTTP {resp.status_code}): {resp.text[:500]}. "
@@ -4432,6 +4571,254 @@ class LookupDatasetUploader:
         except Exception as e:
             if self.log_manager:
                 self.log_manager.log_error(f"Lookup dataset create error: {e}")
+        return False
+
+    # ------------------------------------------------------------------ overwrite
+    def _flush_stale_matches(self):
+        """OVERWRITE this host's matches dataset: delete every row from a PREVIOUS scan.
+
+        The matches dataset is one per host, permanent, and never accumulates — it holds the
+        CURRENT scan and nothing else, which is what makes it a usable deep-dive source and
+        what keeps it inside the 50 MB per-lookup-dataset platform cap for ever. Nothing else
+        in the pipeline does this: consolidation copies rows OUT, it does not clear them.
+
+        Three properties are load-bearing, and each is pinned by a test:
+
+        * The CURRENT scan_id is never removed. Stale ids are enumerated first and the current
+          one is filtered out of that list before a single delete is issued, so the worst
+          outcome of a wrong or stale enumeration is that too FEW rows are deleted.
+        * A missing dataset is a no-op, not an error. A first-ever scan on a host has nothing
+          to overwrite.
+        * It FAILS SAFE. Every failure here is logged and swallowed: stale rows surviving is
+          recoverable (the next scan tries again, and consolidation reads by scan_id anyway),
+          whereas a scan that refuses to run because it could not tidy up is not.
+
+        Serialised by construction: one scanner process per host, one flush per process, and
+        it runs inline in __init__ before the writer thread exists. remove_data is NOT
+        concurrency-safe (xdr_action_center.py:446-449), so this must never be parallelised —
+        not across scan_ids here, and not across hosts (each host has its own dataset).
+
+        Two consequences worth stating rather than discovering:
+
+        * TWO CONCURRENT SCANS ON ONE HOST are not a supported configuration under an
+          overwrite model, and this does not invent protection they never had. The second
+          scan's flush would delete the first's rows, because from the dataset's point of
+          view they ARE a previous scan_id. One host holds one current scan; that is the
+          model. (The host's running.json marker reports liveness but does not exclude.)
+        * The logged open question — whether remove_data re-stamps `_insert_time` on the rows
+          it leaves behind (xdr/docs/topics/Known_Limitations.md:66) — cannot bite here. This
+          flush removes every scan_id that is not the current one, and the current one has
+          written nothing yet at the moment it runs, so there are no surviving rows for a
+          re-stamp to touch. It stays an open question for the partial deletes elsewhere.
+
+        Returns self.flush_stats.
+        """
+        t0 = time.time()
+        st = self.flush_stats
+        st["dataset"] = self.matches_dataset   # report the dataset actually flushed
+        current = str(getattr(self.config, "scan_id", "") or "").strip()
+        self._flush_deadline = (time.monotonic() + LOOKUP_FLUSH_BUDGET_SECS
+                                if LOOKUP_FLUSH_BUDGET_SECS > 0 else None)
+
+        def _finish(outcome, level="upload", error=""):
+            st["outcome"] = outcome
+            st["seconds"] = round(time.time() - t0, 1)
+            if error:
+                st["error"] = str(error)[:300]
+            # Requirement: say what was flushed — dataset, scan_ids, rows, seconds — in one line.
+            msg = (
+                f"Matches dataset overwrite [{outcome}]: {st['dataset']} | "
+                f"stale scan_ids removed: {st['scan_ids_removed'] or 'none'} | "
+                f"rows deleted: {st['rows_deleted']} | {st['seconds']}s"
+            )
+            if st["error"]:
+                msg += f" | error: {st['error']}"
+            if self.log_manager:
+                if level == "error":
+                    self.log_manager.log_error(msg + " | scan continues and will still write")
+                else:
+                    self.log_manager.log_upload(msg)
+            try:
+                # Deep enough to detach the one mutable field, so the summary JSON's copy
+                # cannot be changed by anything that touches flush_stats later.
+                self.config._matches_flush = dict(st, scan_ids_removed=list(st["scan_ids_removed"]))
+            except Exception:
+                pass
+            return st
+
+        # Without a scan_id we cannot tell our own rows from anyone else's, and "delete the
+        # rows I can't identify" is exactly the mistake this must never make.
+        if not current:
+            return _finish("skipped_no_scan_id")
+        if not _YARA_OWNED_DATASET_RE.match(self.matches_dataset):
+            return _finish("skipped_unrecognised_dataset", level="error")
+        # A dataset _ensure_one just created holds no rows, so there is nothing to enumerate.
+        # This is the ordinary first-scan-on-a-host path, and it is why the common case costs
+        # no XQL at all.
+        if not getattr(self, "_matches_pre_existed", False):
+            return _finish("skipped_dataset_new")
+
+        st["attempted"] = True
+        try:
+            stale = [sid for sid in self._matches_scan_ids() if sid and sid != current]
+        except Exception as e:
+            # Includes the 403 an under-permissioned key gets: the scanner delivery key needs
+            # Query Center for the XQL enumeration on top of the Data Management it already
+            # has for add_data/remove_data (see "Key 1 — scanner delivery key" in
+            # .claude/skills/xdr-action-center-api/references/api-permissions.md). Without it
+            # the overwrite degrades to a logged no-op and the scan still runs and writes.
+            return _finish("failed", level="error", error=f"could not list scan_ids: {e}")
+
+        if not stale:
+            return _finish("no_stale_rows")
+
+        failures = []
+        # Strictly sequential — see the concurrency note in the docstring.
+        for sid in stale:
+            if self._flush_out_of_budget():
+                failures.append(f"{sid}: skipped, {LOOKUP_FLUSH_BUDGET_SECS}s flush budget spent")
+                continue
+            try:
+                deleted = self._remove_scan_id(sid)
+            except Exception as e:
+                failures.append(f"{sid}: {e}")
+                continue
+            st["scan_ids_removed"].append(sid)
+            st["rows_deleted"] += deleted
+
+        if failures:
+            return _finish("partial", level="error", error="; ".join(failures)[:300])
+        return _finish("ok")
+
+    def _flush_out_of_budget(self):
+        """True once this flush has spent its wall-clock budget (LOOKUP_FLUSH_BUDGET_SECS).
+
+        Every caller responds by stopping and reporting, never by deleting more or by raising
+        past _flush_stale_matches — a spent budget degrades the overwrite, it does not fail
+        the scan.
+        """
+        deadline = getattr(self, "_flush_deadline", None)
+        return deadline is not None and time.monotonic() >= deadline
+
+    def _matches_scan_ids(self):
+        """Every distinct scan_id currently present in the matches dataset.
+
+        One XQL, the same `comp count() by <field>` idiom xdr_action_center.py:455-457 uses
+        against these datasets. A dataset that does not exist yields no rows rather than an
+        error — the platform's own "not found" wording is treated as empty, because a missing
+        dataset means there is nothing to overwrite.
+        """
+        query = (f"dataset = {self.matches_dataset} | fields scan_id | "
+                 f"comp count() as n by scan_id")
+        rows = self._xql_rows(query)
+        out = []
+        for r in rows or []:
+            sid = r.get("scan_id") if isinstance(r, dict) else None
+            if sid and sid not in out:
+                out.append(str(sid))
+        return out
+
+    def _xql_rows(self, query, limit=1000):
+        """Start one XQL query, poll it to completion, return its rows (possibly empty).
+
+        Raises on a real failure so the caller can fail safe; returns [] for the two
+        "nothing there" outcomes — a not-found dataset and a successful query with no rows.
+        """
+        resp = requests.post(
+            _build_xdr_url(XDR_API_URL, XDR_START_XQL_QUERY_PATH),
+            headers=build_xdr_headers(self.log_manager),
+            json={"request_data": {"query": query}},
+            timeout=LOOKUP_FLUSH_QUERY_TIMEOUT,
+        )
+        if not (200 <= resp.status_code < 300):
+            if _xql_says_missing(resp.text):
+                return []
+            raise RuntimeError(f"start_xql_query HTTP {resp.status_code}: {resp.text[:300]}")
+        body = resp.json()
+        qid = body.get("reply", body) if isinstance(body, dict) else body
+        if isinstance(qid, dict):
+            qid = qid.get("query_id") or qid.get("reply")
+        if not qid:
+            raise RuntimeError(f"start_xql_query returned no query_id: {str(body)[:300]}")
+
+        for _ in range(int(LOOKUP_FLUSH_MAX_POLLS)):
+            resp = requests.post(
+                _build_xdr_url(XDR_API_URL, XDR_GET_QUERY_RESULTS_PATH),
+                headers=build_xdr_headers(self.log_manager),
+                json={"request_data": {"query_id": qid, "pending_flag": True,
+                                       "limit": int(limit), "format": "json"}},
+                timeout=LOOKUP_FLUSH_QUERY_TIMEOUT,
+            )
+            if not (200 <= resp.status_code < 300):
+                if _xql_says_missing(resp.text):
+                    return []
+                raise RuntimeError(f"get_query_results HTTP {resp.status_code}: {resp.text[:300]}")
+            body = resp.json()
+            reply = body.get("reply", body) if isinstance(body, dict) else {}
+            status = reply.get("status") if isinstance(reply, dict) else None
+            if status == "PENDING" or status is None:
+                if self._flush_out_of_budget():
+                    raise RuntimeError(
+                        f"flush budget ({LOOKUP_FLUSH_BUDGET_SECS}s) spent while the query "
+                        f"was still PENDING")
+                time.sleep(LOOKUP_FLUSH_POLL_SECS)
+                continue
+            if status != "SUCCESS":
+                raise RuntimeError(f"XQL {status}: {str(reply)[:300]}")
+            results = reply.get("results", {}) if isinstance(reply, dict) else {}
+            if isinstance(results, dict):
+                if "data" in results:
+                    data = results["data"]
+                    return data if isinstance(data, list) else []
+                if results.get("stream_id"):
+                    # Past ~1000 rows the platform streams instead of inlining (see
+                    # xdr_action_center.py:340-347). One row per DISTINCT scan_id means that
+                    # needs >1000 failed overwrites on a single host, so rather than carry a
+                    # fourth endpoint and an NDJSON parser onto every endpoint for a case that
+                    # should never occur, say so plainly and let the caller fail safe.
+                    raise RuntimeError(
+                        "XQL returned a stream_id: >1000 distinct scan_ids in "
+                        f"{self.matches_dataset}; the overwrite has not been landing"
+                    )
+                return []
+            return results if isinstance(results, list) else []
+        raise RuntimeError(
+            f"XQL timed out after {int(LOOKUP_FLUSH_MAX_POLLS)} polls "
+            f"({LOOKUP_FLUSH_POLL_SECS}s apart)"
+        )
+
+    def _remove_scan_id(self, scan_id):
+        """Delete every matches row carrying `scan_id`. Returns the reported deleted count.
+
+        ONE exact-value filter block per call: remove_data's filters are OR across blocks and
+        AND within one, exact values only, and the multi-block form is all-or-nothing
+        (xdr_action_center.py:446-449 and :752), so one scan_id per call keeps a single bad
+        value from taking the others down with it. The reply is {"deleted": N}.
+        """
+        resp = requests.post(
+            _build_xdr_url(XDR_API_URL, XDR_LOOKUPS_REMOVE_DATA_PATH),
+            headers=build_xdr_headers(self.log_manager),
+            json={"request": {"dataset_name": self.matches_dataset,
+                              "filters": [{"scan_id": scan_id}]}},
+            timeout=LOOKUP_FLUSH_REMOVE_TIMEOUT,
+        )
+        if not (200 <= resp.status_code < 300):
+            if _xql_says_missing(resp.text):
+                return 0
+            raise RuntimeError(f"remove_data HTTP {resp.status_code}: {resp.text[:300]}")
+        try:
+            body = resp.json()
+        except Exception:
+            return 0
+        reply = body.get("reply", body) if isinstance(body, dict) else {}
+        if isinstance(reply, dict):
+            for key in ("deleted", "rows deleted", "records_deleted"):
+                if key in reply:
+                    try:
+                        return int(reply[key])
+                    except (TypeError, ValueError):
+                        return 0
+        return 0
 
     def _start_thread(self):
         if self.log_manager:

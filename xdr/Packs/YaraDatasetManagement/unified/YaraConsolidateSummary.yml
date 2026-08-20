@@ -1,96 +1,170 @@
 args:
 - name: scan_id
-  description: Restrict the run to these scan_id(s), comma-separated. Empty = all in scope.
+  description: Restrict which scans are WRITTEN to these scan_id(s), comma-separated. It does not reduce the read cost — nothing but a query can say which shard holds which scan, so every host shard is still read once. Empty = every eligible scan.
+  required: false
   isArray: true
+  secret: false
 - name: schema_version
-  description: Lookup schema version to act on. The scanner currently writes 3.
-  defaultValue: '3'
+  description: Lookup schema version to act on — the scanner's YARA_LOOKUP_SCHEMA_VER. It selects which shards are in scope AND which query shape is used — v4 expands the `rules` JSON array, v2/v3 read their scalar `rule` column directly.
+  required: false
+  isArray: false
+  defaultValue: '4'
+  secret: false
 - name: retention_hours
-  description: A scan with no terminal status is treated as finished past this age; lifecycle datasets are deleted past it too.
+  description: A scan with no terminal lifecycle status is treated as finished past this age. It is ONLY that threshold — unlike YaraConsolidateFast this is NOT a deletion window, because this automation deletes nothing at all.
+  required: false
+  isArray: false
   defaultValue: '24'
+  secret: false
 - name: execute
-  description: Set true to actually merge and delete. Omitted or false = dry run.
+  description: Set true to actually create the per-scan summary targets and write to them. Omitted or false = dry run, which reports exactly what it would write and its XQL cost while creating and writing nothing.
+  required: false
+  isArray: false
   defaultValue: 'false'
-comment: Cheap consolidation. Merges each finished scan's findings into its per-scan dataset and deletes the source, WITHOUT a row-count verification pass - a small fraction of the queries of YaraConsolidateApply. Lifecycle (scans) datasets are never merged, only retained for retention_hours then deleted. Duplicate rows in a target are possible and accepted. DRY RUN unless execute=true.
+  predefined:
+  - 'true'
+  - 'false'
+  secret: false
+comment: SUMMARY-ONLY consolidation — which rules fired on which host. Writes ONE ROW PER (host, rule) into yara_scanner_summary_v<VER>_scan_<slug>, with just four columns (scan_id, hostname, rule, event_timestamp_ms). No filename, no offsets, no per-rule counts. The rule list comes from ONE XQL per host shard that expands the v4 `rules` JSON array and groups inside the engine, so a naive full-shard read is never made. THIS AUTOMATION NEVER DELETES A HOST SHARD OR A ROW INSIDE ONE — that is its most important difference from YaraConsolidateApply and YaraConsolidateFast, both of which delete a merged source. Under the owner's model the per-host matches dataset is permanent and is overwritten by the next scan on that host; it is the deep-dive source a summary row points back to, so destroying it would make this automation's own output unusable. Still-running scans are left alone, a writing run takes the same consolidation lock the other two take, and it is a DRY RUN unless execute=true.
 commonfields:
-  id: YaraConsolidateFast
+  id: YaraConsolidateSummary
   version: -1
 enabled: true
-name: YaraConsolidateFast
+name: YaraConsolidateSummary
 outputs:
-- contextPath: Yara.Fast.dry_run
-  description: Whether this was a dry run.
+- contextPath: Yara.ConsolidateSummary.dry_run
+  description: Whether this was a dry run (true unless execute=true was passed).
   type: Boolean
-- contextPath: Yara.Fast.xql_calls
-  description: Number of XQL queries the pass made.
+- contextPath: Yara.ConsolidateSummary.xql_calls
+  description: XQL queries this pass issued, counted whether they succeeded or failed. Excludes the one dataset listing, which is not an XQL.
   type: Number
-- contextPath: Yara.Fast.merged
-  description: Shards merged into their per-scan target.
+- contextPath: Yara.ConsolidateSummary.written
+  description: Per-scan summary targets written (or, in a dry run, that would be written), with row count, host count and why the scan was eligible.
   type: Unknown
-- contextPath: Yara.Fast.deleted
-  description: Datasets deleted.
+- contextPath: Yara.ConsolidateSummary.skipped
+  description: Scans and shards left alone, with the reason — a still-running scan, or a target already holding exactly this run's row count.
   type: Unknown
-- contextPath: Yara.Fast.skipped
-  description: Datasets left alone, with the reason.
+- contextPath: Yara.ConsolidateSummary.failed
+  description: Scans that could not be summarised. Host shards are untouched in every case, so re-running is always safe.
   type: Unknown
-- contextPath: Yara.Fast.failed
-  description: Merges that failed; their shards were kept.
+- contextPath: Yara.ConsolidateSummary.schema_version
+  description: The lookup schema version this run acted on.
+  type: String
+- contextPath: Yara.ConsolidateSummary.retention_hours
+  description: The abandoned-scan threshold this run used.
+  type: Number
+- contextPath: Yara.ConsolidateSummary.shards_deleted
+  description: Always 0, and asserted as such — this automation has no deletion path. Present so a dashboard or playbook can prove the difference from YaraConsolidateFast.
+  type: Number
+- contextPath: Yara.ConsolidateSummary.findings_collapsed
+  description: File-level findings behind the summary rows, i.e. how much detail the summary collapsed. Reported only; it is never written into a row.
+  type: Number
+- contextPath: Yara.ConsolidateSummary.query_modes
+  description: Which query shape each shard resolved with — "single-query" (one XQL per shard) or "per-scan fallback" (the tenant rejected the extended comp stage).
   type: Unknown
 script: |
-  """YaraConsolidateFast - cheap consolidation. Merge findings, retire the rest, no verify.
+  """YaraConsolidateSummary - SUMMARY-ONLY consolidation. Which rules fired on which host.
 
   STANDALONE: carries everything it needs. Imports no other automation and neither
   demistomock nor CommonServerPython - the tenant injects demisto and the CommonServerPython
   helpers implicitly.
 
-  This is the deliberately cheaper sibling of YaraConsolidateApply, offered alongside it
-  rather than replacing it. The two differ in one decision only: whether to prove the merge
-  before deleting the source.
+  This is the second of the two consolidation variants the owner's model requires. The host
+  dataset and the scanner behave IDENTICALLY under both; only what consolidation COPIES OUT
+  differs:
 
-    YaraConsolidateApply  counts every row into the target and refuses to delete unless the
-                          totals agree. Many queries, minutes on a large tenant, and a
-                          guarantee you can show an auditor.
-    YaraConsolidateFast   merges and deletes without that proof. A small fraction of the
-                          queries. Duplicate rows are possible and accepted.
+    A. FULL DETAIL   YaraConsolidateApply / YaraConsolidateFast - every matched-file row is
+                     copied into yara_scanner_matches_v<VER>_scan_<slug>.
+    B. SUMMARY ONLY  this file - ONE ROW PER (host, rule) into
+                     yara_scanner_summary_v<VER>_scan_<slug>. Four columns: scan_id,
+                     hostname, rule, event_timestamp_ms. No filename, no offsets, no counts.
 
-  WHAT MAKES IT CHEAP. Three costs were removed, all of them decision-making rather than work:
+  ################################################################################
+  # THIS AUTOMATION NEVER DELETES A HOST SHARD. NOT THE MATCHES DATASET, NOT THE #
+  # SCANS DATASET, NOT ROWS INSIDE EITHER.                                       #
+  #                                                                              #
+  # That is the single most important behavioural difference from                #
+  # YaraConsolidateApply and YaraConsolidateFast, both of which delete a source   #
+  # shard once its rows are safely in the per-scan target.                       #
+  #                                                                              #
+  # Under the owner's model the matches dataset                                  #
+  #     yara_scanner_matches_v4_<host>_<6hex>   (no scan_id, no month suffix)     #
+  # is ONE PER HOST, PERMANENT, and never accumulates: the scanner OVERWRITES it  #
+  # at the start of every scan, clearing the previous scan_id's rows before it    #
+  # writes its own (xdr_yara_scanner.py:4577 `_flush_stale_matches`, called from  #
+  # :4450 before the writer thread exists). It always persists, and it is THE     #
+  # DEEP-DIVE SOURCE - the only place the per-file detail behind a summary row    #
+  # still lives. Deleting it would destroy that source, and nothing would ever    #
+  # recreate it: the scanner only writes the CURRENT scan.                        #
+  #                                                                              #
+  # A summary row says "rule R fired on host H during scan S". The question it    #
+  # provokes is always "on WHICH FILES?", and the host dataset is the only        #
+  # answer. An automation that deleted it would make its own output unusable.     #
+  #                                                                              #
+  # It is also why this file needs no write verification (see main()): the source #
+  # outlives the run, so a failed or partial write is fully recoverable by simply #
+  # running again. YaraConsolidateApply must count rows into its target before    #
+  # deleting the source; there is nothing to prove here because nothing is lost.  #
+  ################################################################################
 
-    1. Lifecycle state now comes from ONE `comp ... by scan_id` aggregate per scans shard.
-       The verified path calls _rows_of() - `dataset = X` with limit=50000 - pulling every
-       lifecycle row from every shard purely to read a status field. On the live tenant that
-       is a full-table read per dataset, repeated across four kind x version passes.
-    2. filter_unconsolidated is not called at all. It costs two XQL per candidate and exists
-       to prove a scan already reached its target, which is exactly the proof this variant is
-       choosing not to buy.
-    3. No target row-count, no source/target comparison.
+  HOW THE RULE LIST IS OBTAINED CHEAPLY. Under v4 a matches row is one per matched FILE, and
+  every rule that hit that file is folded into a JSON array in the `rules` TEXT column
+  (xdr_yara_scanner.py:4239-4260). Reading rows to learn which rules fired would therefore
+  pull the entire shard - the exact cost this variant exists to avoid. Instead ONE XQL per
+  host shard does the expansion and the grouping inside the engine:
 
-  Reading rows in order to MERGE them is unavoidable and remains. The saving is entirely in
-  not reading rows to DECIDE things.
+      dataset = <shard>
+      | alter r = json_extract_array(rules, "$")
+      | arrayexpand r
+      | alter rule = json_extract_scalar(r, "$.rule")
+      | comp count() as n, max(event_timestamp_ms) as ts by scan_id, hostname, rule
 
-  THE TWO KINDS ARE TREATED DIFFERENTLY, and the asymmetry is the design:
+  and returns one row per (scan, host, rule) - already the shape of the output. The expansion
+  idiom is the one verified live on this tenant and recorded at xdr_yara_scanner.py:4250-4256;
+  the additions are confined to that one `comp` stage and each has its own live precedent:
+  `max(event_timestamp_ms)` alongside `count()` in a single comp over a matches shard is what
+  `_scan_stats` already runs (see this file's inlined copy), and grouping the expanded stream
+  by `scan_id, hostname` is the form recorded at
+  xdr/docs/design/Dataset_Management_v2_Design.md:855-861.
 
-    matches shards hold FINDINGS - the thing worth keeping. Merged into the per-scan target,
-                    then deleted.
-    scans shards   hold LIFECYCLE ROWS - start/heartbeat/terminal markers. Worth nothing once
-                    the scan is over, so they are never merged: just retained for
-                    retention_hours and then deleted outright.
+  `n` is the verified pattern's own aggregate and is deliberately DISCARDED - it is only
+  summed into a log line. Per-rule counts are NOT part of the summary schema: the owner ruled
+  them out because a count column turns every dashboard query over the summary into an
+  aggregation over numbers instead of a distinct-set lookup.
 
-  ORDERING IS LOAD-BEARING. The scans shards are the only record of whether a scan finished,
-  so this reads lifecycle state FIRST, decides every matches shard, and only THEN deletes the
-  aged-out scans shards. Deleting a scans shard before its matches sibling is decided destroys
-  the input that decision depends on. It stays self-consistent because once a scans shard is
-  gone, any surviving matches shard is necessarily older than the retention window and
-  qualifies on age alone.
+  SCHEMA VERSIONS. v4 needs the array expansion above. v2/v3 shards carry a scalar `rule`
+  column per row (MATCHES_SCHEMA / MATCHES_SCHEMA_V3 below), so for those the same comp stage
+  runs directly with no expansion. A fleet mid-rollout holds both shapes at once and both
+  summarise correctly.
 
-  THE ONE SAFETY RULE KEPT. A matches shard is deleted only if EVERY write that merged its
-  rows returned success. That is not a count comparison and costs no extra query - it is
-  simply not ignoring an error return. Duplicates are survivable; silent loss is not.
+  GATES, identical in spirit to the other two automations:
+    * A scan is summarised only once it is TERMINAL (a completed/cancelled/failed lifecycle
+      row in its scans shard) or its lifecycle has been silent for longer than
+      retention_hours. A still-running scan is left entirely alone - its host dataset is being
+      written to right now and the rule set is incomplete.
+    * A writing run takes the same `yara_scanner_consolidation_lock` YaraConsolidateApply and
+      YaraConsolidateFast take. Being the cheap variant does not make a collision cheaper.
+    * DRY RUN BY DEFAULT. Without execute=true nothing is created and nothing is written; the
+      run reports exactly what it would have written, and its XQL cost.
 
-  RESIDUAL RISK, stated plainly: if the same scan is processed twice, its rows land in the
-  target twice. Searches show the finding twice. Nothing is lost, and the merged dataset is
-  not a provably exact copy of what the endpoints wrote.
+  ARGUMENTS
+    scan_id          CSV. Restrict which scans are WRITTEN. It does not reduce the read cost:
+                     nothing but a query can say which shard holds which scan, so every host
+                     shard is still read once. Omit to summarise every eligible scan.
+    schema_version   The scanner's YARA_LOOKUP_SCHEMA_VER, e.g. "4". Selects which shards are
+                     in scope AND which query shape is used (see SCHEMA VERSIONS above).
+    retention_hours  Default 24. ONLY the abandoned-scan threshold: how long a non-terminal
+                     scan's lifecycle may be silent before it is summarised anyway. It is NOT
+                     a deletion window - this automation deletes nothing, so unlike
+                     YaraConsolidateFast it never retires an aged-out scans shard either.
+    execute          "true" to write. Anything else, including absent, is a dry run.
+
+  IDEMPOTENCY. A summary target that already holds exactly the row count this run computed is
+  left untouched, not rewritten. One that holds a DIFFERENT non-zero count is reported and NOT
+  written to - appending would duplicate (host, rule) pairs, and this file has no delete path
+  to undo that with. Re-run YaraConsolidateSummary after clearing that target if the mismatch
+  is real.
   """
-
   # ============================================================================
   # Inlined verbatim from the shared consolidation library. Do not edit here in
   # isolation - tests/ gates this against xdr_consolidate.py and xdr_data_management.py.
@@ -126,9 +200,6 @@ script: |
   DEFAULT_ABANDONED_SECS = 24 * 3600
   DELETE_CONCURRENCY = 12
   _WRITE_BATCH = 500
-  # Read cap for a single scan's merge. A scan larger than this is refused by the fast path
-  # rather than silently truncated - see the truncation guard in main().
-  _READ_LIMIT = 50000
   # Endpoint-clock-skew tolerances (edge case #6) — kept in sync with xdr_consolidate.py, see
   # that module for the reasoning and the live measurements behind both numbers.
   SKEW_TOLERANCE_MS = 5 * 60 * 1000
@@ -1657,25 +1728,191 @@ script: |
                   time.sleep(5 * (attempt + 1))
           raise last
 
+  # ============================================================================
+  # YaraConsolidateSummary entry point
+  # ============================================================================
 
-  # ============================================================================
-  # YaraConsolidateFast entry point
-  # ============================================================================
+  # The summary row, and the schema its per-scan target is CREATED with. FOUR COLUMNS, by
+  # design. A dataset created from a wider schema would silently swallow nothing, but a
+  # dataset created from a NARROWER one silently swallows every extra field XDR does not know
+  # about (no error) - so this dict is the contract, not a suggestion.
+  #
+  # Deliberately absent, all on the owner's instruction:
+  #   filename / file_sha256 / offsets  - that is the deep-dive, and the host dataset keeps it.
+  #   n / match_count / rule_count      - per-rule counts turn every dashboard query over this
+  #                                       dataset into an aggregation over numbers rather than
+  #                                       a distinct-set lookup, which is what makes the
+  #                                       summary cheap to query in the first place.
+  SUMMARY_SCHEMA = {
+      "scan_id": "text",
+      "hostname": "text",
+      "rule": "text",
+      "event_timestamp_ms": "number",
+  }
+
+  # Row size ~163 B measured. A lookup dataset caps at 50 MB, so a single per-scan summary
+  # target tops out around 321,000 (host, rule) pairs: the fleet limit is RULES MATCHED PER
+  # HOST multiplied by hosts in the scan, never host count on its own.
+  _SUMMARY_ROW_BYTES = 163
+
+  # Target-name kind. "summary", NOT "matches_summary", and the choice is load-bearing:
+  #
+  #   yara_scanner_summary_v4_scan_<slug>          <- what this writes
+  #   yara_scanner_matches_summary_v4_scan_<slug>  <- REJECTED
+  #
+  # The rejected form matches YARA_OWNED_RE (`yara_scanner_matches(_.*)?`) but NOT CURRENT_RE
+  # (which requires `matches_v<VER>`), so classify_yara_datasets would file every summary
+  # target under LEGACY - i.e. a YaraCleanup run with delete_legacy=true would delete them all.
+  # The chosen form matches neither regex, so it is invisible to that classification and can
+  # never become a deletion candidate. It is equally invisible to _SHARD_RE, so no
+  # consolidation pass can ever mistake a summary target for a source shard and try to merge
+  # it into itself.
+  #
+  # The consequence, stated rather than hidden: YaraCleanup will never prune summary targets
+  # either. That matches how the pack already treats per-scan consolidated targets (never
+  # candidates), and these are the smallest datasets the pipeline produces.
+  _SUMMARY_KIND = "summary"
+
+  # One host shard yields at most (rules matched on that host) summary rows, so this cap is
+  # far above anything a single shard can produce. It is still a cap: a read that comes back
+  # at exactly the limit is reported rather than trusted.
+  _SUMMARY_LIMIT = 10000
+
+
+  def summary_target_name(ver, scan_id):
+      """yara_scanner_summary_v<VER>_scan_<slug>. Same slugifier as every other per-scan
+      target, so the summary and full-detail targets for one scan share a slug."""
+      return target_name(_SUMMARY_KIND, ver, scan_id)
+
+
+  def summary_query(dataset, ver):
+      """The ONE query this automation is built around: one row per (scan_id, hostname, rule),
+      computed entirely in the engine.
+
+      v4 folds every rule that hit a file into the `rules` JSON array, so the array is expanded
+      first; v2/v3 carry a scalar `rule` column per row and need no expansion. See the module
+      docstring for the provenance of each stage.
+      """
+      if str(ver) == "4":
+          return ('dataset = %s | alter r = json_extract_array(rules, "$") | arrayexpand r '
+                  '| alter rule = json_extract_scalar(r, "$.rule") '
+                  '| comp count() as n, max(event_timestamp_ms) as ts '
+                  'by scan_id, hostname, rule' % dataset)
+      return ('dataset = %s | comp count() as n, max(event_timestamp_ms) as ts '
+              'by scan_id, hostname, rule' % dataset)
+
+
+  def summary_query_fallback(dataset, scan_id):
+      """The EXACT idiom recorded as verified at xdr_yara_scanner.py:4250-4256, scoped to one
+      scan by the `filter scan_id = "..."` prefix that _rows_for_scan already uses live.
+
+      It exists because summary_query() extends that idiom's `comp` stage (an extra aggregate
+      and two extra group keys). If a tenant ever rejects the extended form, the automation
+      falls back to the unmodified one rather than failing the shard - at the cost of one query
+      per scan instead of one per shard, and of no `ts` (the caller then stamps the row from
+      lifecycle recency, see main()).
+      """
+      safe = str(scan_id).replace('"', "")
+      return ('dataset = %s | filter scan_id = "%s" '
+              '| alter r = json_extract_array(rules, "$") | arrayexpand r '
+              '| alter rule = json_extract_scalar(r, "$.rule") '
+              '| comp count() as n by hostname, rule' % (dataset, safe))
+
+
+  def _shard_scan_ids(client, dataset):
+      """Distinct scan_ids in a shard - the same `comp count() by <field>` idiom
+      xdr_action_center.py:455-457 uses against these datasets, and the one the scanner's own
+      overwrite uses (xdr_yara_scanner.py:4703). Only the fallback path needs it."""
+      rows = client.xql("dataset = %s | fields scan_id | comp count() as n by scan_id"
+                        % dataset, limit=10000) or []
+      out = []
+      for r in rows:
+          sid = r.get("scan_id") if isinstance(r, dict) else None
+          if sid and sid not in out:
+              out.append(str(sid))
+      return out
+
+
+  def summarise_shard(client, dataset, ver, qcount, log, findings=None):
+      """[(scan_id, hostname, rule, ts_ms_or_None)] for ONE host shard.
+
+      Primary path: a single XQL. Falls back to the unmodified verified idiom (one query per
+      scan) only if that single query is rejected. `findings` accumulates the discarded count()
+      aggregate purely so the run can report how many file-level findings collapsed into the
+      summary; it never reaches a row.
+      """
+      p = parse_shard(dataset)
+      if not p or p["kind"] != "matches":
+          # Guards the XQL interpolation. Every name reaching here came from
+          # _list_yara_datasets and then parse_shard, whose regex is anchored and admits only
+          # the yara_scanner_(matches|scans)_v<N>_<host>_<6hex>[_<YYYYMM>] shape - but the host
+          # segment originates as a HOSTNAME, so the check is made explicitly rather than
+          # assumed (same reasoning as xdr_action_center.py:452-454).
+          raise ValueError("refusing non-matches dataset in XQL: %s" % dataset)
+
+      try:
+          # Counted BEFORE the call, here and everywhere below: a query that fails still cost
+          # the tenant a query, and the reported figure is meant to be the run's real cost.
+          qcount[0] += 1
+          rows = client.xql(summary_query(dataset, ver), limit=_SUMMARY_LIMIT) or []
+          if len(rows) >= _SUMMARY_LIMIT:
+              # Not silent truncation: say so. Nothing is deleted on the strength of this read,
+              # so a short read costs coverage, never data.
+              log("  ! %s returned %d rows - at the %d-row read cap; its summary may be "
+                  "incomplete" % (dataset, len(rows), _SUMMARY_LIMIT))
+          out = []
+          for r in rows:
+              sid, host, rule = r.get("scan_id"), r.get("hostname"), r.get("rule")
+              if not sid or not rule:
+                  continue
+              if findings is not None:
+                  try:
+                      findings[0] += int(r.get("n") or 0)
+                  except (TypeError, ValueError):
+                      pass
+              out.append((str(sid), str(host or ""), str(rule), _as_ms(r.get("ts"))))
+          return out, "single-query"
+      except Exception as e:
+          if str(ver) != "4":
+              raise
+          log("  ! per-shard summary query failed on %s (%s) - retrying with the unmodified "
+              "per-scan form" % (dataset, str(e)[:140]))
+
+      out = []
+      qcount[0] += 1
+      sids = _shard_scan_ids(client, dataset)
+      for sid in sids:
+          qcount[0] += 1
+          rows = client.xql(summary_query_fallback(dataset, sid), limit=_SUMMARY_LIMIT) or []
+          for r in rows:
+              rule = r.get("rule")
+              if not rule:
+                  continue
+              if findings is not None:
+                  try:
+                      findings[0] += int(r.get("n") or 0)
+                  except (TypeError, ValueError):
+                      pass
+              out.append((str(sid), str(r.get("hostname") or ""), str(rule), None))
+      return out, "per-scan fallback"
 
 
   def _lifecycle_state(client, scans_shards, log, qcount):
       """scan_id -> {"terminal": bool, "newest_ms": int} from ONE aggregate per shard.
 
-      The expensive path reads every lifecycle row to learn this. A comp stage returns one
-      row per (scan_id, status) instead, which is the entire cost saving in one function.
+      Ported from YaraConsolidateFast, for the same reason it exists there: reading every
+      lifecycle row to learn a status field is a full-table read per dataset, and a comp stage
+      answers the same question in one row per (scan_id, status). One deviation from that
+      copy - the query counter is incremented BEFORE the call rather than after, so a shard
+      whose lifecycle is unreadable still counts toward the run's reported cost.
       """
       state = {}
       for ds in scans_shards:
           try:
+              qcount[0] += 1
               rows = client.xql("dataset = %s | comp count() as n, "
                                 "max(event_timestamp_ms) as newest by scan_id, status" % ds,
                                 limit=10000) or []
-              qcount[0] += 1
           except Exception as e:
               # Unreadable lifecycle means UNKNOWN, never "finished". Skipping the shard is
               # the safe direction: it survives to the next run.
@@ -1708,29 +1945,33 @@ script: |
       try:
           set_schema_version(args.get("schema_version") or DEFAULT_SCHEMA_VERSION)
       except Exception as ex:
-          return_error("YaraConsolidateFast: invalid argument (%s)." % ex)
+          return_error("YaraConsolidateSummary: invalid argument (%s)." % ex)
           return
 
       ver = str(YARA_SCHEMA_VERSION)
       cutoff_ms = retention_hours * 3600 * 1000
       now_ms = int(time.time() * 1000)
-      qcount = [0]
-      merged, deleted, skipped, failed = [], [], [], []
+      qcount = [0]          # XQL queries ISSUED, succeeded or not; the dataset listing is not
+                            # an XQL and is reported separately rather than folded in here
+      findings = [0]        # the discarded count() aggregate, summed for the report line
+      written, skipped, failed, modes = [], [], [], set()
 
       client = CoreApiClient()
 
-      # Writing runs take the same lock the verified path uses. Two passes mutating the same
-      # shards is the collision the lock exists for, and being the cheap variant does not
-      # make that collision cheaper.
-      if execute and not acquire_consolidation_lock(client, log=log, holder="YaraConsolidateFast"):
+      # A writing run takes the same lock the other two consolidation automations take. Two
+      # passes creating and filling the same per-scan target is exactly the collision it
+      # exists for, and writing only four columns does not make that collision cheaper.
+      # A dry run never takes it - it mutates nothing.
+      if execute and not acquire_consolidation_lock(client, log=log,
+                                                    holder="YaraConsolidateSummary"):
           return_results(CommandResults(
               readable_output="Another consolidation run holds the lock - nothing was touched.",
-              outputs_prefix="Yara.Fast", outputs={"status": "lock_held_by_other_run"}))
+              outputs_prefix="Yara.ConsolidateSummary",
+              outputs={"status": "lock_held_by_other_run"}))
           return
 
       try:
           names = _list_yara_datasets(client)
-          qcount[0] += 1
           shards = {}
           for n in names:
               p = parse_shard(n)
@@ -1738,121 +1979,122 @@ script: |
                   shards[n] = p
           scans_ds = [n for n, p in shards.items() if p["kind"] == "scans"]
           match_ds = [n for n, p in shards.items() if p["kind"] == "matches"]
-          log("schema v%s: %d matches shard(s), %d scans shard(s)" % (ver, len(match_ds), len(scans_ds)))
+          existing = set(names)
+          log("schema v%s: %d matches shard(s), %d scans shard(s)"
+              % (ver, len(match_ds), len(scans_ds)))
 
-          # ---- 1. lifecycle FIRST, before anything is deleted --------------------------
+          # ---- 1. lifecycle, so a still-running scan can be told from a finished one ------
           state = _lifecycle_state(client, scans_ds, log, qcount)
           log("lifecycle: %d scan(s) known" % len(state))
 
-          # ---- 2. decide and merge every matches shard --------------------------------
-          schema = matches_schema_for(ver)
+          # ---- 2. ONE query per host shard -> (scan_id, hostname, rule) -------------------
+          # Every shard is read BEFORE any scan is written, because a scan can span hosts and
+          # its summary must carry every host's rules, not the first shard's.
+          by_scan = {}
           for ds in sorted(match_ds):
               try:
-                  rows = client.xql("dataset = %s | comp count() as n by scan_id" % ds, limit=10000) or []
-                  qcount[0] += 1
+                  tuples, mode = summarise_shard(client, ds, ver, qcount, log, findings)
+                  modes.add(mode)
               except Exception as e:
-                  skipped.append("%s: unreadable (%s)" % (ds, e))
+                  skipped.append("%s: unreadable (%s)" % (ds, str(e)[:120]))
                   continue
-              all_sids = [r.get("scan_id") for r in rows if r.get("scan_id")]
-              sids = [s for s in all_sids if s in only] if only else list(all_sids)
-              # A shard holds MANY scans. Deleting it is only safe when every scan it holds
-              # was handled in this run -- not merely every scan we were asked to handle.
-              # Without this, scoping to one scan_id and succeeding would delete the whole
-              # shard and take every other scan in it, including ones still running.
-              scoped_out = [s for s in all_sids if s not in sids]
-              if not sids:
-                  skipped.append("%s: no scans in scope" % ds)
+              for sid, host, rule, ts in tuples:
+                  # Dedupe on the full key: one host normally lives in exactly one shard, but a
+                  # host that still has a pre-rotation-change month-suffixed matches dataset
+                  # alongside its permanent one is two shards for one host. Keep the newest ts.
+                  slot = by_scan.setdefault(sid, {})
+                  prev = slot.get((host, rule))
+                  slot[(host, rule)] = _max_ms(prev, ts) if prev is not None else ts
+
+          log("collected %d scan(s) across %d matches shard(s); %d file-level finding(s) "
+              "collapsed" % (len(by_scan), len(match_ds), findings[0]))
+
+          # ---- 3. gate, then write ONE ROW PER (host, rule) -------------------------------
+          for sid in sorted(by_scan):
+              if only and sid not in only:
+                  continue
+              pairs = by_scan[sid]
+              st = state.get(sid) or {}
+              terminal = bool(st.get("terminal"))
+              # Recency: the lifecycle stamp, or - when the scan has NO lifecycle row at all
+              # (its scans shard was pruned, or rotated to a month this pass did not see) - the
+              # newest matches stamp this run already read, for free. Without that second
+              # source such a scan could never be summarised, and unlike the deleting variants
+              # there is no danger in judging it: nothing is destroyed either way.
+              newest = int(st.get("newest_ms") or 0)
+              for ts in pairs.values():
+                  newest = max(newest, int(ts or 0))
+              aged = bool(newest) and (now_ms - newest) >= cutoff_ms
+              if not terminal and not aged:
+                  skipped.append("%s: scan still in progress - left alone" % sid[:34])
+                  continue
+              why = "completed" if terminal else "no lifecycle activity for %gh" % retention_hours
+
+              rows = [{"scan_id": sid, "hostname": host, "rule": rule,
+                       "event_timestamp_ms": int(ts) if ts else (newest or now_ms)}
+                      for (host, rule), ts in sorted(pairs.items())]
+              rows = [_coerce_row(r, SUMMARY_SCHEMA) for r in rows]
+              hosts = len({h for h, _ in pairs})
+              target = summary_target_name(ver, sid)
+
+              if dry:
+                  written.append("%s: WOULD write %d (host, rule) row(s) from %d host(s) -> %s "
+                                 "(%s, ~%.1f KB)"
+                                 % (sid[:34], len(rows), hosts, target, why,
+                                    len(rows) * _SUMMARY_ROW_BYTES / 1024.0))
                   continue
 
-              all_done = True
-              for sid in sids:
-                  st = state.get(sid) or {}
-                  terminal = bool(st.get("terminal"))
-                  newest = st.get("newest_ms") or 0
-                  aged = bool(newest) and (now_ms - newest) >= cutoff_ms
-                  if not terminal and not aged:
-                      # Still running, or too new to call abandoned. Leave it entirely alone.
-                      skipped.append("%s [%s]: scan still in progress" % (ds, sid[:34]))
-                      all_done = False
-                      continue
-                  why = "completed" if terminal else "older than %gh" % retention_hours
-                  if dry:
-                      merged.append("%s [%s]: WOULD merge (%s)" % (ds, sid[:34], why))
-                      continue
-                  target = target_name("matches", ver, sid)
+              # Idempotency. The target name is built by target_name(), which slugifies the
+              # scan_id down to [a-z0-9_], so interpolating it into XQL here is safe.
+              pre = 0
+              if target in existing:
                   try:
-                      src = _rows_for_scan(client, ds, sid, limit=_READ_LIMIT)
                       qcount[0] += 1
-                      # TRUNCATION GUARD. _rows_for_scan caps the read. Getting back exactly
-                      # the cap means the read may have been cut short, and we cannot tell a
-                      # scan of exactly N rows from one of N+1 without another query -- which
-                      # is the query this variant exists to avoid.
-                      #
-                      # The verified path is immune to this: it compares source and target
-                      # counts, so a short read shows up as a mismatch and nothing is deleted.
-                      # Dropping that comparison is precisely what exposes the cap, so the cap
-                      # needs its own guard or the two decisions combine into silent loss:
-                      # merge 50,000 of 60,000 rows, then delete the only copy of the other
-                      # 10,000. Duplicates are survivable; this would not be.
-                      if len(src) >= _READ_LIMIT:
-                          failed.append("%s [%s]: read hit the %d-row cap - shard KEPT, use "
-                                        "YaraConsolidateApply for this scan"
-                                        % (ds, sid[:34], _READ_LIMIT))
-                          all_done = False
-                          continue
-                      payload = [_coerce_row(r, schema) for r in src]
-                      ok = True
-                      if payload:
-                          client.create_lookup_dataset(target, schema)
-                          for i in range(0, len(payload), _WRITE_BATCH):
-                              reply = client.add_lookup_data(target, payload[i:i + _WRITE_BATCH])
-                              if _added(reply) <= 0:
-                                  # A batch that added nothing is a failed write. Keeping the
-                                  # shard is the whole safety rule; do not delete on this path.
-                                  ok = False
-                                  break
-                      if ok:
-                          merged.append("%s [%s]: merged %d row(s) -> %s (%s)"
-                                        % (ds, sid[:34], len(payload), target, why))
-                      else:
-                          failed.append("%s [%s]: write failed - shard KEPT" % (ds, sid[:34]))
-                          all_done = False
+                      pre = _count(client, target)
                   except Exception as e:
-                      failed.append("%s [%s]: %s - shard KEPT" % (ds, sid[:34], e))
-                      all_done = False
-
-              # Delete the shard only when every scan it holds was dealt with successfully
-              # AND none were left out of scope by a scan_id filter.
-              if scoped_out:
-                  skipped.append("%s: kept - %d other scan(s) in it were not in scope"
-                                 % (ds, len(scoped_out)))
-              elif all_done and not dry:
-                  deleted.append(ds)
-              elif all_done and dry:
-                  deleted.append("%s (WOULD delete)" % ds)
-
-          # ---- 3. only NOW retire aged-out scans shards -------------------------------
-          scans_to_delete = []
-          for ds in sorted(scans_ds):
-              sids = [s for s, v in state.items() if v.get("newest_ms")]
-              try:
-                  rows = client.xql("dataset = %s | comp max(event_timestamp_ms) as newest" % ds, limit=5) or []
-                  qcount[0] += 1
-                  newest = _as_ms(rows[0].get("newest")) if rows else None
-              except Exception as e:
-                  skipped.append("%s: recency unreadable (%s)" % (ds, e))
+                      failed.append("%s: could not count existing target %s (%s) - NOT written"
+                                    % (sid[:34], target, str(e)[:100]))
+                      continue
+              if pre and pre == len(rows):
+                  skipped.append("%s: target already holds %d row(s) - verified, not rewritten"
+                                 % (sid[:34], pre))
                   continue
-              if newest and (now_ms - newest) >= cutoff_ms:
-                  scans_to_delete.append(ds)
-              else:
-                  skipped.append("%s: lifecycle newer than %gh - kept" % (ds, retention_hours))
+              if pre:
+                  # Appending would duplicate (host, rule) pairs, and this automation has no
+                  # delete path to undo that with. Report and leave it alone - the host dataset
+                  # still holds everything, so nothing is lost by declining.
+                  failed.append("%s: target %s holds %d row(s), this run computed %d - NOT "
+                                "written (appending would duplicate (host, rule) pairs)"
+                                % (sid[:34], target, pre, len(rows)))
+                  continue
 
-          if not dry:
-              to_del = [d for d in deleted if " " not in d] + scans_to_delete
-              if to_del:
-                  _delete_many(client, to_del, log)
-          else:
-              deleted += ["%s (WOULD delete - aged lifecycle)" % d for d in scans_to_delete]
+              try:
+                  client.create_lookup_dataset(target, SUMMARY_SCHEMA)
+                  added, ok = 0, True
+                  for i in range(0, len(rows), _WRITE_BATCH):
+                      reply = client.add_lookup_data(target, rows[i:i + _WRITE_BATCH])
+                      got = _added(reply)
+                      if got <= 0:
+                          # A batch that added nothing is a failed write. There is no source to
+                          # protect here (nothing is ever deleted), so this is reported rather
+                          # than guarded against - re-running simply retries.
+                          ok = False
+                          break
+                      added += got
+                  if ok:
+                      written.append("%s: wrote %d (host, rule) row(s) from %d host(s) -> %s (%s)"
+                                     % (sid[:34], added, hosts, target, why))
+                  else:
+                      failed.append("%s: write to %s returned 0 rows added after %d - re-run to "
+                                    "retry (host shards are untouched)" % (sid[:34], target, added))
+              except Exception as e:
+                  failed.append("%s: %s - host shards untouched" % (sid[:34], str(e)[:140]))
+
+          # ---- 4. there is no step 4. NOTHING IS DELETED. ---------------------------------
+          # No delete_dataset, no remove_lookup_data, no _delete_many anywhere in this file.
+          # The host matches dataset is permanent and is overwritten by the NEXT scan on that
+          # host; the scans shard is the lifecycle record every future pass gates on. See the
+          # banner in the module docstring.
 
       finally:
           if execute:
@@ -1861,25 +2103,37 @@ script: |
               except Exception as e:
                   log("lock release failed: %s" % e)
 
-      head = "DRY RUN - nothing was changed." if dry else "EXECUTED."
-      out = ["%s  XQL calls: %d" % (head, qcount[0]),
-             "merged: %d | deleted: %d | skipped: %d | failed: %d"
-             % (len(merged), len(deleted), len(skipped), len(failed))]
-      for label, items in (("MERGED", merged), ("DELETED", deleted),
-                           ("SKIPPED", skipped), ("FAILED", failed)):
+      head = "DRY RUN - nothing was created or written." if dry else "EXECUTED."
+      out = ["%s  XQL calls: %d (+1 dataset listing)%s"
+             % (head, qcount[0],
+                ("  [%s]" % ", ".join(sorted(modes))) if modes else ""),
+             "written: %d | skipped: %d | failed: %d | file-level findings collapsed: %d"
+             % (len(written), len(skipped), len(failed), findings[0]),
+             "host shards deleted: 0 (this automation never deletes - the host dataset is the "
+             "deep-dive source)"]
+      for label, items in (("WRITTEN", written), ("SKIPPED", skipped), ("FAILED", failed)):
           if items:
               out.append("")
               out.append("%s:" % label)
               out += ["  " + s for s in items[:60]]
               if len(items) > 60:
                   out.append("  ... and %d more" % (len(items) - 60))
+      lock_log = [m for m in log_lines if "lock" in m.lower()]
+      if lock_log:
+          out.append("")
+          out.append("lock events:")
+          out += ["  " + m for m in lock_log]
 
-      demisto.executeCommand("DeleteContext", {"key": "Yara.Fast"})
-      result = {"dry_run": dry, "xql_calls": qcount[0], "merged": merged,
-                "deleted": deleted, "skipped": skipped, "failed": failed,
-                "schema_version": ver, "retention_hours": retention_hours}
+      # Same context-accumulation risk as the other automations - clear before writing so the
+      # written/skipped/failed lists never carry stale entries from a prior call to the same
+      # investigation.
+      demisto.executeCommand("DeleteContext", {"key": "Yara.ConsolidateSummary"})
+      result = {"dry_run": dry, "xql_calls": qcount[0], "written": written,
+                "skipped": skipped, "failed": failed, "schema_version": ver,
+                "retention_hours": retention_hours, "shards_deleted": 0,
+                "findings_collapsed": findings[0], "query_modes": sorted(modes)}
       return_results(CommandResults(readable_output="\n".join(out),
-                                    outputs_prefix="Yara.Fast", outputs=result,
+                                    outputs_prefix="Yara.ConsolidateSummary", outputs=result,
                                     raw_response=result))
 
 

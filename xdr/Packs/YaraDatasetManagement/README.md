@@ -1,7 +1,10 @@
 # YARA Dataset Management (XSOAR pack)
 
-Merges each finished YARA scan's per-host lookup dataset shards into one dataset per scan
-— safely, at fleet scale — reports what needs attention, and prunes what has aged out. This
+Consolidates each finished YARA scan's findings out of the per-host lookup datasets and
+into one dataset per scan — safely, at fleet scale — reports what needs attention, and prunes
+what has aged out. There are **two consolidation modes**, full detail and summary only; which
+one you want is the first decision to make and it is answered in
+[Two consolidation modes](#two-consolidation-modes--full-detail-or-summary-only) below. This
 is the XSOAR-pack delivery of the same logic in [`xdr_consolidate.py`](../../xdr_consolidate.py)
 and [`xdr_data_management.py`](../../xdr_data_management.py) (see
 [Datasets and Maintenance](../../docs/topics/Datasets_and_Maintenance.md) §5 for the
@@ -12,12 +15,147 @@ manual CLI invocation.
 
 | Item | Type | Role |
 |---|---|---|
-| `YARA Dataset Consolidation` | Playbook | Orchestrates one pass: check readiness → wait on in-progress scans → apply → flag failures. Meant to run **twice daily** as a scheduled Job. |
-| `YaraConsolidateStatus` | Automation | Read-only readiness check. Never writes or deletes. |
-| `YaraConsolidateApply` | Automation | The mutating step — creates per-scan targets, writes rows, deletes fully-verified source shards. |
+| `YARA Dataset Consolidation` | Playbook | Orchestrates one pass: check readiness → wait on in-progress scans → **consolidate in the mode `consolidation_mode` selects** → flag failures. Meant to run **twice daily** as a scheduled Job. |
+| `YaraConsolidateStatus` | Automation | Read-only readiness check. Never writes or deletes. Shared by both modes. |
+| `YaraConsolidateApply` | Automation | **Mode A, full detail.** Creates per-scan targets, copies every matched-file row, deletes fully-verified source shards. |
+| `YaraConsolidateSummary` | Automation | **Mode B, summary only.** One row per (host, rule) — which rules fired on which host — into `yara_scanner_summary_v<VER>_scan_<slug>`. Four columns, no filenames, no per-rule counts. **Deletes nothing at all.** Dry run unless `execute=true`. |
+| `YaraConsolidateFast` | Automation | Mode A without the row-count verification pass — a small fraction of the queries, duplicate rows possible and accepted. Deletes the source. Dry run unless `execute=true`. |
 | `YaraReport` | Automation | Read-only inventory of every `yara_scanner_*` lookup dataset (kind, host, age, plus the legacy / newer-schema / consolidated buckets). One API call, no writes — safe any time. Writes to `Yara.Report.*`. |
 | `YaraCleanup` | Automation | Retention pruning — **deletes whole datasets**. Dry run by default; see below. |
-| `YaraConsolidateCommon` | Automation (library only) | Not invoked directly, but it **must still be delivered as an automation in its own right** — the other four do `from YaraConsolidateCommon import ...`, which XSOAR resolves against an automation of that name on the server, and a directory holding only a `.py` is not a content item and is created by no upload path. A verbatim port of `xdr_consolidate.py`'s core logic and `xdr_data_management.py`'s retention logic, kept in sync by `tests/test_consolidation.py::test_pack_copy_gate_logic_matches_xdr_consolidate` and `tests/test_pack_data_management.py::test_pack_data_management_logic_matches_the_cli` (both compare the two files' ported functions and constants statement-by-statement and fail on any drift), plus `CoreApiClient` — a direct, signed-HTTPS client for this tenant's own public API. |
+| `YaraConsolidateCommon` | Automation (library only) | Never invoked directly, and **nothing imports it any more** — every automation above is standalone and inlines the whole library, because each must run on a tenant that injects `demisto` and the `CommonServerPython` helpers implicitly and resolves no cross-script import. It ships as a content item in its own right so the drift gates below have one canonical copy to compare against, and so an older pinned automation that *did* import it still resolves. A verbatim port of `xdr_consolidate.py`'s core logic and `xdr_data_management.py`'s retention logic, kept in sync by `tests/test_consolidation.py::test_pack_copy_gate_logic_matches_xdr_consolidate` and `tests/test_pack_data_management.py::test_pack_data_management_logic_matches_the_cli` (both compare the two files' ported functions and constants statement-by-statement and fail on any drift), plus `CoreApiClient` — a direct, signed-HTTPS client for this tenant's own public API. |
+
+## The overwrite model — one permanent matches dataset per host
+
+Everything below depends on this, so it comes first. It changed with the v4 scanner and it
+is the reason a second consolidation mode exists at all.
+
+```
+yara_scanner_matches_v4_<host>_<6hex>     one per host. No scan_id. No month suffix.
+```
+
+The scanner keeps **one matches dataset per host, permanently**, and **overwrites it at the
+start of every scan**: after ensuring the dataset exists and *before* the writer thread is
+started, it enumerates the `scan_id`s already in there and removes every row belonging to a
+**previous** scan (`xdr/xdr_yara_scanner.py:4577` `_flush_stale_matches`, called from
+`:4450`; naming at `:4360`). The current scan's own `scan_id` is never a removal target, and
+a dataset that did not already exist is skipped entirely. So the dataset never accumulates,
+always exists, and always holds exactly the newest scan of that host.
+
+That makes it **the deep-dive source** — the only place the per-file detail behind a
+consolidated row still lives — and it is why summary mode never deletes it.
+
+**The overwrite is a `remove_data` filter flush, not a delete-and-recreate.** Measured live
+on this tenant:
+
+| Operation | Measured | Notes |
+|---|---|---|
+| `remove_data` filter flush | **10.0s** for ~550 rows | Keeps the dataset object and its schema alive. What the scanner does. |
+| `delete_dataset` + recreate | **190.2s** (the delete alone: 187s) | **19x slower**, and it drops the schema. Never used for the overwrite. |
+| `add_lookup_data` write | 44.7s for 1,097 rows, 3 batches of 500 (~15s/batch) | At fleet scale the **write** dominates, not the flush. |
+
+(For scale, the v4 row grain those numbers came from: `/usr`, 93,137 files → 1,836 findings
+→ 1,097 rows at 749 B ≈ 0.78 MB.)
+
+Three consequences worth knowing before you run anything:
+
+* **Rotation does not apply to the matches dataset any more.** `CONFIG_LOOKUP_ROTATION`
+  governs the *scans* (lifecycle) dataset only — that one is append-only and still grows, so
+  bounding its size still means something. Rotation exists to bound size; the overwrite
+  already bounds matches to a single scan. Leaving it on would have minted a new dataset
+  every month regardless of the overwrite, moved the deep-dive source's name under every
+  dashboard pinned to it, and left last month's copy holding its final scan's rows for ever
+  with nothing that ever overwrites them. `YaraReport` and `YaraCleanup` have **not** been
+  updated for this and will still label each host's matches dataset
+  `not rotated (no YYYYMM) — set CONFIG_LOOKUP_ROTATION="monthly"`. That advice is now wrong
+  and following it re-introduces the contradiction. It is not dangerous — an unrotated
+  dataset is never a deletion candidate (rail 3), so these datasets are safe from the pruner
+  by construction.
+* **The flush needs Query Center on the *scanner's* delivery key**, not this pack's key. It
+  enumerates the stale `scan_id`s with one XQL. Without `investigation_query_view` every
+  scan 403s on that enumeration, fails safe, and the dataset quietly goes back to
+  accumulating — the scan log says so and nothing else will. See
+  [api-permissions.md](../../../.claude/skills/xdr-action-center-api/references/api-permissions.md),
+  Key 1.
+* **One open question, and it cannot bite here.** Whether `remove_data` re-stamps
+  `_insert_time` on *surviving* rows is unresolved (`../../docs/topics/Known_Limitations.md:66`).
+  The overwrite is a full flush of every previous `scan_id`, so no row survives it for a
+  re-stamp to touch. It would matter to a partial, filtered removal; this is not one.
+
+## Two consolidation modes — full detail or summary only
+
+The host dataset and the scanner behave **identically** under both modes. Only what
+consolidation copies out differs — and whether the source survives it.
+
+| | **A. Full detail** | **B. Summary only** |
+|---|---|---|
+| Automation | `YaraConsolidateApply` (or `YaraConsolidateFast`) | `YaraConsolidateSummary` |
+| Target | `yara_scanner_matches_v<VER>_scan_<slug>` | `yara_scanner_summary_v<VER>_scan_<slug>` |
+| Row grain | every matched-file row, copied verbatim | **one row per (host, rule)** |
+| Columns | the full v4 match schema | `scan_id`, `hostname`, `rule`, `event_timestamp_ms` — and nothing else |
+| Per-rule counts | n/a | **deliberately absent.** A count column turns every dashboard query over the summary into an aggregation over numbers instead of a distinct-set lookup. |
+| Source shard afterwards | **deleted**, once the target's row count verifies | **untouched.** No `delete_dataset`, no `remove_lookup_data`, no row removal anywhere in the file. `shards_deleted` is always `0` and is reported so a playbook can assert it. |
+| Read cost | reads the shard's rows | **one XQL per host shard**, which expands the v4 `rules` JSON array and groups inside the engine, so the rows never leave the tenant |
+| Write verification | required — it must count rows into the target *before* deleting the source | not required — the source outlives the run, so a partial write is fixed by re-running |
+| Default | writes (and deletes) | **dry run** unless `execute=true` |
+
+**Which one to use.**
+
+* **Summary** is the right default for fleet-wide reporting: "which rules fired on which
+  host, per scan". It is the cheap variant, it is the safe variant, and it composes with the
+  overwrite model — the per-host dataset stays in place, so any summary row can still be
+  drilled into for the files behind it. Its size limit is `50 MB` per lookup dataset, which
+  at ~163 B per (host, rule) row is ~321,649 rows: **the fleet limit is rules-matched-per-host,
+  not host count.**
+* **Full detail** is right when the per-scan dataset itself has to answer file-level
+  questions with no second lookup — an investigation workflow that queries only the per-scan
+  target, or a tenant where the per-scan target is exported elsewhere.
+* **They are not interchangeable after the fact.** Full mode deletes the per-host shard that
+  summary mode leaves alone. The next scan on that host recreates and refills it (the
+  scanner ensures the dataset exists at scan start), so the loss is bounded — but until then
+  the per-file detail for *that* scan is gone, and a summary row written afterwards has
+  nothing to drill into. Pick per deployment, not per run.
+* `YaraConsolidateFast` is full detail minus the verification pass. It still deletes, and it
+  accepts duplicate rows in the target. Its `_READ_LIMIT = 50000` truncation guard refuses a
+  scan too big to read in one go rather than merging part of it and deleting the rest — that
+  guard is the reason the fast path is survivable at all, so do not raise it casually.
+
+### Choosing the mode from the playbook
+
+`YARA Dataset Consolidation` takes a **`consolidation_mode`** input, `full` (default) or
+`summary`. Task 11 branches on it: `full` → `YaraConsolidateApply` (exactly the pre-existing
+flow, same arguments), `summary` → `YaraConsolidateSummary`. Every pre-existing input still
+works unchanged, and an existing scheduled Job that predates this input picks up the `full`
+default, i.e. the behaviour it already had.
+
+| Playbook input | Default | Notes |
+|---|---|---|
+| `consolidation_mode` | `full` | Matched **exactly** against `full` and `summary`. Anything else — a typo, an empty value — reaches neither automation: it lands on a dead-end task that merges, writes and deletes nothing, so an unrecognised mode can never fall through to the branch that deletes shards. |
+| `summary_execute` | `true` | Summary mode only. `YaraConsolidateSummary` is a dry run unless `execute=true`, so a scheduled Job with this defaulted the other way would report forever and never write a row. Set it to `false` deliberately to preview a pass. The full-detail branch has no equivalent — `YaraConsolidateApply` always writes, and deletes. |
+| `abandoned_after_hours` | *(script default: 24h)* | Reaches summary mode as its `retention_hours`: the same idea (how long a non-terminal scan may be silent before it is consolidated anyway), and in summary mode it is **only** that threshold — it is not a deletion window, because nothing is deleted. |
+
+`schema_version` is deliberately **not** a playbook input. A single-version fleet is served
+by the automation's own default; a fleet mid-rollout should be summarised by invoking
+`YaraConsolidateSummary` directly per version rather than by giving a scheduled Job a version
+number that will go stale. (The automation handles both shapes: v4 expands the `rules` JSON
+array, v2/v3 read their scalar `rule` column.)
+
+Summary-mode results land under `Yara.ConsolidateSummary.*`: `written`, `skipped`, `failed`,
+`dry_run`, `xql_calls`, `query_modes`, `findings_collapsed` (how much file-level detail the
+summary collapsed — reported only, never written into a row), `shards_deleted` (always `0`),
+plus the `schema_version` and `retention_hours` the run used. A failure here never destroyed
+anything, so it is a flag to read rather than an incident to chase: host shards are untouched
+in every failure case and **re-running is always safe**.
+
+**Two consequences of summary mode, stated rather than defended against.** Summary targets
+are invisible to `YaraCleanup` by construction — the name matches neither the current-dataset
+regex nor the shard regex, which is what stops one `delete_legacy=true` pass taking every
+summary target with it, and the price is that they accumulate one per scan for ever. They are
+also the smallest datasets this pipeline makes. And a scan consolidated by summary mode is
+not recorded as consolidated by the merge's own bookkeeping (which keys on the *matches*
+per-scan target name), so on a summary-only tenant `YaraCleanup`'s rail 7 will still read
+those matches shards as unconsolidated. Under the overwrite model that rail is moot for the
+permanent per-host dataset — an unrotated dataset is never a candidate anyway — but know it
+before running the two modes side by side.
 
 ## Read-only inventory — `YaraReport`
 
@@ -193,6 +331,26 @@ gotcha #16 in the same file). If you need to iterate on one of these scripts aft
 is installed, either re-import the whole pack or accept the `system:true` constraint; don't
 reach for a one-off `demisto-sdk upload` on just that file.
 
+**Upload `unified/`, not the `.py` files.** An XSOAR automation *is* its yml: the tenant
+runs whatever sits under that file's `script:` key. `unified/<Name>.yml` carries the whole
+Python body inline and is the delivery copy for every automation in this pack;
+`Scripts/<Name>/<Name>.py` exists so the code can be reviewed, tested and `py_compile`d.
+Those are two copies of one source, and they have already drifted once — the shipped
+`YaraConsolidateFast` yml was missing the `_READ_LIMIT` truncation guard its `.py` had, i.e.
+the guard that stops the fast path merging 50,000 of a 60,000-row scan and then deleting the
+only copy of the rest. Regenerate rather than hand-edit:
+
+```
+python3 tools/build_pack_unified.py            # rewrite every embedded copy from its .py
+python3 tools/build_pack_unified.py --check    # exit 1 if any is stale
+```
+
+`tests/test_pack_unified_yaml_is_in_sync.py` runs `--check` in CI, and
+`tests/test_pack_playbook_consolidation_modes.py` checks the playbook's tasks against the
+automations they call. `YaraConsolidateFast` and `YaraConsolidateSummary` are self-contained
+on the `Scripts/` side too (their `Scripts/<Name>/<Name>.yml` embeds the script); the rest
+carry `script: '-'` there and are unified at upload time.
+
 **`YaraReport` and `YaraCleanup` are not tasks in the consolidation playbook**, and nothing
 in this pack schedules them. They install as standalone automations, run from the War Room
 or their own Job. That is deliberate for `YaraCleanup`: a destructive action attached to the
@@ -264,6 +422,9 @@ the YaraCleanup section above before granting this key to anything.
 | `YaraConsolidateStatus failed: ... HTTP 401: ...` or `YaraConsolidateApply failed: ... HTTP 401: ...` in the Job's task error / War Room | The embedded `DEFAULT_XDR_API_KEY`/`DEFAULT_XDR_API_ID` were rotated, revoked, or hit their `expiration` on the tenant. The identical generic 401 also covers a mistyped key/ID and a Standard/Advanced type mismatch — the response body alone cannot tell you which. | Regenerate an Advanced-type key for this pack's role (see Credentials above), edit the three `DEFAULT_XDR_*` constants in `YaraConsolidateCommon.py`, and re-deliver the pack (editing the repo file alone does nothing until it's re-imported/re-installed — see Deployment above). Confirm with `YaraConsolidateStatus` — it's read-only and safe to run any time. |
 | Every scheduled Job run fails at task "Check consolidation status" (or "Apply consolidation") and task 8 ("Flag failures for attention") never lights up | `return_error` halts the whole playbook run at the failing task, before task 8's condition is ever evaluated — task 8 only reports data-level `failed_count` from a *completed* run, not a total execution error. | Watch the Job's own run history, not just the task-8 context flag — a dead key (or any other uncaught exception) is a hard failure, not a soft one. The `yara_scanner_consolidation_runs` dataset (see Monitoring below) also gets a `status="crashed"` row for a mid-run `YaraConsolidateApply` crash specifically (not for a `YaraConsolidateStatus` crash — that one never reaches `YaraConsolidateApply` at all). |
 | Job history shows "0 scan(s) consolidated" every run, nothing actually being merged | Consolidation lock held by another concurrent run (the CLI's `xdr_data_management.py --consolidate --yes`, or an overlapping Job execution) | Check `Yara.ConsolidateApply.lock_held_by_other_run` in context, or just read the readable output — it now says "Skipped this pass — consolidation lock is held by another concurrent run" instead of looking identical to a genuinely-empty pass. Confirm the Job's Queue Handling is set to "Don't trigger a new job instance" and that no one is running the CLI `--consolidate --yes` concurrently. |
+| The playbook run ends at **"Unrecognised consolidation_mode - nothing done"** and nothing was merged or written | `consolidation_mode` is neither exactly `full` nor exactly `summary` — a typo, a capitalised value, or an empty one. This is the designed fail-safe, not a bug: an unrecognised mode must never fall through to the branch that deletes per-host shards. | Set the input to exactly `full` or exactly `summary` and re-run. If it is already one of those, the `isEqualString` condition in task 11 is the thing to verify against the live tenant (see the playbook description's NOTE ON VERIFICATION) — it has no local precedent in this repo. |
+| Summary mode runs every pass, reports rows it "WOULD write", and never writes any | `summary_execute` was set to `false` (or the automation was invoked directly without `execute=true`). `YaraConsolidateSummary` is a dry run by default. | Leave the playbook's `summary_execute` at its default of `true`. The War Room entry names the mode it ran in on its first line — `DRY RUN - nothing was created or written.` vs `EXECUTED.` |
+| Summary mode reports failures in `Yara.ConsolidateSummary.failed` | A write or a count query failed for that scan. **Nothing was destroyed** — this automation has no deletion path, and the message says `host shards untouched`. | Re-run; it is idempotent. A target already holding exactly this run's row count is verified and left alone, and one holding a *different* count is refused rather than appended to (appending would duplicate (host, rule) pairs and there is no delete path to undo that). Clear that target by hand if the mismatch is real. |
 | `YaraCleanup` reports `Nothing selected and nothing deleted: no retention window was given` | Neither `older_than_months` nor `delete_legacy=true` was passed. This is not a failure — it is the "a bare invocation must never delete" property, and no API call was made at all. | Pass a retention window (`older_than_months=N`) and/or `delete_legacy=true`. There is deliberately no default window to fall back on. |
 | `YaraCleanup` ran `EXECUTED` but deleted far less than expected, and `Yara.Cleanup.newer` is non-empty | Rail 4 vetoed those datasets: they are on a **higher** schema version than the `schema_version` argument, i.e. the argument is stale-LOW. | Set `schema_version` to what the fleet actually writes (`YARA_LOOKUP_SCHEMA_VER` on the endpoints). Run `YaraReport` first — its "newer schema" bucket shows the same thing without touching anything. |
 | `YaraCleanup` selected almost nothing and every skip reason names the recency or consolidation rail | Working as designed, and usually one of two real conditions: scans are still writing to those shards (rail 6 — the *name*'s month is not when it was last written), or consolidation has not yet verified their `scan_id`s into per-scan targets (rail 7). Both rails also keep a dataset when their live query **errors**, so a flaky query window looks the same. | Read the per-candidate reasons in `Yara.Cleanup.skipped` — they name the specific rail. Let the consolidation Job catch up (`YaraConsolidateStatus` shows readiness) and re-run. Do not lower `min_quiet_hours` to force it through; below 1h it is raised back to the floor anyway. |

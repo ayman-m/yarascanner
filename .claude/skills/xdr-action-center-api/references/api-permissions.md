@@ -22,8 +22,9 @@ it is the only one that can delete data.
 
 ### Key 1 — scanner delivery key (embedded in the uploaded script)
 
-Used by every endpoint running the scan. It only *writes results* — it can't run scripts,
-read endpoints, or query.
+Used by every endpoint running the scan. It writes results, and — since the matches dataset
+became permanent-and-overwritten — clears its own previous scan's rows from that one dataset.
+It still can't run scripts or read endpoints.
 
 | Operation (API) | Required permission component | Machine key |
 |---|---|---|
@@ -31,10 +32,26 @@ read endpoints, or query.
 | Write dataset rows — `xql/lookups/add_data` | **Data Management** (Configurations → Data Management) | `data_management_action` |
 | Create datasets — `xql/add_dataset` | **Data Management** | `data_management_action` |
 | List datasets — `xql/get_datasets` | **Data Management** | `data_management_action` |
+| Clear the previous scan's rows — `xql/lookups/remove_data` | **Data Management** | `data_management_action` |
+| List the scan_ids to clear — `xql/start_xql_query` + `xql/get_query_results` | **Query Center** | `investigation_query_view` |
 
 **Custom role recipe `yara-scanner-delivery`:** External Issues Mapping +
-Data Management. Nothing else. No endpoint scope needed (it touches no endpoints).
-**Verified sufficient** by live smoke test (6/6 alerts + datasets, 0 forbidden).
+Data Management + Query Center. No endpoint scope needed (it touches no endpoints).
+The first two were **verified sufficient** for delivery by live smoke test (6/6 alerts +
+datasets, 0 forbidden); Query Center is the addition the start-of-scan overwrite needs.
+
+> **Query Center is new here, and its absence is quiet.** The overwrite
+> (`LookupDatasetUploader._flush_stale_matches`, xdr/xdr_yara_scanner.py) enumerates the
+> stale `scan_id`s with one XQL before deleting them, because `remove_data` accepts exact
+> values only and cannot express "everything that is not this scan". A key without Query
+> Center 403s on that enumeration; the scanner is built to fail safe there, so the scan still
+> runs and still writes — it just never clears the previous scan, and the host's matches
+> dataset silently goes back to accumulating. The scan log says so on every run
+> (`Matches dataset overwrite [failed]`), but nothing else will.
+>
+> Data Management already covers `remove_data` — it is the same component that grants
+> `add_data`, and it has no view-only tier (see Key 3's finding 1), so no extra grant is
+> needed for the delete itself.
 
 > Do **not** use "Cases and Issues / Alerts" for the alert permission — verified to 403 on
 > `insert_parsed_alerts`. Insert Parsed/CEF Alerts is an *external-alert ingestion* API, so
