@@ -1,7 +1,7 @@
 # XDR Round 4 — Dataset management
 
-**IN PROGRESS.** Criteria in [ROUND4_CRITERIA.md](ROUND4_CRITERIA.md), written before this
-round ran.
+**CLOSED.** All 26 criteria decided, 659 tests pass, 0 outstanding failures. Criteria in
+[ROUND4_CRITERIA.md](ROUND4_CRITERIA.md), written before this round ran.
 
 ## The full cycle works
 
@@ -353,7 +353,7 @@ merely safe to abandon. The orphaned-lock half is covered by
 
 ## Round 4 — closed
 
-All 24 criteria are decided. **659 tests pass, 0 outstanding failures.**
+All 26 criteria are decided. **659 tests pass, 0 outstanding failures.**
 
 | Group | Criteria | How decided |
 |---|---|---|
