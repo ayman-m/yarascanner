@@ -4708,7 +4708,15 @@ rule test {{
             error_logger.has_errors = True
             error_logger.error_logger.error(f"COMPILATION_ERROR: {error_msg}")
             try:
-                debug_file = os.path.join(self.config.failed_rules_dir, "raw_yara_content.yar")
+                # run_id-scoped like every other artefact in failed_rules/. That directory
+                # is deliberately never pruned, so a fixed name is not "the latest copy" --
+                # it is the only copy, silently replaced on every run. The rule content that
+                # failed to split is the whole point of the file, and the case it exists for
+                # (a pack that produces no parseable rules) is exactly the case someone
+                # re-runs while trying to fix it, overwriting the evidence each time.
+                debug_file = os.path.join(
+                    self.config.failed_rules_dir,
+                    f"raw_yara_content_{self.config.run_id}.yar")
                 with open(debug_file, "w", encoding="utf-8") as f:
                     f.write("// RAW YARA CONTENT - Failed to split into individual rules\n")
                     f.write("// " + "="*70 + "\n\n")
@@ -6684,61 +6692,81 @@ def main(yarafile=None, scan_folder=None, alert_severity="low"):
         
         scan_total_time = time.time() - scan_start_time
         
-        final_performance_stats = stats_manager.get_current_stats_for_upload()
-        final_upload_stats = webhook_uploader.get_upload_statistics()
-        final_log_stats = log_manager.get_upload_statistics()
+        # Guarded for the same reason as the XDR edition, but note the symptom differs
+        # because the ORDER differs. Here the terminal status upload
+        # (set_status("cancelled"/"completed")) happens AFTER this block, not before it. So a
+        # raise in here does not produce a contradicting terminal value -- it means no
+        # terminal value is ever sent at all, and control jumps to main()'s outer handler.
+        #
+        # That is precisely the failure this file already documents fixing on the failure
+        # path: "It also sent no terminal event, so a dashboard just saw the scan stop."
+        # Leaving the success path unguarded left the same hole open for any scan whose
+        # closing statistics or report upload happened to fail.
+        #
+        # A reporting failure does not un-scan the files, so log it and carry on to the
+        # terminal emit below, which is itself guarded.
+        try:
+            final_performance_stats = stats_manager.get_current_stats_for_upload()
+            final_upload_stats = webhook_uploader.get_upload_statistics()
+            final_log_stats = log_manager.get_upload_statistics()
         
-        comprehensive_final_stats = {
-            'scan_duration_seconds': scan_total_time,
-            'scan_duration_formatted': str(datetime.timedelta(seconds=int(scan_total_time))),
-            'files_processed': scanner.files_scanned + scanner.files_skipped,
-            'files_scanned': scanner.files_scanned,
-            'files_skipped': scanner.files_skipped,
-            'total_detections': scanner.total_detections,
-            'unique_rules_triggered': len(scanner.detection_counts),
-            'performance_metrics': final_performance_stats,
-            'webhook_upload_stats': final_upload_stats,
-            'log_generation_stats': final_log_stats,
-            'error_summary': {
-                'compilation_errors': error_logger.failed_rules_count,
-                'scan_errors': sum(count for reason, count in scanner.skip_reasons.items()
-                                   if 'error' in reason.lower())
+            comprehensive_final_stats = {
+                'scan_duration_seconds': scan_total_time,
+                'scan_duration_formatted': str(datetime.timedelta(seconds=int(scan_total_time))),
+                'files_processed': scanner.files_scanned + scanner.files_skipped,
+                'files_scanned': scanner.files_scanned,
+                'files_skipped': scanner.files_skipped,
+                'total_detections': scanner.total_detections,
+                'unique_rules_triggered': len(scanner.detection_counts),
+                'performance_metrics': final_performance_stats,
+                'webhook_upload_stats': final_upload_stats,
+                'log_generation_stats': final_log_stats,
+                'error_summary': {
+                    'compilation_errors': error_logger.failed_rules_count,
+                    'scan_errors': sum(count for reason, count in scanner.skip_reasons.items()
+                                       if 'error' in reason.lower())
+                }
             }
-        }
         
-        # Telemetry must agree with the returned result and the summary JSON. Reporting
-        # "completed successfully" for a run the operator cancelled makes the dashboard
-        # contradict the Action Center output, and hides that the counts are partial.
-        _was_cancelled = getattr(scanner, "cancel_requested", False)
-        _elapsed_txt = datetime.timedelta(seconds=int(scan_total_time))
-        _completion_msg = (
-            f"Scan cancelled by operator after {_elapsed_txt} (partial results)"
-            if _was_cancelled else
-            f"Scan completed successfully in {_elapsed_txt}"
-        )
-        comprehensive_final_stats['outcome'] = "cancelled" if _was_cancelled else "completed"
-        if _was_cancelled:
-            comprehensive_final_stats['cancel_source'] = getattr(scanner, "cancel_source", "")
+            # Telemetry must agree with the returned result and the summary JSON. Reporting
+            # "completed successfully" for a run the operator cancelled makes the dashboard
+            # contradict the Action Center output, and hides that the counts are partial.
+            _was_cancelled = getattr(scanner, "cancel_requested", False)
+            _elapsed_txt = datetime.timedelta(seconds=int(scan_total_time))
+            _completion_msg = (
+                f"Scan cancelled by operator after {_elapsed_txt} (partial results)"
+                if _was_cancelled else
+                f"Scan completed successfully in {_elapsed_txt}"
+            )
+            comprehensive_final_stats['outcome'] = "cancelled" if _was_cancelled else "completed"
+            if _was_cancelled:
+                comprehensive_final_stats['cancel_source'] = getattr(scanner, "cancel_source", "")
 
-        standard_log = create_standard_log(
-            log_type='scan_completion_summary',
-            hostname=config.hostname,
-            os_info=config.os_info,
-            ip_address=config.ip_addresses[0] if config.ip_addresses else "Unknown",
-            scan_id=config.scan_id,
-            message=_completion_msg,
-            level="INFO",
-            data=comprehensive_final_stats
-        )
-        webhook_uploader._queue_standard_upload(standard_log, priority=True)
+            standard_log = create_standard_log(
+                log_type='scan_completion_summary',
+                hostname=config.hostname,
+                os_info=config.os_info,
+                ip_address=config.ip_addresses[0] if config.ip_addresses else "Unknown",
+                scan_id=config.scan_id,
+                message=_completion_msg,
+                level="INFO",
+                data=comprehensive_final_stats
+            )
+            webhook_uploader._queue_standard_upload(standard_log, priority=True)
 
-        upload_final_comprehensive_report(scanner, scan_total_time)
+            upload_final_comprehensive_report(scanner, scan_total_time)
 
-        log_manager.log_statistics(
-            (f"SCAN CANCELLED BY OPERATOR after {_elapsed_txt}" if _was_cancelled
-             else f"SCAN COMPLETED SUCCESSFULLY in {_elapsed_txt}"),
-            comprehensive_final_stats
-        )
+            log_manager.log_statistics(
+                (f"SCAN CANCELLED BY OPERATOR after {_elapsed_txt}" if _was_cancelled
+                 else f"SCAN COMPLETED SUCCESSFULLY in {_elapsed_txt}"),
+                comprehensive_final_stats
+            )
+        except Exception as e:
+            log_manager.log_error(
+                f"Final reporting failed after a completed scan: {e}. The scan itself "
+                f"finished; only the closing statistics/report step failed, and the "
+                f"terminal status below is still emitted."
+            )
         
         try:
             scanner.evidence_collector.collect_evidence()
