@@ -139,7 +139,10 @@ SCANS_SCHEMA = {
 # ---- overlap guard: one lock dataset, so two runs cannot collide on one target ----
 _LOCK_DATASET = "yara_scanner_consolidation_lock"
 _LOCK_SCHEMA = {"holder": "text", "started_ms": "number"}
-DEFAULT_LOCK_STALE_SECS = 2 * 3600     # another run's lock is abandoned past this age
+DEFAULT_LOCK_STALE_SECS = 20 * 60   # a run cannot outlive the 900s task timeout
+# One pass consolidates at most this many scans, so it finishes inside that 900s
+# timeout instead of being killed mid-merge still holding the lock.
+DEFAULT_MAX_SCANS_PER_PASS = 20
 
 
 def _read_lock(client):
@@ -694,13 +697,30 @@ def check_consolidation_status(client, kinds=("matches", "scans"), vers=KNOWN_MA
 def consolidate_all(client, kinds=("matches", "scans"), vers=KNOWN_MATCHES_SCHEMA_VERSIONS, dry_run=False,
                     only_scan_ids=None, quiet_secs=DEFAULT_QUIET_SECS,
                     row_ceiling=DEFAULT_ROW_CEILING, abandoned_after_secs=DEFAULT_ABANDONED_SECS,
-                    now_ms=None, action_state_for=None, log=print):
+                    now_ms=None, action_state_for=None, max_scans=None, log=print):
     if not dry_run and not acquire_consolidation_lock(client, log=log, now_ms=now_ms):
         return {"consolidated_count": 0, "consolidated_scan_ids": [],
                 "deferred_count": 0, "deferred_scan_ids": [],
                 "failed_count": 0, "failed_scan_ids": [], "failed_reasons": {},
+                "stopped_early": False,
                 "lock_held_by_other_run": True}
     try:
+        stopped_early = False
+        if max_scans:
+            if only_scan_ids is None:
+                _ready = check_consolidation_status(
+                    client, kinds=kinds, vers=vers, quiet_secs=quiet_secs,
+                    row_ceiling=row_ceiling, abandoned_after_secs=abandoned_after_secs,
+                    now_ms=now_ms, action_state_for=action_state_for, log=log)
+                _candidates = sorted(_ready.get("eligible_scan_ids") or [])
+            else:
+                _candidates = sorted(only_scan_ids)
+            stopped_early = len(_candidates) > max_scans
+            only_scan_ids = _candidates[:max_scans]
+            if stopped_early:
+                log("pass bounded to %d of %d eligible scan(s) so it finishes inside its "
+                    "task timeout; the rest are owed a further pass"
+                    % (max_scans, len(_candidates)))
         consolidated, deferred, failed = set(), set(), set()
         failed_reasons = {}
         for ver in vers:
@@ -724,6 +744,7 @@ def consolidate_all(client, kinds=("matches", "scans"), vers=KNOWN_MATCHES_SCHEM
     return {"consolidated_count": len(consolidated), "consolidated_scan_ids": sorted(consolidated),
             "deferred_count": len(deferred), "deferred_scan_ids": sorted(deferred),
             "lock_held_by_other_run": False,
+            "stopped_early": stopped_early,
             "failed_count": len(failed), "failed_scan_ids": sorted(failed),
             "failed_reasons": failed_reasons}
 

@@ -11,6 +11,11 @@ args:
   isArray: false
   default: false
   secret: false
+- name: max_scans
+  description: Most scans this pass will consolidate before stopping and reporting that more remain. Bounds the pass so it finishes inside the script timeout instead of being killed mid-merge still holding the consolidation lock. Leave empty for the built-in default (20).
+  required: false
+  isArray: false
+  default: false
 - name: row_ceiling
   description: Override the default per-scan row ceiling (2,000,000).
   required: false
@@ -92,7 +97,10 @@ script: |
   # Write and delete behaviour. Lower the batch size if the tenant gateway returns 502s.
   _WRITE_BATCH = 500                  # rows per lookups/add_data call
   DELETE_CONCURRENCY = 12             # source shards deleted in parallel
-  DEFAULT_LOCK_STALE_SECS = 2 * 3600  # another run's lock is treated as abandoned past this age
+  DEFAULT_LOCK_STALE_SECS = 20 * 60   # a run cannot outlive the 900s task timeout
+  # One pass consolidates at most this many scans, so it finishes inside that 900s
+  # timeout instead of being killed mid-merge still holding the lock.
+  DEFAULT_MAX_SCANS_PER_PASS = 20
 
   # Lookup schema version assumed when the schema_version argument is left empty.
   # Must match the scanner's YARA_LOOKUP_SCHEMA_VER on the endpoints.
@@ -733,13 +741,30 @@ script: |
   def consolidate_all(client, kinds=("matches", "scans"), vers=KNOWN_MATCHES_SCHEMA_VERSIONS, dry_run=False,
                       only_scan_ids=None, quiet_secs=DEFAULT_QUIET_SECS,
                       row_ceiling=DEFAULT_ROW_CEILING, abandoned_after_secs=DEFAULT_ABANDONED_SECS,
-                      now_ms=None, action_state_for=None, log=print):
+                      now_ms=None, action_state_for=None, max_scans=None, log=print):
       if not dry_run and not acquire_consolidation_lock(client, log=log, now_ms=now_ms):
           return {"consolidated_count": 0, "consolidated_scan_ids": [],
                   "deferred_count": 0, "deferred_scan_ids": [],
                   "failed_count": 0, "failed_scan_ids": [], "failed_reasons": {},
+                  "stopped_early": False,
                   "lock_held_by_other_run": True}
       try:
+          stopped_early = False
+          if max_scans:
+              if only_scan_ids is None:
+                  _ready = check_consolidation_status(
+                      client, kinds=kinds, vers=vers, quiet_secs=quiet_secs,
+                      row_ceiling=row_ceiling, abandoned_after_secs=abandoned_after_secs,
+                      now_ms=now_ms, action_state_for=action_state_for, log=log)
+                  _candidates = sorted(_ready.get("eligible_scan_ids") or [])
+              else:
+                  _candidates = sorted(only_scan_ids)
+              stopped_early = len(_candidates) > max_scans
+              only_scan_ids = _candidates[:max_scans]
+              if stopped_early:
+                  log("pass bounded to %d of %d eligible scan(s) so it finishes inside its "
+                      "task timeout; the rest are owed a further pass"
+                      % (max_scans, len(_candidates)))
           consolidated, deferred, failed = set(), set(), set()
           failed_reasons = {}
           for ver in vers:
@@ -763,6 +788,7 @@ script: |
       return {"consolidated_count": len(consolidated), "consolidated_scan_ids": sorted(consolidated),
               "deferred_count": len(deferred), "deferred_scan_ids": sorted(deferred),
               "lock_held_by_other_run": False,
+              "stopped_early": stopped_early,
               "failed_count": len(failed), "failed_scan_ids": sorted(failed),
               "failed_reasons": failed_reasons}
 
@@ -1543,7 +1569,9 @@ script: |
       row_ceiling = args.get("row_ceiling")
       abandoned_after_hours = args.get("abandoned_after_hours")
 
-      kwargs = {"only_scan_ids": scan_ids, "dry_run": False}
+      max_scans = args.get("max_scans")
+      kwargs = {"only_scan_ids": scan_ids, "dry_run": False,
+                "max_scans": int(max_scans) if max_scans else DEFAULT_MAX_SCANS_PER_PASS}
       if quiet_secs:
           kwargs["quiet_secs"] = int(quiet_secs)
       if row_ceiling:
@@ -1555,6 +1583,13 @@ script: |
       client = None
       try:
           client = CoreApiClient()
+          # Recorded BEFORE the merge, not only after. The platform kills a task that overruns
+          # its timeout, and a kill runs no Python - so the terminal row below and the
+          # except-branch "crashed" row are both unreachable in exactly the case worth
+          # diagnosing. Measured on emea: a pass died at the 900s timeout and left no row at
+          # all, so nothing in the tenant recorded that it had ever run. A "started" row with
+          # no matching terminal row is what makes that state queryable.
+          record_consolidation_run(client, "started", log=lambda *a: None)
           result = consolidate_all(client, log=lambda m: log_lines.append(m), **kwargs)
       except Exception as ex:
           # Record the crash as a queryable row BEFORE return_error: return_error halts this
@@ -1574,6 +1609,9 @@ script: |
                    "concurrent run."]
       else:
           lines = ["{} scan(s) consolidated".format(result["consolidated_count"])]
+          if result.get("stopped_early"):
+              lines.append("Pass was bounded so it would finish inside the task timeout - more "
+                           "scans remain eligible. Run again to continue.")
           if result["deferred_count"]:
               lines.append("{} scan(s) deferred (became active mid-run): {}".format(
                   result["deferred_count"], ", ".join(result["deferred_scan_ids"][:10])))

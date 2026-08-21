@@ -970,6 +970,9 @@ def test_consolidate_all_skips_when_locked_by_another_run():
     result = C.consolidate_all(fc, kinds=("matches",), dry_run=False, quiet_secs=1,
                                now_ms=NOW + 1000, log=lambda *a: None)
     assert result == {"consolidated_count": 0, "consolidated_scan_ids": [],
+                      # A pass that never ran cannot have left work behind; the key must
+                      # still be present so callers can read it unconditionally.
+                      "stopped_early": False,
                        "deferred_count": 0, "deferred_scan_ids": [],
                        "failed_count": 0, "failed_scan_ids": [], "failed_reasons": {},
                        "lock_held_by_other_run": True}
@@ -1289,7 +1292,8 @@ _SHARED_CONSTS = ("SKEW_TOLERANCE_MS", "DEFAULT_SKEW_BACKSTOP_SECS", "DEFAULT_QU
                   "_PREFIX", "_SHARD_RE", "MATCHES_SCHEMA", "MATCHES_SCHEMA_V3",
                   "SCANS_SCHEMA", "_MATCHES_SCHEMAS_BY_VER", "KNOWN_MATCHES_SCHEMA_VERSIONS",
                   "_WRITE_BATCH", "DELETE_CONCURRENCY", "DEFAULT_ROW_CEILING",
-                  "_LOCK_DATASET", "_LOCK_SCHEMA", "DEFAULT_LOCK_STALE_SECS")
+                  "_LOCK_DATASET", "_LOCK_SCHEMA", "DEFAULT_LOCK_STALE_SECS",
+                  "DEFAULT_MAX_SCANS_PER_PASS")
 
 
 def _logic_index(path):

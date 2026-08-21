@@ -13,6 +13,13 @@ args:
   isArray: false
   default: false
   secret: false
+- name: max_scans
+  description: Most scans this pass will consolidate before stopping and reporting that more
+    remain. Bounds the pass so it finishes inside the script timeout instead of being killed
+    mid-merge still holding the consolidation lock. Leave empty for the built-in default (20).
+  required: false
+  isArray: false
+  default: false
 - name: row_ceiling
   description: Override the default per-scan row ceiling (2,000,000).
   required: false
