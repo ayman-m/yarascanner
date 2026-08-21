@@ -1286,7 +1286,8 @@ _SHARED_GATE_FUNCS = (
     "_cleanup_verified_scan_rows", "_rows_of", "_rows_for_scan", "_added", "_count",
     "_delete_many", "_list_yara_datasets", "matches_schema_for", "_read_lock",
     "acquire_consolidation_lock", "release_consolidation_lock",
-    "run_consolidation", "check_consolidation_status", "consolidate_all")
+    "run_consolidation", "check_consolidation_status", "consolidate_all",
+    "_is_live_overwrite_dataset")
 _SHARED_CONSTS = ("SKEW_TOLERANCE_MS", "DEFAULT_SKEW_BACKSTOP_SECS", "DEFAULT_QUIET_SECS",
                   "DEFAULT_ABANDONED_SECS", "TERMINAL_LIFECYCLE", "TERMINAL_ACTION",
                   "_PREFIX", "_SHARD_RE", "MATCHES_SCHEMA", "MATCHES_SCHEMA_V3",

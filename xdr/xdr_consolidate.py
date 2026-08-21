@@ -505,6 +505,25 @@ def _rows_for_scan(client, dataset, scan_id, limit=50000):
     return client.xql('dataset = %s | filter scan_id = "%s"' % (dataset, safe), limit=limit) or []
 
 
+def _is_live_overwrite_dataset(name):
+    """True for the scanner's permanent per-host matches dataset (v4+, no month) - the
+    dataset an unsuffixed name RESOLVES TO, independent of whatever list a caller believes
+    it collected. parse_shard's exclusion at enumeration time is the only thing that keeps
+    this name out of a shard/deletion list in the first place; this is a SECOND, independent
+    check at the point of the two destructive calls (_cleanup_verified_scan_rows,
+    _delete_many), so a bug in enumeration - stale state, a future refactor, a caller that
+    builds its own shard list - cannot reach delete_dataset() or remove_lookup_data() against
+    this name. Belt-and-braces: under correct enumeration this never fires.
+
+    Deliberately does NOT call parse_shard - depending on the function this is meant to
+    backstop would make the two guards fail together the moment parse_shard itself is what
+    broke. This re-derives the answer from _SHARD_RE directly."""
+    m = _SHARD_RE.match(name or "")
+    return bool(m and m.group("kind") == "matches" and int(m.group("ver")) >= 4
+               and not m.group("month") and not (m.group("host") or "").startswith("scan_")
+               and (m.group("host") or "") != "scan")
+
+
 def _cleanup_verified_scan_rows(client, srcs, scan_id, log):
     """Once scan_id's per-scan target is verified, strip just its rows out of every source
     shard right away — narrowing the window where a dashboard querying the wildcard
@@ -524,6 +543,10 @@ def _cleanup_verified_scan_rows(client, srcs, scan_id, log):
     stuck until the 24h abandoned-scan cutoff bails it out. "matches" shards carry no
     lifecycle data, so they have no such consumer and are always safe to strip."""
     for ds in srcs:
+        if _is_live_overwrite_dataset(ds):
+            log("  scan %s: refusing to strip rows from %s - permanent overwrite dataset, "
+               "never a cleanup source regardless of how it reached this list" % (scan_id, ds))
+            continue
         try:
             client.remove_lookup_data(ds, [{"scan_id": scan_id}])
         except Exception as e:
@@ -920,6 +943,11 @@ def consolidate_all(client, kinds=("matches", "scans"), vers=KNOWN_MATCHES_SCHEM
 def _delete_many(client, names, log, concurrency=None):
     """Delete datasets concurrently in bounded batches. Different-dataset deletes are safe to
     parallelise (verified live); this turns a fleet's serial ~60s-per-delete into hours."""
+    blocked = [n for n in names if _is_live_overwrite_dataset(n)]
+    for n in blocked:
+        log("  refusing to delete %s - permanent overwrite dataset, never a deletion "
+           "candidate regardless of how it reached this list" % n)
+    names = [n for n in names if n not in blocked]
     import threading
     concurrency = concurrency or DELETE_CONCURRENCY
     lock = threading.Lock()
