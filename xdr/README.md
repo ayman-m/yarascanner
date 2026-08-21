@@ -31,7 +31,8 @@ nothing else: upload all of them, each is self-contained, and none imports any o
 Three things that cost people a deployment:
 
 - **The two keys are different types.** The scanner takes a Standard key in
-  `xdr_yara_scanner.py` lines 205–207 (`DEFAULT_XDR_API_KEY` / `_API_ID` / `_API_URL`). The
+  `xdr_yara_scanner.py` lines 131–133 (`DEFAULT_XDR_API_KEY` / `_API_ID` / `_API_URL`, at the
+  top of the CUSTOMER CONFIG block). The
   automations take an Advanced (HMAC) key. A Standard key in an automation 401s.
 - **Each automation carries its own copy of the credential block** — `YaraReport.yml:1500`,
   `YaraConsolidateStatus.yml:1487`, `YaraConsolidateApply.yml:1490`, `YaraConsolidateFast.yml:1519`,

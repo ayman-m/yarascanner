@@ -1,29 +1,19 @@
 """
-YARA Scanner (XDR API Edition)
-==================================
-Enterprise-grade file scanner with real-time threat detection and Cortex XDR API reporting.
+YARA Scanner - Cortex XDR Edition (v3.3.0)
 
-    VERSION : 3.3.0
-    RELEASED: 2026-08-17
-    SOURCE  : https://github.com/ayman-m/yarascanner
-    NOTES   : https://github.com/ayman-m/yarascanner/blob/main/CHANGELOG.md
+Scans one or more folders on an endpoint with a YARA ruleset delivered with the
+run, and reports what it finds to Cortex XDR.
 
-Capabilities in this version:
-- Multi-threaded YARA scanning of one or more paths, with per-run rule delivery
-- Cortex XDR alerts via Insert Parsed Alerts, one per finding, with a storm cap
-- Lookup datasets for matches and scan lifecycle, per endpoint, monthly-rotated
-- CPU governor bounding the scan's own share of the host (headroom / budget / none)
-- Cooperative scan cancellation that preserves findings
-- Evidence ZIP, local forensic logs, and a machine-readable per-scan summary
-- Advanced (HMAC) and Standard API authentication, auto-detected
+Action Center inputs (the `main` entry point):
+    yarafile        base64-encoded YARA rules to scan with
+    scan_folder     folder to scan; comma-separate several ("C:\\Users,D:\\Shares")
+    alert_severity  severity of the alerts this scan raises
 
-To confirm which build an endpoint is running, read "scanner_version" in
-scan_summary_<run_id>.json, or the VERSION line at the top of
-yara_processing_<run_id>.log. Both come from __version__ below, so a shared copy of
-this file always identifies itself.
-
-Report the version with any support request: behaviour differs between releases and
-the release notes above record what changed.
+It writes one XDR alert per finding (file x rule, storm-capped); two per-host
+lookup datasets, yara_scanner_matches_* (one row per matched file) and
+yara_scanner_scans_* (scan lifecycle); and, on the endpoint, per-category logs,
+an evidence ZIP and scan_summary_<run_id>.json. Every other setting lives in the
+CUSTOMER CONFIG block below. Use the `cancel` entry point to stop a running scan.
 """
 
 __version__ = "3.3.0"
@@ -64,24 +54,15 @@ import requests
 import yara
 
 # ============================================================================
-# CONSTANTS
+# Environment-variable helpers, used by the configuration below.
 # ============================================================================
 
 def _env_number(name, default, cast=float, minimum=None):
-    """Read a numeric tuning env var without letting a deployer typo crash the scanner.
+    """Read a numeric YARA_* env var, falling back to `default`.
 
-    Most of the knobs below are read at MODULE level, so an unguarded int('5s') raised
-    ValueError at import time - before ScanConfig, before LogManager, before anything
-    existed that could report why the action failed. The operator saw a dead action with
-    no local log and no telemetry.
-
-    `minimum` additionally rejects values that PARSE but are unusable, because parsing is
-    not validation: YARA_MAX_MB=-1 is a valid int that made max_file_bytes negative, so
-    every file failed the size check and the scan reported "completed" having scanned
-    nothing. Both failure modes fall back to the documented default and warn.
-
-    Ported from the XSIAM edition, which already had this helper but applied it only to
-    its module-level knobs.
+    A value that will not parse, or that is below `minimum`, is ignored with a
+    warning. These are read at import time, before any log channel exists, so a
+    bad value must not raise.
     """
     raw = os.environ.get(name, "")
     if not raw:
@@ -102,25 +83,13 @@ def _env_number(name, default, cast=float, minimum=None):
 
 
 def _extra_skip_fragments(env_var="YARA_EXTRA_SKIP_PATHS"):
-    """Deployer-supplied skip fragments, normalised to the bounded "/x/" form.
+    """Extra paths to exclude, from YARA_EXTRA_SKIP_PATHS (comma-separated).
 
-    The built-in skip lists are Python literals mid-file, so a site running a non-Cortex
-    EDR, a large build-artifact tree or an unusual mount layout had NO supported way to
-    exclude it - the only options were editing the script's internals or not scanning.
-
-    Two properties make this safe to expose:
-
-    ADDITIVE ONLY. The result is appended to the built-in list, never substituted for it.
-    A replace-style knob would let one deployer's typo silently drop the Cortex agent
-    paths, and the scanner would start re-scanning /opt/traps with no visible change.
-
-    BOUNDED. Every entry is forced to a leading and trailing separator, so it matches
-    whole path COMPONENTS only. An unbounded "cyvera" would match any path containing
-    that substring anywhere - which is an evasion vector, not a skip rule: an attacker
-    who can name a directory can then hide anything inside it. "/cyvera/" cannot do that.
-
-    A lone separator is rejected outright: it normalises to "/", which appears in every
-    absolute path and would silently disable the entire scan.
+    APPENDED to the built-in skip lists, never substituted for them. Each entry is
+    forced to the bounded "/x/" form so it matches whole path COMPONENTS only; an
+    unbounded fragment would match anywhere in a path, which an attacker who can
+    name a directory could hide behind. A lone separator is rejected - it appears
+    in every absolute path and would disable the scan.
     """
     raw = os.environ.get(env_var, "")
     if not raw.strip():
@@ -146,28 +115,115 @@ def _extra_skip_fragments(env_var="YARA_EXTRA_SKIP_PATHS"):
     return tuple(out)
 
 
-UPLOAD_RESULTS = True  # Match uploads to XDR
-UPLOAD_NON_MATCH_DATA = False  # Keep non-match logs on disk only
-DEFAULT_TIMEOUT_SECS = 20            # increased request timeout everywhere
-MAX_RETRIES_PER_ITEM = 4             # per-batch retry cap (Insert Parsed Alerts)
-# Alert (Insert Parsed Alerts) upload BATCHING. The API accepts a LIST of alerts per POST, so
-# batching turns thousands of per-match POSTs into a handful — essential for match-heavy scans
-# (a broad rule can produce tens of thousands of string matches, which one-POST-per-match cannot
-# deliver before the scan ends). Edit these to tune the batch amount, flush interval, and how long
-# to keep draining pending alerts when the scan finishes.
+# ============================================================================
+# CUSTOMER CONFIG - set these for your deployment, then re-upload the script.
+#
+# Credentials first; everything after them is a per-run default, so an operator
+# supplies only yarafile / scan_folder / alert_severity at run time. An Action
+# Center `options` string ("key=value,key=value") overrides most of these for a
+# single run; the settings marked DEPLOYMENT-WIDE can be changed only here.
+# ============================================================================
+
+# Cortex XDR API key, key ID and tenant API URL (Advanced or Standard key).
+# Required for alerts and lookup datasets: while these are still placeholders,
+# a scan that would deliver either one aborts before scanning. URL form:
+# https://api-<tenant>.xdr.<region>.paloaltonetworks.com
+DEFAULT_XDR_API_KEY = "replace_with_xdr_standard_api_key"
+DEFAULT_XDR_API_ID = "replace_with_xdr_standard_api_id"
+DEFAULT_XDR_API_URL = "replace_with_xdr_standard_api_url"
+
+# --- What the run does ------------------------------------------------------
+CONFIG_MODE = "scan"                    # "scan" (run a scan) or "cancel" (stop a running scan)
+CONFIG_CREATE_ALERTS = True             # push one XDR alert per YARA match (feeds incidents)
+CONFIG_WRITE_DATASET = True             # write the yara_scanner_* lookup datasets (dashboards)
+CONFIG_COLLECT_FILES = False            # copy matched files into the evidence ZIP (off = metadata only)
+
+# --- CPU impact -------------------------------------------------------------
+# The scanner bounds its OWN share of the host; it does not react to load that
+# other processes create.
+#   "headroom" - adaptive: always leave CONFIG_CPU_HEADROOM_PCT of the host free
+#   "budget"   - fixed: never exceed CONFIG_CPU_BUDGET_PCT of the host
+#   "none"     - no CPU governing (low process priority still applies)
+CONFIG_CPU_GUARANTEE    = "headroom"    # "headroom" | "budget" | "none"
+CONFIG_CPU_HEADROOM_PCT = 30            # headroom policy: % of the host always left free
+CONFIG_CPU_BUDGET_PCT   = 25            # budget policy: max % of the host we may use
+CONFIG_CPU_FLOOR_PCT    = 5             # never target below this - guarantees progress
+# Scanning is disk-bound as well as CPU-bound, so more workers is not reliably
+# faster; raise this only after measuring on the target hardware.
+CONFIG_WORKERS          = 2             # 0 = auto (cores // 2); >0 = explicit
+
+# --- Where the rows land ----------------------------------------------------
+CONFIG_TENANT_ID = ""                   # tag rows/alerts with this tenant id; "" = derive from API URL
+CONFIG_LOOKUP_SHARD = "endpoint"        # dataset sharding: "endpoint" (per-host, recommended) | "none" | "<label>"
+# DEPLOYMENT-WIDE. Rotation applies to the SCANS dataset only. That dataset is
+# append-only, and lookup add_data merge time grows with dataset size, so a fresh
+# _<YYYYMM> dataset each month keeps writes bounded; dashboards match
+# yara_scanner_scans* and follow it automatically. The matches dataset is
+# permanent and overwritten at the start of every scan, so it never rotates.
+CONFIG_LOOKUP_ROTATION = "monthly"      # "monthly" (recommended) | "none" — SCANS dataset only
+
+# --- Volume caps ------------------------------------------------------------
+# DEPLOYMENT-WIDE. Alerts are one per finding (file x rule), and the Insert Parsed
+# Alerts budget (~600 alerts/min) is shared by every endpoint using this API key.
+# Past the cap, per-finding alerts stop and one rollup alert per rule reports the
+# remainder; suppressed findings are still in the lookup dataset. <= 0 = no cap.
+CONFIG_ALERT_MAX_PER_SCAN = 500         # max per-finding alerts per scan; beyond -> rollup per rule
+# Offsets/strings sampled per (rule, file) inside that file's dataset row. One
+# short pattern can hit a large file tens of thousands of times, and only the
+# network copy is capped - the local alert files keep every offset. <= 0 = no cap.
+CONFIG_LOOKUP_ROWS_PER_FINDING_MAX = _env_number("YARA_LOOKUP_ROWS_PER_FINDING", 50, cast=int, minimum=0)
+# Ceiling on the total bytes this run writes under alert/. On reaching it, offset
+# detail is dropped while the per-finding counts keep being written, so the
+# dataset totals still reconcile against the local files. 0 disables it.
+CONFIG_ALERT_DIR_MAX_BYTES = int(_env_number("YARA_ALERT_DIR_MAX_MB", 256, minimum=0) * 1024 * 1024)
+# Offsets rendered per (rule, file) in the local alert/<rule>.txt. The per-string-ID
+# census in that file is never capped; only the offsets are sampled. 0 = render all.
+CONFIG_ALERT_OFFSETS_PER_FINDING_MAX = 50
+
+# End-of-run host cleanup. DEPLOYMENT-WIDE, and it deletes this run's files from
+# the endpoint, so it is off by default.
+#   "off"         - keep everything (default)
+#   "on_delivery" - remove only when this run's findings are confirmed delivered
+#   "always"      - remove regardless of delivery
+# KEEP decides what survives: "nothing", "summary" (scan_summary_<run_id>.json) or
+# "evidence" (summary + evidence ZIP). rule_cache is never touched.
+CONFIG_HOST_CLEANUP      = "off"        # "off" | "on_delivery" | "always"
+CONFIG_HOST_CLEANUP_KEEP = "summary"    # "nothing" | "summary" | "evidence"
+
+CONFIG_OPTIONS = ""                     # extra "key=value,key=value" overrides applied every run (rarely needed)
+
+# ============================================================================
+# END CUSTOMER CONFIG
+# ============================================================================
+
+
+# ============================================================================
+# ADVANCED - internal tuning. Rarely edited; most values also read a YARA_*
+# environment variable so a single run can be overridden without editing here.
+#
+# A few knobs are environment-only and have no constant here, because they are set
+# per host rather than per deployment: YARA_MAX_MB (max file size scanned, default
+# 64), YARA_EXTRA_SKIP_PATHS (extra paths to exclude), YARA_SCANNER_DIR (working
+# directory), YARA_THREADS / YARA_QUEUE_SIZE, YARA_PROGRESS_LOG_SECS and
+# XDR_AUTH_TYPE.
+# ============================================================================
+UPLOAD_RESULTS = True                   # upload match results to XDR
+UPLOAD_NON_MATCH_DATA = False           # keep non-match logs on disk only
+DEFAULT_TIMEOUT_SECS = 20               # HTTP request timeout
+MAX_RETRIES_PER_ITEM = 4                # per-batch retry cap (Insert Parsed Alerts)
+
+# Alert delivery. Insert Parsed Alerts takes a LIST of alerts per POST (hard cap
+# 60) and is rate-limited to ~600 alerts/min per API key, shared across every
+# endpoint using that key. Batching plus a minimum interval between POSTs keeps a
+# match-heavy scan under the ceiling; the drain window is how long the run keeps
+# delivering after scanning ends, and scales with the remaining backlog.
 ALERT_BATCH_SIZE = min(60, _env_number("YARA_ALERT_BATCH", 60, cast=int, minimum=1))  # alerts per POST (XDR HARD CAP = 60; clamped)
 ALERT_FLUSH_SECS = _env_number("YARA_ALERT_FLUSH_SECS", 10, minimum=0)     # flush a partial batch after this idle
 ALERT_DRAIN_SECS = _env_number("YARA_ALERT_DRAIN_SECS", 60, minimum=0)     # MINIMUM end-of-scan drain window
 ALERT_DRAIN_MAX_SECS = _env_number("YARA_ALERT_DRAIN_MAX_SECS", 300, minimum=0)  # backlog-scaled drain cap
-# Insert Parsed Alerts is RATE-LIMITED (~600 alerts/min; the API returns HTTP 500 "Exceeding the
-# rate limit" when tripped). Pace batches to stay under it: 60 alerts every >=7s ~= 510/min. Without
-# pacing, over-fast batches fail and their retries burn the upload window, starving the rest.
 ALERT_MIN_BATCH_INTERVAL = _env_number("YARA_ALERT_MIN_INTERVAL", 7, minimum=0)  # min secs between alert POSTs
-# Requeue-on-rate-limit: when a batch exhausts its retries because it was RATE-LIMITED (not a real
-# error), put it back on the queue to try again once the per-minute window frees up — instead of
-# dropping it. Bounded by a global wall-clock budget so a permanently-saturated key (many concurrent
-# agents) can't loop forever; past the budget, or once the scan is stopping, batches drop as before.
-# This can't beat the shared server-side ceiling, only ride out transient saturation.
+# Requeue a batch whose retries were exhausted by RATE LIMITING (not a real error)
+# so it gets another window, bounded by a global wall-clock budget.
 ALERT_REQUEUE_ENABLED = (os.environ.get("YARA_ALERT_REQUEUE", "1").strip().lower() not in ("0", "false", "no", ""))
 ALERT_MAX_DELIVER_SECS = _env_number("YARA_ALERT_MAX_DELIVER_SECS", 900, minimum=0)  # global requeue budget
 BASE_BACKOFF_SECS = 1.0              # initial backoff
@@ -177,21 +233,17 @@ CIRCUIT_RESET_TIMEOUT_SECS = 40      # stay open before probing again
 WORKER_GET_TIMEOUT_SECS = 2.0        # queue.get timeout to allow graceful exit checks
 THREAD_CLEANUP_TIMEOUT = 60          # Maximum time to wait for thread cleanup
 
-# Per-worker throughput reporting fires every 100 files PROCESSED, so its volume scales
-# with file count rather than with time. On the XSIAM side one scan wrote 3,260 of these
-# lines, burying the six governor samples that actually diagnose a scan; a 10M-file server
-# would write ~100,000 lines and ~12 MB, per run, on the endpoint's disk. Throughput is a
-# sampled gauge, so it is bounded on the axis that matters: the 100-file trigger stays the
-# sampling point, and this gate decides whether the sample is written, at the same cadence
-# the governor and progress heartbeats already use. 0 disables it.
+# Per-worker throughput samples fire every 100 files processed, which scales with
+# file count rather than time; this gate bounds how often one is written.
+# 0 disables it.
 WORKER_REPORT_MIN_SECS = _env_number("YARA_WORKER_REPORT_SECS", 30, minimum=0)
 
 
 def _worker_report_due(last_report, now, interval=None):
-    """Whether a worker's throughput sample should be written.
+    """Whether a worker's throughput sample is due.
 
-    A worker's FIRST report always lands (last_report == 0), so a scan too short to span
-    one interval still produces a throughput reading rather than none at all.
+    A worker's FIRST report always lands, so a scan too short to span one interval
+    still produces a throughput reading.
     """
     if interval is None:
         interval = WORKER_REPORT_MIN_SECS
@@ -202,286 +254,104 @@ def _worker_report_due(last_report, now, interval=None):
     return (now - last_report) >= interval
 
 
-DEFAULT_XDR_API_KEY = "replace_with_xdr_standard_api_key"
-DEFAULT_XDR_API_ID = "replace_with_xdr_standard_api_id"
-DEFAULT_XDR_API_URL = "replace_with_xdr_standard_api_url"
-
-# ============================================================================
-# CUSTOMER CONFIG — set these ONCE for your deployment, then (re)upload/deliver
-# the script. These are the per-run behaviour knobs; putting them here means an
-# operator only supplies the essentials at run time — yarafile, scan_folder,
-# alert_severity — instead of a long options string on every scan.
-#
-# Precedence: an explicit Action Center `options` value (key=value,key=value)
-# OVERRIDES the matching constant below, so per-run overrides remain possible
-# without editing the script. Leave a value as-is to use it fleet-wide.
-#
-# This applies to the ten keys in _VALID_OPTION_KEYS only. CONFIG_LOOKUP_ROTATION,
-# CONFIG_ALERT_MAX_PER_SCAN, CONFIG_HOST_CLEANUP and CONFIG_HOST_CLEANUP_KEEP have NO
-# options equivalent and can be changed only here — passing them in an options string
-# is rejected as an unknown key. All four are deployment-wide by nature: rotation
-# decides the SCANS dataset's naming (mixing rotated and unrotated runs on one host splits
-# its lifecycle history across two datasets), the alert cap protects a per-API-key ceiling
-# that is shared across every concurrent scan, and host cleanup deletes files on the endpoint
-# — none of these should be one accidental options-string typo away from a different
-# behaviour on a single run.
-# ============================================================================
-CONFIG_MODE = "scan"                    # "scan" (run a scan) or "cancel" (stop a running scan)
-CONFIG_CREATE_ALERTS = True             # push one XDR alert per YARA match (feeds incidents)
-CONFIG_WRITE_DATASET = True             # write the yara_scanner_* lookup datasets (dashboards)
-CONFIG_COLLECT_FILES = False            # copy matched files into the evidence ZIP (off = metadata only)
-# CPU impact control. The scanner bounds its OWN share of the machine; it does NOT react
-# to load other processes create. Measured rationale (8-core Linux, 2026-08-01): the
-# previous design watched system-wide CPU and parked the scan for load it did not cause
-# (285s of a 347s scan, up to 65.9x slowdown) while protecting the host by -3% to +1%
-# versus no throttling at all. Impact is now bounded independently of worker count, so
-# scans can use the machine when it is idle and shrink when it is not.
-#   "headroom" - adaptive: always leave CONFIG_CPU_HEADROOM_PCT of the host free.
-#                A quiet machine gets a fast scan; a busy one gets a quiet scanner.
-#   "budget"   - fixed: never exceed CONFIG_CPU_BUDGET_PCT of the host. Predictable.
-#   "none"     - no CPU governing (low process priority still applies).
-CONFIG_CPU_GUARANTEE    = "headroom"    # "headroom" | "budget" | "none"
-CONFIG_CPU_HEADROOM_PCT = 30            # headroom policy: % of the host always left free
-CONFIG_CPU_BUDGET_PCT   = 25            # budget policy: max % of the host we may use
-CONFIG_CPU_FLOOR_PCT    = 5             # never target below this - guarantees progress
-# Worker threads. MEASURED on an 8-core Linux endpoint scanning /usr (93k files) with
-# governing off and a warm cache: 2 workers = 71s, 4 = 93s, 8 = 101s. More workers is
-# SLOWER here - the work is disk-bound, so extra concurrent readers cause seek contention
-# rather than useful overlap, and the scanner's internal locks add more on top.
-# The old hard cap of 2 is therefore removed (raise this if you have fast NVMe and have
-# measured a gain) but 2 remains the DEFAULT, because that is what the data supports.
-CONFIG_WORKERS          = 2             # 0 = auto (cores // 2); >0 = explicit
-CONFIG_TENANT_ID = ""                   # tag rows/alerts with this tenant id; "" = derive from API URL
-CONFIG_LOOKUP_SHARD = "endpoint"        # dataset sharding: "endpoint" (per-host, recommended) | "none" | "<label>"
-# Alert storm cap: alerts are ONE PER FINDING (file x rule). Past this many findings in one scan,
-# per-finding alerts stop and ONE rollup alert per rule reports the remainder ("rule X matched N
-# more files - see dataset"). Protects the shared ~600 alerts/min per-API-key ceiling while keeping
-# every suppressed finding visible (rollup + lookup dataset). <= 0 disables the cap.
-CONFIG_ALERT_MAX_PER_SCAN = 500         # max per-finding alerts per scan; beyond -> rollup per rule
-# Lookup-dataset row cap per (rule, file) finding: an unanchored/short string pattern (e.g. a bare
-# "powershell" substring) can occur tens of thousands of times inside one large file (measured live:
-# 33,118 offsets from one rule hitting one .evtx log). Unlike the alert channel above, this loop had
-# NO cap - one such finding could consume an entire scan's upload retry budget before genuinely
-# distinct findings elsewhere in the same scan ever got a turn, starving them out silently. Local
-# results/alert files keep every offset regardless (disk is not the scarce resource); only the
-# network upload is capped. <= 0 disables the cap.
-# max dataset rows uploaded per (rule, file); rest logged only. 0 = no cap. Env-reachable
-# because the XSIAM twin exposes both of its equivalents (YARA_MAX_MATCH_SAMPLES,
-# YARA_MAX_ALERT_OFFSETS) and a bare literal here made XDR strictly less tunable than
-# XSIAM on the one axis that drives per-finding upload volume.
-CONFIG_LOOKUP_ROWS_PER_FINDING_MAX = _env_number("YARA_LOOKUP_ROWS_PER_FINDING", 50, cast=int, minimum=0)
-
-# Ceiling on the TOTAL bytes this run may add under alert/. Per-finding caps bound each
-# record but say nothing about the sum: F files x R rules is unbounded, so a noisy ruleset
-# on a small endpoint disk had no ceiling at all. 0 disables it. On reaching it, offset
-# DETAIL is dropped while the per-finding count lines are still written - degrading detail
-# and keeping counts complete is the invariant, because the counts are what the tenant-side
-# dataset totals are reconciled against. The ceiling triggers degradation rather than a
-# hard stop, so the final size overshoots it by the compact records still being written.
-CONFIG_ALERT_DIR_MAX_BYTES = int(_env_number("YARA_ALERT_DIR_MAX_MB", 256, minimum=0) * 1024 * 1024)
-# Offsets RENDERED per (rule, file) in the local alert/<rule>.txt. Ported from the XSIAM
-# edition, where the unbounded version produced a 220 MB file on one endpoint - 98.6% of
-# it from four Windows event logs, because a rule hunting PowerShell strings legitimately
-# matches thousands of times inside a PowerShell log.
-#
-# Individual offsets are not what an analyst works from: which host, which rule, which
-# string IN that rule, and which file are. So the per-string-ID census below is written in
-# full and stays UNCAPPED, and only the offsets are sampled. 50 matches
-# CONFIG_LOOKUP_ROWS_PER_FINDING_MAX above, so the local file and the dataset row show the
-# same sample. 0 renders everything, as it does there.
-CONFIG_ALERT_OFFSETS_PER_FINDING_MAX = 50
-# Lookup dataset rotation — SCANS DATASET ONLY. It no longer has any effect on the matches
-# dataset; see the resolution note below.
-#
-# Why rotation exists: add_data merge time grows with DATASET SIZE (measured on-tenant: ~13s at
-# 15k rows, ~31s at 77k rows), so an ever-growing dataset eventually outlives any client timeout
-# and goes write-dead. "monthly" starts a fresh _<YYYYMM> dataset each month -> bounded size ->
-# bounded merge time, forever. Dashboards need no change (they match yara_scanner_scans*
-# wildcards); prune old months with xdr_action_center.py prune-datasets. "none" = single
-# unrotated dataset (legacy behaviour).
-#
-# RESOLVED (matches is now permanent + overwritten): the matches dataset is one per host,
-# created once and OVERWRITTEN at the start of every scan (LookupDatasetUploader._flush_stale_
-# matches), so it can never grow past a single scan's rows and has nothing for rotation to
-# bound. Worse, leaving rotation on it would have been actively contradictory: it would mint a
-# NEW dataset every month regardless, so "permanent, one per host" would silently become
-# "twelve per host per year", the deep-dive source's name would change under every dashboard
-# and consolidation caller pinned to it, and last month's dataset would keep its final scan's
-# rows forever with nothing left that ever overwrites them. So rotation is applied to exactly
-# one of the two datasets now, not half-applied to both:
-#   matches -> NEVER rotated. Permanent name, bounded by the per-scan overwrite.
-#   scans   -> STILL rotated by this setting. It is 2 rows/scan and append-only — nothing
-#              overwrites it — so it is the one that still grows without bound, which is
-#              precisely the case rotation was built for. Its behaviour is unchanged.
-# The YARA_LOOKUP_ROTATION env override has the same scans-only meaning.
-CONFIG_LOOKUP_ROTATION = "monthly"      # "monthly" (recommended) | "none" — SCANS dataset only
-# End-of-run host cleanup. The scanner already manages its footprint ACROSS repeat scans
-# (initial_cleanup clears the previous run's alert/evidence dirs, logs keep the last 10
-# scans) but does nothing at the END of a run. On a one-off fleet sweep the host is never
-# scanned again, so its full working directory - logs, evidence ZIP, alert files - sits on
-# disk forever. This is opt-in and off by default because it deletes files on the endpoint;
-# the wrong default here is a bigger risk than leaving today's behaviour in place.
-#   "off"         - unchanged behaviour (default). Nothing removed at end of run.
-#   "on_delivery" - remove only if this run's findings are confirmed delivered
-#                   (delivery_shortfall is empty). Keeps everything if delivery was
-#                   incomplete or if neither CONFIG_CREATE_ALERTS nor CONFIG_WRITE_DATASET
-#                   is enabled - with no delivery channel there is nothing to verify, and
-#                   the local copy is the only copy.
-#   "always"      - remove regardless of delivery. Only for hosts where the local copy is
-#                   not wanted even as a fallback.
-# CONFIG_HOST_CLEANUP_KEEP controls what survives the removal:
-#   "nothing"  - remove everything, including the summary JSON.
-#   "summary"  - keep only scan_summary_<run_id>.json (recommended default: tiny, and the
-#                machine-readable record of what this run did and found).
-#   "evidence" - keep the summary and the evidence ZIP, remove the rest.
-# rule_cache is NEVER touched by this - it is a cross-run performance cache, not this run's
-# data, and is already self-capped (RULE_CACHE_MAX_FILES).
-CONFIG_HOST_CLEANUP      = "off"        # "off" | "on_delivery" | "always"
-CONFIG_HOST_CLEANUP_KEEP = "summary"    # "nothing" | "summary" | "evidence"
-CONFIG_OPTIONS = ""                     # extra "key=value,key=value" overrides applied every run (rarely needed)
-# ============================================================================
-
-# XDR's lookups/add_data is NOT concurrency-safe server-side: it stages each write through a
-# per-write BigQuery "clone" table, and concurrent writes to the SAME lookup dataset race with
-# a transient HTTP 500 "...<dataset>_clone was not found". The server holds the dataset through
-# a slow merge, so client-side time-spreading alone can't fix it (verified: even 45s of jitter
-# across 8 writers to one dataset still lost 7/8). The REAL fix is per-writer dataset sharding
-# (see LOOKUP_DATASET_SHARD) so no two writers ever touch the same dataset. The knobs below are
-# secondary insurance for the rare case of two scans on the SAME host writing that host's shard:
-#   FEWER posts  -> big batches + deferred partial flush (each POST is one collision chance).
-#   DECORRELATE  -> small pre-write jitter spreads same-host writers.
-#   RECOVER      -> full-jitter retries mop up the remainder.
-LOOKUP_DATASET_BATCH_SIZE = _env_number("YARA_LOOKUP_BATCH", 500, cast=int, minimum=1)  # rows per POST. 500 is a sweet spot: bigger (e.g. 1000) makes the add_data payload slow enough that the API GATEWAY returns 502/read-timeouts under concurrent fleet load, losing whole batches.
+# Lookup-dataset writes. XDR's lookups/add_data is not concurrency-safe: two writers
+# on the SAME dataset race on a server-side staging table and one loses its rows.
+# LOOKUP_DATASET_SHARD is the real fix (one dataset per writer); these knobs are
+# secondary insurance for two scans on the same host - fewer POSTs (bigger batches,
+# deferred partial flush), a small pre-write jitter, and jittered retries.
+LOOKUP_DATASET_BATCH_SIZE = _env_number("YARA_LOOKUP_BATCH", 500, cast=int, minimum=1)  # rows per POST (500 stays under gateway 502s)
 LOOKUP_DATASET_FLUSH_SECS = _env_number("YARA_LOOKUP_FLUSH_SECS", 30, minimum=0)  # defer partials -> fewer POSTs
 LOOKUP_WRITE_JITTER_SECS = _env_number("YARA_LOOKUP_WRITE_JITTER", 2, minimum=0)   # light same-host spread
 LOOKUP_ADD_DATA_MAX_RETRIES = _env_number("YARA_LOOKUP_RETRIES", 6, cast=int, minimum=0)
 LOOKUP_DRAIN_TIMEOUT = _env_number("YARA_LOOKUP_DRAIN_SECS", 150, minimum=0)  # MINIMUM final-flush budget (covers jitter+retries)
-# The final drain budget scales with the backlog (datasets are the record — give a storm scan's
-# 70-batch backlog the time the math requires, not a flat window) up to a hard cap so a dead API
-# can't hang shutdown. Roughly: per-batch worst case ~= jitter + merge + one retry.
+# The final drain scales with the backlog, up to a hard cap so an unreachable API
+# cannot hang shutdown. Per batch, worst case ~= jitter + server merge + one retry.
 LOOKUP_DRAIN_MAX_SECS = _env_number("YARA_LOOKUP_DRAIN_MAX_SECS", 600, minimum=0)
 LOOKUP_DRAIN_PER_BATCH_SECS = _env_number("YARA_LOOKUP_DRAIN_PER_BATCH", 45, minimum=0)
-# add_data merges are slow server-side, and the merge time scales with the DATASET's total size,
-# not the payload (measured on-tenant with a 1-row POST: ~13s against a 15k-row dataset, ~31s
-# against a 77k-row one). A read timeout below the real merge time is catastrophic: every POST
-# "fails" client-side while the server may still commit it, retries re-run the full merge (and can
-# duplicate rows), and the batch ends up abandoned — a grown dataset goes into total write outage
-# (observed live: 500/36,106 rows landed). So: fail fast on CONNECT, stay patient on the read
-# (120s >> the largest merge a monthly-rotated dataset can grow into), and cap retries after a
-# READ timeout separately (see LOOKUP_TIMEOUT_MAX_ATTEMPTS) because the write may have succeeded.
+# add_data merge time scales with the DATASET's size, not the payload, and a read
+# timeout below the real merge time is destructive: the POST fails client-side while
+# the server may still commit it. Fail fast on CONNECT, stay patient on the read.
 LOOKUP_POST_TIMEOUT = (5, _env_number("YARA_LOOKUP_READ_TIMEOUT", 120, minimum=0))
-# Max POST attempts for a batch whose failures are READ timeouts. Unlike a connect failure (server
-# never saw the request; retry freely), a read timeout means the server was mid-merge when we hung
-# up — the rows often land anyway, so each blind retry risks duplicating the whole batch. 2 =
-# one retry, then stop and count the batch 'unconfirmed' (fate unknown) instead of looping.
+# A read timeout means the server was mid-merge, so the rows may have landed;
+# a blind retry can duplicate the whole batch. Past this many attempts the batch is
+# counted 'unconfirmed' instead of retried. Connect errors keep the full budget.
 LOOKUP_TIMEOUT_MAX_ATTEMPTS = _env_number("YARA_LOOKUP_TIMEOUT_ATTEMPTS", 2, cast=int, minimum=1)
-# THE fix for the add_data concurrency limitation: shard the lookup datasets per-writer so the
-# server never sees two endpoints writing the SAME dataset at once (the only condition that
-# triggers the clone-table race). Each endpoint writes yara_scanner_matches_<shard> and
-# _scans_<shard>; dashboards fan back in with a wildcard: `dataset = yara_scanner_matches_* | ...`.
-#   endpoint  -> one dataset per host (default; 1 writer per dataset -> 100% landing at any scale)
-#   none      -> legacy single shared dataset (only safe when fleet concurrency is ~1)
-#   <literal> -> force a specific shard label (e.g. a wave/site bucket)
+# Per-writer dataset sharding - the fix for the add_data concurrency limit. Each
+# endpoint writes its own yara_scanner_matches_<shard> / _scans_<shard>; dashboards
+# fan back in with a wildcard (`dataset = yara_scanner_matches_* | ...`).
+#   endpoint  -> one dataset per host (default; one writer per dataset)
+#   none      -> a single shared dataset (only safe at fleet concurrency ~1)
+#   <literal> -> a fixed shard label (e.g. a wave or site bucket)
 LOOKUP_DATASET_SHARD = os.environ.get("YARA_LOOKUP_SHARD", "endpoint").strip() or "endpoint"
-# Lookup datasets have a FIXED schema set at creation — XDR silently SKIPS rows that carry fields
-# the existing dataset doesn't know about. So schema changes can't be applied in place; instead we
-# tag the dataset name with a schema version and bump it whenever the row shape changes. A fresh
-# version = a fresh dataset with the new schema; old-version datasets remain queryable (the
-# dashboards' `yara_scanner_matches*` wildcard spans every version). Bump this on any schema edit.
-# v4 (current): one row per matched FILE. See MATCHES_SCHEMA_V4 for the shape, and for the reason
-# each v3 column was kept per-row, folded into `rules`, or dropped as derivable.
+# A lookup dataset's schema is FIXED at creation and XDR silently SKIPS rows that
+# carry fields the dataset does not know, so a row-shape change is a new version
+# with a new dataset name, never an in-place edit. Bump this on any schema edit;
+# older datasets stay queryable under the dashboards' yara_scanner_matches* wildcard.
 LOOKUP_SCHEMA_VERSION = os.environ.get("YARA_LOOKUP_SCHEMA_VER", "4").strip() or "4"
-# Rule-compilation DISK cache. Compiling a large pack (~500 rules) costs ~90s and is repeated on
-# every run because the scanner is a fresh process per action. yara-python's rules.save()/load()
-# lets us persist the compiled ruleset on the endpoint and skip the whole per-rule compile loop on
-# a subsequent run with identical rules. The cache is keyed on the exact rule text + yara/platform
-# version + externals + module availability + a format tag, so it can never load a stale or
-# cross-version bundle; any load failure falls back to a fresh compile.
+
+# Compiled-rule disk cache. Compiling a large pack costs ~90s and the scanner is a
+# fresh process per action, so the compiled bundle is persisted and reloaded when
+# the rules are unchanged. The cache key covers rule text, yara/platform version,
+# externals, module availability and RULE_CACHE_FORMAT, so it can never load a
+# stale or cross-version bundle; any load failure falls back to a fresh compile.
 RULE_CACHE_ENABLED = (os.environ.get("YARA_RULE_CACHE", "1").strip().lower() not in ("0", "false", "no", ""))
-# Bumped to "2" for v3.2.0: that release changed the rule *classification* logic (a rule is
-# skipped only when yara itself raises `undefined identifier`, not when its text mentions a
-# module name). Classification is not one of the key's inputs below, so without this bump a
-# host with a warm cache would take a HIT and keep running the pre-fix bundle — the wrongly
-# skipped rules would stay missing, silently, for as long as the cache entry survived.
 RULE_CACHE_FORMAT = os.environ.get("YARA_RULE_CACHE_FORMAT", "2").strip() or "2"  # bump when compile logic changes
-# The two numeric knobs go through _env_number rather than a bare os.environ read: an
-# unparseable value (YARA_RULE_CACHE_MAX_MB=256MB) used to raise inside ScanConfig, which
-# main() builds BEFORE LogManager exists, so the scan died with nothing recording why.
 RULE_CACHE_MAX_FILES = _env_number("YARA_RULE_CACHE_MAX", 5, cast=int, minimum=0)
 RULE_CACHE_MAX_BYTES = int(_env_number("YARA_RULE_CACHE_MAX_MB", 256, minimum=0) * 1024 * 1024)
 _RULE_CACHE_LOCK = threading.Lock()
-# Fixed lookup-dataset base name (stable so dashboards can reference literally):
-#   <prefix>_matches -> one row per matched FILE (v4 grain; `rules` carries every rule that hit
-#                       the file, rule_count/match_total the file-level totals, and each rule's
-#                       offsets/strings a capped sample)
+
+# Fixed lookup-dataset base name, stable so dashboards can reference it literally:
+#   <prefix>_matches -> one row per matched FILE (schema v4)
 #   <prefix>_scans   -> scan-lifecycle rows (initiated/running/completed/cancelled/failed)
 LOOKUP_DATASET_PREFIX = "yara_scanner"
-# The matches dataset is PERMANENT and OVERWRITTEN per scan (see LookupDatasetUploader.
-# _flush_stale_matches): every scan starts by deleting the rows the PREVIOUS scan left there,
-# so the dataset always holds exactly one scan per host and never accumulates.
-#
-# Two constraints shape how that is done, both measured on this tenant (2026-08-19):
-#   * remove_data filter flush = 10.0s for ~550 rows; delete_dataset + recreate = 190.2s.
-#     19x. So the overwrite is a filtered row delete, never a dataset delete — and it also
-#     keeps the dataset OBJECT (and therefore its schema, and anything pinned to its name)
-#     alive across the overwrite.
-#   * remove_data takes EXACT-VALUE filters only, so "everything that is not this scan" is
-#     not expressible: the stale scan_ids must be enumerated first (one XQL) and then removed
-#     one exact value at a time.
+
+# Start-of-scan overwrite of this host's matches dataset. It is a filtered row
+# delete, not a dataset delete: remove_data takes EXACT-VALUE filters only, so the
+# stale scan_ids are enumerated with one XQL first and then removed one value at a
+# time, which also keeps the dataset object (and its schema and name) alive.
 LOOKUP_FLUSH_POLL_SECS = _env_number("YARA_LOOKUP_FLUSH_POLL_SECS", 3, minimum=0)
 LOOKUP_FLUSH_MAX_POLLS = _env_number("YARA_LOOKUP_FLUSH_MAX_POLLS", 20, cast=int, minimum=1)
-# Read timeout for the results poll and for remove_data. 200s on the delete matches the proven
-# caller (xdr_action_center.py:449) and is 20x the measured 10.0s flush, so a fleet-scale
-# dataset has room; fail fast on CONNECT, stay patient on the read, exactly as the add_data
-# path does (LOOKUP_POST_TIMEOUT).
+# Read timeouts for the results poll and for remove_data: fail fast on CONNECT,
+# stay patient on the read, as the add_data path does.
 LOOKUP_FLUSH_QUERY_TIMEOUT = (5, _env_number("YARA_LOOKUP_FLUSH_QUERY_TIMEOUT", 90, minimum=1))
-# Whole-flush wall-clock budget. This runs on the critical path of EVERY scan start on every
-# host, and it is the least important thing a run does — so a pathological tenant (each poll
-# hanging to its read timeout) must cost the fleet one bounded delay and a log line, not
-# max_polls x read_timeout before a single file is scanned. Measured cost to beat: 10.0s for
-# the delete plus a few seconds of query; 300s is 20x that. <= 0 disables the budget.
+# Whole-flush wall-clock budget. This runs at the start of every scan on every
+# host and is the least important thing a run does, so it must cost one bounded
+# delay and a log line, never max_polls x read_timeout. <= 0 disables the budget.
 LOOKUP_FLUSH_BUDGET_SECS = _env_number("YARA_LOOKUP_FLUSH_BUDGET", 300, minimum=0)
 LOOKUP_FLUSH_REMOVE_TIMEOUT = (5, _env_number("YARA_LOOKUP_FLUSH_REMOVE_TIMEOUT", 200, minimum=1))
-# Only a dataset this scanner itself owns may be interpolated into an XQL string or handed to
-# remove_data. Mirrors YARA_OWNED_RE (xdr_action_center.py:44) for the same reason: the shard
-# suffix is derived from a hostname, and a name that does not round-trip to the shape we mint
-# is a name we must not delete rows from.
+# Only a dataset this scanner mints may be interpolated into XQL or handed to
+# remove_data: the shard suffix comes from a hostname, and a name that does not
+# round-trip to this shape is not one we may delete rows from.
 _YARA_OWNED_DATASET_RE = re.compile(r"^yara_scanner_(matches|scans)_v\d+(?:_[a-z0-9_]+)?$")
-SCANS_HEARTBEAT_SECS = _env_number("YARA_HEARTBEAT_SECS", 600, minimum=0)  # running-row cadence
-# How many past scans' logs (+ their JSON summary) to keep on the endpoint. The old value (2)
-# wiped diagnostics too aggressively under frequent scans; keep more by default, configurable.
+
+SCANS_HEARTBEAT_SECS = _env_number("YARA_HEARTBEAT_SECS", 600, minimum=0)  # 'running' row cadence
+# Past scans' logs (and their JSON summary) kept on the endpoint.
 LOG_KEEP_SCANS = _env_number("YARA_LOG_KEEP", 10, cast=int, minimum=0)
 CANCEL_POLL_SECS = _env_number("YARA_CANCEL_POLL_SECS", 5, minimum=0)        # cancel-flag watcher cadence
 CANCEL_DRAIN_DEADLINE_SECS = _env_number("YARA_CANCEL_DEADLINE_SECS", 30, minimum=0)  # graceful cancel budget
-# Cadence for the independent heartbeat thread (#8, distinct from #21): _maybe_heartbeat()
-# was previously called ONLY from the directory-walker loop, so a walker parked in
-# _enqueue_scan_path's backpressure retry loop (a large directory on a throttled host) also
-# stalled the "scans" dataset heartbeat for as long as it was blocked. This poll interval only
-# needs to be comfortably below SCANS_HEARTBEAT_SECS; it does not itself gate emission.
+# Cadence of the independent heartbeat thread. _maybe_heartbeat() is also called
+# from the directory walker, which can legitimately block on queue backpressure;
+# this thread keeps the heartbeat landing meanwhile. Only needs to be comfortably
+# below SCANS_HEARTBEAT_SECS - it does not itself gate emission.
 HEARTBEAT_THREAD_POLL_SECS = _env_number("YARA_HEARTBEAT_POLL_SECS", 30, minimum=0)
 CANCEL_STALE_TOLERANCE_SECS = 2.0  # mtime slack when judging a cancel flag stale (coarse-FS safety)
-# Governor telemetry heartbeat: emit at least this often even when nothing changes, so a
-# healthy scan still leaves a time series proving the CPU promise held.
+# Governor telemetry heartbeat: emit at least this often even when nothing changes,
+# so a healthy scan still leaves a time series showing the CPU promise held.
 GOVERNOR_HEARTBEAT_SECS = _env_number("YARA_GOVERNOR_HEARTBEAT_SECS", 30, minimum=0)
 
+# Working copies of the credentials above; ScanConfig rebinds them at startup.
 XDR_API_KEY = DEFAULT_XDR_API_KEY
 XDR_API_ID = DEFAULT_XDR_API_ID
 XDR_API_URL = DEFAULT_XDR_API_URL
 
 # XDR public-API authentication mode.
-#   "auto"     -> probe the tenant once (Advanced first, then Standard) and cache the winner
-#   "advanced" -> per-request HMAC signature (x-xdr-nonce + x-xdr-timestamp + sha256(key+nonce+ts))
+#   "auto"     -> probe the tenant once (Advanced first, then Standard), cache the winner
+#   "advanced" -> per-request HMAC signature (x-xdr-nonce + x-xdr-timestamp + sha256)
 #   "standard" -> plain header (Authorization: <key> + x-xdr-auth-id)
-# Advanced is the modern default for Cortex XDR/XSIAM API keys; Standard-only keys still work via auto.
 XDR_AUTH_TYPE = (os.environ.get("XDR_AUTH_TYPE") or "auto").strip().lower()
 _RESOLVED_AUTH_TYPE = None  # cache for "auto": resolved to "advanced" | "standard" on first use
 
 YARA_RULE = r""""""
-
-
-# Note: the cleanup script is now generated at runtime from config.alert_dir
-# (CleanupManager._get_cleanup_script_content) instead of hardcoded base64 blobs,
-# which previously drifted to the wrong directory (P2 fix).
 
 
 # ============================================================================
@@ -557,18 +427,10 @@ def _b64_to_text(s: str) -> str:
 
 
 def decode_yara_rules(encoded_b64: str, error_logger=None) -> str:
-    """
-    Decode and validate YARA rules from base64.
-    
-    Args:
-        encoded_b64: Base64 encoded YARA rules
-        error_logger: Optional error logger instance
-        
-    Returns:
-        Decoded YARA rules text
-        
-    Raises:
-        ValueError: If decoding fails or content is invalid
+    """Decode and validate base64-encoded YARA rules.
+
+    Returns the decoded rule text. Raises ValueError if the input is empty, too
+    large, not valid base64, or contains no `rule` declaration.
     """
     if len(encoded_b64) > 50_000_000:
         raise ValueError("YARA rules input too large")
@@ -610,8 +472,8 @@ _CASE_PROBE_LOCK = threading.Lock()
 def case_probe_count():
     """How many times the Darwin case-sensitivity probe touched the filesystem.
 
-    Exposed because a cached probe and a platform branch that never probes both leave
-    zero files behind, so the filesystem alone cannot tell them apart.
+    Exposed for tests: a cached probe and a platform branch that never probes both
+    leave zero files behind, so the filesystem alone cannot tell them apart.
     """
     return _CASE_PROBE_COUNT
 
@@ -619,18 +481,11 @@ def case_probe_count():
 def _is_case_sensitive_fs():
     """Detect if the filesystem is case-sensitive. Answered once per process.
 
-    On Darwin this is decided by experiment - create /tmp/CaSe_TeSt_YaRa_<pid>, write to
-    it, stat the lowercased name, unlink - and it is reached from _get_real_path(), which
-    scan_file() calls for EVERY file that passes the pre-checks. Uncached, a 48,921-file
-    macOS scan performed ~49,000 create/write/stat/unlink cycles in /tmp to re-answer a
-    question whose answer cannot change while the process lives.
-
-    That was also the scanner's only per-file WRITE. A tool that reads the disk looking
-    for malware should not leave tens of thousands of file creations behind on the host
-    it is scanning; another EDR watching /tmp has every reason to find that interesting.
-
-    A FAILED probe is cached too. Otherwise an unwritable /tmp costs one exception per
-    scanned file - the worst case, not the rare one.
+    On Darwin the answer comes from an experiment in /tmp (create a mixed-case name,
+    stat the lowercased one, unlink). It is reached for every scanned file, so both
+    the answer and a FAILED probe are cached - otherwise an unwritable /tmp costs one
+    exception per file, and the scan leaves tens of thousands of file creations on the
+    host it is scanning.
     """
     global _CASE_SENSITIVE_FS, _CASE_PROBE_COUNT
     if _CASE_SENSITIVE_FS is not None:
@@ -770,20 +625,15 @@ def _dataset_shard_suffix(raw_label: str) -> str:
 
 
 # ============================================================================
-# INTERNAL — Cortex XDR public API paths. NOT customer-editable.
-# Kept beside the URL builders that consume them rather than up in the CUSTOMER
-# CONFIG region, so the only block an operator edits contains only settings they
-# are meant to change.
+# INTERNAL - Cortex XDR public API paths. Not customer-editable; kept beside
+# the URL builders that consume them.
 # ============================================================================
 XDR_INSERT_PARSED_ALERTS_PATH = "/public_api/v1/alerts/insert_parsed_alerts"
 XDR_LOOKUPS_ADD_DATA_PATH = "/public_api/v1/xql/lookups/add_data"
 XDR_GET_DATASETS_PATH = "/public_api/v1/xql/get_datasets"
 XDR_ADD_DATASET_PATH = "/public_api/v1/xql/add_dataset"
-# The three endpoints the start-of-scan overwrite needs. Trailing slashes are kept here
-# (unlike the four above, whose slashless form is proven live by every scan) because these
-# exact strings are the ones exercised against this tenant by xdr_action_center.py —
-# remove_data at xdr_action_center.py:449, start/poll at :315 and :324. Same API either
-# way; matching the proven caller is cheaper than re-verifying the variant.
+# The three endpoints the start-of-scan overwrite needs. Trailing slashes are kept
+# on these three (the four above are proven slashless by every scan).
 XDR_LOOKUPS_REMOVE_DATA_PATH = "/public_api/v1/xql/lookups/remove_data/"
 XDR_START_XQL_QUERY_PATH = "/public_api/v1/xql/start_xql_query/"
 XDR_GET_QUERY_RESULTS_PATH = "/public_api/v1/xql/get_query_results/"
@@ -832,9 +682,7 @@ def _build_xdr_add_dataset_url(api_url: str) -> str:
 def _build_xdr_url(api_url: str, path: str) -> str:
     """Build a full endpoint URL for `path` from a base or already-full URL.
 
-    Same contract as the four builders above (idempotent when handed a full URL), but
-    parameterised — the overwrite step needs three more endpoints and four more
-    copy-pasted builders would be four more places for a path typo to hide.
+    Idempotent when handed a full URL, like the four fixed builders above.
     """
     base = (api_url or "").strip().rstrip("/")
     if not base:
@@ -847,13 +695,10 @@ def _build_xdr_url(api_url: str, path: str) -> str:
 def _xql_says_missing(text: str) -> bool:
     """True when an API error body means "that dataset isn't there".
 
-    A first-ever scan on a host has no dataset to overwrite, and the start-of-scan flush must
-    treat that as a no-op rather than an error. "not found" is the wording this tenant returns
-    for a missing lookup dataset (the same signature _ensure_one already relies on from
-    add_data's HTTP 400 "Dataset not found"); the other two are conservative synonyms.
-
-    Matching too eagerly is safe in this one direction only: every caller responds by deleting
-    NOTHING and letting the scan proceed.
+    A first-ever scan on a host has no dataset to overwrite, so the start-of-scan
+    flush must treat that as a no-op. "not found" is this tenant's wording; the other
+    two are conservative synonyms. Matching too eagerly is safe in one direction only:
+    every caller responds by deleting NOTHING and letting the scan proceed.
     """
     low = (text or "").lower()
     return "not found" in low or "does not exist" in low or "no such dataset" in low
@@ -867,8 +712,8 @@ def _advanced_auth_headers():
     """Advanced (HMAC) auth headers. A fresh nonce+timestamp is generated per call,
     so callers MUST build headers per HTTP attempt (never reuse across retries).
 
-    Uses os.urandom (not the `secrets` module): the Cortex agent's snippet/script
-    sandbox enforces an import allowlist that rejects `secrets`.
+    Uses os.urandom, not the `secrets` module: the Cortex agent's script sandbox
+    enforces an import allowlist that rejects `secrets`.
     """
     nonce = os.urandom(32).hex()
     timestamp = str(int(time.time() * 1000))
@@ -987,8 +832,7 @@ def _derive_tenant_id(api_url, override=""):
 
 
 # Runtime options exposed through the compact `options` string parameter
-# (key=value,key=value). Kept small on purpose: each is also a plain kwarg on
-# main()/ScanConfig for standalone use.
+# (key=value,key=value). Each is also a plain kwarg on main()/ScanConfig.
 _VALID_OPTION_KEYS = {
     "create_alerts", "write_dataset", "collect_files",
     "cpu_guarantee", "cpu_headroom_pct", "cpu_budget_pct", "cpu_floor_pct",
@@ -996,9 +840,8 @@ _VALID_OPTION_KEYS = {
 }
 
 # Options retired by the CPU-governor redesign. Accepted and translated rather than
-# rejected, so existing scripts and scheduled jobs keep running. The old BEHAVIOUR is
-# deliberately not preserved: it was measured to cost up to 65.9x scan time while
-# protecting the host by -3% to +1% versus not throttling at all.
+# rejected, so existing scripts and scheduled jobs keep running. They are translated,
+# not reinstated: CONFIG_CPU_GUARANTEE is what bounds impact now.
 _RETIRED_OPTION_KEYS = {
     "throttle_mode", "cpu_high_threshold", "cpu_critical_threshold", "max_pause_secs",
 }
@@ -1040,9 +883,8 @@ def _parse_options_string(options):
         k, v = chunk.split("=", 1)
         k = k.strip().lower()
         v = v.strip()
-        # Retired keys are ACCEPTED here and translated later by
-        # migrate_throttle_option(). Rejecting them at the parser would break every
-        # existing script and scheduled job that still sets throttle_mode.
+        # Retired keys are ACCEPTED here and translated later by migrate_throttle_option().
+        # Rejecting them at the parser would break scripts that still set throttle_mode.
         if k not in _VALID_OPTION_KEYS and k not in _RETIRED_OPTION_KEYS:
             raise ValueError(
                 f"Unknown option '{k}'. Valid keys: {', '.join(sorted(_VALID_OPTION_KEYS))}"
@@ -1135,19 +977,18 @@ def _parse_alert_severity(value, arg_name="alert_severity"):
 
 
 YARA_COMPILE_EXTERNALS = {
-    # External vars community rules reference in conditions. Declared here at compile time
-    # AND populated per-file at match time (see scan_file) so `filename`/`filepath` rules
-    # actually work — previously `filename` was undeclared (rules failed to compile) and
-    # `filepath` was never set (always "", so those rules never matched).
+    # External vars community rules reference in conditions. Declared at compile time
+    # AND populated per-file at match time (see scan_file), so `filename`/`filepath`
+    # rules both compile and match.
     "filepath": "",
     "filename": "",
 }
 
-# Module -> regex that detects a rule *using* that module (e.g. `cuckoo.network...`). Single
-# source of truth shared by _inject_missing_rule_imports (auto-import decision) and
-# _rule_uses_unavailable_modules (skip-vs-fail decision) so "does this rule need module X" is
-# answered identically in both places. A rule that references an UNAVAILABLE module can never
-# compile on this agent, so it must be SKIPPED (module missing), not counted as a FAILED rule.
+# Module -> regex detecting a rule that USES that module (e.g. `cuckoo.network...`).
+# Shared by _inject_missing_rule_imports (auto-import) and
+# _rule_uses_unavailable_modules (skip-vs-fail), so both answer "does this rule
+# need module X" identically. A rule referencing an UNAVAILABLE module can never
+# compile here, so it must be SKIPPED, not counted as a FAILED rule.
 MODULE_USAGE_PATTERNS = OrderedDict([
     ("math", r"\bmath\."),
     ("elf", r"\belf\."),
@@ -1219,10 +1060,8 @@ def _apply_light_process_priority(log_manager=None, throttle_mode="script", conf
 
     throttle_mode:
       script/off -> baseline low priority (below-normal / nice 10 + ionice BE-7)
-      os         -> idle-tier priority so the OS scheduler fully arbitrates and the
-                    scanner never competes with real work (customer request: hand
-                    resource control to the OS, bypassing script-side sleeps).
-    All calls are best-effort; a failure here must never fail the scan.
+      os         -> idle-tier priority; the OS scheduler fully arbitrates
+    A failure here must never fail the scan.
     """
     details = {"throttle_mode": throttle_mode}
     os_mode = (throttle_mode == "os")
@@ -1268,24 +1107,19 @@ def _apply_light_process_priority(log_manager=None, throttle_mode="script", conf
                 except Exception as e:
                     details["io_priority_error"] = str(e)
 
-        # CPU affinity materially changes what the throttle can observe. The Cortex
-        # agent pins Windows payload processes to a SUBSET of cores (measured: 2 of 8),
-        # so the scanner may be unable to move system-wide CPU anywhere near
-        # cpu_high_threshold on its own. Record it: without this, throttle behaviour
-        # on Windows is inexplicable from the logs.
-        # host_cores is recorded FIRST and separately: it is platform-independent, and the
-        # governor's own-share maths is (process_cpu / cpu_count), so a log without it
-        # cannot be interpreted at all. cpu_affinity() does NOT exist on macOS (psutil
-        # raises AttributeError on Darwin) — when host_cores lived inside that same try,
-        # every macOS run recorded "host_cores": null and lost the denominator.
+        # host_cores is recorded FIRST and separately from affinity: the governor's
+        # own-share maths is (process_cpu / cpu_count), so a log without it cannot be
+        # interpreted, and cpu_affinity() does not exist on macOS. Affinity matters
+        # because the Cortex agent pins Windows payloads to a SUBSET of cores, which
+        # bounds what the scanner can observe.
         details["host_cores"] = os.cpu_count()
         try:
             affinity = process.cpu_affinity()
             details["cpu_affinity"] = affinity
             details["cpu_affinity_count"] = len(affinity)
         except (AttributeError, NotImplementedError):
-            # Platform does not expose affinity (macOS). Not an error: the process is
-            # free to use every core, so the affinity count IS the host core count.
+            # Platform does not expose affinity (macOS). Not an error: the process is free
+            # to use every core, so the affinity count IS the host core count.
             details["cpu_affinity_count"] = os.cpu_count()
             details["cpu_affinity"] = "unrestricted"
         except Exception as e:
@@ -1293,8 +1127,8 @@ def _apply_light_process_priority(log_manager=None, throttle_mode="script", conf
 
         if log_manager:
             log_manager.log_system("Applied process priority tuning", details)
-            # Self-describing header for the performance log, so a run's throttle
-            # behaviour can be interpreted without cross-referencing other files.
+            # Self-describing header for the performance log, so a run's CPU behaviour can be
+            # read without cross-referencing other files.
             try:
                 log_manager.log_performance("THROTTLE_CONFIG " + json.dumps({
                     "priority_tier": throttle_mode,
@@ -1321,15 +1155,9 @@ def _apply_light_process_priority(log_manager=None, throttle_mode="script", conf
 class CpuGovernor:
     """Bounds the scanner's OWN CPU share so the host keeps a guaranteed remainder.
 
-    Replaces the previous system-CPU pause loop, which measured a quantity the scanner
-    cannot control. Measured consequence of that design (8-core Linux, 2026-08-01): with
-    unrelated load holding ~74% CPU, the scanner parked 285s of a 347s scan waiting for a
-    resume condition that could never arrive - while protecting the competing workload by
-    -3% to +1% versus not throttling at all. It punished itself for load it did not cause.
-
-    This governor instead asks "how much of the machine am I using?" and holds that under
-    a target. It reacts to external load only by SHRINKING its own share, never by
-    stopping, so it structurally cannot stall: the target is floored at floor_pct.
+    Asks "how much of the machine am I using?" and holds that under a target. It
+    reacts to external load only by SHRINKING its own share, never by stopping, so
+    it cannot stall: the target is floored at floor_pct.
 
     Policies:
       "headroom" - adaptive; always leave headroom_pct of the host free for other work
@@ -1363,11 +1191,8 @@ class CpuGovernor:
 
     def normalise_own(self, raw_pct):
         """psutil reports PROCESS cpu as a percentage of ONE core - a 4-thread scanner
-        reads 400%. Convert to a share of the whole machine.
-
-        Omitting this holds the scanner to 1/N of the configured budget, and does so
-        invisibly: the scan still runs, still throttles, still reports success. It is
-        simply N times slower than promised, and the bigger the host the worse it gets.
+        reads 400%. Convert to a share of the whole machine, or the scanner is held to
+        1/N of the configured budget.
         """
         if self.cpu_count <= 0:
             return float(raw_pct)
@@ -1389,12 +1214,10 @@ class CpuGovernor:
         """Recompute the sleep ratio from a fresh pair of CPU readings.
 
         own_raw_pct is psutil's PROCESS reading (percent of one core); system_pct is the
-        machine-wide reading. `others` is what everyone else is using - deriving it as
-        (system - own) is what makes this immune to the original bug: the scanner reacts
-        to external load only by shrinking its own share, never by halting.
+        machine-wide reading. `others` is derived as (system - own), which is what keeps
+        the scanner reacting to external load by shrinking its share rather than halting.
 
         `now` is injectable so the sampling cadence can be tested without sleeping.
-
         Returns the target share, or None when disabled.
         """
         if not self.enabled:
@@ -1410,12 +1233,10 @@ class CpuGovernor:
             self.last_own = own
             self.last_others = others
             self.last_target = target
-            # Counted where readings are CONSUMED, not where they are logged. The
-            # `CPU governor |` line is emitted on a change threshold plus a 30 s
-            # heartbeat, so line spacing measures the emission policy and not the
-            # sampling rate; on a steady scan the two diverge completely. Without these
-            # an operator cannot tell "readings are steady so nothing is worth emitting"
-            # from "sampling has stalled" - both simply produce fewer lines.
+            # Counted where readings are CONSUMED, not where they are logged: the `CPU governor |`
+            # line is emitted on a change threshold plus a heartbeat, so line spacing measures
+            # the emission policy, not the sampling rate. Without these, "steady, nothing worth
+            # emitting" and "sampling has stalled" look identical.
             self.last_sample_gap = (None if self.last_sample_at is None
                                     else round(stamp - self.last_sample_at, 3))
             self.last_sample_at = stamp
@@ -1426,8 +1247,7 @@ class CpuGovernor:
         """Sleep in proportion to the work just done. Returns seconds slept.
 
         Proportional rather than fixed sleeping keeps the slowdown factor stable
-        regardless of file size or machine speed, so the promised share holds on a
-        laptop and a 32-core server alike.
+        regardless of file size or machine speed.
         """
         if not self.enabled:
             return 0.0
@@ -1459,17 +1279,12 @@ class CpuGovernor:
 def _scan_error_reason(exc):
     """Bounded skip_reasons key for a per-file scan error.
 
-    skip_reasons is an AGGREGATE breakdown - its keys are labels, and the whole dict is
-    serialised into the final report and a statistics event. Returning str(exc) made every
-    errored file its own key, because both common error texts embed the absolute path
-    (yara.Error is 'could not open file "<path>"', OSError is '[Errno 2] ...: <path>').
-    On a full-system scan, where files vanish or lock between the access check and
-    rules.match routinely, that is unbounded growth shipped to the tenant - measured at
-    307,780 bytes for 5,000 errored files.
-
-    The exception TYPE is kept so genuinely different failures stay distinguishable, and
-    "error" stays in the label because the final report counts error reasons by that
-    substring. The specific message and path are not lost: scan_file logs them per file.
+    skip_reasons is an aggregate breakdown whose keys are labels, and the whole dict
+    ships in the final report and a statistics event. Keys must therefore be bounded:
+    the common error texts embed the absolute path, which on a full-system scan would
+    grow without limit. The exception TYPE keeps genuinely different failures apart,
+    and "error" stays in the label because the final report counts error reasons by
+    that substring. The message and path are still logged per file by scan_file.
     """
     return f"Scan error ({type(exc).__name__})"
 
@@ -1477,10 +1292,9 @@ def _scan_error_reason(exc):
 def _render_match_data(data) -> str:
     """Render YARA-matched bytes as a printable string for human-readable output.
 
-    YARA wide-string matches return UTF-16 LE bytes (e.g. b'N\\x00o\\x00...');
-    decoding those as UTF-8 leaves embedded NUL bytes in the output and breaks
-    editors like Notepad. Decode UTF-16 LE when the byte pattern looks wide,
-    fall back to UTF-8 for ASCII matches, and to hex for binary blobs.
+    YARA wide-string matches return UTF-16 LE bytes; decoding those as UTF-8 leaves
+    embedded NUL bytes and breaks editors. Decode UTF-16 LE when the byte pattern
+    looks wide, fall back to UTF-8 for ASCII, and to hex for binary blobs.
     """
     if not isinstance(data, (bytes, bytearray)):
         return str(data)
@@ -1501,30 +1315,7 @@ def _render_match_data(data) -> str:
 
 
 def _iter_hit_fields(hit):
-    """Extract rule, tags, meta and normalised strings from a live yara Match object.
-
-    This used to accept a second shape: a plain dict whose `strings` were
-    (offset, id, hex-text) triples, rehydrated with bytes.fromhex. That implied a match
-    CACHE - something that serialised findings and replayed them later. No such cache
-    exists, and the arm was unreachable:
-
-      * four call sites (the rules_matched comprehension, the _write_alerts loop, the
-        total_string_matches sum, and rules_triggered) all iterate `matches`;
-      * `matches` has exactly ONE binding, `matches = self.rules.match(...)`, which
-        returns yara.Match objects and never dicts;
-      * _write_alerts takes `matches` as a parameter but has a single caller, which
-        passes that same local;
-      * no module outside this file imports _iter_hit_fields.
-
-    This edition did have a producer for the dict shape, _serialize_matches(), which the
-    XSIAM edition never had. It had zero call sites of its own - dead code feeding a dead
-    branch - and was removed with this arm rather than left behind.
-
-    It was removed rather than kept for safety, because it was not safe. Its decode
-    fallback was `hx.encode("utf-8", errors="ignore")` on anything bytes.fromhex
-    rejected - so a non-hex string produced WRONG BYTES silently instead of raising, and
-    every offset and matched-data field downstream would have been quietly corrupt.
-    """
+    """Extract rule, tags, meta and normalised strings from a live yara Match object."""
     strings = _normalize_match_strings(list(getattr(hit, "strings", []) or []))
     return hit.rule, list(getattr(hit, "tags", []) or []), dict(getattr(hit, "meta", {}) or []), strings
 
@@ -1612,9 +1403,8 @@ class PerformanceSnapshot:
                  system_cpu_percent=0.0):
         self.timestamp = timestamp
         self.cpu_percent = cpu_percent
-        # System-wide CPU. This is the signal the CPU throttle actually decides on
-        # (see CpuGovernor); process cpu_percent above is the scanner's
-        # own share and does NOT explain throttle behaviour on its own.
+        # System-wide CPU. The scanner's own share is the process cpu_percent above; the two
+        # are reported separately because only the pair explains governor behaviour.
         self.system_cpu_percent = system_cpu_percent
         self.memory_mb = memory_mb
         self.memory_percent = memory_percent
@@ -1772,13 +1562,10 @@ class ErrorLogger:
         return error_logger
 
     def close(self):
-        """Close the yara_processing FileHandler. Idempotent — safe to call more than once.
+        """Close the yara_processing FileHandler. Idempotent - safe to call more than once.
 
-        Never previously needed: nothing tried to delete this file while the process was
-        still alive, so an unclosed handler was harmless until host cleanup's end-of-run
-        removal made it not — Windows refuses to delete a file that is still open
-        (WinError 32), where POSIX does not, so this went unnoticed until measured on a
-        real Windows agent. Mirrors LogManager.stop_logging()'s handler-closing pattern.
+        Must run before anything deletes the logs directory: Windows refuses to delete
+        a file that is still open. Mirrors LogManager.stop_logging().
         """
         for handler in self.error_logger.handlers[:]:
             try:
@@ -1858,12 +1645,9 @@ class ErrorLogger:
         """Log detailed rule compilation error.
 
         preamble_lines is how many lines the compiler saw AHEAD of rule_content. The
-        compile site builds `preamble + "\n\n" + rule_content` and hands libyara that,
-        so libyara's "line N" counts from the preamble's first line -- while the echo
-        below enumerates rule_content from 1. Without the offset the `<-- ERROR HERE`
-        marker lands N lines too far down, which on a real pack means past the rule's
-        closing brace and onto a comment belonging to the NEXT rule. Measured on a
-        live 4-import pack: both failed rules had the marker on the wrong rule entirely.
+        compile site hands libyara `preamble + "\n\n" + rule_content`, so libyara counts
+        "line N" from the preamble while the echo below numbers rule_content from 1;
+        without the offset the `<-- ERROR HERE` marker lands on the wrong rule.
         """
         self.has_errors = True
         self.failed_rules_count += 1
@@ -1878,9 +1662,8 @@ class ErrorLogger:
             line_match = re.search(r'line (\d+)', str(error_msg))
             if line_match:
                 error_line_num = int(line_match.group(1)) - int(preamble_lines or 0)
-                # A negative or zero result means the error is IN the shared preamble, not
-                # in this rule's body. Marking a body line then would be actively wrong, so
-                # mark nothing and let the unannotated echo speak for itself.
+                # A negative or zero result means the error is IN the shared preamble, not in this
+                # rule's body - mark nothing rather than marking the wrong line.
                 if error_line_num < 1:
                     error_line_num = None
         except Exception:
@@ -2411,10 +2194,8 @@ class LogManager:
     def _log(self, log_type, message, level="INFO", data=None):
         """Write log message to its dedicated file.
 
-        Structured `data` (dicts passed by call sites) used to be accepted and silently
-        dropped — it is now serialized onto the line as JSON so the context an operator
-        actually needs (error types, failure reasons, counts) survives in the log. Capped
-        so a stray large payload can't bloat the file.
+        Structured `data` is serialized onto the line as JSON, capped so a stray large
+        payload cannot bloat the file.
         """
         if data is not None:
             try:
@@ -2540,17 +2321,8 @@ class LogManager:
     def get_upload_statistics(self):
         """Get current log generation statistics. A real snapshot, not a half-live one.
 
-        dict.copy() is SHALLOW: it snapshots total_logs by value but hands back the SAME
-        by_type dict, which every subsequent _log() call keeps mutating. The result was a
-        record whose breakdown did not sum to its own total -- measured live at by_type
-        summing to 69 against total_logs 67, the two records emitted between the snapshot
-        and its serialisation. Worse, the two completion records that are supposed to carry
-        IDENTICAL stats disagreed, because each serialised the shared live dict at a
-        different moment.
-
-        An operator reconciling by_type against total_logs cannot tell which number to
-        trust, and "the counters are inconsistent" is indistinguishable from "logging
-        dropped records".
+        by_type is copied deeply enough that it cannot keep changing after the snapshot;
+        otherwise the breakdown would not sum to its own total.
         """
         snap = self.upload_stats.copy()
         snap["by_type"] = dict(self.upload_stats["by_type"])
@@ -2571,9 +2343,8 @@ class LogManager:
     def write_scan_summary(self, summary: dict):
         """Write a single machine-readable scan summary JSON for this run.
 
-        The six per-category text logs are for humans; this one file is for tools — the skill,
-        an Action Center follow-up, or the customer's own automation can read one JSON instead
-        of grepping six logs. Written atomically so a reader never sees a half-written file.
+        The per-category text logs are for humans; this one file is for tools. Written
+        atomically so a reader never sees a half-written file.
         """
         path = os.path.join(self.config.logs_dir, f"scan_summary_{self.config.run_id}.json")
         record = {
@@ -2960,8 +2731,7 @@ class ScanConfig:
         parsed_alert_severity = _parse_alert_severity(alert_severity, "alert_severity")
         self.alert_severity = "low" if parsed_alert_severity is None else parsed_alert_severity
 
-        # --- v2 runtime options (all default to preserve prior behavior, except
-        #     collect_files which now defaults OFF per customer request) ---
+        # Runtime options. All default to the CONFIG_* constants at the top of the file.
         self.mode = (str(mode) if mode is not None else "scan").strip().lower() or "scan"
         if self.mode not in ("scan", "cancel"):
             raise ValueError(f"Invalid mode '{mode}'. Use scan or cancel.")
@@ -2972,7 +2742,7 @@ class ScanConfig:
         _cf = _parse_bool_arg(collect_files, "collect_files")
         self.collect_files = False if _cf is None else _cf
         # CPU impact control. The scanner bounds its OWN share; it does not react to load
-        # other processes create (see CpuGovernor for the measured rationale).
+        # other processes create (see CpuGovernor).
         _guarantee = cpu_guarantee if cpu_guarantee is not None else CONFIG_CPU_GUARANTEE
         self.cpu_guarantee = str(
             os.getenv("YARA_CPU_GUARANTEE", _guarantee) or _guarantee).strip().lower()
@@ -3026,10 +2796,9 @@ class ScanConfig:
         XDR_API_URL = DEFAULT_XDR_API_URL
         self.api_url_source = "default"
 
-        # Detect un-configured credentials: the shipped script has "replace_with_*" placeholders
-        # that the customer MUST replace with their real Advanced API key + tenant URL before
-        # uploading. If they don't, every alert/dataset upload fails ("No scheme supplied") and a
-        # perfect scan silently delivers nothing. Flag it here so run() can fail loud up front.
+        # Detect un-configured credentials: while DEFAULT_XDR_API_* are still
+        # "replace_with_*" placeholders every upload fails, so a perfect scan would deliver
+        # nothing. Flagged here so run() can fail loud before scanning.
         self.creds_placeholder = any(
             "replace_with" in str(v).lower() or not str(v).strip()
             for v in (XDR_API_URL, XDR_API_KEY, XDR_API_ID)
@@ -3073,11 +2842,9 @@ class ScanConfig:
             raise
 
         yara_hash = hashlib.sha256(self.yara_rule.encode('utf-8')).hexdigest()
-        # scan_id must be unique per scan run, not per ruleset. Two hosts (or two
-        # runs on one host) using the same rules previously collided on a single
-        # rule-hash scan_id, which broke multi-host correlation in XDR. The hash
-        # prefix is preserved (truncated to 12 chars) so the ruleset is still
-        # identifiable from the scan_id alone.
+        # scan_id must be unique per scan RUN, not per ruleset, or two hosts using the same
+        # rules collide on one id and multi-host correlation breaks. The rule hash is kept
+        # as a prefix so the ruleset stays identifiable from the scan_id alone.
         self.rule_hash = yara_hash
         self.scan_id = f"{self.hostname}_{self.run_id}_yara_{yara_hash[:12]}"
         self.error_logger.error_logger.info(f"Scan ID: {self.scan_id} (rule hash: {yara_hash[:12]}...)")
@@ -3088,31 +2855,24 @@ class ScanConfig:
         self.file_mapping = os.path.join(self.evidence_dir, "file_mapping.txt")
         self.output_log = os.path.join(self.logs_dir, f"scanner_{self.run_id}.log")
 
-        # minimum=0: 0 legitimately means "no size cap", but a NEGATIVE parsed fine and
-        # made max_file_bytes negative, so every file failed the size check and the scan
-        # reported success having scanned nothing.
+        # minimum=0: 0 legitimately means "no size cap", but a NEGATIVE value would make
+        # max_file_bytes negative and fail every file's size check.
         self.max_file_mb = _env_number("YARA_MAX_MB", 64, cast=int, minimum=0)
         self.max_file_bytes = self.max_file_mb * 1024 * 1024 if self.max_file_mb else 0
 
         cpu_count = os.cpu_count() or 2
-        # Impact is bounded by CpuGovernor, NOT by starving the worker pool. The previous
-        # min(2, ...) cap welded throughput to impact: a 32-core server scanned no faster
-        # than a laptop, permanently, whether or not anyone else was using the machine.
-        # More workers also helps at the SAME cpu budget, because scanning is disk-bound
-        # as well as CPU-bound - more outstanding reads per CPU-second.
+        # Impact is bounded by CpuGovernor, not by starving the worker pool. Scanning is
+        # disk-bound as well as CPU-bound, so more workers can help at the same CPU budget.
         _cfg_workers = self._opt_workers if self._opt_workers is not None else CONFIG_WORKERS
         configured_workers = _env_number("YARA_THREADS", _cfg_workers, cast=int, minimum=1)
         self.max_workers = configured_workers if configured_workers > 0 else max(2, cpu_count // 2)
         self.scan_queue_size = max(
             2, _env_number("YARA_QUEUE_SIZE", self.max_workers * 2, cast=int, minimum=2)
         )
-        # Default 30s, not 120s: this is the progress-heartbeat's sampling interval, and at
-        # 120s a scan whose active phase is shorter than that emits NO progress telemetry at
-        # all. Clamped to >=1s because this value is a threading.Event.wait() interval -
-        # wait(0) (or any negative) returns immediately, which would turn the heartbeat into
-        # a busy-spin that re-takes lock_counts continuously and floods the upload queue.
-        # "0" is a plausible thing for an operator to set trying to disable progress logging;
-        # to actually disable it, set a large interval. Ported from the XSIAM edition.
+        # The progress heartbeat's sampling interval. Clamped to >=1s because it is a
+        # threading.Event.wait() interval: wait(0) would busy-spin, re-taking lock_counts
+        # continuously and flooding the upload queue. To disable progress logging, set a
+        # large interval rather than 0.
         self.log_interval = max(1, _env_number("YARA_PROGRESS_LOG_SECS", 30, cast=int, minimum=1))
         self.enable_performance_monitoring = str(
             os.getenv("YARA_ENABLE_PERF_MONITOR", "false")
@@ -3124,11 +2884,9 @@ class ScanConfig:
             os.getenv("YARA_ENABLE_FD_MONITOR", "false")
         ).strip().lower() in ("1", "true", "yes", "on")
         self.track_real_paths = False
-        # Throttling is active unless the operator hands resource control to the OS
-        # (throttle_mode="os") or disables it outright (throttle_mode="off").
-        # How often the governor refreshes its CPU reading. 1s is plenty: the actuator is
-        # a per-file proportional sleep, not a hard gate, so sub-second sampling bought
-        # nothing but psutil overhead.
+        # How often the governor refreshes its CPU reading. 1s is plenty: the actuator is a
+        # per-file proportional sleep, not a hard gate, so sub-second sampling buys only
+        # psutil overhead.
         self.throttle_check_interval_secs = float(
             os.getenv("YARA_GOVERNOR_INTERVAL_SECS", "1.0") or 1.0)
         self.queue_backoff_secs = _env_number("YARA_QUEUE_BACKOFF_SECS", 0.25, minimum=0)
@@ -3154,17 +2912,15 @@ class ScanConfig:
             "/appdata/local/packages/",
         )
 
-        # Deployer extension point. APPENDED, never substituted: a replace-style knob
-        # would let one typo silently drop the Cortex agent paths above. Entries are
-        # forced to the bounded "/x/" form so they match whole path components only -
-        # see _extra_skip_fragments for why an unbounded fragment is an evasion vector.
+        # Deployer extension point. APPENDED, never substituted, so one typo cannot drop the
+        # Cortex agent paths above. Entries are forced to the bounded "/x/" form and match
+        # whole path components only - see _extra_skip_fragments.
         self.skip_path_fragments = self.skip_path_fragments + _extra_skip_fragments()
-        # Always-scan carve-outs (checked BEFORE skip logic): browser caches/profiles
-        # are common malware staging/persistence areas, so they are scanned even when a
-        # broader skip fragment/dir would otherwise exclude them. On Windows/Linux the
-        # browser-cache skip fragments were removed above; this list surgically re-opens
-        # browser caches on macOS where the broad "/library/caches/" (and the mac skip
-        # dirs) would still bypass them. Safari is best-effort under TCC/Full Disk Access.
+        # Always-scan carve-outs, checked BEFORE skip logic: browser caches/profiles are
+        # common malware staging areas, so they are scanned even when a broader skip
+        # fragment or skip dir would exclude them. This list re-opens them on macOS, where
+        # "/library/caches/" and the mac skip dirs would otherwise bypass them. Safari is
+        # best-effort under TCC / Full Disk Access.
         self.force_scan_fragments = (
             "/library/caches/google/chrome/",
             "/library/caches/chromium/",
@@ -3173,11 +2929,10 @@ class ScanConfig:
             "/library/caches/com.apple.safari/",
         )
 
-        # Boundary skips a force-scan fragment must never override. These keep the scanner
-        # on THIS host; they are not noise reduction. A mounted Time Machine volume holds a
-        # browser cache per backup snapshot, so without this an allowlist fragment would
-        # walk every snapshot on the disk. Consulted in _is_special_file before the
-        # force_scan_fragments check.
+        # Boundary skips a force-scan fragment must never override. These keep the scanner on
+        # THIS host - a mounted Time Machine volume holds a browser cache per snapshot, so
+        # without this an allowlist fragment would walk every snapshot on the disk.
+        # Consulted in _is_special_file before the force_scan_fragments check.
         self.force_scan_never_under = (
             "/volumes/",   # macOS mounted volumes (also in mac_skip_directory)
             "/media/",     # Linux removable media
@@ -3212,11 +2967,8 @@ class ScanConfig:
             self.lin_skip_directory = [
                 "/sys/", "/proc/", "/dev/", "/run/", "/tmp/.X11-unix/",
                 "/var/run/", "/lost+found/", "/media/", "/opt/yara_scanner/",
-                # Cortex XDR / Traps agent install root. Confirmed against the official
-                # Cortex XDR Agent Administrator Guide ("Install the Cortex XDR agent for
-                # Linux"): "The script installs the files for the Cortex XDR agent for
-                # Linux in the /opt/traps folder". Windows and macOS already skip their
-                # vendor install roots; this was the one platform with no equivalent entry.
+                # Cortex XDR / Traps agent install root on Linux (per the Cortex XDR Agent
+                # Administrator Guide). Windows and macOS skip their vendor install roots below.
                 "/opt/traps/",
                 os.path.normpath(self.scanner_dir).rstrip("/") + "/",
             ]
@@ -3229,8 +2981,7 @@ class ScanConfig:
                 '/private/tmp/', '/dev/', '/Volumes/', '/.Spotlight-V100/',
                 '/.DocumentRevisions-V100/', '/.fseventsd/', '/.TemporaryItems/',
                 '/.Trashes/', '/Library/Application Support/PaloAltoNetworks/Traps/',
-                # Second real vendor location, confirmed against the official docs
-                # (Cytool/troubleshooting pages for Mac): the agent's own logs.
+                # The Cortex XDR agent's own logs on macOS.
                 '/Library/Logs/PaloAltoNetworks/Cortex XDR/',
                 '/Library/Developer/', '/Library/Caches/', '/Library/Logs/',
                 'Library/Containers/', 'Library/Caches/',
@@ -3269,13 +3020,11 @@ class ScanConfig:
         self.statistics_upload_interval = 60
 
         if self.scan_folder and self.scan_folder.lower() != "default":
-            # scan_folder accepts a COMMA-SEPARATED list of locations so one run can cover
-            # multiple scopes/partitions (e.g. "C:\Users,D:\Shares" or "/opt/data, /srv/www").
-            # A single path (no comma) behaves exactly as before. Each entry is validated
-            # independently: a typo in one folder of a scheduled multi-target scan must not
-            # kill the whole run, but it must be LOUD in the logs — and if nothing is valid,
-            # fail the scan outright. (A path that itself contains a comma is rare; scan its
-            # parent folder instead.)
+            # scan_folder accepts a COMMA-SEPARATED list so one run can cover several scopes or
+            # partitions (e.g. "C:\Users,D:\Shares" or "/opt/data, /srv/www"). Each entry is
+            # validated independently - one bad folder must not kill a multi-target run, but it
+            # must be loud in the logs, and if nothing is valid the scan fails outright. A path
+            # containing a comma is not expressible; scan its parent instead.
             requested = [p.strip().strip('"').strip("'") for p in self.scan_folder.split(",")]
             requested = [p for p in requested if p]
             valid, invalid = [], []
@@ -3293,10 +3042,9 @@ class ScanConfig:
                 self.error_logger.error_logger.warning(
                     f"Ignoring {len(invalid)} specified scan folder(s) that are not valid "
                     f"directories on this endpoint: {invalid}")
-            # A target can be a real directory and still yield nothing, because the
-            # platform skip-list filters it out during the walk. That produced a
-            # silent no-op: "Scan completed: 0 files scanned" with no reason given
-            # (e.g. /private/tmp on macOS, /proc on Linux). Say so explicitly.
+            # A target can be a real directory and still yield nothing, because the platform
+            # skip-list filters it out during the walk (e.g. /private/tmp on macOS, /proc on
+            # Linux). Say so explicitly rather than reporting a silent "0 files scanned".
             skips = getattr(self, "skip_paths", None) or ()
             excluded = []
             for ap in valid:
@@ -3447,16 +3195,9 @@ class ResultsUploader:
     
     def __init__(self, config):
         self.config = config
-        # NOTE: this uploader deliberately keeps NO local copy of per-offset detail.
-        # It used to build one dict per matched offset and hold them all in memory for the
-        # whole scan (measured: 1,048,035 offsets -> ~15 GB RSS on one endpoint), to be
-        # serialized at the end by save_results(). That write never actually happened -
-        # save_results()'s only caller, upload_results(), is never invoked - so the data was
-        # accumulated and then discarded. Streaming it to disk was considered and rejected:
-        # _write_alerts() already records EVERY offset (String ID / Offset / Data, uncapped)
-        # to alert_dir/<rule>.txt, which the evidence ZIP bundles, so a second copy would
-        # duplicate an already-large artifact for no new information. The aggregated
-        # per-finding upload is unaffected.
+        # This uploader keeps NO local copy of per-offset detail: _write_alerts() already
+        # records every offset to alert_dir/<rule>.txt, which the evidence ZIP bundles.
+        # Only the aggregated per-finding upload is built here.
         self.hostname = config.hostname
         self.os_info = config.os_info
         self.ip_address = config.ip_addresses[0] if config.ip_addresses else "Unknown"
@@ -3478,9 +3219,8 @@ class ResultsUploader:
             'rollups': 0,             # per-rule storm-rollup alerts queued at scan end
             'undelivered': 0,         # alerts still queued when the drain budget expired
         }
-        # Rate-limit counters so a sustained upload failure (or a very match-heavy scan) can't
-        # bloat the logs with one line per matched string — a placeholder-cred run produced
-        # ~36k identical "Invalid URL" error lines (10 MB) before this.
+        # Rate-limit counters so a sustained upload failure, or a very match-heavy scan,
+        # cannot bloat the logs with one line per matched string.
         self._rl_counters = {}
         self._last_alert_post = 0.0  # monotonic time of the last alert POST (for rate-limit pacing)
         self._deliver_deadline = None  # global wall-clock budget for requeuing rate-limited batches
@@ -3530,9 +3270,8 @@ class ResultsUploader:
                 return
             status = self._upload_alert_batch(batch)
             if status == "requeue":
-                # Rate-limited, not a real error: put the matches back so they get another shot
-                # when the per-minute window frees up. Bounded by _deliver_deadline (checked in
-                # _upload_alert_batch) so this can't loop forever on a saturated key.
+                # Rate-limited, not a real error: put the matches back for another window.
+                # Bounded by _deliver_deadline (checked in _upload_alert_batch).
                 self._requeued_total += len(batch)
                 for sl in batch:
                     try:
@@ -3542,25 +3281,12 @@ class ResultsUploader:
             batch.clear()
 
         while True:
-            # Checked BEFORE taking work, not only on an Empty queue. By the time this is
-            # set, stop() has already spent the whole backlog-proportional drain budget
-            # WITH requeue enabled (the flag stays False for that window on purpose), so
-            # anything still queued is past its window and must be reported undelivered
-            # rather than attempted anyway.
-            #
-            # Consulting the flag only in `except Empty` made it unreachable under exactly
-            # the condition it exists for: a full queue never raises Empty. The sentinel
-            # lands at the BACK of the backlog, so the worker chews through everything
-            # ahead of it; the 60 s join times out, stop() books the still-queued items
-            # `undelivered`, and this loop then delivers some of them into
-            # `successful_uploads` -- the same item in two buckets, with
-            # ok + failed + undelivered exceeding the number ever queued.
-            #
-            # Breaking here does not drop the accumulated batch: flush() runs once more
-            # after the loop. Those items are already task_done()'d, so they are not in
-            # qsize() and cannot also be booked undelivered. If that final flush is
-            # rate-limited it can no longer requeue (the requeue test reads this same
-            # flag), so it falls through to failed_uploads -- counted, not leaked.
+            # Checked BEFORE taking work, not only on an Empty queue - a full queue never raises
+            # Empty. By the time this is set, stop() has already spent the whole backlog-scaled
+            # drain budget with requeue enabled, so anything still queued is past its window
+            # and is booked undelivered rather than attempted here (which would double-count
+            # it). Breaking does not drop the accumulated batch: flush() runs once more after
+            # the loop, and those items are already task_done()'d.
             if self.stop_upload_thread:
                 break
             try:
@@ -3602,22 +3328,17 @@ class ResultsUploader:
         event_timestamp_ms = int(getattr(standard_log, "timestamp", time.time()) * 1000)
         rule_name = data.get("rule", "unknown_rule")
         hostname = getattr(standard_log, "hostname", "UnknownHost")
-        # Alert identity = the FINDING (rule + file), NOT the scan time and NOT the string offset.
-        # XDR aggregates alerts that share an alert_name, so:
-        #   - putting the timestamp in the name made every re-scan mint NEW alerts (alert flood)
-        #     AND collapsed distinct matches that shared a millisecond into one — the opposite of
-        #     what we want.
-        #   - putting the OFFSET in the name made every string hit its own alert (a 22x flood on a
-        #     multi-string rule) and broke idempotency whenever a file edit shifted offsets. The
-        #     per-offset evidence belongs in the lookup dataset; the alert carries match_count and
-        #     a sample, and stays 1:1 with the finding across re-scans (XDR updates the existing
-        #     alert instead of piling on duplicates). event_timestamp still carries the scan time.
+        # Alert identity = the FINDING (rule + file). XDR aggregates alerts sharing an
+        # alert_name, so the name must carry neither the scan time (every re-scan would
+        # mint new alerts) nor the string offset (every string hit would be its own alert,
+        # and a file edit shifting offsets would break idempotency). Per-offset evidence
+        # lives in the lookup dataset; the alert carries match_count and a sample, and
+        # stays 1:1 with the finding across re-scans. event_timestamp carries the scan time.
         _full_path = str(data.get("filename", "") or data.get("file", ""))
         match_file = os.path.basename(_full_path)
-        # Tag the identity with a stable hash of the FULL path so two distinct files that share a
-        # basename (e.g. per-user copies of one dropper at ...\alice\svchost.exe and ...\bob\svchost.exe)
-        # don't collapse into a single alert. basename alone loses the path; file_sha256 can't separate
-        # byte-identical copies at different locations. Same path -> same tag keeps re-scans idempotent.
+        # Tag the identity with a stable hash of the FULL path, so two files sharing a
+        # basename (per-user copies of one dropper) do not collapse into a single alert.
+        # Same path -> same tag keeps re-scans idempotent.
         _path_tag = hashlib.sha1(_full_path.encode("utf-8", "replace")).hexdigest()[:8] if _full_path else "nopath"
         if data.get("rollup"):
             # Storm rollup: one alert per rule summarizing findings suppressed past the per-scan
@@ -3848,10 +3569,9 @@ class ResultsUploader:
                     self.log_manager.log_error(f"Error queueing rollup alerts: {e}")
 
             # Bounded, requeue-ENABLED drain first: give the end-of-scan backlog a real "later
-            # window" to deliver (stop_upload_thread stays False so rate-limited batches can still
-            # requeue) before we force the hard stop. The window scales with the backlog (a capped
-            # scan is at most cap/60 batches at ALERT_MIN_BATCH_INTERVAL pacing) and is hard-capped
-            # so shutdown can't hang; it short-circuits the moment the queue empties.
+            # window" before the hard stop (stop_upload_thread stays False so rate-limited
+            # batches can still requeue). Scales with the backlog, hard-capped so shutdown
+            # cannot hang, and short-circuits the moment the queue empties.
             if wait and self.upload_thread and self.upload_thread.is_alive():
                 pending = self.upload_queue.qsize()
                 if pending > 0:
@@ -3914,27 +3634,18 @@ class ResultsUploader:
     def add_match(self, filename, rule, match_data, file_sha256=None, file_creation_time=None):
         """Aggregate ONE (rule, file) finding: fire its alert, return its dataset detail.
 
-        Grain split, and the two channels no longer share one:
+        The two channels have different grains:
 
-        * ALERT channel (below) — ONE alert per FINDING (file x rule), unchanged. The storm cap
-          CONFIG_ALERT_MAX_PER_SCAN is measured against that grain and its rollup accounting
-          depends on it, so this method still runs once per rule and still queues one alert.
-        * LOOKUP DATASET — ONE row per FILE (schema v4). This method therefore no longer writes
-          a dataset row at all; it returns this rule's contribution, and the caller — which is
-          _write_alerts, and which already receives every rule that matched the file in a single
-          call — passes the collected list to add_file_matches().
+        * ALERT - one alert per FINDING (file x rule). CONFIG_ALERT_MAX_PER_SCAN is
+          measured against that grain, so this method runs once per rule and queues
+          one alert.
+        * LOOKUP DATASET - one row per FILE (schema v4). This method writes no row; it
+          returns this rule's contribution, and _write_alerts passes the collected
+          list for the file to add_file_matches().
 
-        History of the dataset grain. v2 wrote one row per matched string OFFSET: that repeats
-        every per-file column (hostname, filename, sha256, scan context — ~18 of 20 fields)
-        unchanged on every row, and an unanchored/short pattern hitting one large file multiplies
-        it into tens of thousands of near-duplicate rows (measured live: 33,118 rows from one rule
-        against one .evtx log), enough to exhaust a scan's whole upload budget before genuinely
-        distinct findings elsewhere get a turn. v3 folded the offsets into the finding. v4 folds
-        the findings into the FILE, because the same per-file columns were still being repeated
-        once per rule — measured on a real /etc scan, 1.93 times for the average matched file.
-
-        Per-offset detail is not retained here at all (alert_dir/<rule>.txt already records
-        every offset) — only the NETWORK/dataset representation is aggregated+sampled here."""
+        Per-offset detail is not retained here - alert_dir/<rule>.txt already records
+        every offset. Only the network/dataset representation is aggregated and sampled.
+        """
         match_count = 0
         _first_offset = None
         _hit_samples = []      # first few "string_id@offset" pairs for the alert description
@@ -3943,18 +3654,15 @@ class ResultsUploader:
         _strings_distinct = [] # DISTINCT rendered values — NOT aligned 1:1 with _offsets_sample
         _strings_seen = set()
         _string_id_counts = {} # TRUE per-string-identifier counts across every offset, uncapped
-        # Cap semantics, restated because the grain moved under it: this knob used to bound how
-        # many ROWS one (rule, file) finding could put on the wire. Under v4 a finding produces
-        # no rows of its own, so the SAME number now bounds the offsets/strings sample carried
-        # for that rule INSIDE its file's single row. Same knob, same job — bounding what one
-        # pathological finding can push onto the network — applied one level down. <= 0 disables.
+        # Bounds what one pathological finding can push onto the network: the offsets and
+        # strings sample carried for this rule inside its file's row. <= 0 disables.
         _row_cap = CONFIG_LOOKUP_ROWS_PER_FINDING_MAX
         for string_id, offset, string_data in match_data:
             string_data = _render_match_data(string_data)
 
-            # Normalise the identifier the same way the local alert census does: yara reports
-            # None for an anonymous string, and a None key would both sort-compare against str
-            # (TypeError) and serialise to JSON as "null".
+            # Normalise the identifier the way the local alert census does: yara reports None
+            # for an anonymous string, and a None key would sort-compare against str and
+            # serialise to JSON as "null".
             _sid = "$?" if string_id is None else str(string_id)
             self.upload_stats['total_matches'] += 1
             match_count += 1
@@ -3966,11 +3674,9 @@ class ResultsUploader:
                 _hit_samples.append(f"{_sid}@{offset}")
             if _row_cap <= 0 or len(_offsets_sample) < _row_cap:
                 _offsets_sample.append(offset)
-            # DISTINCT values only. v3 stored the same literal once per offset (measured:
-            # ["127.0.0.1"] repeated 50 times) — repetition that carried no information, because
-            # the counts already live in match_count and string_ids. Scanned across EVERY offset
-            # rather than only the capped offset window, so the sample is strictly more
-            # informative than v3's, and bounded by the same cap.
+            # DISTINCT values only - the repetition carries no information, since the counts
+            # already live in match_count and string_ids. Scanned across EVERY offset rather
+            # than only the capped window, and bounded by the same cap.
             if (string_data not in _strings_seen
                     and (_row_cap <= 0 or len(_strings_distinct) < _row_cap)):
                 _strings_seen.add(string_data)
@@ -4000,9 +3706,9 @@ class ResultsUploader:
                 )
 
         # ---- Alert channel: ONE alert per finding (file x rule), storm-capped ----
-        # The Insert Parsed Alerts budget is ~600/min SHARED across every endpoint on the API key,
-        # so alert volume must be bounded by design, not by luck. Findings past the cap are counted
-        # per rule and surface as one rollup alert each at scan end — nothing goes silent.
+        # The Insert Parsed Alerts budget (~600/min) is SHARED across every endpoint on the
+        # API key, so alert volume is bounded by design. Findings past the cap are counted
+        # per rule and surface as one rollup alert each at scan end.
         if UPLOAD_RESULTS and match_count > 0 and self.upload_thread and self.upload_thread.is_alive():
             queue_it = False
             with self._findings_lock:
@@ -4056,15 +3762,13 @@ class ResultsUploader:
     def add_file_matches(self, filename, findings, file_sha256=None, file_creation_time=None):
         """Queue ONE lookup-dataset row for one matched FILE (schema v4).
 
-        `findings` is the list of per-rule detail dicts add_match() returned for this file — every
-        rule that hit it. The file-level columns (tenant/scan/host/os/ip, filename, size, sha256,
-        creation time) are written ONCE here instead of once per rule, and the per-rule detail
-        rides along in the `rules` JSON array. Measured on a real /etc scan, that collapses 5,240
-        (rule, file) rows into 2,713 file rows.
+        `findings` is the list of per-rule detail dicts add_match() returned for this
+        file. The file-level columns (tenant/scan/host/os/ip, filename, size, sha256,
+        creation time) are written ONCE here instead of once per rule, and the per-rule
+        detail rides along in the `rules` JSON array.
 
-        `rules` is TEXT holding a JSON array because XDR lookup columns have no array or nested
-        type. That keeps it queryable rather than opaque — XQL expands a JSON array held in a
-        text field (verified live on the tenant):
+        `rules` is TEXT holding a JSON array because XDR lookup columns have no array or
+        nested type. It stays queryable - XQL expands a JSON array held in a text field:
             | alter r = json_extract_array(rules, "$") | arrayexpand r
             | alter rule = json_extract_scalar(r, "$.rule")
             | comp sum(to_integer(json_extract_scalar(r, "$.match_count"))) as hits by rule
@@ -4088,10 +3792,9 @@ class ResultsUploader:
             match_total += int(f.get("match_count") or 0)
             truncated_any = truncated_any or bool(f.get("truncated"))
             entry = dict(f)
-            # Per-rule severity. Today every rule inherits the scan's configured alert severity,
-            # so this is scan-constant — it is still written per rule because the file-level
-            # `severity` below is defined as the MAX across the file's rules, which only means
-            # anything if the per-rule value is the one that can vary.
+            # Per-rule severity. Every rule currently inherits the scan's configured severity, so
+            # this is scan-constant; it is still written per rule because the file-level
+            # `severity` below is the MAX across the file's rules.
             entry["severity"] = severity
             rules.append(entry)
 
@@ -4106,8 +3809,7 @@ class ResultsUploader:
             "file_size": _file_size,
             "file_sha256": file_sha256 or "",
             "file_creation_time": file_creation_time or "",
-            # Compact separators: at ~2 rules per file this is a few bytes, but on a file matched
-            # by many rules the ", " padding is paid once per key of every rule object.
+            # Compact separators: the ", " padding is paid once per key of every rule object.
             "rules": json.dumps(rules, separators=(",", ":")),
             "rule_count": len(rules),
             "match_total": match_total,
@@ -4183,13 +3885,13 @@ class ResultsUploader:
 
 
 # ---- matches-dataset schemas ------------------------------------------------------------
-# A lookup dataset's schema is FIXED at creation and XDR silently SKIPS rows carrying fields the
-# dataset doesn't know about, so a row-shape change is a new schema VERSION with a new dataset
-# name (LOOKUP_SCHEMA_VERSION), never an in-place edit. Older versions are kept here rather than
-# deleted: a fleet mid-rollout writes both shapes at once, xdr_consolidate.py resolves a schema
-# by version to merge older shards, and the dashboards' `yara_scanner_matches*` wildcard spans
-# every version. v2 (one row per matched OFFSET) predates this module's constants and lives only
-# in xdr_consolidate.MATCHES_SCHEMA, which is the module that still has to read it.
+# A lookup dataset's schema is FIXED at creation and XDR silently SKIPS rows carrying
+# fields the dataset does not know, so a row-shape change is a new schema VERSION with
+# a new dataset name (LOOKUP_SCHEMA_VERSION), never an in-place edit. Older versions
+# are kept here because a fleet mid-rollout writes both shapes, xdr_consolidate.py
+# resolves a schema by version, and the dashboards' `yara_scanner_matches*` wildcard
+# spans every version. v2 (one row per matched OFFSET) lives only in
+# xdr_consolidate.MATCHES_SCHEMA.
 #
 # v3: one row per (rule, file) FINDING; offsets/strings/string_ids folded into the row.
 MATCHES_SCHEMA_V3 = {
@@ -4216,26 +3918,21 @@ MATCHES_SCHEMA_V3 = {
     "event_timestamp_ms": "number",
     "date_of_scan": "text",
 }
-# v4 (current): one row per matched FILE, carrying every rule that hit it.
-#
-# Why: measured on a real /etc scan (2,713 matched files, 5,240 findings -> 1.93 rules per file),
-# v3 repeated ~11 of its 22 columns — hostname/os/ip/filename/sha256/size/creation-time/scan
-# context — once per rule per file, for 838 B/row and 4.19 MB from ONE endpoint. A lookup dataset
-# is capped at 50 MB by the platform, which is what bounds how many hosts a consolidated dataset
-# can hold. v4 pays the file-level cost once and moves the per-rule detail into `rules`.
+# v4 (current): one row per matched FILE, carrying every rule that hit it. v3 repeated
+# the ~11 file-level columns once per rule per file; a lookup dataset is capped at
+# 50 MB by the platform, which bounds how many hosts a consolidated dataset can hold.
 #
 # Dropped from v3, and where each remains recoverable:
-#   run_id       -> already embedded verbatim inside scan_id (<host>_<run_id>_yara_<hash>)
+#   run_id       -> embedded verbatim inside scan_id (<host>_<run_id>_yara_<hash>)
 #   scan_date    -> the leading YYYYMMDD of that same run_id segment
-#   date_of_scan -> event_timestamp_ms is the same instant: to_timestamp(event_timestamp_ms,"MILLIS")
-#   scan_folder  -> scan-constant, and the yara_scanner_scans* lifecycle row for this scan_id
-#                   still carries it (that dataset is 2 rows/scan and was deliberately untouched)
-#   rule, match_count, offsets, strings, string_ids, and the per-rule truncated flag
+#   date_of_scan -> to_timestamp(event_timestamp_ms, "MILLIS")
+#   scan_folder  -> scan-constant, and still on this scan_id's yara_scanner_scans* row
+#   rule, match_count, offsets, strings, string_ids, per-rule truncated flag
 #                -> folded into the `rules` array below
-# Kept per-row because they genuinely VARY across a consolidated multi-host dataset: hostname,
-# os_info, os_type, ip_address, scan_id, event_timestamp_ms, and every file-level field.
-# tenant_id is kept although it is constant per tenant: the shipped widget headers state that
-# every row carries it for multi-tenant views, so dropping it would break that contract.
+# Kept per-row because they vary across a consolidated multi-host dataset: hostname,
+# os_info, os_type, ip_address, scan_id, event_timestamp_ms, and every file-level
+# field. tenant_id is kept although constant per tenant - the shipped widget headers
+# state that every row carries it for multi-tenant views.
 MATCHES_SCHEMA_V4 = {
     "tenant_id": "text",
     "scan_id": "text",
@@ -4249,14 +3946,13 @@ MATCHES_SCHEMA_V4 = {
     "file_creation_time": "text",
     # JSON ARRAY of per-rule objects, one per rule that matched this file:
     #   {"rule","match_count","offsets","strings","string_ids","truncated","severity"}
-    # TEXT because XDR lookup columns have no array/nested type. It stays queryable — XQL can
-    # expand a JSON array held in a text field (verified live on the tenant):
+    # TEXT because XDR lookup columns have no array/nested type. It stays queryable - XQL
+    # can expand a JSON array held in a text field:
     #   | alter r = json_extract_array(rules, "$") | arrayexpand r
     #   | alter rule = json_extract_scalar(r, "$.rule") | comp count() as n by rule
     # string_ids is an ARRAY of {id, count} rather than an object keyed by the identifier
-    # precisely so it stays reachable that way: YARA string identifiers begin with '$', and
-    # json_extract_scalar(x, "$.$ip") is not a valid JSONPath — the v3 object shape
-    # ({"$ip": 50}) could be stored but never queried.
+    # so it stays reachable that way: YARA string identifiers begin with '$', and
+    # json_extract_scalar(x, "$.$ip") is not a valid JSONPath.
     "rules": "text",
     "rule_count": "number",      # len(rules); how many distinct rules hit this file
     "match_total": "number",     # TRUE total string hits across every rule, even where sampled
@@ -4267,10 +3963,10 @@ MATCHES_SCHEMA_V4 = {
 # Version tag -> schema. Mirrors xdr_consolidate._MATCHES_SCHEMAS_BY_VER, which must know the
 # same shapes to consolidate shards written by any scanner version still in the fleet.
 MATCHES_SCHEMAS_BY_VER = {"3": MATCHES_SCHEMA_V3, "4": MATCHES_SCHEMA_V4}
-# The shape this build actually EMITS (ResultsUploader.add_file_matches). LOOKUP_SCHEMA_VERSION
-# only tags the dataset NAME and an operator can pin it; the schema a dataset is CREATED with is
-# always this one, because a dataset created from an older schema would silently swallow every
-# row we send (XDR skips unknown fields without an error).
+# The shape this build actually EMITS (ResultsUploader.add_file_matches).
+# LOOKUP_SCHEMA_VERSION only tags the dataset NAME and an operator can pin it; the
+# schema a dataset is CREATED with is always this one, because a dataset created
+# from an older schema would silently swallow every row we send.
 MATCHES_ROW_SCHEMA_VERSION = "4"
 
 
@@ -4300,37 +3996,33 @@ def _max_severity(values, default="Low"):
 class LookupDatasetUploader:
     """Write this scan's rows to the two Cortex XDR lookup datasets for this host.
 
-    Two datasets, two different lifetimes — the difference is the whole design:
+    Two datasets, two lifetimes:
 
       ``yara_scanner_matches_v<N>_<host>_<6hex>``   one row per matched FILE
-          PERMANENT and OVERWRITTEN. One per host, no scan_id and no month in the name, so
-          dashboards and the consolidation automations can pin it literally. Every scan
-          begins by deleting the rows the previous scan left in it (_flush_stale_matches),
-          so it holds exactly one scan and never accumulates. It is the deep-dive source.
+          PERMANENT and OVERWRITTEN. One per host, with no scan_id and no month in the
+          name, so dashboards and the consolidation automations can pin it literally.
+          Every scan begins by deleting the rows the previous scan left in it
+          (_flush_stale_matches), so it holds exactly one scan and never accumulates.
 
       ``yara_scanner_scans_v<N>_<host>_<6hex>[_<YYYYMM>]``   scan-lifecycle rows
-          APPEND-ONLY, 2 rows/scan, nothing ever overwrites it — so it is the one that still
-          needs CONFIG_LOOKUP_ROTATION's monthly size bound.
+          APPEND-ONLY, 2 rows per scan, so this is the one CONFIG_LOOKUP_ROTATION
+          bounds.
 
-    Neither is created implicitly: add_data returns HTTP 400 "Dataset not found" against a
-    name that does not exist, so _ensure_datasets creates both up front (and reports whether
-    matches pre-existed, which is what tells the overwrite whether there can be anything to
-    delete).
+    Neither is created implicitly: add_data returns HTTP 400 "Dataset not found" for a
+    name that does not exist, so _ensure_datasets creates both up front.
 
     Matches are batched (LOOKUP_DATASET_BATCH_SIZE rows per POST) to stay under XDR's
-    ~1000 entries / 10s rate limit AND to minimise the number of POSTs (each POST is one
-    chance to hit the server-side add_data clone-table race). A timer flushes any partial
-    batch after LOOKUP_DATASET_FLUSH_SECS idle; that interval is deliberately long so short
-    scans emit a single end-of-scan POST per dataset instead of a trickle. Each POST is also
-    preceded by a small random delay (LOOKUP_WRITE_JITTER_SECS) to decorrelate the fleet.
+    ~1000 entries / 10s rate limit and to minimise POST count, since each POST is one
+    chance at the server-side add_data clone-table race. A partial batch flushes after
+    LOOKUP_DATASET_FLUSH_SECS idle, and each POST is preceded by a small random delay
+    (LOOKUP_WRITE_JITTER_SECS) to decorrelate the fleet.
     """
 
     def __init__(self, config, log_manager=None):
         self.config = config
         self.log_manager = log_manager
         self.tenant_id = getattr(config, "tenant_id", "unknown")
-        # scan_date (YYYYMMDD) bounds dataset growth via targeted remove_data pruning,
-        # replacing the old daily-rotating dataset NAME (which dashboards can't follow).
+        # scan_date (YYYYMMDD) bounds dataset growth via targeted remove_data pruning.
         self.scan_date = (config.run_id.split("_", 1)[0] if getattr(config, "run_id", "") else
                           datetime.datetime.now().strftime("%Y%m%d"))
         # Per-writer dataset sharding — the fix for the add_data concurrency limitation.
@@ -4345,18 +4037,15 @@ class LookupDatasetUploader:
             self.dataset_shard = _dataset_shard_suffix(shard_cfg)
         _suffix = f"_{self.dataset_shard}" if self.dataset_shard else ""
         _ver = f"_v{LOOKUP_SCHEMA_VERSION}"  # schema-version tag; bump when the row shape changes
-        # Monthly rotation bounds a dataset's SIZE, and therefore its add_data merge time, forever
-        # (merge time scales with dataset size; an unrotated APPEND-ONLY shard eventually outgrows
-        # any client timeout and goes write-dead). It applies to the SCANS dataset only — see
-        # CONFIG_LOOKUP_ROTATION for why it is now meaningless-to-harmful on matches. Dashboards
-        # fan in via wildcard, so a new month's scans dataset joins them automatically; prune old
-        # months with the prune-datasets tooling.
+        # Monthly rotation bounds a dataset's SIZE and therefore its add_data merge time: an
+        # unrotated append-only shard eventually outgrows any client timeout and goes
+        # write-dead. SCANS dataset only - see CONFIG_LOOKUP_ROTATION. Dashboards fan in via
+        # wildcard, so a new month joins automatically; prune old months with prune-datasets.
         _rot_cfg = str(os.environ.get("YARA_LOOKUP_ROTATION", "") or CONFIG_LOOKUP_ROTATION).strip().lower()
         _rot = f"_{self.scan_date[:6]}" if _rot_cfg == "monthly" and len(self.scan_date) >= 6 else ""
         # matches: PERMANENT name, one per host, no scan_id and no month. It is the deep-dive
-        # source, so its name must stay stable for dashboards and for the consolidation
-        # automations that read it; its size is bounded by the start-of-scan overwrite below,
-        # not by rotation.
+        # source, so its name must stay stable for dashboards and the consolidation
+        # automations; its size is bounded by the start-of-scan overwrite, not by rotation.
         self.matches_dataset = f"{LOOKUP_DATASET_PREFIX}_matches{_ver}{_suffix}"
         self.scans_dataset = f"{LOOKUP_DATASET_PREFIX}_scans{_ver}{_suffix}{_rot}"
         # Surface the resolved (sharded) dataset names so the scan-summary JSON and logs can
@@ -4388,8 +4077,7 @@ class LookupDatasetUploader:
         self._drain_budget = None    # scaled at stop(): backlog-aware, capped by LOOKUP_DRAIN_MAX_SECS
         # Start-of-scan overwrite bookkeeping (see _flush_stale_matches). Always a dict, even
         # when the flush is skipped or fails, so the summary JSON has a shape to read.
-        # _matches_pre_existed is set by _ensure_datasets; default False so a flush that
-        # somehow runs without it skips (deletes nothing) rather than raising.
+        # _matches_pre_existed defaults False so a flush without it deletes nothing.
         self._matches_pre_existed = False
         self.flush_stats = {
             "dataset": self.matches_dataset,
@@ -4401,11 +4089,10 @@ class LookupDatasetUploader:
             "error": "",
         }
 
-        # Matches schema — must match the keys produced by ResultsUploader.add_file_matches.
-        # XDR add_dataset supports: text, number, datetime, bool.
-        # Always the EMITTED shape, never one resolved from the (operator-pinnable) name tag: a
-        # dataset created from an older schema accepts the POST and silently drops every row
-        # whose fields it doesn't recognise, so a mismatch would lose whole scans without error.
+        # Matches schema - must match the keys produced by ResultsUploader.add_file_matches.
+        # XDR add_dataset supports: text, number, datetime, bool. Always the EMITTED shape,
+        # never one resolved from the operator-pinnable name tag: a dataset created from an
+        # older schema accepts the POST and silently drops every unrecognised field.
         self.matches_schema = matches_schema_for(MATCHES_ROW_SCHEMA_VERSION)
         if str(LOOKUP_SCHEMA_VERSION).strip() != MATCHES_ROW_SCHEMA_VERSION and self.log_manager:
             self.log_manager.log_error(
@@ -4442,11 +4129,11 @@ class LookupDatasetUploader:
 
         if UPLOAD_RESULTS and getattr(config, "write_dataset", True) and self._xdr_configured():
             self._ensure_datasets()
-            # OVERWRITE, not append: clear any previous scan's rows from this host's matches
+            # OVERWRITE, not append: clear the previous scan's rows from this host's matches
             # dataset BEFORE the writer thread exists, so no row this scan produces can be
-            # deleted by its own tidy-up. Deliberately synchronous and inline — one flush per
-            # host, never parallelised (remove_data is not concurrency-safe), and it must be
-            # finished before the first add_data POST can be issued.
+            # deleted by its own tidy-up. Synchronous and inline - one flush per host, never
+            # parallelised (remove_data is not concurrency-safe), and finished before the first
+            # add_data POST.
             self._flush_stale_matches()
             self._start_thread()
         elif self.log_manager:
@@ -4460,9 +4147,8 @@ class LookupDatasetUploader:
     def _ensure_datasets(self):
         """Ensure both the matches and scans lookup datasets exist.
 
-        Records whether the matches dataset PRE-EXISTED: a dataset this call just created
-        holds no rows at all, so the start-of-scan overwrite has nothing to look for and can
-        skip an XQL round trip entirely.
+        Records whether the matches dataset PRE-EXISTED: one this call just created
+        holds no rows, so the start-of-scan overwrite can skip an XQL round trip.
         """
         self._matches_pre_existed = bool(self._ensure_one(self.matches_dataset, self.matches_schema))
         self._ensure_one(self.scans_dataset, self.scans_schema)
@@ -4470,13 +4156,11 @@ class LookupDatasetUploader:
     def _ensure_one(self, dataset_name, dataset_schema):
         """Probe get_datasets; create the dataset via add_dataset if it does not exist yet.
 
-        XDR's add_data endpoint returns HTTP 400 "Dataset not found" when the lookup
-        dataset hasn't been created, so creation is a hard prerequisite — not implicit.
+        XDR's add_data returns HTTP 400 "Dataset not found" when the lookup dataset has
+        not been created, so creation is a hard prerequisite, not implicit.
 
-        Returns True when the dataset already existed before this call, False when we created
-        it (or could not tell). Callers may use it only as an optimisation — never as proof:
-        False can also mean the create failed, and the flush is written to survive a wrong
-        guess in either direction.
+        Returns True when the dataset already existed, False when we created it or could
+        not tell. Callers may use it only as an optimisation, never as proof.
         """
         found = False
         try:
@@ -4544,9 +4228,8 @@ class LookupDatasetUploader:
                         f"(schema fields: {len(dataset_schema)})"
                     )
                 return False
-            # XDR returns HTTP 500 with err_extra "Dataset X already exists" when the
-            # dataset is in fact already there (often when our get_datasets probe
-            # missed it for any reason). Treat that as success, not error.
+            # XDR returns HTTP 500 with err_extra "Dataset X already exists" when the dataset is
+            # in fact already there. Treat that as success, not error.
             already_exists = False
             try:
                 body = resp.json()
@@ -4577,39 +4260,27 @@ class LookupDatasetUploader:
     def _flush_stale_matches(self):
         """OVERWRITE this host's matches dataset: delete every row from a PREVIOUS scan.
 
-        The matches dataset is one per host, permanent, and never accumulates — it holds the
-        CURRENT scan and nothing else, which is what makes it a usable deep-dive source and
-        what keeps it inside the 50 MB per-lookup-dataset platform cap for ever. Nothing else
-        in the pipeline does this: consolidation copies rows OUT, it does not clear them.
+        The matches dataset is one per host, permanent, and never accumulates - it holds
+        the CURRENT scan and nothing else, which is what keeps it a usable deep-dive
+        source and inside the 50 MB per-lookup-dataset platform cap.
 
         Three properties are load-bearing, and each is pinned by a test:
 
-        * The CURRENT scan_id is never removed. Stale ids are enumerated first and the current
-          one is filtered out of that list before a single delete is issued, so the worst
-          outcome of a wrong or stale enumeration is that too FEW rows are deleted.
-        * A missing dataset is a no-op, not an error. A first-ever scan on a host has nothing
-          to overwrite.
-        * It FAILS SAFE. Every failure here is logged and swallowed: stale rows surviving is
-          recoverable (the next scan tries again, and consolidation reads by scan_id anyway),
-          whereas a scan that refuses to run because it could not tidy up is not.
+        * The CURRENT scan_id is never removed. Stale ids are enumerated first and the
+          current one filtered out before any delete, so the worst outcome of a wrong
+          enumeration is that too FEW rows are deleted.
+        * A missing dataset is a no-op, not an error (first-ever scan on a host).
+        * It FAILS SAFE. Every failure is logged and swallowed: stale rows surviving is
+          recoverable, a scan refusing to run because it could not tidy up is not.
 
-        Serialised by construction: one scanner process per host, one flush per process, and
-        it runs inline in __init__ before the writer thread exists. remove_data is NOT
-        concurrency-safe (xdr_action_center.py:446-449), so this must never be parallelised —
-        not across scan_ids here, and not across hosts (each host has its own dataset).
+        Serialised by construction - one scanner process per host, one flush per process,
+        inline in __init__ before the writer thread exists. remove_data is NOT
+        concurrency-safe, so this must never be parallelised, neither across scan_ids
+        here nor across hosts.
 
-        Two consequences worth stating rather than discovering:
-
-        * TWO CONCURRENT SCANS ON ONE HOST are not a supported configuration under an
-          overwrite model, and this does not invent protection they never had. The second
-          scan's flush would delete the first's rows, because from the dataset's point of
-          view they ARE a previous scan_id. One host holds one current scan; that is the
-          model. (The host's running.json marker reports liveness but does not exclude.)
-        * The logged open question — whether remove_data re-stamps `_insert_time` on the rows
-          it leaves behind (xdr/docs/topics/Known_Limitations.md:66) — cannot bite here. This
-          flush removes every scan_id that is not the current one, and the current one has
-          written nothing yet at the moment it runs, so there are no surviving rows for a
-          re-stamp to touch. It stays an open question for the partial deletes elsewhere.
+        Two concurrent scans on one host are not a supported configuration under an
+        overwrite model: the second scan's flush would delete the first's rows, because
+        from the dataset's point of view they ARE a previous scan_id.
 
         Returns self.flush_stats.
         """
@@ -4639,8 +4310,7 @@ class LookupDatasetUploader:
                 else:
                     self.log_manager.log_upload(msg)
             try:
-                # Deep enough to detach the one mutable field, so the summary JSON's copy
-                # cannot be changed by anything that touches flush_stats later.
+                # Detach the one mutable field so the summary JSON's copy cannot change later.
                 self.config._matches_flush = dict(st, scan_ids_removed=list(st["scan_ids_removed"]))
             except Exception:
                 pass
@@ -4653,8 +4323,7 @@ class LookupDatasetUploader:
         if not _YARA_OWNED_DATASET_RE.match(self.matches_dataset):
             return _finish("skipped_unrecognised_dataset", level="error")
         # A dataset _ensure_one just created holds no rows, so there is nothing to enumerate.
-        # This is the ordinary first-scan-on-a-host path, and it is why the common case costs
-        # no XQL at all.
+        # This is the ordinary first-scan-on-a-host path, and why it costs no XQL.
         if not getattr(self, "_matches_pre_existed", False):
             return _finish("skipped_dataset_new")
 
@@ -4662,11 +4331,10 @@ class LookupDatasetUploader:
         try:
             stale = [sid for sid in self._matches_scan_ids() if sid and sid != current]
         except Exception as e:
-            # Includes the 403 an under-permissioned key gets: the scanner delivery key needs
-            # Query Center for the XQL enumeration on top of the Data Management it already
-            # has for add_data/remove_data (see "Key 1 — scanner delivery key" in
-            # .claude/skills/xdr-action-center-api/references/api-permissions.md). Without it
-            # the overwrite degrades to a logged no-op and the scan still runs and writes.
+            # Includes the 403 an under-permissioned key gets: the delivery key needs Query Center
+            # for the XQL enumeration on top of the Data Management it already has for
+            # add_data/remove_data. Without it the overwrite degrades to a logged no-op and the
+            # scan still runs and writes.
             return _finish("failed", level="error", error=f"could not list scan_ids: {e}")
 
         if not stale:
@@ -4693,9 +4361,8 @@ class LookupDatasetUploader:
     def _flush_out_of_budget(self):
         """True once this flush has spent its wall-clock budget (LOOKUP_FLUSH_BUDGET_SECS).
 
-        Every caller responds by stopping and reporting, never by deleting more or by raising
-        past _flush_stale_matches — a spent budget degrades the overwrite, it does not fail
-        the scan.
+        Every caller responds by stopping and reporting, never by deleting more or by
+        raising: a spent budget degrades the overwrite, it does not fail the scan.
         """
         deadline = getattr(self, "_flush_deadline", None)
         return deadline is not None and time.monotonic() >= deadline
@@ -4703,10 +4370,9 @@ class LookupDatasetUploader:
     def _matches_scan_ids(self):
         """Every distinct scan_id currently present in the matches dataset.
 
-        One XQL, the same `comp count() by <field>` idiom xdr_action_center.py:455-457 uses
-        against these datasets. A dataset that does not exist yields no rows rather than an
-        error — the platform's own "not found" wording is treated as empty, because a missing
-        dataset means there is nothing to overwrite.
+        One XQL, using the `comp count() by <field>` idiom. A dataset that does not exist
+        yields no rows rather than an error - a missing dataset means nothing to
+        overwrite.
         """
         query = (f"dataset = {self.matches_dataset} | fields scan_id | "
                  f"comp count() as n by scan_id")
@@ -4771,11 +4437,9 @@ class LookupDatasetUploader:
                     data = results["data"]
                     return data if isinstance(data, list) else []
                 if results.get("stream_id"):
-                    # Past ~1000 rows the platform streams instead of inlining (see
-                    # xdr_action_center.py:340-347). One row per DISTINCT scan_id means that
-                    # needs >1000 failed overwrites on a single host, so rather than carry a
-                    # fourth endpoint and an NDJSON parser onto every endpoint for a case that
-                    # should never occur, say so plainly and let the caller fail safe.
+                    # Past ~1000 rows the platform streams instead of inlining. One row per DISTINCT
+                    # scan_id means that needs >1000 failed overwrites on a single host, so rather than
+                    # carry an NDJSON parser onto every endpoint, say so plainly and fail safe.
                     raise RuntimeError(
                         "XQL returned a stream_id: >1000 distinct scan_ids in "
                         f"{self.matches_dataset}; the overwrite has not been landing"
@@ -4790,10 +4454,9 @@ class LookupDatasetUploader:
     def _remove_scan_id(self, scan_id):
         """Delete every matches row carrying `scan_id`. Returns the reported deleted count.
 
-        ONE exact-value filter block per call: remove_data's filters are OR across blocks and
-        AND within one, exact values only, and the multi-block form is all-or-nothing
-        (xdr_action_center.py:446-449 and :752), so one scan_id per call keeps a single bad
-        value from taking the others down with it. The reply is {"deleted": N}.
+        ONE exact-value filter block per call: remove_data's filters are OR across blocks
+        and AND within one, exact values only, and the multi-block form is all-or-nothing,
+        so one scan_id per call keeps a bad value from taking the others down with it.
         """
         resp = requests.post(
             _build_xdr_url(XDR_API_URL, XDR_LOOKUPS_REMOVE_DATA_PATH),
@@ -4902,10 +4565,9 @@ class LookupDatasetUploader:
                     self.log_manager.log_error(f"Lookup worker loop error (continuing): {e}")
                 continue
 
-        # Final drain: the matches and scans datasets are DIFFERENT datasets, so flushing them
-        # concurrently can't trigger the same-dataset race — and since each add_data POST is slow
-        # (~10s server-side), overlapping them roughly halves the shutdown drain instead of paying
-        # ~10s + ~10s back to back.
+        # Final drain: matches and scans are DIFFERENT datasets, so flushing them concurrently
+        # cannot trigger the same-dataset race, and since each add_data POST is slow
+        # server-side, overlapping them roughly halves the shutdown drain.
         pending = [t for t in list(batches.keys()) if batches[t]]
         if len(pending) <= 1:
             for target in pending:
@@ -4939,19 +4601,18 @@ class LookupDatasetUploader:
         }
         url = _build_xdr_lookups_add_data_url(XDR_API_URL)
 
-        # Decorrelate the fleet burst: many endpoints POST to the SAME dataset at Job start (and
-        # again as they finish). A small random pre-write delay spreads those synchronized writes
-        # across a window so far fewer collide on the server-side per-second clone table. This is
-        # the single biggest lever against the add_data race; retries only mop up the remainder.
+        # Decorrelate the fleet burst: many endpoints POST to the same dataset at scan start
+        # and again as they finish. A small random pre-write delay spreads those writes so
+        # far fewer collide on the server-side clone table. This is the biggest lever
+        # against the add_data race; retries only mop up the remainder.
         if LOOKUP_WRITE_JITTER_SECS > 0:
             time.sleep(random.uniform(0, LOOKUP_WRITE_JITTER_SECS))
 
-        # Wall-clock deadline so this batch can't out-live the drain join budget. Without it, a
-        # hung add_data endpoint (every POST blocking to the read timeout) makes 6 retries take
-        # ~6*read_timeout, which exceeds LOOKUP_DRAIN_TIMEOUT; the daemon drain thread is then
-        # killed mid-POST at process exit and the batch is lost SILENTLY (counted neither sent nor
-        # failed). Refusing an attempt that can't finish in time lets the loop fall through to the
-        # accounted send_failures + "rows lost" path BEFORE the join fires — visible, not silent.
+        # Wall-clock deadline so this batch cannot out-live the drain join budget. Without it
+        # a hung add_data endpoint makes the retries exceed LOOKUP_DRAIN_TIMEOUT, the daemon
+        # drain thread is killed mid-POST at process exit, and the batch is lost silently -
+        # counted neither sent nor failed. Refusing an attempt that cannot finish in time
+        # routes it to the accounted send_failures path instead.
         _read_to = LOOKUP_POST_TIMEOUT[1] if isinstance(LOOKUP_POST_TIMEOUT, (tuple, list)) else LOOKUP_POST_TIMEOUT
         _budget = getattr(self, "_drain_budget", None) or LOOKUP_DRAIN_TIMEOUT
         _deadline = time.monotonic() + max(1.0, _budget - 20)
@@ -4960,9 +4621,8 @@ class LookupDatasetUploader:
         recreate_attempted = False
         attempt = 0
         while attempt < LOOKUP_ADD_DATA_MAX_RETRIES:
-            # `attempt > 0` guarantees at least ONE POST regardless of how the drain/read knobs are
-            # tuned (a healthy endpoint then succeeds); the deadline only bounds the RETRIES so the
-            # drain still exits within its join budget.
+            # `attempt > 0` guarantees at least ONE POST however the drain/read knobs are tuned;
+            # the deadline bounds only the RETRIES, so the drain still exits within its budget.
             if attempt > 0 and time.monotonic() + _read_to > _deadline:
                 if self.log_manager:
                     self.log_manager.log_upload(
@@ -5006,14 +4666,11 @@ class LookupDatasetUploader:
                     time.sleep(delay)
                     continue
 
-                # Dataset missing mid-scan (HTTP 400 "Dataset not found") is not necessarily a
-                # config error - it happens for real if a consolidation/cleanup pass elsewhere
-                # deletes this scan's still-in-progress dataset (measured live: a scan whose
-                # newest row crossed a maintenance tool's abandoned-scan cutoff had its own
-                # dataset pulled out from under it mid-write). _ensure_one() only runs once, at
-                # startup, so without this the scan just keeps failing silently for its entire
-                # remaining lifetime. Recreate once and retry this same batch - bounded by
-                # `recreate_attempted` so a genuinely broken create call can't loop forever.
+                # Dataset missing mid-scan (HTTP 400 "Dataset not found") is not necessarily a config
+                # error - it happens when a consolidation or cleanup pass elsewhere deletes this
+                # scan's still-in-progress dataset. _ensure_one() only runs at startup, so without
+                # this the scan would keep failing silently for its whole remaining lifetime.
+                # Recreate once and retry the same batch, bounded by `recreate_attempted`.
                 if (resp.status_code == 400 and not recreate_attempted
                         and "not found" in resp.text.lower()):
                     recreate_attempted = True
@@ -5040,12 +4697,11 @@ class LookupDatasetUploader:
                 return
 
             except (requests.Timeout, requests.ConnectionError) as e:
-                # A READ timeout is not a clean failure: the server was mid-merge when we hung up,
-                # and the rows often commit anyway — every blind retry risks duplicating the whole
-                # batch (and re-running a merge whose duration CAUSED the timeout). Allow at most
-                # LOOKUP_TIMEOUT_MAX_ATTEMPTS attempts on read timeouts, then stop and count the
-                # batch 'rows_unconfirmed' (fate unknown — NOT added, NOT lost). Connect-phase
-                # errors never reached the server, so they keep the full retry budget.
+                # A READ timeout is not a clean failure: the server was mid-merge when we hung up and
+                # the rows often commit anyway, so every blind retry risks duplicating the batch.
+                # Allow at most LOOKUP_TIMEOUT_MAX_ATTEMPTS, then count the batch 'rows_unconfirmed'
+                # (fate unknown - NOT added, NOT lost). Connect-phase errors never reached the
+                # server, so they keep the full retry budget.
                 if isinstance(e, requests.exceptions.ReadTimeout):
                     read_timeouts += 1
                     if read_timeouts >= LOOKUP_TIMEOUT_MAX_ATTEMPTS:
@@ -5240,11 +4896,8 @@ class EvidenceCollector:
     def _log(self, message, data=None):
         """Route evidence diagnostics to LogManager, not the root logger.
 
-        setup_logging() removes every root handler and pins the level to WARNING, so the
-        logging.info() calls these replaced produced NOTHING - on any host, ever. The
-        dedupe and metadata-only paths were working and completely unobservable: the only
-        way to confirm either had run was to crack the ZIP open by hand. A capability with
-        no evidence trail cannot be a test criterion.
+        The dedupe and metadata-only paths are otherwise unobservable without cracking
+        the ZIP open by hand.
         """
         lm = self.log_manager or getattr(self.config, "log_manager", None)
         if lm:
@@ -5298,14 +4951,11 @@ class EvidenceCollector:
             self.config.evidence_zip, "w", zipfile.ZIP_DEFLATED
         ) as zip_file:
             if copy_files:
-                # Entries are content-addressed, but this iterated by PATH, so several
-                # paths holding identical bytes each wrote a full copy under the same
-                # entry name. zipfile only WARNS on a repeated arcname and stores the
-                # member anyway, so the archive silently carried N copies while readers
-                # could only ever extract the first. Measured on the XSIAM edition:
-                # 22,918 matched paths held 22,213 distinct files - 705 redundant copies,
-                # 506 MB. file_mapping.txt keeps the full path -> hash relation, which is
-                # what makes collapsing them lossless.
+                # Entries are content-addressed but this iterates by PATH, so several paths holding
+                # identical bytes would each write a full copy under the same entry name. zipfile
+                # only WARNS on a repeated arcname and stores the member anyway, so readers could
+                # extract only the first. file_mapping.txt keeps the full path -> hash relation,
+                # which is what makes collapsing them lossless.
                 packaged_hashes = set()
                 duplicates_skipped = 0
                 for file_path, file_hash in self.file_hashes.items():
@@ -5314,9 +4964,8 @@ class EvidenceCollector:
                         continue
                     try:
                         zip_file.write(file_path, f"matched_files/{file_hash}")
-                        # Only mark packaged after a successful write - if this path
-                        # vanished mid-scan, another path with the same content still
-                        # deserves a try.
+                        # Only mark packaged after a successful write - if this path vanished mid-scan,
+                        # another path with the same content still deserves a try.
                         packaged_hashes.add(file_hash)
                     except Exception as e:
                         logging.error(f"Error adding file to zip {file_path}: {e}")
@@ -5343,11 +4992,9 @@ class CleanupManager:
 
     def __init__(self, config, log_manager=None):
         self.config = config
-        # Every call site here used to read `self.config.log_manager`, which ScanConfig
-        # never assigns - so the entire cleanup-scheduling trail was dead. Cleanup
-        # installs a scheduled task / LaunchDaemon / systemd unit on the endpoint, which
-        # is exactly the kind of thing that must leave a record, so the channel is passed
-        # in explicitly rather than deleted.
+        # Cleanup installs a scheduled task / LaunchDaemon / systemd unit on the endpoint,
+        # so it must leave a record. The channel is passed in explicitly because ScanConfig
+        # never carries one.
         self.log_manager = log_manager
 
     def _log(self, message, data=None, level="system"):
@@ -5471,16 +5118,8 @@ class CleanupManager:
     def schedule_final_cleanup(self):
         """Schedule final cleanup, unless the run produced no usable rules.
 
-        Cleanup is suppressed on exactly one condition: the ruleset failed to yield a
-        single valid rule, so the local artefacts are the only record of what went wrong.
-
-        A second suppressor used to sit here - "more than 50% of log events were errors" -
-        guarded by `hasattr(self.config, 'log_manager')`. ScanConfig never assigns
-        log_manager, so that guard was permanently False and the branch was dead. It was
-        removed rather than repaired, because the policy was wrong as well as unreachable:
-        an error RATIO conflates a noisy scan with a broken one. A healthy scan of a
-        locked-down host produces hundreds of legitimate permission errors and would have
-        had its diagnostics preserved forever.
+        Suppressed on exactly one condition: the ruleset yielded no valid rule, so the
+        local artefacts are the only record of what went wrong.
         """
         has_critical_errors = False
         
@@ -5531,10 +5170,8 @@ class CleanupManager:
     def _get_cleanup_script_content(self):
         """Generate the cleanup script from the ACTUAL alert dir.
 
-        Fixes the historical path-drift bug (P2): the old embedded base64 scripts
-        targeted c:\\xdr-data\\alert / /opt/xdr-data/alert, which never matched the real
-        <scanner_dir>/alert, so scheduled cleanup renamed nothing. Generating from
-        config.alert_dir keeps the script and the data in lock-step.
+        Generating it from config.alert_dir keeps the scheduled rename task and the data
+        it renames in lock-step.
         """
         alert_dir = self.config.alert_dir
         if platform.system() == "Windows":
@@ -5651,15 +5288,12 @@ WantedBy=multi-user.target
 class HostCleanup:
     """End-of-run removal of THIS run's on-host working files.
 
-    CleanupManager (above) only ever handles the alert/evidence dirs at the START of the
-    NEXT scan (initial_cleanup) or a background rename task. Neither removes anything at
-    the end of a run, so a host scanned once and never again keeps its full logs, evidence
-    ZIP and alert files indefinitely - the exact gap a one-off fleet sweep hits. This class
-    is the opt-in fix: it runs once, in the finally block of run(), after delivery has
-    fully drained, and only when the operator has explicitly turned it on.
+    CleanupManager handles the alert/evidence dirs at the START of the NEXT scan, so a
+    host scanned once and never again would keep its logs, evidence ZIP and alert files
+    indefinitely. This runs once, in run()'s finally block, after delivery has drained,
+    and only when the operator has turned it on (CONFIG_HOST_CLEANUP).
 
-    Off by default. It deletes files on a customer endpoint, so the wrong default is a far
-    bigger risk than leaving today's behaviour in place.
+    Off by default: it deletes files on a customer endpoint.
     """
 
     VALID_MODES = ("off", "on_delivery", "always")
@@ -5683,11 +5317,11 @@ class HostCleanup:
             return True, ""
         # mode == "on_delivery" from here.
         if not delivery_enabled:
-            # Both CONFIG_CREATE_ALERTS and CONFIG_WRITE_DATASET are off: there is no
-            # "delivery" for this gate to check, so an empty shortfall would mean "nothing
-            # was ever attempted", not "everything landed". Treating that as safe to delete
-            # would wipe the only copy of this scan's findings. Refuse unless the operator
-            # opts all the way out of the gate with CONFIG_HOST_CLEANUP=always.
+            # Both CONFIG_CREATE_ALERTS and CONFIG_WRITE_DATASET are off: there is no delivery
+            # for this gate to check, so an empty shortfall would mean "nothing was ever
+            # attempted", not "everything landed". Deleting then would wipe the only copy of
+            # this scan's findings. Refuse unless the operator opts out with
+            # CONFIG_HOST_CLEANUP=always.
             return False, ("on_delivery has no delivery channel to verify (alerts and "
                            "dataset writes are both off) - keeping the local copy")
         if shortfall:
@@ -5697,15 +5331,13 @@ class HostCleanup:
     def run(self, summary_path, log=lambda *_: None):
         """Remove this run's artefacts per the KEEP tier. Returns (removed_paths, errors).
 
-        Never touches: a DIFFERENT run's logs/summary in the same logs_dir (that is
+        Never touches a DIFFERENT run's logs/summary in the same logs_dir (that is
         LOG_KEEP_SCANS' retained history), or rule_cache (a cross-run performance cache,
-        already self-capped by RULE_CACHE_MAX_FILES, and not this run's data at all).
+        self-capped by RULE_CACHE_MAX_FILES).
 
-        Safety check: only proceeds if `summary_path` was actually and durably written -
-        the audit record that this run happened and what it found. A missing summary means
-        we cannot even attest the run completed, so cleanup is refused rather than deleting
-        blind. This mirrors the verify-before-delete principle used elsewhere (dataset
-        consolidation): confirm the thing you are relying on actually exists first.
+        Only proceeds if `summary_path` was durably written - the audit record that this
+        run happened and what it found. A missing summary means we cannot attest the run
+        completed, so cleanup is refused rather than deleting blind.
         """
         removed, errors = [], []
         if not (summary_path and os.path.isfile(summary_path)):
@@ -5731,10 +5363,9 @@ class HostCleanup:
         logs_dir = self.config.logs_dir
         summary_name = os.path.basename(summary_path)
 
-        # This run's per-category logs, identified the SAME way log retention identifies
-        # them (CleanupManager._extract_run_id_from_log_name), so the two mechanisms can
-        # never disagree about which files belong to which run. The summary itself is
-        # handled separately below (kept or removed per KEEP), never blind-removed here.
+        # This run's per-category logs, identified the SAME way log retention identifies them
+        # (CleanupManager._extract_run_id_from_log_name), so the two can never disagree
+        # about which files belong to which run. The summary is handled separately below.
         cm = CleanupManager(self.config, getattr(self, 'log_manager', None))
         if os.path.isdir(logs_dir):
             for name in os.listdir(logs_dir):
@@ -5744,9 +5375,8 @@ class HostCleanup:
                     _rm_file(os.path.join(logs_dir, name))
 
         # alert_dir / evidence_dir / failed_rules_dir are NOT partitioned per run_id - the
-        # scanner already wipes them wholesale at the START of the next run
-        # (CleanupManager.initial_cleanup). This is that same wipe, one run early, which is
-        # the entire point: a one-off sweep never gets a "next run" to do it.
+        # scanner wipes them wholesale at the START of the next run. This is that same wipe,
+        # one run early, which is the point: a one-off sweep never gets a next run.
         if self.keep != "evidence":
             _rm_tree(self.config.evidence_dir)
         _rm_tree(self.config.alert_dir)
@@ -5826,10 +5456,9 @@ class YaraScanner:
         self.junction_skip_count = 0
         self.lock_real_paths = threading.Lock()
 
-        # Requested scan targets that the skip list excludes wholesale. Without this a
-        # target inside the skip list produced outcome="completed", 0 scanned, exit 0 -
-        # indistinguishable from an empty directory, so an operator scanning e.g.
-        # AppData\Local\Temp got a clean success and zero coverage.
+        # Requested scan targets that the skip list excludes wholesale. Without this, a target
+        # inside the skip list gives outcome="completed", 0 scanned, exit 0 - indistinguishable
+        # from an empty directory.
         self.excluded_targets = []
         self.worker_processing_times = defaultdict(list)
         self.cpu_governor = CpuGovernor(
@@ -5865,14 +5494,13 @@ class YaraScanner:
         self._last_heartbeat = 0.0
         self._scans_row_lock = threading.Lock()
         self._cancel_lock = threading.Lock()
-        # Guards the check-and-set on _last_heartbeat: _maybe_heartbeat() is now called from
-        # BOTH the directory-walker loop and the independent heartbeat thread below, so the
-        # gate must be atomic or two overlapping callers could both pass it and emit a
-        # duplicate 'running' row.
+        # Guards the check-and-set on _last_heartbeat: _maybe_heartbeat() is called from both
+        # the directory-walker loop and the independent heartbeat thread, so the gate must
+        # be atomic or two overlapping callers could both emit a duplicate 'running' row.
         self._heartbeat_lock = threading.Lock()
 
         # Prime psutil's system-CPU sampler: the first cpu_percent(None) call always
-        # returns 0.0, which would let the first throttle window through blind (P3).
+        # returns 0.0, which would let the first governor window through blind.
         try:
             psutil.cpu_percent(interval=None)
         except Exception:
@@ -6049,17 +5677,14 @@ class YaraScanner:
         self._emit_scan_row("running", "heartbeat")
 
     def _start_heartbeat_thread(self):
-        """Start a dedicated background thread that keeps the dataset heartbeat flowing on a
-        fixed cadence, independent of the directory-walker's progress (#8).
+        """Start the background thread that keeps the dataset heartbeat on a fixed cadence,
+        independent of the directory walker.
 
-        Before this, _maybe_heartbeat() was called ONLY once per directory finished by the
-        walker loop. _enqueue_scan_path() blocks (retrying every queue_backoff_secs) when the
-        scan queue is saturated rather than dropping files, so a large single directory on a
-        heavily-throttled host can leave the walker parked there - and therefore skip
-        _maybe_heartbeat() entirely - for stretches well past the quiet period the
-        consolidation tool waits out before treating a scan as finished/abandoned. This thread
-        keeps the heartbeat landing on schedule even while the walker itself is legitimately
-        blocked."""
+        _enqueue_scan_path() blocks (retrying every queue_backoff_secs) when the scan
+        queue is saturated rather than dropping files, so a large single directory can
+        park the walker - and with it _maybe_heartbeat() - for stretches past the quiet
+        period the consolidation tool waits out before treating a scan as abandoned.
+        """
         self.heartbeat_thread = threading.Thread(
             target=self._heartbeat_worker, name="HeartbeatWorker", daemon=True
         )
@@ -6121,13 +5746,9 @@ class YaraScanner:
     def _get_available_yara_modules(self, source_text=None):
         """Detect which YARA modules are available on THIS agent's libyara build.
 
-        The candidate set is the standard probe list UNION every module actually
-        imported by the submitted rules. Probing only a hardcoded list meant any
-        module outside it was treated as unavailable no matter what libyara really
-        supported - so `_split_yara_rules` would strip a perfectly good preamble
-        import and the rule would then fail to compile with "undefined identifier".
-        Deriving the extra candidates from the source makes this correct for any
-        current or future libyara build.
+        The candidate set is the standard probe list UNION every module actually imported
+        by the submitted rules, so this is correct for any current or future libyara
+        build rather than only for a hardcoded list.
         """
         test_modules = ['pe', 'elf', 'cuckoo', 'magic', 'hash', 'math', 'dotnet', 'time']
         if source_text:
@@ -6153,19 +5774,16 @@ rule test {{
     def _rule_uses_unavailable_modules(self, rule_content, available_modules, source_imported_modules=None):
         """Return (True, module) if a rule REQUIRES a YARA module missing on this agent.
 
-        A rule can require a module two ways, and both mean it can never compile here, so it
-        must be SKIPPED (module unavailable), not counted as a FAILED compilation:
+        A rule can require a module two ways, and both mean it can never compile here, so
+        it must be SKIPPED (module unavailable), not counted as a FAILED compilation:
           1. an explicit `import "<module>"` line inside the rule block, or
-          2. a reference to `<module>.<field>` whose declaring top-level import was dropped from
-             the preamble by _split_yara_rules (because the module is unavailable). The split
-             rule body then has no import line but still uses the module; previously it fell
-             through to yara.compile, raised `undefined identifier`, and was mis-counted as FAILED.
+          2. a reference to `<module>.<field>` whose declaring top-level import was
+             dropped from the preamble by _split_yara_rules.
 
-        Case (2) is gated on the module actually being imported SOMEWHERE in the original source
-        (`source_imported_modules`). A bare `cuckoo.` in a rule that never imported cuckoo is just
-        literal text (a hunt string / comment / meta value) — it compiles and matches fine, so it
-        must NOT be skipped. Without this gate, a rule looking for the *string* "cuckoo.conf" was
-        silently dropped on a cuckoo-less agent.
+        Case (2) is gated on the module actually being imported SOMEWHERE in the original
+        source. A bare `cuckoo.` in a rule that never imported cuckoo is literal text (a
+        hunt string, comment or meta value) - it compiles and matches fine, so it must
+        NOT be skipped.
         """
         # (1) explicit inline import of an unavailable module
         import_pattern = r'^\s*import\s+"?(\w+)"?'
@@ -6177,35 +5795,23 @@ rule test {{
                     logging.debug(f"Rule imports unavailable module: {module_name}")
                     return True, module_name
 
-        # Case (2) - a rule whose declaring preamble import was stripped - is NO LONGER
-        # detected here by matching a `<mod>.` usage regex against the rule text. That test
-        # could not tell a real module reference from the same characters appearing inside a
-        # string literal, a comment, or a meta value, and its `source_imported_modules` guard
-        # did not save it: that set is computed once over the WHOLE submitted ruleset, so a
-        # single `import "cuckoo"` anywhere in the pack opened the gate for every other rule
-        # in the file - exactly the situation case (2) exists for. A rule hunting the literal
-        # string "cuckoo.conf" was therefore dropped without ever being compiled, silently
-        # losing detection coverage.
-        #
-        # It is now classified from the ACTUAL compile error instead - see
+        # Case (2) is classified from the ACTUAL compile error, not by matching a `<mod>.`
+        # usage regex against the rule text - that could not tell a real module reference
+        # from the same characters inside a string literal, comment or meta value. See
         # _module_missing_from_compile_error(), called from the compile loop's except branch.
-        # A rule that merely mentions a module name compiles cleanly, never raises, and so can
-        # never be reclassified. Ported from the XSIAM edition.
         return False, None
 
     def _module_missing_from_compile_error(self, error, source_imported_modules, available_modules):
         """Return the module name if a compile error is really "this agent lacks a module".
 
-        A rule that inherits `import "cuckoo"` from a shared preamble (the normal, idiomatic
-        YARA layout) has that import stripped by _split_yara_rules when the module is not
-        available here. The rule body still references `cuckoo.something`, so yara.compile
-        raises `undefined identifier "cuckoo"` and the rule would otherwise be booked as a
-        COMPILE FAILURE - inflating the failed count and making a healthy scan look broken.
+        A rule that inherits `import "cuckoo"` from a shared preamble has that import
+        stripped by _split_yara_rules when the module is unavailable here. The body still
+        references `cuckoo.something`, so yara.compile raises `undefined identifier
+        "cuckoo"` and the rule would otherwise be booked as a COMPILE FAILURE.
 
-        Requiring all three of: yara itself reported the identifier undefined, the name was
-        imported somewhere in the original source, and the module is genuinely unavailable,
-        cannot mis-handle a literal string. It also needs no per-module usage table, so it
-        works for any module a future libyara build might add.
+        Requiring all three of: yara reported the identifier undefined, the name was
+        imported somewhere in the original source, and the module is genuinely
+        unavailable, cannot mis-handle a literal string, and needs no per-module table.
         """
         if not source_imported_modules:
             return None
@@ -6273,20 +5879,16 @@ rule test {{
                 meta = json.load(f)
             el.valid_rules_count = int(meta.get("valid_rules", 0))
             el.failed_rules_count = int(meta.get("failed_rules", 0))
-            # Assign skipped onto the logger too, not just return it. Returning it only fed the
-            # "Rule cache HIT ..." log line, so on every cache HIT the operator-facing surfaces
-            # (the SCAN_RESULT line's "N rules skipped" segment and scan_summary's
-            # skipped_rules) read el.skipped_rules_count == 0 and stayed silent — the exact
-            # "a pack whose rules mostly could not run reports nothing" failure the skipped
-            # count exists to prevent, and the normal case, since a repeat scan of the same
-            # ruleset always hits the cache.
+            # Assign skipped onto the logger as well as returning it: the operator-facing surfaces
+            # (the SCAN_RESULT line and scan_summary's skipped_rules) read el.skipped_rules_count,
+            # and a repeat scan of the same ruleset always hits the cache.
             el.skipped_rules_count = int(meta.get("skipped", 0))
             return el.skipped_rules_count
         except Exception:
-            # No/broken sidecar: recover the true valid count from the loaded bundle
-            # (yara.Rules is iterable and yields exactly the compiled rules). The skipped count
-            # is not recoverable this way — the bundle holds what compiled, not what didn't — so
-            # leave it at 0 rather than inventing one.
+            # No/broken sidecar: recover the true valid count from the loaded bundle (yara.Rules
+            # is iterable and yields exactly the compiled rules). The skipped count is not
+            # recoverable this way - the bundle holds what compiled, not what did not - so leave
+            # it at 0 rather than inventing one.
             if not getattr(el, "valid_rules_count", 0):
                 try:
                     el.valid_rules_count = sum(1 for _ in rules) if rules is not None else 1
@@ -6426,12 +6028,10 @@ rule test {{
             error_logger.has_errors = True
             error_logger.error_logger.error(f"COMPILATION_ERROR: {error_msg}")
             try:
-                # run_id-scoped like every other artefact in failed_rules/. That directory
-                # is deliberately never pruned, so a fixed name is not "the latest copy" --
-                # it is the only copy, silently replaced on every run. The rule content that
-                # failed to split is the whole point of the file, and the case it exists for
-                # (a pack that produces no parseable rules) is exactly the case someone
-                # re-runs while trying to fix it, overwriting the evidence each time.
+                # run_id-scoped like every other artefact in failed_rules/. That directory is never
+                # pruned, so a fixed name would not be "the latest copy" but the only copy, silently
+                # replaced on every run - and the case this file exists for is exactly the one
+                # someone re-runs while trying to fix it.
                 debug_file = os.path.join(
                     self.config.failed_rules_dir,
                     f"raw_yara_content_{self.config.run_id}.yar")
@@ -6563,10 +6163,10 @@ rule test {{
             error_logger.error_logger.info(f"Skipped {skipped_count} rules due to unavailable modules")
 
         if not valid_sources:
-            # Distinguish "your rules are broken" from "this agent's libyara cannot run
-            # them". Both end the scan, but they need completely different responses, and
-            # reporting an all-skipped pack as a compilation failure sends the operator
-            # hunting for a syntax error that does not exist.
+            # Distinguish "your rules are broken" from "this agent's libyara cannot run them".
+            # Both end the scan but need different responses, and reporting an all-skipped pack
+            # as a compilation failure sends the operator hunting a syntax error that does not
+            # exist.
             if skipped_count and not error_logger.failed_rules_count:
                 error_msg = (
                     f"No rules could run on this endpoint: all {skipped_count} rule(s) need "
@@ -6800,11 +6400,9 @@ rule test {{
             return
         self.cpu_governor.update(own_raw, system)
 
-        # Emit on meaningful change, OR on a heartbeat. Change-only emission produced a
-        # single line across a 15,516-file scan (the ratio never moved because the host
-        # was idle) - and a steady, un-throttled scan is exactly the case a customer
-        # wants evidence for. The heartbeat guarantees a usable time series without
-        # emitting per sample.
+        # Emit on meaningful change OR on a heartbeat. Change-only emission can produce a
+        # single line across a whole scan when the host is idle - and a steady, un-throttled
+        # scan is exactly the case a customer wants evidence for.
         s = self.cpu_governor.stats()
         changed = (self._last_governor_emit is None
                    or abs(s["ratio"] - self._last_governor_emit) >= 0.25)
@@ -6819,14 +6417,10 @@ rule test {{
         """os.walk replacement whose cancellation latency is bounded by ONE scandir.
 
         os.walk yields only after its internal recursion produces the next directory, so
-        `scan_active` can go unobserved for an unbounded interval. Measured on C:\\ : both
-        workers stopped 4.45s after a cancel, but the process took a further 50s to exit
-        because the walk was still inside the generator. Same cause left running.json
-        stale, which made `cancel` report "scanner running: no" during a live scan.
-
-        Driving the traversal with an explicit stack puts the check under our control: it
-        runs before every directory and between entries, so a cancel is honoured within a
-        single scandir call.
+        `scan_active` can go unobserved for an unbounded interval - long enough to leave
+        running.json stale and make `cancel` report "scanner running: no" during a live
+        scan. Driving the traversal with an explicit stack puts the check under our
+        control: it runs before every directory and between entries.
 
         Contract matches os.walk(topdown=True): yields (dirpath, dirnames, filenames), and
         the caller may prune `dirnames` in place to skip subtrees - the stack is extended
@@ -6904,22 +6498,15 @@ rule test {{
     def _maybe_sample_fds(self):
         """Advance the FD sampling counter and take a reading on the interval.
 
-        Called once per file PROCESSED, before any early return. It used to be inlined at
-        the end of scan_file, after the matched and skipped returns, so it only ran on
-        files that were scanned and did not match; on a ruleset matching everything it
-        never ran at all. FD monitoring went quiet exactly when the scanner held the most
-        handles.
+        Called once per file PROCESSED, before any early return, so FD monitoring does
+        not go quiet on a ruleset that matches everything.
 
-        The counter moves under lock_counts. Unlocked, the read-modify-write raced across
-        workers and silently dropped increments, making the effective interval longer than
-        configured and impossible to reason about from the settings.
+        The counter moves under lock_counts - unlocked, the read-modify-write races
+        across workers and silently drops increments.
 
-        A healthy sample records last_fd_count and bumps fd_samples_taken. Previously only
-        threshold breaches emitted anything, so "sampled and fine" and "never sampled"
-        left identical evidence.
-
-        Never raises: a scan is worth more than its FD telemetry, and a failed read is not
-        counted as a sample taken.
+        A healthy sample records last_fd_count and bumps fd_samples_taken, so "sampled
+        and fine" and "never sampled" leave different evidence. Never raises: a failed
+        read is not counted as a sample taken.
         """
         if not self.fd_monitoring_enabled:
             return
@@ -7022,9 +6609,8 @@ rule test {{
                 externals={"filepath": file_path, "filename": os.path.basename(file_path)},
                 callback=self._yara_callback,
             )
-            # Pace AFTER the work, proportional to how long it took. The old code gated
-            # BEFORE the match on a system-CPU threshold, which is why it could park
-            # indefinitely without ever doing any work.
+            # Pace AFTER the work, proportional to how long it took - a gate BEFORE the match,
+            # keyed on a system-CPU threshold, could park indefinitely without doing any work.
             self.cpu_governor.pace(time.time() - _work_started)
 
             if matches:
@@ -7101,32 +6687,26 @@ rule test {{
             return True
         if any(portable_path.endswith(ext) for ext in self.config.skip_extensions):
             return True
-        # Force-scan allowlist wins over all path-based skips (fragments + platform
-        # skip dirs): browser caches/profiles are scanned even if a broader rule excludes
-        # them. Filename/extension skips above still apply (no point scanning a .iso).
+        # Force-scan allowlist wins over all path-based skips (fragments + platform skip
+        # dirs): browser caches/profiles are scanned even if a broader rule excludes them.
+        # Filename/extension skips above still apply.
         #
-        # Two constraints, both ported from the XSIAM edition:
+        # Two constraints:
         #  - Probe with a trailing separator appended. os.walk yields a directory root with
-        #    no trailing separator, so ".../library/caches/firefox" failed to match the
+        #    no trailing separator, so ".../library/caches/firefox" would not match the
         #    "/library/caches/firefox/" fragment while still matching the broad
-        #    "/library/caches/" skip - the whole directory was pruned and no file inside
-        #    ever reached this allowlist.
-        #  - It must NOT override BOUNDARY skips. force_scan_never_under exists to keep the
-        #    scanner on THIS host, not to reduce noise: a Time Machine disk under /Volumes/
-        #    holds one browser cache per backup snapshot, and a force-scan fragment would
-        #    otherwise drag the walker across every one of them. Without this guard the
-        #    allowlist has no backstop at all.
+        #    "/library/caches/" skip - pruning the whole directory.
+        #  - It must NOT override BOUNDARY skips. force_scan_never_under keeps the scanner on
+        #    THIS host: a Time Machine disk under /Volumes/ holds one browser cache per
+        #    backup snapshot.
         _probe = portable_path + "/"
         if not any(b in _probe for b in getattr(self.config, "force_scan_never_under", ())):
             if any(fragment in _probe for fragment in getattr(self.config, "force_scan_fragments", ())):
                 return False
         # Matched as a bounded "/fragment/" substring AND at the tail. os.walk yields a
         # directory root with no trailing separator, so the directory that IS the excluded
-        # component (".../node_modules") closed no bounded form and matched nothing, while
-        # every file inside it matched. Caught only by re-verifying on real Windows: the
-        # Darwin branch masked it locally through its own relative-entry list, so an
-        # operator scanning ...\node_modules got 0 files and no exclusion warning on the
-        # one platform the fleet actually runs.
+        # component (".../node_modules") closes no bounded form and would match nothing,
+        # while every file inside it matched.
         if any(fragment in portable_path or portable_path.endswith(fragment.rstrip("/"))
                for fragment in self.config.skip_path_fragments):
             return True
@@ -7169,10 +6749,8 @@ rule test {{
             # Linux filesystems are typically case-sensitive, so this stays on
             # normalized_path (case-preserved), unlike the Darwin branch below.
             for skip_dir in self.config.lin_skip_directory:
-                # skip_dir always carries a trailing "/", which a plain startswith() never
-                # matches against the BARE root os.walk yields for the directory itself -
-                # only its contents. So the scanner's own directory root was walked and
-                # enumerated even though everything inside it was correctly skipped.
+                # skip_dir always carries a trailing "/", which a plain startswith() never matches
+                # against the BARE root os.walk yields for the directory itself - only its contents.
                 if normalized_path == skip_dir.rstrip("/") or normalized_path.startswith(skip_dir):
                     return True
             return False
@@ -7182,18 +6760,14 @@ rule test {{
             # portable_path already is; mac_skip_directory is lowercased at construction.
             #
             # Entries come in three shapes needing different match semantics:
-            #   - starts with "/"  -> ANCHOR: a real top-level path, matching only there
-            #     and beneath it (so "/System/" never matches a user's own "~/System/").
+            #   - starts with "/"  -> ANCHOR: a real top-level path, matching only there and
+            #     beneath it (so "/System/" never matches a user's own "~/System/").
             #   - contains ".app/" -> BUNDLE SUFFIX: ".app/Contents/Frameworks/" must match
-            #     "Slack.app/Contents/..." for ANY app name, so the character before ".app"
-            #     is that name's last letter, never a separator - checked WITHOUT a leading
-            #     slash, unlike every other fragment.
-            #   - otherwise        -> FRAGMENT: matches wherever the component occurs, at
-            #     any depth. A bare startswith() can never satisfy this - a relative string
-            #     is never a prefix of an absolute path - so 32 of these 58 entries matched
-            #     nothing at all. Also checked at the tail, because when the fragment's own
-            #     directory IS the walk root the path has no trailing separator to close
-            #     the bounded "/entry/" substring.
+            #     "Slack.app/Contents/..." for ANY app name, so the character before ".app" is
+            #     that name's last letter, never a separator - checked WITHOUT a leading slash.
+            #   - otherwise        -> FRAGMENT: matches wherever the component occurs, at any
+            #     depth. Also checked at the tail, because when the fragment's own directory IS
+            #     the walk root the path has no trailing separator to close the bounded form.
             for skip_dir in self.config.mac_skip_directory:
                 if skip_dir.startswith("/"):
                     if portable_path == skip_dir.rstrip("/") or portable_path.startswith(skip_dir):
@@ -7219,17 +6793,16 @@ rule test {{
     def _write_alerts(self, matches, file_path, file_sha256=None, file_creation_time=None):
         """Write alerts for YARA matches, and queue this file's single dataset row.
 
-        `matches` is every rule that hit ONE file, which is why the schema-v4 lookup row — one
-        row per FILE carrying all of them — is assembled here: each add_match() call below returns
-        that rule's contribution, and the collected list goes to add_file_matches() once. The
-        alert channel is untouched by that: it stays one alert per (rule, file) finding."""
+        `matches` is every rule that hit ONE file, which is why the schema-v4 lookup row
+        - one row per FILE carrying all of them - is assembled here. The alert channel is
+        unaffected: it stays one alert per (rule, file) finding.
+        """
         file_detections = []
         _rule_findings = []   # per-rule detail dicts for this file's single dataset row
 
-        # finally, not just fall-through: under the v3 grain each rule's dataset row was queued
-        # inside this loop, so a later rule raising (e.g. a TOCTOU OSError on a file deleted
-        # mid-scan, which getsize below can still raise) cost only the rules not yet reached.
-        # Aggregating must not make that worse — whatever detail was gathered still ships.
+        # finally, not just fall-through: a later rule raising (e.g. a TOCTOU OSError on a
+        # file deleted mid-scan, which getsize below can raise) must not cost the detail
+        # already gathered for the earlier rules.
         try:
             for m in matches:
                 rule, tags, meta, strings = _iter_hit_fields(m)
@@ -7277,11 +6850,9 @@ rule test {{
                                 f.write(f"File Creation Time: {file_creation_time}\n")
                             f.write("=" * 80 + "\n")
                             if strings and not _over_budget:
-                                # Census first, and deliberately UNCAPPED: which string in
-                                # the rule fired and how many times is what an analyst works
-                                # from, and it costs one line no matter how many offsets there
-                                # are. The offsets below are sampled precisely so this can be
-                                # complete.
+                                # Census first, and deliberately UNCAPPED: which string in the rule fired and how
+                                # many times is what an analyst works from, and it costs one line no matter how many
+                                # offsets there are. The offsets below are sampled precisely so this can be complete.
                                 id_counts = {}
                                 for (_o, _sid, _d) in strings:
                                     key = "$?" if _sid is None else str(_sid)
@@ -7418,12 +6989,9 @@ rule test {{
             scan_rate = self.files_scanned / elapsed if elapsed > 0 else 0
             
             try:
-                # Reuse ONE long-lived, primed handle: psutil's first cpu_percent() call on
-                # a given Process object always returns 0.0, so building a fresh
-                # psutil.Process() each tick reported 0.0% CPU forever - the same reason
-                # __init__ primes self._governor_proc. Latent before the progress heartbeat
-                # existed (this path used to almost never run), but it now fires every
-                # log_interval for the whole scan, so the zeros would be the norm.
+                # Reuse ONE long-lived, primed handle: psutil's first cpu_percent() call on a given
+                # Process object always returns 0.0, so a fresh psutil.Process() each tick would
+                # report 0.0% CPU forever. Same reason __init__ primes self._governor_proc.
                 process = getattr(self, "_governor_proc", None) or getattr(self, "_progress_proc", None)
                 if process is None:
                     process = psutil.Process()
@@ -7433,9 +7001,8 @@ rule test {{
                 memory_info = process.memory_info()
                 memory_mb = memory_info.rss / 1024 / 1024
 
-                # io_counters() does not exist on macOS (psutil raises AttributeError).
-                # Unguarded it aborted this whole block, zeroing memory/network too - which
-                # do work there - and logged an error every tick.
+                # io_counters() does not exist on macOS (psutil raises AttributeError). Unguarded it
+                # aborts this whole block, zeroing memory/network too.
                 disk_io_mb = 0
                 try:
                     io_counters = process.io_counters()
@@ -7561,12 +7128,9 @@ rule test {{
     def _progress_heartbeat(self):
         """Periodic _log_progress() call spanning the WHOLE scan, not just file discovery.
 
-        Progress logging used to be an inline check in the discovery os.walk loop, which
-        almost never runs long enough on its own to cross log_interval - file enumeration
-        is fast; matching file content in the worker threads is what actually takes
-        minutes, and that happens after discovery ends. Ported from the XSIAM edition,
-        where this was confirmed live: zero "Scan Progress" events had ever been
-        recorded, on any host, under the inline-only approach.
+        File enumeration rarely runs long enough on its own to cross log_interval;
+        matching file content in the worker threads is what takes minutes, and that
+        happens after discovery ends.
         """
         while not self._progress_heartbeat_stop.wait(self.config.log_interval):
             if not self.scan_active:
@@ -7584,11 +7148,9 @@ rule test {{
         cleanup_start = time.time()
        
 
-        # Resource/stats monitoring is stopped AFTER the worker-thread join below, not
-        # here (matches the XSIAM edition's fix) - file discovery finishing (which is where
-        # control reaches this point) is not the same as the workers finishing the matching
-        # work still sitting in scan_queue, and stopping the monitor here was cutting
-        # resource telemetry off for most of the real scan duration on a large scan.
+        # Resource/stats monitoring is stopped AFTER the worker-thread join below, not here:
+        # file discovery finishing is not the workers finishing the matching work still
+        # sitting in scan_queue.
         self.log_manager.log_system("Initiating worker thread cleanup")
         
         for _ in range(self.config.max_workers):
@@ -7624,9 +7186,8 @@ rule test {{
             f"Worker cleanup: {successful_joins} stopped, {failed_joins} timed out in {worker_join_time:.1f}s"
         )
 
-        # Stopped here, AFTER the join above, for the same reason as resource/stats
-        # monitoring below - the heartbeat needs to keep firing for as long as workers
-        # are actually still draining scan_queue, not just until file discovery ends.
+        # Stopped here, AFTER the join above, for the same reason as resource/stats monitoring
+        # below - the heartbeat must keep firing while workers are still draining scan_queue.
         if getattr(self, '_progress_heartbeat_stop', None) is not None:
             self._progress_heartbeat_stop.set()
             if getattr(self, '_progress_heartbeat_thread', None) is not None:
@@ -7672,7 +7233,7 @@ rule test {{
         self._last_heartbeat = start_time  # first heartbeat waits a full interval
         # Start watching for an operator cancel flag and announce the scan started.
         self._start_cancellation_watcher()
-        # Independent of walker progress (#8) - see _start_heartbeat_thread's docstring.
+        # Independent of walker progress - see _start_heartbeat_thread's docstring.
         self._start_heartbeat_thread()
         self._emit_scan_row("initiated", "scan initiated")
 
@@ -7752,10 +7313,9 @@ rule test {{
                         {'target_index': target_idx + 1, 'target_path': target}
                     )
 
-                    # The operator asked for this path explicitly, but it matches the skip
-                    # list, so the walk below drops every directory in it and reports a
-                    # clean zero. Record it so the result line can say so - silently
-                    # returning 0 reads as "nothing here", not "policy excluded this".
+                    # The operator asked for this path explicitly, but it matches the skip list, so the
+                    # walk below drops every directory in it and reports a clean zero. Record it so the
+                    # result line can say "policy excluded this" rather than "nothing here".
                     if self._is_special_file(target):
                         self.excluded_targets.append(target)
                         self.log_manager.log_error(
@@ -7766,19 +7326,16 @@ rule test {{
                     
                     # _walk_cancellable, not os.walk: the flag is checked before every
                     # directory so a cancel is honoured within one scandir, instead of
-                    # whenever os.walk next happens to yield (measured 50s on C:\).
+                    # whenever os.walk next happens to yield, which on a large volume is far longer.
                     for root, dirs, files in self._walk_cancellable(target):
                         if not self.scan_active:
                             break
                             
                         if self._is_special_file(root):
-                            # Count what this skip actually excluded. A bare `continue`
-                            # touched no counter, so an entire skipped subtree vanished
-                            # from the books: files_scanned + files_skipped could not be
-                            # reconciled against what is on disk, and skip_rate read 0%.
-                            # Subdirectories are not pruned, so each one arrives here as
-                            # its own root and contributes its own files - the whole
-                            # subtree is counted exactly once.
+                            # Count what this skip actually excluded. A bare `continue` touches no counter, so an
+                            # entire skipped subtree vanishes from the books and files_scanned + files_skipped
+                            # cannot be reconciled against what is on disk. Subdirectories are not pruned, so
+                            # each arrives here as its own root and the subtree is counted exactly once.
                             if files:
                                 with self.lock_counts:
                                     self.files_skipped += len(files)
@@ -7857,23 +7414,16 @@ def close_diagnostics_handler():
     """Close and detach the root diagnostics FileHandler. Returns whether one was open.
 
     Windows refuses to delete a file that is still open, so every per-run log handler
-    must be closed before anything tries to remove the logs directory. There are EIGHT:
+    must be closed before anything removes the logs directory. There are EIGHT:
     LogManager owns six category handlers, ErrorLogger owns yara_processing, and
-    setup_logging() installs this one on the ROOT logger. Only the first seven were ever
-    closed.
+    setup_logging() installs this one on the ROOT logger.
 
-    It is the worst one to leave open, because host cleanup's own messages cannot go
-    through LogManager (already closed by then) and use the plain `logging` module
-    instead - so cleanup writes its progress INTO the file it is about to unlink,
-    guaranteeing the handle is hot at exactly the wrong moment. os.remove() then fails
-    with WinError 32, which is recorded as an error rather than raised, and the endpoint
-    keeps one diagnostics_<run_id>.log per scan forever.
+    It is the worst one to leave open: host cleanup's own messages cannot go through
+    LogManager (already closed by then) and use the plain `logging` module instead, so
+    cleanup would write into the file it is about to unlink.
 
-    The WARNING StreamHandler is deliberately left attached: cleanup's warnings still
-    need somewhere to go, and stderr is not the capped resource.
-
-    Idempotent, and never raises - this runs on the shutdown path, where a failure would
-    mask the run's actual result.
+    The WARNING StreamHandler is deliberately left attached. Idempotent, and never
+    raises - this runs on the shutdown path.
     """
     global _DIAGNOSTICS_HANDLER
     handler = _DIAGNOSTICS_HANDLER
@@ -7894,19 +7444,15 @@ def close_diagnostics_handler():
 def setup_logging(config):
     """Keep the root logger off stdout, but give its INFO records somewhere to land.
 
-    Categorized logging is handled by LogManager. Root-logger output stays off
-    stdout because Action Center truncates a script's stdout at 10,240 characters -
-    a chatty scan would push the SCAN_RESULT line out of the window entirely.
+    Categorized logging is handled by LogManager. Root-logger output stays off stdout
+    because Action Center truncates a script's stdout at 10,240 characters - a chatty
+    scan would push the SCAN_RESULT line out of the window entirely.
 
-    That is why this used to drop every root handler and pin WARNING. The side
-    effect was that the ~44 logging.info calls in this file reached NOTHING on any
-    host, and for a number of capabilities an info line is the only evidence the
-    behaviour ran at all - which made them impossible to verify on a live scan.
-    They now go to logs/diagnostics_<run_id>.log instead. stdout is unaffected and
-    stderr still shows WARNING+ so interactive runs surface fatal issues.
+    Root INFO records go to logs/diagnostics_<run_id>.log instead. stdout is unaffected
+    and stderr still shows WARNING+ so interactive runs surface fatal issues.
 
-    The three categorized loggers (error, exception, webhook) set propagate=False,
-    so nothing they emit is duplicated here.
+    The three categorized loggers (error, exception, webhook) set propagate=False, so
+    nothing they emit is duplicated here.
     """
     try:
         for handler in logging.root.handlers[:]:
@@ -7931,7 +7477,7 @@ def setup_logging(config):
             _DIAGNOSTICS_HANDLER = diag
         except Exception as e:
             # No disk sink is survivable - the scan still runs, it just loses the
-            # info-level trail. Keep the old WARNING behaviour rather than failing.
+            # info-level trail. Fall back to WARNING rather than failing.
             logging.root.setLevel(logging.WARNING)
             print(f"Diagnostics log unavailable ({e}); root logging stays at WARNING",
                   file=sys.stderr)
@@ -8027,11 +7573,10 @@ def upload_final_comprehensive_report(scanner, total_scan_time):
 def _delivery_shortfall(scanner, config):
     """Human summary of findings that did NOT reach XDR, or "" when all delivered.
 
-    Counts anything queued for a channel that we cannot show as landed. Deliberately
-    counts read-timeout batches ('rows_unconfirmed') as NOT delivered: the server may
-    have committed them, but 'may have' is not evidence, and over-reporting success is
-    the failure mode this exists to prevent. Local logs and the evidence ZIP always hold
-    the complete record either way, so the operator is told where to look.
+    Counts anything queued for a channel that we cannot show as landed, including
+    read-timeout batches ('rows_unconfirmed'): the server may have committed them, but
+    over-reporting success is the failure mode this exists to prevent. The local logs
+    and evidence ZIP hold the complete record either way.
     """
     parts = []
     try:
@@ -8073,12 +7618,11 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
         tenant_id=None, lookup_shard=None):
     """Full scanner implementation (internal API).
 
-    Operators do NOT call this directly through the Action Center — use the `main` entry point,
-    whose only inputs are yarafile / scan_folder / alert_severity. Every other behaviour knob
-    defaults to its CUSTOMER CONFIG constant at the top of this file (edit once per deployment).
-    Any knob left unset (None) falls back to its CONFIG_* constant; an explicit `options`
-    "key=value,key=value" entry still OVERRIDES the constant. `mode="cancel"` short-circuits to
-    deliver a cancel flag for a running scan instead of starting one.
+    Operators do NOT call this directly through the Action Center - use the `main` entry
+    point, whose only inputs are yarafile / scan_folder / alert_severity. Any knob left
+    unset (None) falls back to its CONFIG_* constant; an explicit `options`
+    "key=value,key=value" entry overrides the constant. `mode="cancel"` short-circuits
+    to deliver a cancel flag for a running scan instead of starting one.
     """
     # Fall back to the CUSTOMER CONFIG constants for anything not explicitly supplied.
     if mode is None:
@@ -8106,9 +7650,8 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
     if lookup_shard is None:
         lookup_shard = CONFIG_LOOKUP_SHARD
 
-    # Resolve the compact options string over the explicit kwargs (options win).
-    # Retired throttle_* options are translated first, so existing scripts and scheduled
-    # jobs keep running rather than erroring on an unrecognised key.
+    # Resolve the compact options string over the explicit kwargs (options win). Retired
+    # throttle_* options are translated first so existing scripts keep running.
     opts = migrate_throttle_option(_parse_options_string(options))
 
     def _pick(key, current):
@@ -8153,20 +7696,15 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
             lookup_shard=lookup_shard,
         )
         log_manager = LogManager(config)
-        # Late-bind the channel onto config. ErrorLogger is constructed inside
-        # ScanConfig (long before this point) and reads `self.config.log_manager` when a
-        # rule fails to compile - a guard that was permanently False, so compilation
-        # failures never produced a telemetry error event carrying the rule name, error
-        # type and line number. Rules compile inside YaraScanner, well after this line,
-        # so binding it here is early enough for every consumer.
+        # Late-bind the log channel onto config. ErrorLogger is constructed inside ScanConfig
+        # and reads `self.config.log_manager` when a rule fails to compile; rules compile
+        # inside YaraScanner, well after this line, so binding here is early enough.
         config.log_manager = log_manager
 
-        # Fail loud on un-configured credentials BEFORE scanning: if the API creds are still the
-        # 'replace_with_*' placeholders and this run intends to deliver (alerts and/or datasets),
-        # a full scan would find matches but drop 100% of them. Abort now with a clear message in
-        # the SCAN_RESULT the operator sees, instead of wasting the scan and silently losing data.
-        # Use the PARSED booleans on config, not the raw run() args — an options string passes
-        # "false" (a truthy non-empty string), which config.__init__ has already coerced to bool.
+        # Fail loud on un-configured credentials BEFORE scanning: with placeholder creds a
+        # full scan would find matches and drop 100% of them. Uses the PARSED booleans on
+        # config, not the raw run() args - an options string passes "false" (a truthy
+        # non-empty string) which config.__init__ has already coerced to bool.
         if getattr(config, "creds_placeholder", False) and (config.create_alerts or config.write_dataset):
             msg = (
                 "SCAN ABORTED — XDR API credentials are not set. DEFAULT_XDR_API_KEY / "
@@ -8184,8 +7722,8 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
                 pass
             return msg
 
-        # Always the below-normal tier. The old 'os' idle tier was measured to STARVE
-        # on a saturated host (252s vs 77s on 8 cores); the governor bounds impact now.
+        # Always the below-normal tier; the idle tier can starve on a saturated host, and the
+        # governor bounds impact instead.
         _apply_light_process_priority(log_manager, throttle_mode="standard", config=config)
         exception_logger = config.exception_logger
         stats_manager = StatisticsManager(config, log_manager)
@@ -8323,10 +7861,9 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
         log_manager.log_system("YARA Scanner initialized successfully", init_data)
 
         scanner = YaraScanner(config, log_manager=log_manager, stats_manager=stats_manager)
-        # Route POSIX termination signals into the same graceful cancel path so a hard
-        # Action-Center abort (where a signal is delivered) still drains cleanly. The
-        # handler sets the flags BARE (no lock, no logging) to stay async-signal-safe;
-        # the watcher/main loop observe cancel_requested and drive the graceful shutdown.
+        # Route POSIX termination signals into the same graceful cancel path, so a hard Action
+        # Center abort still drains cleanly. The handler sets the flags BARE (no lock, no
+        # logging) to stay async-signal-safe; the watcher and main loop drive the shutdown.
         try:
             import signal as _signal
 
@@ -8382,12 +7919,9 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
                 f"Scan cancelled by operator: {scanner.files_scanned} files scanned | "
                 f"{scanner.total_detections} matches found | {config.posture}"
             )
-            # A cancelled scan can still have lost findings in transit, and this early
-            # return used to bypass the delivery-shortfall check entirely - so the one
-            # outcome where partial results matter most was also the one that never told
-            # the operator any of them failed to land. Uploaders are stopped by
-            # _perform_enhanced_cleanup before scan_system returns, so the counters are
-            # settled here exactly as they are on the completed path.
+            # A cancelled scan can still have lost findings in transit, so the shortfall is
+            # checked here too. Uploaders are stopped by _perform_enhanced_cleanup before
+            # scan_system returns, so the counters are settled exactly as on the completed path.
             _cancel_shortfall = _delivery_shortfall(scanner, config)
             if _cancel_shortfall:
                 _cancel_summary += " | " + _cancel_shortfall
@@ -8404,13 +7938,10 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
             }
             log_manager.log_error("Scan stopped due to fatal failures", failure_data)
 
-            # A fatal failure still has evidence worth keeping and a story worth telling.
-            # This used to return immediately, skipping evidence collection entirely - so a
-            # scan that FOUND matches and then died produced no ZIP at all, even though the
-            # alert texts and file_mapping it would package are exactly what a responder
-            # needs from a partial run (verified: 1 match, alert text written, 0 zips). It
-            # also sent no terminal event, so a dashboard just saw the scan stop. Both are
-            # best-effort: a failing scan must still return its result line.
+            # A fatal failure still has evidence worth keeping: the alert texts and file_mapping
+            # are what a responder needs from a partial run, and a terminal event keeps the
+            # dashboard from just seeing the scan stop. Both are best-effort - a failing scan
+            # must still return its result line.
             try:
                 scanner.status_uploader.set_status("failed")
             except Exception as _e:
@@ -8430,27 +7961,15 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
         
         scan_total_time = time.time() - scan_start_time
 
-        # Everything from here to the end of this block is REPORTING, and it is wrapped for
-        # one specific reason: the terminal lifecycle row has already been written.
+        # Everything from here to the end of this block is REPORTING, and it is wrapped
+        # because the terminal lifecycle row has ALREADY been written by
+        # _perform_enhanced_cleanup. A raise here would escape to run()'s outer handler,
+        # which sets scan_failed=True and derives outcome="failed" - leaving the summary
+        # JSON and the operator's result line saying "failed" while the yara_scanner_scans
+        # row consolidation reads says "completed", with nothing to reconcile them.
         #
-        # _perform_enhanced_cleanup emits it from scan_system's `finally` (see
-        # _emit_scan_row(_term_status, ...)), and at that point scan_failed was False, so the
-        # dataset row says "completed" and the tenant has already been told the scan finished.
-        # This block used to be unguarded while both its neighbours -- the failure-path
-        # evidence collection above and the evidence collection below -- were not. A raise in
-        # here therefore escaped to run()'s outer handler, which sets scanner.scan_failed =
-        # True so the finally-block derives outcome="failed".
-        #
-        # The result was two records of the same scan that disagree: scan_summary_<run_id>.json
-        # and the operator's result line say "failed", while the yara_scanner_scans row that
-        # consolidation reads says "completed". Nothing reconciles them, and the dataset row is
-        # the one the playbook gates on -- so a scan that reported failure to a human would be
-        # consolidated as an ordinary success, and anyone comparing the two would be chasing a
-        # contradiction with no cause.
-        #
-        # A statistics call or a report upload failing does not un-scan the files. The scan
-        # genuinely completed; only its epilogue did not. So log it and keep the outcome that
-        # the dataset already committed to.
+        # A statistics call or a report upload failing does not un-scan the files. Log it and
+        # keep the outcome the dataset already committed to.
         try:
             final_performance_stats = stats_manager.get_current_stats_for_upload()
             final_log_stats = log_manager.get_upload_statistics()
@@ -8522,10 +8041,9 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
         # rules were mostly skipped reports "0 rules failed compilation" and reads clean.
         _skipped = getattr(error_logger, "skipped_rules_count", 0) or 0
         _skipped_txt = f" | {_skipped} rules skipped (module unavailable)" if _skipped else ""
-        # A target the operator explicitly asked for but the skip list excludes wholesale
-        # must be named on the result line. Reporting only "0 files scanned" is
-        # indistinguishable from an empty directory, so a scan of e.g. AppData\Local\Temp
-        # read as a clean success with zero coverage.
+        # A target the operator explicitly asked for but the skip list excludes wholesale must
+        # be named on the result line - reporting only "0 files scanned" is
+        # indistinguishable from an empty directory.
         _excluded = list(getattr(scanner, "excluded_targets", []) or [])
         _excl_txt = ""
         if _excluded:
@@ -8533,9 +8051,8 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
                          f"skip list, nothing under them was scanned: "
                          + ", ".join(_excluded[:3])
                          + (" ..." if len(_excluded) > 3 else ""))
-        # Terminal status - see the XSIAM edition for the rationale. Without it the last
-        # value emitted on a successful run was "finishing", indistinguishable from a scan
-        # hung mid-shutdown.
+        # Terminal status. Without it the last value emitted on a successful run is
+        # "finishing", indistinguishable from a scan hung mid-shutdown.
         try:
             scanner.status_uploader.set_status("completed")
         except Exception as _e:
@@ -8547,11 +8064,9 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
                 f"cpu-slept {scanner.cpu_governor.slept_total:.0f}s | {config.posture}{_excl_txt}")
 
         # A scan that found everything and delivered none of it must not read as a clean
-        # success. 'undelivered' only counts items never ATTEMPTED (drain budget expired);
+        # success. 'undelivered' counts only items never ATTEMPTED (drain budget expired);
         # anything attempted and failed lands in send_failures/failed_uploads, so a total
-        # delivery outage (bad key, revoked permission, unreachable tenant) previously
-        # showed undelivered=0, outcome=completed and no error log at all — the operator's
-        # only clue was one line in the upload log. Report the shortfall where it is seen.
+        # delivery outage would otherwise show undelivered=0 and outcome=completed.
         shortfall = _delivery_shortfall(scanner, config)
         if shortfall:
             summary += " | " + shortfall
@@ -8636,8 +8151,7 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
                             else None)
                     _el = config.error_logger if hasattr(config, "error_logger") else None
                     _det = getattr(scanner, "detection_counts", {}) or {}
-                    # Computed once and reused below for HostCleanup's gate, rather than
-                    # calling _delivery_shortfall a second time — the two must never see a
+                    # Computed once and reused below for HostCleanup's gate: the two must never see a
                     # different answer to "did this run's findings actually land?".
                     _shortfall = _delivery_shortfall(scanner, config)
                     _summary_path = log_manager.write_scan_summary({
@@ -8652,23 +8166,17 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
                         "failed_rules": getattr(_el, "failed_rules_count", None),
                         "valid_rules": getattr(_el, "valid_rules_count", None),
                         "skipped_rules": getattr(_el, "skipped_rules_count", 0),
-                        # Host footprint. alert_detail_suppressed > 0 means the byte ceiling
-                        # was reached and per-offset detail was dropped for that many
-                        # findings - counts above stay complete, so a non-zero value
-                        # explains a thin alert file without implying data loss.
+                        # Host footprint. alert_detail_suppressed > 0 means the byte ceiling was reached and
+                        # per-offset detail was dropped for that many findings; the counts above stay
+                        # complete, so a non-zero value explains a thin alert file without implying loss.
                         "alert_bytes_written": getattr(scanner, "_alert_bytes_written", None),
                         "alert_detail_suppressed": getattr(scanner, "_alert_detail_suppressed", 0),
                         "alert_dir_max_bytes": CONFIG_ALERT_DIR_MAX_BYTES,
                         "scan_rate_fps": (round(getattr(scanner, "files_scanned", 0) / _dur, 2)
                                           if _dur and _dur > 0 else 0),
-                        # Backpressure, measured. The producer BLOCKS on a full queue
-                        # rather than dropping paths, and until now the only evidence that
-                        # ever happened was a log line gated on put(timeout=1.0) raising
-                        # Full -- i.e. on the producer stalling for a WHOLE SECOND. A live
-                        # run with the queue forced to 8 against 97,430 paths produced zero
-                        # such lines, because 8 workers drain a queue of 8 in ~10ms. The
-                        # counter existed but reached no reader; now it does, so "never
-                        # saturated" and "saturated constantly" are finally distinguishable.
+                        # Backpressure. The producer BLOCKS on a full queue rather than dropping paths, and
+                        # this counter is the only evidence of how often that happened - the log line is
+                        # gated on put(timeout=1.0) raising Full, i.e. on a whole-second stall.
                         "queue_full_events": getattr(scanner, "queue_full_events", 0),
                         "total_paused_secs": round(
                             getattr(getattr(scanner, "cpu_governor", None), "slept_total", 0) or 0, 2),
@@ -8683,50 +8191,35 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
                                            if hasattr(scanner, "results_uploader") and scanner.results_uploader else {}),
                         "dataset_delivery": (dict(getattr(scanner.lookup_uploader, "upload_stats", {}))
                                              if hasattr(scanner, "lookup_uploader") and scanner.lookup_uploader else {}),
-                        # "" when everything queued reached XDR. Non-empty means findings
-                        # exist only in the local logs — the one field to check when asking
-                        # "did this scan's results actually land?". Local summary file only:
-                        # the lookup datasets have a fixed schema and silently skip rows
-                        # carrying unknown fields, so this must never be added to a row.
+                        # "" when everything queued reached XDR. Non-empty means findings exist only in the
+                        # local logs - the one field to check when asking "did this scan's results land?".
+                        # Local summary file only: the lookup datasets have a fixed schema and silently skip
+                        # rows carrying unknown fields, so this must never be added to a row.
                         "delivery_shortfall": _shortfall,
                         "top_rules": sorted(_det.items(), key=lambda rc: rc[1], reverse=True)[:10],
                     })
 
-                    # End-of-run host cleanup — opt-in, off by default (see CUSTOMER CONFIG).
-                    # Scoped to outcome == "completed" only: a crash's delivery accounting
-                    # is not trustworthy, and a cooperative-cancel's partial run is exactly
-                    # the case an operator would want to inspect afterwards, not have wiped.
-                    # Isolated in its own try/except so a failure here can never mask this
-                    # run's actual result or escape main()'s finally block.
+                    # End-of-run host cleanup - opt-in, off by default (see CUSTOMER CONFIG). Scoped to
+                    # outcome == "completed" only: a crash's delivery accounting is not trustworthy, and
+                    # a cancelled scan's partial run is exactly what an operator would want to inspect.
+                    # Isolated in its own try/except so a failure here cannot mask the run's result.
                     #
-                    # log_manager.stop_logging() AND config.error_logger.close() are called
-                    # HERE, before cleanup, not left to the unconditional call further down.
-                    # Both hold per-category log files open via a persistent
-                    # logging.FileHandler for the whole run — LogManager for six of the
-                    # seven categories, and ErrorLogger (config.error_logger) separately for
-                    # yara_processing, which is NOT one of LogManager's own handlers. POSIX
-                    # allows unlinking a file that is still open (Linux tolerates the
-                    # ordering either way), but Windows refuses to delete one — os.remove()
-                    # fails with WinError 32 and HostCleanup silently records it as an error
-                    # rather than crashing the scan. Verified live, in two rounds: closing
-                    # only log_manager's handlers fixed six of the seven files; the seventh
-                    # (yara_processing) needed error_logger.close() too, since it was never
-                    # closed anywhere in the codebase before host cleanup existed — nothing
-                    # had previously tried to delete it while the process was still alive.
-                    # Host cleanup's OWN status/error messages therefore cannot go through
-                    # log_manager (its handlers are already closed) — the plain `logging`
-                    # module is used instead, the same convention CleanupManager already
-                    # uses for messages outside the per-run structured-log lifecycle.
+                    # log_manager.stop_logging() AND config.error_logger.close() are called HERE, before
+                    # cleanup. Both hold per-category log files open via a persistent logging.FileHandler
+                    # - LogManager for six of the seven categories, ErrorLogger separately for
+                    # yara_processing - and Windows refuses to delete a file that is still open
+                    # (os.remove() fails with WinError 32, which HostCleanup records as an error rather
+                    # than raising). Host cleanup's own messages therefore cannot go through log_manager
+                    # and use the plain `logging` module instead.
                     try:
                         if _outcome == "completed":
                             if log_manager:
                                 log_manager.stop_logging()
                             if _el is not None and hasattr(_el, "close"):
                                 _el.close()
-                            # The eighth handler. setup_logging() put a FileHandler for
-                            # diagnostics_<run_id>.log on the ROOT logger, and the
-                            # `log=logging.warning` below writes through it - into the
-                            # file being deleted. Windows then refuses the unlink.
+                            # The eighth handler. setup_logging() put a FileHandler for diagnostics_<run_id>.log
+                            # on the ROOT logger, and the `log=logging.warning` below writes through it - into
+                            # the file being deleted.
                             close_diagnostics_handler()
                             _hc = HostCleanup(config, CONFIG_HOST_CLEANUP, CONFIG_HOST_CLEANUP_KEEP)
                             _delivery_enabled = bool(getattr(config, "create_alerts", False)
@@ -8774,9 +8267,8 @@ if __name__ == "__main__":
     try:
         # Ordered params (matches the XDR script_input order):
         #   1 yarafile  2 scan_folder  3 alert_severity  4 mode  5 options
-        # Only 1-3 are typically needed now — mode/options fall back to CONFIG_MODE/CONFIG_OPTIONS
-        # (and every other behaviour knob to its CUSTOMER CONFIG constant) when left blank.
-        # An empty string for any input selects the CONFIG_* default.
+        # Only 1-3 are normally needed; an empty string for any input selects the CONFIG_*
+        # default.
         def _argv(i):
             return sys.argv[i] if len(sys.argv) > i and str(sys.argv[i]).strip() else None
 
@@ -8795,12 +8287,9 @@ if __name__ == "__main__":
         )
 
         result_text = str(result or "")
-        # Print the outcome. Without this the CLI path is silent: it exits 0 having
-        # reported nothing, because the only place the result was ever printed is the
-        # footer that build_scanner_snippet appends (which also neutralizes this
-        # guard). Anyone running the script directly - a customer validating it, a
-        # scheduled task, CI - got no output at all. Same "SCAN_RESULT: " prefix as
-        # the snippet path so downstream parsing is identical either way.
+        # Print the outcome. Without this the CLI path exits 0 having reported nothing - the
+        # result is otherwise only printed by the footer build_scanner_snippet appends (which
+        # also neutralizes this guard). Same "SCAN_RESULT: " prefix either way.
         print("SCAN_RESULT: " + result_text)
         sys.stdout.flush()
         low = result_text.lower()
