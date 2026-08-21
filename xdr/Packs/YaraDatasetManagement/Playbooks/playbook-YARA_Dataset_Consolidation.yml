@@ -303,6 +303,8 @@ tasks:
       scan_id:
         complex:
           root: Yara.ConsolidateStatus.eligible_scan_ids
+      max_scans:
+        simple: ${inputs.max_scans}
       row_ceiling:
         simple: ${inputs.row_ceiling}
       abandoned_after_hours:
@@ -613,6 +615,12 @@ inputs:
     simple: '240'
   required: false
   description: Total minutes to wait for in-progress scans before giving up on this cycle and letting the next scheduled run pick it up. This is THIS RUN's patience budget, separate from CONFIG_CONSOLIDATE_OBSOLETE_AFTER (days-scale, in the script) which governs when a truly-stuck scan is merged anyway to preserve its findings.
+  playbookInputQuery: null
+- key: max_scans
+  value:
+    simple: ''
+  required: false
+  description: 'Most scans one Apply pass consolidates before stopping and reporting more remain (see Yara.ConsolidateApply output). Bounds a pass to finish inside the script timeout instead of being killed mid-merge while still holding the consolidation lock - measured live: 5 scans took 71% of a 900s timeout, so 20 would be killed around scan 7. Leave empty for the script default (4). The polling loop above means a bounded pass is not a dead end - "Anything ready after waiting?" is not what re-invokes it, though: a full backlog needs this playbook re-run, or the input raised, to finish.'
   playbookInputQuery: null
 - key: row_ceiling
   value:

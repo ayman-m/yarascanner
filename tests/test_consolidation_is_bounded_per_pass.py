@@ -125,3 +125,40 @@ def test_the_bound_limits_WORK_not_just_the_REPORT():
     assert len(r["consolidated_scan_ids"]) == len(targets), (
         "reported %d consolidated but %d targets exist — the report does not match the work"
         % (len(r["consolidated_scan_ids"]), len(targets)))
+
+
+def test_the_shipped_default_reflects_the_measured_per_scan_cost():
+    """DEFAULT_MAX_SCANS_PER_PASS shipped as 20 with no measurement behind it. Live on emea
+    (2026-08-21): 5 scans took 638s (71% of the 900s task timeout) - 20 would be killed
+    around scan 7, reproducing the exact stuck-lock incident this whole file exists to
+    prevent. A 4-scan pass was separately measured at 403s (45% of budget) and completed
+    cleanly. Pin to that, with real margin instead of none.
+    """
+    assert C.DEFAULT_MAX_SCANS_PER_PASS <= 4, (
+        "DEFAULT_MAX_SCANS_PER_PASS=%d has no margin against the measured ~128s/scan rate "
+        "and the 900s task timeout" % C.DEFAULT_MAX_SCANS_PER_PASS)
+
+
+def test_the_playbook_apply_task_passes_max_scans():
+    """The default above is meaningless if the playbook never sends it. Task 6 (Apply
+    consolidation) omitted max_scans entirely, so every playbook-driven pass used whatever
+    DEFAULT_MAX_SCANS_PER_PASS happened to be - the exact gap that would have reproduced
+    this morning's incident on the very first customer playbook run."""
+    import yaml
+    path = os.path.join(_REPO, "xdr", "Packs", "YaraDatasetManagement", "Playbooks",
+                        "playbook-YARA_Dataset_Consolidation.yml")
+    pb = yaml.safe_load(open(path))
+    apply_task = next(t for t in pb["tasks"].values()
+                      if (t.get("task") or {}).get("script") == "YaraConsolidateApply")
+    args = apply_task.get("scriptarguments") or {}
+    assert "max_scans" in args, "the playbook's Apply task does not pass max_scans"
+    assert args["max_scans"] == {"simple": "${inputs.max_scans}"}, args["max_scans"]
+
+
+def test_the_playbook_declares_a_max_scans_input():
+    import yaml
+    path = os.path.join(_REPO, "xdr", "Packs", "YaraDatasetManagement", "Playbooks",
+                        "playbook-YARA_Dataset_Consolidation.yml")
+    pb = yaml.safe_load(open(path))
+    keys = [i.get("key") for i in (pb.get("inputs") or [])]
+    assert "max_scans" in keys, "playbook has no max_scans input for an operator to override"

@@ -41,7 +41,11 @@ DELETE_CONCURRENCY = 12             # source shards deleted in parallel
 DEFAULT_LOCK_STALE_SECS = 20 * 60   # a run cannot outlive the 900s task timeout
 # One pass consolidates at most this many scans, so it finishes inside that 900s
 # timeout instead of being killed mid-merge still holding the lock.
-DEFAULT_MAX_SCANS_PER_PASS = 20
+# 20 shipped with no measurement behind it. Live on emea (2026-08-21): 5 scans took 638s -
+# 71% of the 900s task timeout - and 20 would be killed around scan 7, reproducing the exact
+# stuck-lock incident this bound exists to prevent. A 4-scan pass measured at 403s (45%)
+# completed cleanly; keep real margin, not none.
+DEFAULT_MAX_SCANS_PER_PASS = 4
 
 # Lookup schema version assumed when the schema_version argument is left empty.
 # Must match the scanner's YARA_LOOKUP_SCHEMA_VER on the endpoints.
