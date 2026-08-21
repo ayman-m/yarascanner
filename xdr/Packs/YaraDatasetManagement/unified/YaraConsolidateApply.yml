@@ -12,7 +12,7 @@ args:
   default: false
   secret: false
 - name: max_scans
-  description: Most scans this pass will consolidate before stopping and reporting that more remain. Bounds the pass so it finishes inside the script timeout instead of being killed mid-merge still holding the consolidation lock. Leave empty for the built-in default (20).
+  description: Most scans this pass will consolidate before stopping and reporting that more remain. Bounds the pass so it finishes inside the script timeout instead of being killed mid-merge still holding the consolidation lock. Leave empty for the built-in default (4).
   required: false
   isArray: false
   default: false

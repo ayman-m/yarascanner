@@ -1626,6 +1626,29 @@ def _shard_scan_ids(client, dataset):
     return out
 
 
+def _matches_shard_for_read(name, ver):
+    """{kind, ver, host, month} for a dataset safe to READ as a matches source of schema
+    `ver`, or None. Unlike parse_shard, this INCLUDES the live overwrite dataset (matches
+    v4+, unsuffixed) - parse_shard excludes it so Apply/Fast can never select it for
+    deletion, but Summary never deletes anything, and the live dataset is the ONLY place a
+    v4-scanned host's current findings live once matches stopped rotating. Excluding it here
+    left Summary silently producing zero rows for every host on the shipped default: `main`
+    built match_ds from parse_shard's list alone, and the live host dataset was the only
+    thing in it for a host running the current scanner. Read-for-summary and
+    safe-to-delete are different questions; this answers the first one, independent of
+    parse_shard's answer to the second."""
+    p = parse_shard(name)
+    if p:
+        return p if p["kind"] == "matches" and str(p["ver"]) == str(ver) else None
+    m = _SHARD_RE.match(name or "")
+    if not (m and m.group("kind") == "matches" and str(m.group("ver")) == str(ver)):
+        return None
+    host = m.group("host")
+    if host.startswith("scan_") or host == "scan":
+        return None
+    return {"kind": "matches", "ver": m.group("ver"), "host": host, "month": m.group("month")}
+
+
 def summarise_shard(client, dataset, ver, qcount, log, findings=None):
     """[(scan_id, hostname, rule, ts_ms_or_None)] for ONE host shard.
 
@@ -1633,11 +1656,11 @@ def summarise_shard(client, dataset, ver, qcount, log, findings=None):
     rejected. `findings` accumulates the discarded count() aggregate so the run can report how
     many file-level findings collapsed into the summary; it never reaches a row.
     """
-    p = parse_shard(dataset)
-    if not p or p["kind"] != "matches":
+    p = _matches_shard_for_read(dataset, ver)
+    if not p:
         # Guards the XQL interpolation. Names reaching here are already anchored by
-        # parse_shard's regex, but the host segment originates as a HOSTNAME, so the check is
-        # made explicitly rather than assumed.
+        # _matches_shard_for_read's regex, but the host segment originates as a HOSTNAME, so
+        # the check is made explicitly rather than assumed.
         raise ValueError("refusing non-matches dataset in XQL: %s" % dataset)
 
     try:
@@ -1764,7 +1787,12 @@ def main():
             if p and str(p.get("ver")) == ver:
                 shards[n] = p
         scans_ds = [n for n, p in shards.items() if p["kind"] == "scans"]
-        match_ds = [n for n, p in shards.items() if p["kind"] == "matches"]
+        # matches uses the WIDER, read-only inclusion: unlike scans (unaffected by the
+        # overwrite model, parse_shard is correct for it as-is), a v4+ host's current
+        # findings live ONLY in its live overwrite dataset once matches stopped rotating -
+        # parse_shard excludes that name deliberately (Apply/Fast must never delete it), but
+        # reading it here is safe. See _matches_shard_for_read.
+        match_ds = [n for n in names if _matches_shard_for_read(n, ver)]
         existing = set(names)
         log("schema v%s: %d matches shard(s), %d scans shard(s)"
             % (ver, len(match_ds), len(scans_ds)))

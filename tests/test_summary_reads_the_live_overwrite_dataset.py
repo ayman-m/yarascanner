@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""YaraConsolidateSummary must read the v4+ live overwrite dataset, not just dated leftovers.
+
+Confirmed live on emea (2026-08-21): a dry run against real tenant data produced
+
+    written: 0 | skipped: 0 | ... XQL calls: 1 (+1 dataset listing)
+
+one query total, meaning zero matches shards were even selected to query. main() built
+match_ds from parse_shard's list alone. parse_shard deliberately returns None for an
+unsuffixed v4 matches dataset - correct for Apply/Fast, where that exclusion is what stops
+the permanent per-host dataset from being merged into a per-scan target and deleted - but
+Summary reuses the SAME exclusion despite never deleting anything. Since matches stopped
+rotating at v4, a current-scanner host's findings live ONLY in that one dataset, so Summary
+was structurally unable to produce a row for any host running the current scanner.
+
+_matches_shard_for_read is the fix: parse_shard's answer where it says yes, plus the live
+overwrite pattern it deliberately excludes, for this READ-ONLY path only. Apply/Fast/Status/
+Report/Cleanup are untouched - this function exists only in YaraConsolidateSummary.py, not
+in the drift-gated shared core (confirmed: summarise_shard/match_ds appear in no other
+shipping file and not in xdr_consolidate.py).
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import pytest  # noqa: E402
+from test_pack_data_management import (  # noqa: E402
+    YaraConsolidateSummary as S, FakeTenant, _run_automation, NOW_YYYYMM,
+)
+
+LIVE = "yara_scanner_matches_v4_xdr_agent_cd7e9b"
+DATED = "yara_scanner_matches_v4_xdr_agent_cd7e9b_202608"
+TARGET = "yara_scanner_matches_v4_scan_s1"
+SCANS = "yara_scanner_scans_v4_xdr_agent_cd7e9b_202608"
+
+
+# ------------------------------------------------------------- _matches_shard_for_read
+
+def test_the_live_overwrite_dataset_is_a_valid_v4_read_source():
+    p = S._matches_shard_for_read(LIVE, "4")
+    assert p is not None and p["kind"] == "matches" and p["host"] == "xdr_agent_cd7e9b"
+    assert p["month"] is None
+
+
+def test_wrong_version_is_still_excluded():
+    """The read-only widening must not become "any matches dataset, any version"."""
+    assert S._matches_shard_for_read(LIVE, "2") is None
+    assert S._matches_shard_for_read(LIVE, "3") is None
+
+
+def test_a_dated_v4_matches_dataset_is_still_included():
+    """parse_shard already accepts this one; the widened function must not change that."""
+    p = S._matches_shard_for_read(DATED, "4")
+    assert p is not None and p["month"] == "202608"
+
+
+def test_an_older_schema_unsuffixed_dataset_is_still_included():
+    """On v2/v3 matches really did rotate, so parse_shard already accepts an unsuffixed name
+    there without needing the live-overwrite fallback at all."""
+    assert S._matches_shard_for_read("yara_scanner_matches_v2_hosta_aa0001", "2") is not None
+
+
+def test_a_per_scan_target_is_never_a_read_source():
+    """The one thing that must stay excluded no matter what: re-consuming consolidation's
+    own output as if it were a fresh source."""
+    assert S._matches_shard_for_read(TARGET, "4") is None
+
+
+def test_a_scans_kind_dataset_is_never_returned_as_matches():
+    assert S._matches_shard_for_read(SCANS, "4") is None
+
+
+# ------------------------------------------------------------- summarise_shard's guard
+
+def test_summarise_shard_accepts_the_live_dataset_instead_of_raising():
+    calls = {"n": 0}
+
+    class _Client:
+        def xql(self, query, limit=None):
+            calls["n"] += 1
+            return []
+
+    S.summarise_shard(_Client(), LIVE, "4", qcount=[0], log=lambda *a: None)
+    assert calls["n"] == 1, "summarise_shard raised instead of querying the live dataset"
+
+
+# ------------------------------------------------------------- end-to-end selection
+
+def test_main_selects_the_live_dataset_for_summarisation(monkeypatch):
+    """The regression this file exists to catch: reproduces the live symptom (zero shards
+    selected) and proves it's fixed, without needing to fake the JSON-array-expand XQL
+    summary query itself - that's summarise_shard's own concern, isolated here by recording
+    which dataset names main() hands it."""
+    seen = []
+    real = S.summarise_shard
+
+    def spy(client, dataset, ver, qcount, log, findings=None):
+        seen.append(dataset)
+        return [], "primary"
+
+    monkeypatch.setattr(S, "summarise_shard", spy)
+    t = FakeTenant(names=[LIVE, SCANS])
+    _run_automation(S, {"schema_version": "4", "execute": "false"}, t)
+    assert LIVE in seen, "the live overwrite dataset was never handed to summarise_shard"
