@@ -37,6 +37,7 @@ deeper where operators usually need it:
 
 | Guide | Answers |
 |---|---|
+| **[Operations Deep Dive](Operations_Deep_Dive.md)** | ***"What will surprise me in production?"*** — every measured limit, caveat and failure mode in one place. Read §1 before a first fleet scan. |
 | [CPU Impact Control](topics/CPU_Impact_Control.md) | *"Will this scan slow my machine, and how do you know?"* |
 | [Scan Cancellation](topics/Scan_Cancellation.md) | *"How do I stop a scan, and why does a cancelled one still show as running?"* |
 | [Rule Compatibility](topics/Rule_Compatibility.md) | *"Which YARA library does each agent ship, and why do my rules work locally but get skipped on the endpoint?"* |

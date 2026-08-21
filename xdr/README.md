@@ -155,6 +155,10 @@ facility** — there is no built-in way to run this on a timer.
 
 ## Where to read more
 
+- **[docs/Operations_Deep_Dive.md](docs/Operations_Deep_Dive.md)** — **start here before a
+  fleet rollout.** Every measured limit, caveat and failure mode: run-timeout sizing, the
+  overwrite model, consolidation safety rails, the lock, capacity ceilings, and a pre-flight
+  checklist.
 - **[docs/Deployment_Guide.md](docs/Deployment_Guide.md)** — install and first scan.
 - **[docs/CAPACITY.md](docs/CAPACITY.md)** — the full sizing measurements behind the table above.
 - **[docs/Troubleshooting.md](docs/Troubleshooting.md)** — when something looks wrong.
