@@ -4585,7 +4585,16 @@ class LookupDatasetUploader:
                 for target in list(batches.keys()):
                     if batches[target] and (now - last_flush.get(target, now)) >= self.flush_interval:
                         flush_target(target)
-                if self.stop_flag and not any(batches.values()):
+                # `self.queue.empty()` is load-bearing, not belt-and-braces. flush_target
+                # above can block for seconds inside _send_batch (jitter + POST + retries),
+                # and it CLEARS batches on the way out. Anything the scan enqueues during
+                # that window - its trailing match rows and the terminal lifecycle row -
+                # lands in the queue, while stop() concurrently sets stop_flag. Without this
+                # third condition the very next line sees "stopping, no batches" and breaks
+                # with those rows still queued; the final drain below only flushes `batches`,
+                # so they are never sent, never failed, just counted undelivered. Measured
+                # on xdragent 2026-08-21: 19 rows lost this way, the terminal row among them.
+                if self.stop_flag and not any(batches.values()) and self.queue.empty():
                     break
                 continue
             except Exception as e:
@@ -4818,8 +4827,12 @@ class LookupDatasetUploader:
                     self.upload_stats["undelivered"] += leftover
                 if self.log_manager:
                     self.log_manager.log_error(
-                        f"Lookup drain budget expired with {leftover} rows undelivered "
-                        f"(counted in dataset_delivery.undelivered)")
+                        f"Lookup uploader exited with {leftover} row(s) still queued - never "
+                        f"attempted (counted in dataset_delivery.undelivered). Budget was "
+                        f"{self._drain_budget:.0f}s; thread_alive="
+                        f"{bool(self.upload_thread and self.upload_thread.is_alive())}. "
+                        f"This does NOT by itself mean the budget expired - check the worker's "
+                        f"exit path before assuming a timeout.")
         except Exception as e:
             if self.log_manager:
                 self.log_manager.log_error(f"Error stopping lookup uploader: {e}")
