@@ -4500,6 +4500,36 @@ class LookupDatasetUploader:
         """Queue one scan-lifecycle record for the scans dataset. Non-blocking."""
         self._enqueue(self.scans_dataset, record)
 
+    def send_scan_row_now(self, record):
+        """Send ONE scan-lifecycle row synchronously, bypassing the batch queue.
+
+        The terminal row is the only row consolidation needs in order to see a scan as
+        finished, and it is enqueued LAST - behind every match row still in flight - so it
+        is structurally the tail of the queue and the first casualty of any shortfall at
+        drain time. Measured on a 636k-file Windows scan: the worker stopped 2.3s into a
+        150s drain budget with 19 rows still queued and zero send failures; the terminal row
+        was among them, and a scan whose own summary said outcome=completed read as
+        "running" in the dataset until the 24h abandoned-scan fallback could rescue it.
+
+        Sending it inline removes it from the queue entirely, so its fate no longer depends
+        on how the drain behaves. It costs one extra add_data POST per scan.
+
+        Accounting is unchanged: `queued` is incremented here exactly as _enqueue would, and
+        _send_batch books every outcome itself (records_added / send_failures /
+        rows_unconfirmed), so queued still balances against the delivery counters.
+        """
+        with self._stats_lock:
+            self.upload_stats["queued"] += 1
+        try:
+            self._send_batch(self.scans_dataset, [record])
+        except Exception as e:
+            # _send_batch handles its own failures; this only catches a programming error,
+            # and must never take the scan down with it.
+            with self._stats_lock:
+                self.upload_stats["send_failures"] += 1
+            if self.log_manager:
+                self.log_manager.log_error(f"Terminal lifecycle row direct send failed: {e}")
+
     def _enqueue(self, target, record):
         # _enqueue runs on the scan-worker threads (via add/add_scan_row), so guard the counters
         # with the same _stats_lock the drain uses — bare += from N threads loses updates.
@@ -5617,8 +5647,13 @@ class YaraScanner:
         except Exception:
             pass
 
-    def _emit_scan_row(self, status, message=""):
-        """Append one scan-lifecycle row to the yara_scanner_scans lookup dataset."""
+    def _emit_scan_row(self, status, message="", sync=False):
+        """Append one scan-lifecycle row to the yara_scanner_scans lookup dataset.
+
+        sync=True sends the row inline instead of queueing it - see
+        LookupDatasetUploader.send_scan_row_now. Used for the terminal row only; heartbeats stay
+        queued, where batching them is fine and losing one costs nothing.
+        """
         lu = getattr(self, "lookup_uploader", None)
         if lu is None or not getattr(self.config, "write_dataset", True):
             return
@@ -5658,7 +5693,10 @@ class YaraScanner:
                 "message": message or "",
             }
         try:
-            lu.add_scan_row(row)
+            if sync:
+                lu.send_scan_row_now(row)
+            else:
+                lu.add_scan_row(row)
         except Exception as e:
             self.log_manager.log_error(f"Failed to emit scan-lifecycle row: {e}")
 
@@ -7204,7 +7242,9 @@ rule test {{
         cleanup_total_time = time.time() - cleanup_start
 
         # Emit the terminal lifecycle row now that workers have drained and counts are
-        # final, but BEFORE the uploaders are stopped so the row is actually sent.
+        # final, and BEFORE the uploaders are stopped. Sent inline (sync=True) rather than
+        # queued: this is the row consolidation reads to decide a scan is finished, and as
+        # the last thing enqueued it was the tail of the drain queue and got stranded there.
         if self.cancel_requested:
             _term_status = "cancelled"
             _term_msg = f"cancelled by operator (source={self.cancel_source})"
@@ -7214,7 +7254,7 @@ rule test {{
         else:
             _term_status = "completed"
             _term_msg = "scan completed"
-        self._emit_scan_row(_term_status, _term_msg)
+        self._emit_scan_row(_term_status, _term_msg, sync=True)
 
         try:
             if hasattr(self, "results_uploader") and self.results_uploader:
