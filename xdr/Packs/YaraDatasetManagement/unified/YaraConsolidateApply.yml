@@ -290,6 +290,15 @@ script: |
       host = m.group("host")
       if host.startswith("scan_") or host == "scan":
           return None
+      # v4 is where matches stopped rotating and became overwrite-per-scan, so an UNSUFFIXED
+      # matches dataset at v4+ is the scanner's permanent write target, not a rotation shard.
+      # Consolidating it would delete the host dataset and leave one per-scan dataset behind
+      # for every scan - precisely the unbounded growth the overwrite model removed - and the
+      # scanner would recreate the host dataset for the next pass to eat again. A DATED v4
+      # matches dataset predates that model and stays ordinary, consolidatable debris; scans
+      # still rotates monthly at v4 and is untouched by this.
+      if m.group("kind") == "matches" and int(m.group("ver")) >= 4 and not m.group("month"):
+          return None
       return {"kind": m.group("kind"), "ver": m.group("ver"), "host": host, "month": m.group("month")}
 
 
