@@ -33,7 +33,7 @@ wrong in both directions.
 
 ## Per-host budget
 
-A host's own dataset holds one scan's detail (overwritten each scan under the v2 design).
+A host's own dataset holds one scan's detail (overwritten each scan under the v4 design).
 
 ```
 50 MB / 749 B per row  =  ~70,000 matched files per host

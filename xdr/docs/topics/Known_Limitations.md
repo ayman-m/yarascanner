@@ -1,7 +1,13 @@
 # Known Limitations — XDR scanner & dataset consolidation
 
-*Applies to scanner **v3.0.1** / `xdr_consolidate.py` **v2.7.0**. History of changes:
+*Applies to scanner **3.4.0**. History of changes:
 [release notes](../../../CHANGELOG.md).*
+
+> The entries below describe the consolidation **engine's** internal edge cases (locking,
+> quiet periods, clock skew, row ceilings, schema-version fan-out) and are unaffected by the
+> v4 scanner's overwrite model — that model changed dataset *naming and lifecycle*, not this
+> engine's gating logic. See [Datasets and Maintenance](Datasets_and_Maintenance.md) for what
+> did change.
 
 A residual-risk ledger for the lower-priority edge cases surfaced during this project's
 systematic edge-case review, kept separate from the higher-tier items that were actually
@@ -48,6 +54,23 @@ future investigation doesn't have to rediscover the same ground.
 
 ## Consolidation engine
 
+- **A pass can outlive the platform's declared task timeout, silently.** Observed live: an
+  `Apply` invocation's task timeout is 900s, but the platform did not appear to hard-kill the
+  underlying execution at that mark — the caller's own request timed out and returned an
+  error, while the run kept going server-side for roughly two hours afterward, eventually
+  completing and writing its result under code that predated several since-landed fixes. A
+  caller's timeout/disconnect must be treated as "unknown," never "dead" — check
+  `yara_scanner_consolidation_runs` (a `started` row with no matching terminal row means a
+  pass may still be running) before assuming it is safe to intervene manually, e.g. by
+  clearing the consolidation lock. `DEFAULT_LOCK_STALE_SECS` (20 min) is sized to the
+  *declared* timeout, not to this observed behaviour, so a genuinely long-running zombie can
+  still have its lock stolen by a later run while it is mid-write — this is the leading
+  explanation (not fully confirmed) for a live incident where a still-running pre-fix
+  execution and a later pass both touched consolidation state around the same window.
+- **`max_scans` bounds one pass; it does not make a full backlog self-draining.** A pass
+  capped below the backlog size reports `stopped_early` and needs to be **re-run** (or the
+  cap raised) to make further progress — the playbook does not loop back to re-check
+  eligibility after `Apply` completes within a single execution.
 - **Quiet period (900s default) shorter than a scan's actual worst-case drain.** Tunable via
   `--quiet-secs`/`quiet_secs`; *accepted risk* for the default value, not a design gap.
 - **Endpoint clock running *ahead*, on a platform returning no usable `_insert_time`.** The

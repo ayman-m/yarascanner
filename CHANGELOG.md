@@ -5,13 +5,15 @@ companion scripts. Each entry records what changed and **why**, so you can decid
 a release is worth taking.
 
 The guides in `docs/xdr/` and `docs/xsiam/` are the reference for deployment and day-to-day
-operation, but they are **not currently in step with the shipped scanners**: both Deployment
-Guides, both Troubleshooting docs and four of the five `docs/xdr/topics/` guides are still
-stamped **v2.1.0 (2026-08-06)**, against a shipped XDR scanner of **v3.2.0** and XSIAM of
-**v4.1.0**. `docs/xdr/topics/Known_Limitations.md` is the only one carrying a current stamp.
-Until the rest are re-stamped, treat this file as authoritative for anything added after
-v2.1.0. Anything about how a behaviour used to work, or the testing behind a change, lives
-here.
+operation. As of the shipped XDR scanner **3.4.0**, the `docs/xdr/` guides are re-stamped and
+re-checked against that version — including the v4 matches-dataset overwrite model
+(permanent per host, no rotation), the pack automations' `max_scans` bound and consolidation
+lock behaviour, and Action Center run-timeout sizing for large-scan upload drain, none of
+which were documented before. **`docs/xdr/CAPABILITIES.md` is the one exception** — it is
+pinned to an audited v3.3.0 snapshot for provenance and has not been re-verified against
+3.4.0 (see the banner at its top for which sections are affected). The `docs/xsiam/` guides
+were not touched in this pass and may still lag. Anything about how a behaviour used to
+work, or the testing behind a change, lives here regardless of the guides' currency.
 
 **Which version am I running?** Read `scanner_version` in `scan_summary_<run_id>.json` — both
 editions write it. The XDR edition *additionally* logs a `YARA Scanner VERSION <v> (released

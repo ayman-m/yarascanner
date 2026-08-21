@@ -21,11 +21,11 @@ is correct for writing, and everything else on this page follows from it.
 | File | Where it goes | Key type |
 |---|---|---|
 | `xdr_yara_scanner.py` | Action Center → Scripts (manual; there is no upload API) | **Standard** |
-| The six YAMLs in `Packs/YaraDatasetManagement/unified/` | Automations | **Advanced (HMAC)** |
+| The five YAMLs in `Packs/YaraDatasetManagement/unified/` | Automations | **Advanced (HMAC)** |
 | `Packs/YaraDatasetManagement/Playbooks/playbook-YARA_Dataset_Consolidation.yml` | Playbooks → **Import, through the console** | — |
 
-The six automations are `YaraReport`, `YaraConsolidateStatus`, `YaraConsolidateApply`,
-`YaraConsolidateFast`, `YaraConsolidateSummary`, `YaraCleanup`. That folder holds those six and
+The five automations are `YaraReport`, `YaraConsolidateStatus`, `YaraConsolidateApply`,
+`YaraConsolidateSummary`, `YaraCleanup`. That folder holds those five and
 nothing else: upload all of them, each is self-contained, and none imports any of the others.
 
 Three things that cost people a deployment:
@@ -35,8 +35,8 @@ Three things that cost people a deployment:
   top of the CUSTOMER CONFIG block). The
   automations take an Advanced (HMAC) key. A Standard key in an automation 401s.
 - **Each automation carries its own copy of the credential block** — `YaraReport.yml:1500`,
-  `YaraConsolidateStatus.yml:1487`, `YaraConsolidateApply.yml:1490`, `YaraConsolidateFast.yml:1519`,
-  `YaraConsolidateSummary.yml:1590`, `YaraCleanup.yml:1569`. That is **six separate edits**, not
+  `YaraConsolidateStatus.yml:1487`, `YaraConsolidateApply.yml:1490`,
+  `YaraConsolidateSummary.yml:1590`, `YaraCleanup.yml:1569`. That is **five separate edits**, not
   one — the tenant resolves no cross-script import, so there is no shared library to edit once.
   (`Scripts/<Name>/<Name>.py` is the repo-side review copy; editing it changes nothing on the
   tenant until `tools/build_pack_unified.py` regenerates the yml that actually gets uploaded.)
@@ -64,7 +64,7 @@ dataset still rotates monthly because nothing ever overwrites it.
 
 |  | Full detail | Summary only |
 |---|---|---|
-| Automation | `YaraConsolidateApply` (verifies row counts before deleting) or `YaraConsolidateFast` (no verification, ~15 XQL calls, much quicker) | `YaraConsolidateSummary` |
+| Automation | `YaraConsolidateApply` (verifies row counts before deleting) | `YaraConsolidateSummary` |
 | Writes to | `yara_scanner_matches_v4_scan_<id>` | `yara_scanner_summary_v4_scan_<id>` |
 | Row grain | one row per matched file | one row per (host, rule) |
 | Per-rule counts | yes | **no** — you see that a rule fired on a host, not on how many files |
@@ -132,14 +132,19 @@ for 1,097 rows (3 batches of 500). At fleet scale the **write** dominates, not t
 
 ## Operating it
 
-Every automation that writes or deletes is a **dry run unless `execute=true`**. A bare
-invocation cannot lose data.
+Most automations that write or delete are a **dry run unless `execute=true`** —
+**`YaraConsolidateApply` is the one exception, and it matters.** It always writes and always
+deletes verified source shards; there is no `execute` argument, no dry-run mode, and no
+equivalent flag. A bare `!YaraConsolidateApply` with zero arguments deletes data on its
+first run. Check with the read-only `YaraConsolidateStatus` first if you want to see what a
+pass *would* do before committing to it.
 
 1. **`YaraReport`** — read-only inventory of every `yara_scanner_*` dataset: kind, host, age,
    state. One API call, safe any time. Start here when asked "why are there so many datasets?"
 2. **`YaraConsolidateStatus`** — read-only readiness check: which scans are eligible now, which
    are still running or inside their settle window, which are blocked. Safe in a poll loop.
-3. **`YaraConsolidateApply`** / **`YaraConsolidateFast`** / **`YaraConsolidateSummary`** — the
+3. **`YaraConsolidateApply`** (always writes and deletes — see above) or
+   **`YaraConsolidateSummary`** (dry run unless `execute=true`) — the
    merge itself, per the mode you chose above.
 4. **`YaraCleanup`** — retention pruning; deletes whole datasets, subject to seven safety rails
    (never the current month, among others). Dry run by default.

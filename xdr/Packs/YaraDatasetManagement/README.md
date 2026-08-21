@@ -19,7 +19,6 @@ manual CLI invocation.
 | `YaraConsolidateStatus` | Automation | Read-only readiness check. Never writes or deletes. Shared by both modes. |
 | `YaraConsolidateApply` | Automation | **Mode A, full detail.** Creates per-scan targets, copies every matched-file row, deletes fully-verified source shards. |
 | `YaraConsolidateSummary` | Automation | **Mode B, summary only.** One row per (host, rule) — which rules fired on which host — into `yara_scanner_summary_v<VER>_scan_<slug>`. Four columns, no filenames, no per-rule counts. **Deletes nothing at all.** Dry run unless `execute=true`. |
-| `YaraConsolidateFast` | Automation | Mode A without the row-count verification pass — a small fraction of the queries, duplicate rows possible and accepted. Deletes the source. Dry run unless `execute=true`. |
 | `YaraReport` | Automation | Read-only inventory of every `yara_scanner_*` lookup dataset (kind, host, age, plus the legacy / newer-schema / consolidated buckets). One API call, no writes — safe any time. Writes to `Yara.Report.*`. |
 | `YaraCleanup` | Automation | Retention pruning — **deletes whole datasets**. Dry run by default; see below. |
 
@@ -63,12 +62,13 @@ Three consequences worth knowing before you run anything:
   already bounds matches to a single scan. Leaving it on would have minted a new dataset
   every month regardless of the overwrite, moved the deep-dive source's name under every
   dashboard pinned to it, and left last month's copy holding its final scan's rows for ever
-  with nothing that ever overwrites them. `YaraReport` and `YaraCleanup` have **not** been
-  updated for this and will still label each host's matches dataset
-  `not rotated (no YYYYMM) — set CONFIG_LOOKUP_ROTATION="monthly"`. That advice is now wrong
-  and following it re-introduces the contradiction. It is not dangerous — an unrotated
-  dataset is never a deletion candidate (rail 3), so these datasets are safe from the pruner
-  by construction.
+  with nothing that ever overwrites them. `YaraReport` and `YaraCleanup` classify a live
+  matches dataset as a permanent `overwrite` state, distinct from both `frozen` and
+  `not rotated` — the report line reads "N permanent per-host matches dataset(s) — replaced
+  wholesale at the start of every scan... rotation does not apply", not the old
+  "set `CONFIG_LOOKUP_ROTATION="monthly"`" advice. That fix is gated on schema version (v4+
+  only); a tenant still pinned to v2/v3 correctly keeps seeing the old advice, because
+  matches genuinely still rotated under those versions.
 * **The flush needs Query Center on the *scanner's* delivery key**, not this pack's key. It
   enumerates the stale `scan_id`s with one XQL. Without `investigation_query_view` every
   scan 403s on that enumeration, fails safe, and the dataset quietly goes back to
@@ -87,7 +87,7 @@ consolidation copies out differs — and whether the source survives it.
 
 | | **A. Full detail** | **B. Summary only** |
 |---|---|---|
-| Automation | `YaraConsolidateApply` (or `YaraConsolidateFast`) | `YaraConsolidateSummary` |
+| Automation | `YaraConsolidateApply` | `YaraConsolidateSummary` |
 | Target | `yara_scanner_matches_v<VER>_scan_<slug>` | `yara_scanner_summary_v<VER>_scan_<slug>` |
 | Row grain | every matched-file row, copied verbatim | **one row per (host, rule)** |
 | Columns | the full v4 match schema | `scan_id`, `hostname`, `rule`, `event_timestamp_ms` — and nothing else |
@@ -113,10 +113,14 @@ consolidation copies out differs — and whether the source survives it.
   scanner ensures the dataset exists at scan start), so the loss is bounded — but until then
   the per-file detail for *that* scan is gone, and a summary row written afterwards has
   nothing to drill into. Pick per deployment, not per run.
-* `YaraConsolidateFast` is full detail minus the verification pass. It still deletes, and it
-  accepts duplicate rows in the target. Its `_READ_LIMIT = 50000` truncation guard refuses a
-  scan too big to read in one go rather than merging part of it and deleting the rest — that
-  guard is the reason the fast path is survivable at all, so do not raise it casually.
+* **One pass is bounded, in both modes.** `YaraConsolidateApply` takes `max_scans` (default
+  **4**) to cap how many scans one invocation processes, so it finishes comfortably inside
+  the script timeout instead of being killed mid-merge while still holding the consolidation
+  lock — measured live: a 5-scan pass used 71% of a 900-second timeout, and 20 would have
+  been killed around scan 7. A bounded pass reports how many scans it left for the next run;
+  the playbook's `max_scans` input passes this through, but a full backlog larger than one
+  pass still needs to be **re-run**, or the cap raised, to fully drain — it does not loop on
+  its own within a single playbook execution.
 
 ### Choosing the mode from the playbook
 
@@ -334,10 +338,10 @@ reach for a one-off `demisto-sdk upload` on just that file.
 runs whatever sits under that file's `script:` key. `unified/<Name>.yml` carries the whole
 Python body inline and is the delivery copy for every automation in this pack;
 `Scripts/<Name>/<Name>.py` exists so the code can be reviewed, tested and `py_compile`d.
-Those are two copies of one source, and they have already drifted once — the shipped
-`YaraConsolidateFast` yml was missing the `_READ_LIMIT` truncation guard its `.py` had, i.e.
-the guard that stops the fast path merging 50,000 of a 60,000-row scan and then deleting the
-only copy of the rest. Regenerate rather than hand-edit:
+Those are two copies of one source, and they have already drifted once — a shipped `.yml`
+was missing a safety guard its `.py` had, silently shipping the unguarded behaviour to the
+tenant while every reviewer, test and `py_compile` run only ever saw the guarded file.
+Regenerate rather than hand-edit:
 
 ```
 python3 tools/build_pack_unified.py            # rewrite every embedded copy from its .py
@@ -346,8 +350,8 @@ python3 tools/build_pack_unified.py --check    # exit 1 if any is stale
 
 `tests/test_pack_unified_yaml_is_in_sync.py` runs `--check` in CI, and
 `tests/test_pack_playbook_consolidation_modes.py` checks the playbook's tasks against the
-automations they call. `YaraConsolidateFast` and `YaraConsolidateSummary` are self-contained
-on the `Scripts/` side too (their `Scripts/<Name>/<Name>.yml` embeds the script); the rest
+automations they call. `YaraConsolidateSummary` is self-contained
+on the `Scripts/` side too (its `Scripts/<Name>/<Name>.yml` embeds the script); the rest
 carry `script: '-'` there and are unified at upload time.
 
 **`YaraReport` and `YaraCleanup` are not tasks in the consolidation playbook**, and nothing
@@ -366,14 +370,14 @@ Each automation's own `CoreApiClient` calls this tenant's own public API directl
 signed Advanced (HMAC) HTTPS — the design-rationale comment above the class explains why (the
 originally-planned "Cortex Core - IR" generic REST bridge is not registered on this tenant).
 
-**This is six edits, not one.** Every automation in this pack is self-contained: it inlines
+**This is five edits, not one.** Every automation in this pack is self-contained: it inlines
 the whole shared library, including its own copy of `CoreApiClient` and its own copy of the
 three constants below. That is not duplication for its own sake — the tenant resolves no
 cross-script import, so a shared library automation could not be imported at runtime even if
 one shipped, and each file must therefore carry everything it needs. Before uploading, edit
-the three placeholder constants near the top of **each of the six** automations
+the three placeholder constants near the top of **each of the five** automations
 (`YaraConsolidateStatus`, `YaraConsolidateApply`, `YaraConsolidateSummary`,
-`YaraConsolidateFast`, `YaraReport`, `YaraCleanup`) — in `Scripts/<Name>/<Name>.py` if you
+`YaraReport`, `YaraCleanup`) — in `Scripts/<Name>/<Name>.py` if you
 are regenerating, or directly in the `unified/<Name>.yml` you import:
 
 ```python
@@ -427,7 +431,7 @@ the YaraCleanup section above before granting this key to anything.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `YaraConsolidateStatus failed: ... HTTP 401: ...` or `YaraConsolidateApply failed: ... HTTP 401: ...` in the Job's task error / War Room | The embedded `DEFAULT_XDR_API_KEY`/`DEFAULT_XDR_API_ID` were rotated, revoked, or hit their `expiration` on the tenant. The identical generic 401 also covers a mistyped key/ID and a Standard/Advanced type mismatch — the response body alone cannot tell you which. | Regenerate an Advanced-type key for this pack's role (see Credentials above), edit the three `DEFAULT_XDR_*` constants in **all six** automations — each one carries its own credential block, because the tenant resolves no cross-script import and every automation is therefore self-contained — and re-deliver the pack (editing the repo file alone does nothing until it's re-imported/re-installed — see Deployment above). Confirm with `YaraConsolidateStatus` — it's read-only and safe to run any time. |
+| `YaraConsolidateStatus failed: ... HTTP 401: ...` or `YaraConsolidateApply failed: ... HTTP 401: ...` in the Job's task error / War Room | The embedded `DEFAULT_XDR_API_KEY`/`DEFAULT_XDR_API_ID` were rotated, revoked, or hit their `expiration` on the tenant. The identical generic 401 also covers a mistyped key/ID and a Standard/Advanced type mismatch — the response body alone cannot tell you which. | Regenerate an Advanced-type key for this pack's role (see Credentials above), edit the three `DEFAULT_XDR_*` constants in **all five** automations — each one carries its own credential block, because the tenant resolves no cross-script import and every automation is therefore self-contained — and re-deliver the pack (editing the repo file alone does nothing until it's re-imported/re-installed — see Deployment above). Confirm with `YaraConsolidateStatus` — it's read-only and safe to run any time. |
 | Every scheduled Job run fails at task "Check consolidation status" (or "Apply consolidation") and task 8 ("Flag failures for attention") never lights up | `return_error` halts the whole playbook run at the failing task, before task 8's condition is ever evaluated — task 8 only reports data-level `failed_count` from a *completed* run, not a total execution error. | Watch the Job's own run history, not just the task-8 context flag — a dead key (or any other uncaught exception) is a hard failure, not a soft one. The `yara_scanner_consolidation_runs` dataset (see Monitoring below) also gets a `status="crashed"` row for a mid-run `YaraConsolidateApply` crash specifically (not for a `YaraConsolidateStatus` crash — that one never reaches `YaraConsolidateApply` at all). |
 | Job history shows "0 scan(s) consolidated" every run, nothing actually being merged | Consolidation lock held by another concurrent run (the CLI's `xdr_data_management.py --consolidate --yes`, or an overlapping Job execution) | Check `Yara.ConsolidateApply.lock_held_by_other_run` in context, or just read the readable output — it now says "Skipped this pass — consolidation lock is held by another concurrent run" instead of looking identical to a genuinely-empty pass. Confirm the Job's Queue Handling is set to "Don't trigger a new job instance" and that no one is running the CLI `--consolidate --yes` concurrently. |
 | The playbook run ends at **"Unrecognised consolidation_mode - nothing done"** and nothing was merged or written | `consolidation_mode` is neither exactly `full` nor exactly `summary` — a typo, a capitalised value, or an empty one. This is the designed fail-safe, not a bug: an unrecognised mode must never fall through to the branch that deletes per-host shards. | Set the input to exactly `full` or exactly `summary` and re-run. If it is already one of those, the `isEqualString` condition in task 11 is the thing to verify against the live tenant (see the playbook description's NOTE ON VERIFICATION) — it has no local precedent in this repo. |

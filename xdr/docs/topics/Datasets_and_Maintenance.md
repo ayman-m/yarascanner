@@ -1,28 +1,37 @@
 # Datasets and Maintenance — technical detail
 
-*Applies to scanner **v2.1.0**. History of changes: [release notes](../../../CHANGELOG.md).*
+*Applies to scanner **v3.4.0**. History of changes: [release notes](../../../CHANGELOG.md).*
 
 Companion to the XDR YARA Scanner Guide. Read this to understand why the dataset names look
 the way they do, and how to stop them growing forever.
+
+> **The matches dataset no longer rotates.** Since v4 (scanner 3.4.0+) the *matches* dataset
+> is a single **permanent** dataset per host, overwritten at the start of every scan — it is
+> not deleted and rewritten each month the way §3 below describes. Only the *scans*
+> (lifecycle) dataset still rotates monthly. This is a deliberate, load-bearing change — see
+> [the pack README's "overwrite model" section](../../Packs/YaraDatasetManagement/README.md#the-overwrite-model--one-permanent-matches-dataset-per-host)
+> for the full mechanism and measured numbers. §1, §3, §5 and §6 below are rewritten for it;
+> §2's sharding rationale and §4's cleanup safety rails are unaffected and still current.
 
 ---
 
 ## 1. What the scanner writes
 
-Two lookup datasets per host:
-
 ```
-yara_scanner_matches_v2_<host>_<YYYYMM>     one row per matched string
-yara_scanner_scans_v2_<host>_<YYYYMM>       one row per scan lifecycle event
+yara_scanner_matches_v4_<host>_<6hex>       one row per matched FILE (rules folded into a
+                                             JSON array) — PERMANENT, no month suffix, one
+                                             per host, overwritten at the start of every scan
+yara_scanner_scans_v4_<host>_<YYYYMM>       one row per scan lifecycle event — still rotates
+                                             monthly, still append-only
 ```
 
-The name carries four things, and each is there for a reason:
+The two datasets are named differently on purpose now — they have different lifecycles:
 
 | Part | Why |
 |---|---|
-| `_v2` | schema version — bumped whenever the row shape changes |
-| `_<host>` | per-writer sharding (§2) |
-| `_<YYYYMM>` | monthly rotation (§3) |
+| `_v4` | schema version — bumped whenever the row shape changes |
+| `_<host>_<6hex>` | per-writer sharding (§2); the 6-hex suffix is a short hash of the host identity, not a literal hostname |
+| `_<YYYYMM>` (scans only) | monthly rotation (§3) — matches does **not** carry this any more |
 
 The scanner **creates these itself** if they do not exist. It never depends on any other
 script having run first.
@@ -83,10 +92,11 @@ single dataset.
 > Set `CONFIG_LOOKUP_SHARD = "none"` only for a single scanning endpoint. At fleet scale it
 > is the configuration measured above at 2/8 delivery.
 
-## 3. Monthly rotation — why the name carries a date
+## 3. Monthly rotation — why the *scans* name carries a date
 
-`CONFIG_LOOKUP_ROTATION = "monthly"` (the default) appends `_<YYYYMM>`, so a fresh dataset
-begins each month.
+`CONFIG_LOOKUP_ROTATION = "monthly"` (the default) appends `_<YYYYMM>` to the **scans**
+dataset only, so a fresh one begins each month. It has no effect on matches — see the
+callout at the top of this page.
 
 **This exists because `add_data` merge time scales with dataset SIZE, not payload size.**
 Measured on a live tenant, writing a single row:
@@ -96,14 +106,22 @@ Measured on a live tenant, writing a single row:
 | 15,000 rows | ~13 s |
 | 77,000 rows | ~31 s |
 
-An unrotated dataset therefore gets progressively slower until writes exceed any client
-timeout and it goes **write-dead** — observed at ~77k rows, where a host lost the majority
-of a scan's rows to read timeouts.
+An unrotated append-only dataset therefore gets progressively slower until writes exceed any
+client timeout and it goes **write-dead** — observed at ~77k rows, where a host lost the
+majority of a scan's rows to read timeouts. That is exactly the failure mode the matches
+dataset used to be exposed to before the overwrite model — an append-only dataset with no
+bound eventually goes write-dead regardless of *why* it never shrinks. Rotation was the
+original fix for scans and matches alike; for matches the overwrite (§1) is now the fix
+instead, because a permanent single-scan dataset never grows past one scan's worth of rows in
+the first place — it does not need rotation to stay small.
 
-Rotation bounds each dataset's size permanently, so write time stays flat forever.
+Rotation bounds the scans dataset's size permanently, so write time stays flat forever.
 
 > Rotation **bounds size but deletes nothing.** Old months accumulate on the tenant
-> indefinitely. That is what §4 is for.
+> indefinitely. That is what §4 is for. `YaraReport`/`YaraCleanup` correctly treat a live
+> matches dataset as a permanent, never-delete candidate rather than as "not rotated" —
+> that classification was fixed in the pack; if you are running scanner 3.4.0+ against an
+> **older** copy of the pack automations, re-deploy them before relying on this.
 
 ## 4. Cleanup — `xdr_data_management.py`
 
@@ -117,7 +135,7 @@ not, and coupling them would mean a scan could fail because a different script h
 ```bash
 python3 xdr_data_management.py --report                      # inventory (default action)
 python3 xdr_data_management.py --older-than-months 6 --yes   # drop months older than 6
-python3 xdr_data_management.py --delete-legacy --yes         # drop pre-v2 schema datasets
+python3 xdr_data_management.py --delete-legacy --yes         # drop older-than-current-schema datasets
 ```
 
 ### Reading the report
@@ -162,24 +180,75 @@ every other rail here, skip (keep) the dataset rather than delete it if that que
 A failed delete is reported and the run continues to the next dataset, so one dataset with
 dependencies cannot strand the whole cleanup. Exit code is non-zero if any deletion failed.
 
-## 5. Consolidation — one dataset per scan (`--consolidate`)
+## 5. Consolidation — one dataset per scan
 
-Deleting old months (§4) bounds *age*. It does not bound *count*: a large fleet still
-produces two datasets per host every month. Consolidation addresses the count directly — it
-folds each scan's per-host shards into a **single dataset per scan** and deletes the shards.
+Deleting old months (§4) bounds *age*. It does not bound *count*: a fleet still produces one
+scans dataset per host every month, and — since a single scan can legitimately span many
+scan_ids over time — the *matches* side still benefits from being folded down to one dataset
+per scan even though it no longer rotates. Consolidation addresses the count directly — it
+folds each scan's per-host shards into a **single dataset per scan**, and, in the mode that
+does so, deletes the shards.
 
-```bash
-python3 xdr_data_management.py --consolidate                 # dry run — plan only
-python3 xdr_data_management.py --consolidate --yes           # apply
-python3 xdr_data_management.py --consolidate --scan-id <id>  # one scan (repeatable)
-```
+**Two delivery mechanisms exist for the same underlying logic** (`xdr_consolidate.py`):
 
-The result is `yara_scanner_matches_v2_scan_<scan_id>` / `..._scans_v2_scan_<scan_id>`: all
+- **The pack automations** (`xdr/Packs/YaraDatasetManagement/`) — `YaraConsolidateStatus`
+  (read-only check), `YaraConsolidateApply` (writes and **deletes** verified source shards),
+  `YaraConsolidateSummary` (writes a lightweight rollup, **deletes nothing**), driven by the
+  `YARA Dataset Consolidation` playbook or invoked directly from the console. This is the
+  supported day-to-day path — see the
+  [pack README](../../Packs/YaraDatasetManagement/README.md) for the full comparison of the
+  two modes, arguments, and outputs.
+- **The CLI** (`xdr_data_management.py --consolidate`) — the same logic, for scripted/ad-hoc
+  use outside XSOAR:
+
+  ```bash
+  python3 xdr_data_management.py --consolidate                 # dry run — plan only
+  python3 xdr_data_management.py --consolidate --yes           # apply
+  python3 xdr_data_management.py --consolidate --scan-id <id>  # one scan (repeatable)
+  ```
+
+  > **The CLI path has no per-pass bound.** `--consolidate --yes` calls the same underlying
+  > merge logic as the pack's `YaraConsolidateApply`, but without the cap described below —
+  > `_run_consolidate` in `xdr_data_management.py` was not updated when that cap was added.
+  > A CLI-driven consolidation against a large backlog can run for as long as there is work
+  > to do; there is currently no equivalent of `--max-scans` to bound one invocation. Restrict
+  > scope with `--scan-id` (repeatable) if you need to control how much one run touches.
+
+The result is `yara_scanner_matches_v4_scan_<scan_id>` / `..._scans_v4_scan_<scan_id>`: all
 hosts for one scan, in one place, filterable by the same fields as before.
 
 **This is a housekeeping step, not a requirement, and not a reporting fix.** Reporting never
 needed it — dashboards query `yara_scanner_*` wildcards, so a query spans per-host and
 per-scan datasets identically. Consolidation only reduces how many datasets exist.
+
+> **`YaraConsolidateApply` is destructive with no dry-run mode; `YaraConsolidateStatus` is
+> read-only.** Check status first if you want to see what a pass *would* do before it does
+> it. There is no equivalent "would delete" flag on Apply itself.
+
+### One pass is bounded — it is not "run once and the backlog is gone"
+
+Both the CLI and the pack `YaraConsolidateApply` cap how many scans **one invocation**
+processes (`--max-scans` / the `max_scans` argument, default **4**), so a pass finishes
+comfortably inside the script/task timeout instead of being killed mid-merge while still
+holding the consolidation lock — measured live: a 5-scan pass used 71% of a 900-second
+timeout, and 20 would have been killed around scan 7. A bounded pass reports how many scans
+it left for next time; a backlog larger than one pass's cap needs to be **re-run**, or the
+cap raised, to fully drain — it does not resume itself automatically.
+
+### The consolidation lock
+
+Only one Apply/Summary(execute) pass may write at a time — a second concurrent invocation
+finds the lock held and returns immediately, touching nothing. The lock is a dataset
+(`yara_scanner_consolidation_lock`) created by whichever run wins the race to create it
+first; the second run's `create_lookup_dataset` returns "already exists" instead of failing,
+which is the actual mutex. If a run is genuinely dead (crashed, or its host container was
+recycled) without releasing the lock, another run treats it as **stale** after 20 minutes and
+takes over — sized to roughly the 900-second task timeout, not to how long a healthy run
+could conceivably take. **A run can, in practice, keep executing well past its declared
+timeout without the platform actually killing it** — treat a caller's request timing out as
+"unknown," not "dead," and check `yara_scanner_consolidation_runs` (a `started` row with no
+matching terminal row means a pass is still — or was still — running) before assuming it is
+safe to intervene manually.
 
 ### Why it is safe to run against live data
 
@@ -223,10 +292,13 @@ targets appear while the shard persists until its last scan clears.
 
 ## 6. Row shapes
 
-**`yara_scanner_matches_v2_*`** — one row per matched string: host, rule, file path, offset,
-matched length, severity, scan id, timestamps.
+**`yara_scanner_matches_v4_*`** — one row per matched **file**, not per matched string or
+per rule: host, file path, severity, scan id, timestamps, plus a `rules` field holding a
+JSON array of every rule that matched that file (rule name, match count, offsets, matched
+strings). This folds v2/v3's one-row-per-finding grain down to one row per file — measured
+~47% smaller for the same underlying findings.
 
-**`yara_scanner_scans_v2_*`** — scan lifecycle. Each scan writes `initiated`, then a terminal
+**`yara_scanner_scans_v4_*`** — scan lifecycle. Each scan writes `initiated`, then a terminal
 row (`completed` / `cancelled` / `failed`), plus periodic `running` rows.
 
 > A scan stopped by the **console Cancel** never writes a terminal row, so its lifecycle
@@ -235,7 +307,7 @@ row (`completed` / `cancelled` / `failed`), plus periodic `running` rows.
 
 ## 7. Schema changes
 
-The row shape is pinned by the `_v2` tag for a reason: **`add_data` silently skips rows
+The row shape is pinned by the `_v4` tag (currently) for a reason: **`add_data` silently skips rows
 carrying fields that are not in the existing dataset's schema.** It returns
 `records_skipped=N, records_added=0` with HTTP 200 and no error anywhere.
 

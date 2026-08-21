@@ -1,6 +1,6 @@
 % YARA Scanner for Cortex XDR — Deployment Guide
-% Cortex XDR edition (`xdr_yara_scanner.py`, v2)
-% Version 3.3.0 · Released 2026-08-17
+% Cortex XDR edition (`xdr_yara_scanner.py`)
+% Version 3.4.0
 
 ---
 
@@ -18,20 +18,20 @@ This edition uses the **Cortex XDR public API** directly:
 | Channel | XDR API | Result |
 |---------|---------|--------|
 | Alerts | **Insert Parsed Alerts** (`/public_api/v1/alerts/insert_parsed_alerts`) | One alert per **finding** (`rule + file`, offset-free identity; hit count + sample inside) → feeds XDR incident creation. Storm-capped at `CONFIG_ALERT_MAX_PER_SCAN` (default 500) with one rollup alert per rule beyond it |
-| Match records | **Lookup dataset** `yara_scanner_matches_v2_<host>_<YYYYMM>` (`/xql/lookups/add_data`) | One row per matched string; per-endpoint shard, **monthly-rotated** (bounds `add_data` merge time, which grows with dataset size), queried via `yara_scanner_matches*` |
-| Scan lifecycle | **Lookup dataset** `yara_scanner_scans_v2_<host>_<YYYYMM>` | initiated / running / completed / cancelled / failed rows |
+| Match records | **Lookup dataset** `yara_scanner_matches_v4_<host>_<6hex>` (`/xql/lookups/add_data`) | One row per matched **file** (every rule that hit it folded into a `rules` JSON array); per-endpoint shard, **permanent — overwritten at the start of every scan**, not rotated (bounds size by holding one scan's worth of rows, not by deleting old months), queried via `yara_scanner_matches*` |
+| Scan lifecycle | **Lookup dataset** `yara_scanner_scans_v4_<host>_<YYYYMM>` | initiated / running / completed / cancelled / failed rows — this one still rotates monthly; only matches changed |
 
 Every row and alert is tagged with a **`tenant_id`** derived from your API URL, so the
 data is safe to consolidate across tenants.
 
-> **v2 highlights:** Advanced (HMAC) authentication with auto-detection, per-channel
+> **Highlights:** Advanced (HMAC) authentication with auto-detection, per-channel
 > output flags, a CPU governor that bounds the scan's share of the host, cooperative scan
-> cancellation, per-endpoint rotated lookup datasets, a dedicated dashboard, and automation
-> playbooks.
+> cancellation, a permanent per-endpoint matches dataset overwritten each scan, a dedicated
+> dashboard, and automation playbooks.
 
 ## Topic guides
 
-This guide covers deployment and the capabilities of **v2.1.0** as shipped. What changed
+This guide covers deployment and the capabilities of **3.4.0** as shipped. What changed
 between versions, and why, is in the [release notes](../../CHANGELOG.md). Four companion documents go
 deeper where operators usually need it:
 
@@ -259,6 +259,12 @@ POST /public_api/v1/scripts/run_script/
 `parameters_values` must match the library script's inputs **exactly** — the three above
 for `main`, and an empty set for the `cancel` entry point. Any extra key is rejected.
 
+> **`timeout` must cover more than the scan.** The `3600` above is illustrative, not a
+> recommendation — a large scan's upload queue can keep draining for several minutes *after*
+> the scan itself reports done, and a timeout sized to scan duration alone kills the payload
+> mid-drain, silently dropping queued match rows. See "Sizing the run timeout for large
+> scans" in §11.
+
 Advanced-key tenants must HMAC-sign the request (§3). Poll
 `/public_api/v1/actions/get_action_status/` (by `group_action_id`) and read
 `/public_api/v1/scripts/get_script_execution_results/` for the per-endpoint summary.
@@ -341,27 +347,36 @@ modes**, tuning, telemetry reference, measured behaviour, and the Windows CPU ce
 ## Dataset naming
 
 ```
-yara_scanner_matches_v2_<host>_<YYYYMM>     yara_scanner_scans_v2_<host>_<YYYYMM>
+yara_scanner_matches_v4_<host>_<6hex>       yara_scanner_scans_v4_<host>_<YYYYMM>
+   PERMANENT — no month, overwritten            still rotates monthly, still append-only
+   at the start of every scan
 ```
 
-Each host writes **its own pair of datasets** (`CONFIG_LOOKUP_SHARD = "endpoint"`), and a
-fresh pair begins **each month** (`CONFIG_LOOKUP_ROTATION = "monthly"`). `_v2` is the schema
-version.
+Each host writes **its own pair of datasets** (`CONFIG_LOOKUP_SHARD = "endpoint"`). `_v4` is
+the schema version. **The two datasets have different lifecycles now** — this is the single
+most important fact in this section, and it changed with the v4 scanner:
 
-**This is a workaround, not a preference.** A single dataset for the whole estate would be
-the better design — every row already carries `scan_id`, `run_id`, `scan_date`, `hostname`
-and `tenant_id`, so filtering alone would give you everything. It is not used because
-`lookups/add_data` is not concurrency-safe: two endpoints writing the same dataset collide
-on a server-side clone-table race and the rows are **silently lost** (measured: ~2 of 8
-batches landed at 8-way concurrency; client-side jitter does not help). One writer per
-dataset makes the collision impossible — verified at 8/8. Monthly rotation exists for a
-second platform limit: `add_data` merge time scales with dataset size, so an unbounded
-dataset eventually stops accepting writes.
+- **`matches`** is one dataset per host, **permanently** — the scanner overwrites it (removes
+  every row from the *previous* scan) at the start of each new scan, so it never grows past
+  one scan's worth of rows and never needs rotation. It always holds exactly the newest scan.
+- **`scans`** (the lifecycle dataset) is append-only and still rotates monthly
+  (`CONFIG_LOOKUP_ROTATION = "monthly"`, unchanged) — it still needs bounding the old way.
 
-The cost is dataset count: a 500-endpoint fleet produces on the order of 1,000 datasets a
-month. Control it by bucketing rather than per-host — `CONFIG_LOOKUP_SHARD` accepts a
-literal label (`wave1`, `emea`) so hosts group into a fixed number of shards — and by
-deleting old months with `xdr_data_management.py`.
+**This split exists because `lookups/add_data` is not concurrency-safe.** Two endpoints
+writing the same dataset collide on a server-side clone-table race and the rows are
+**silently lost** (measured: ~2 of 8 batches landed at 8-way concurrency; client-side jitter
+does not help). One writer per dataset makes the collision impossible — verified at 8/8.
+Per-host sharding is what gives every scanner its own writer; the overwrite (matches) and
+rotation (scans) are two different answers to the *separate* problem of `add_data` merge
+time scaling with dataset size — the matches dataset never needs rotation to solve that,
+because the overwrite already keeps it small.
+
+The cost is dataset count: a fleet produces roughly one matches dataset and one scans
+dataset per host, plus a new scans dataset per host every month. Control the fleet-wide
+count by bucketing rather than per-host — `CONFIG_LOOKUP_SHARD` accepts a literal label
+(`wave1`, `emea`) so hosts group into a fixed number of shards — and by deleting old scans
+months and consolidating matches with the pack automations (below) or
+`xdr_data_management.py`.
 
 **Querying is unaffected either way.** Dashboards match `yara_scanner_matches*` wildcards,
 so shards fan back in automatically and filtering by `scan_id` or `scan_date` behaves
@@ -369,16 +384,18 @@ exactly as it would against one dataset.
 
 > Set `CONFIG_LOOKUP_SHARD = "none"` only for a single scanning endpoint — at fleet scale
 > that is the configuration measured at 2/8 delivery. Full detail and the reasoning behind
-> both defaults: [Datasets and Maintenance](topics/Datasets_and_Maintenance.md).
+> the overwrite model: [Datasets and Maintenance](topics/Datasets_and_Maintenance.md).
 
-## `yara_scanner_matches_v2_<host>_<YYYYMM>` — one row per matched string
+## `yara_scanner_matches_v4_<host>_<6hex>` — one row per matched file
 
-`tenant_id`, `scan_id`, `run_id`, `scan_date`, `hostname`, `os_info`, `os_type`,
-`ip_address`, `rule`, `filename`, `file_size`, `file_sha256`, `file_creation_time`,
-`scan_folder`, `match`, `offset`, `matched_length`, `string`, `severity`,
-`event_timestamp_ms`, `date_of_scan`.
+`tenant_id`, `scan_id`, `run_id`, `hostname`, `os_info`, `os_type`, `ip_address`, `filename`,
+`file_size`, `file_sha256`, `file_creation_time`, `severity`, `rule_count`, `match_total`,
+`truncated`, `event_timestamp_ms`, and `rules` — a JSON array with one entry per rule that
+hit the file (`rule`, `match_count`, `offsets`, `strings`, `severity`). One row per matched
+**file**, not per matched string or per rule — v2/v3 wrote one row per finding; v4 folds
+every rule that hit a file into that file's single row (~47% smaller for the same findings).
 
-## `yara_scanner_scans_v2_<host>_<YYYYMM>` — scan lifecycle
+## `yara_scanner_scans_v4_<host>_<YYYYMM>` — scan lifecycle
 
 `tenant_id`, `scan_id`, `run_id`, `scan_date`, `hostname`, `os_info`, `os_type`,
 `ip_address`, `status` (initiated/running/completed/cancelled/failed), `scan_folder`,
@@ -393,24 +410,61 @@ Every run also writes a machine-readable `scan_summary_<run_id>.json` under the 
 rules, and the resolved dataset names) — one file to parse instead of six text logs. Log
 retention keeps the last 10 scans (`YARA_LOG_KEEP`).
 
+`dataset_delivery.undelivered` in that file is the one field to check for a large scan: it
+counts rows that were queued for upload but never sent when the run ended — see
+"Sizing the run timeout for large scans" below for why, and how to avoid it.
+
 ## Keeping datasets bounded
 
-Rotation bounds each dataset's size, but never deletes anything — old months accumulate.
-`xdr_data_management.py` removes them:
+The **scans** dataset still needs rotation-based cleanup — old months accumulate and nothing
+deletes them automatically. The **matches** dataset needs a different kind of housekeeping:
+it never grows unbounded (the overwrite already prevents that), but a fleet still accumulates
+one matches dataset per host, and every finished scan is worth folding into a single
+searchable record rather than leaving scattered across per-host datasets. Two tools, two
+different jobs:
 
 ```bash
 python3 xdr_data_management.py --report                      # inventory (default)
-python3 xdr_data_management.py --older-than-months 6 --yes   # drop months older than 6
+python3 xdr_data_management.py --older-than-months 6 --yes   # drop scans months older than 6
 ```
 
 Dry run unless `--yes`. It never deletes the current month, a future-dated month, an
-unsuffixed dataset, a newer schema version, or anything outside the `yara_scanner_*` naming
-contract. **No scan depends on it having run** — if it never runs, datasets grow but every
-scan still succeeds.
+unsuffixed (permanent) dataset, a newer schema version, or anything outside the
+`yara_scanner_*` naming contract. **No scan depends on it having run** — if it never runs,
+scans-lifecycle datasets grow but every scan still succeeds, and the matches dataset is
+unaffected either way (it is never a deletion candidate for this tool).
 
-**Detail:** [Datasets and Maintenance](topics/Datasets_and_Maintenance.md) — why sharding
-and rotation both exist, the report's `frozen` vs *not rotated* distinction, all safety
-rails, and schema-change rules.
+For folding finished scans out of the per-host matches datasets, use the
+`YaraDatasetManagement` XSOAR pack (`YaraConsolidateStatus` / `YaraConsolidateApply` /
+`YaraConsolidateSummary`, driven by the `YARA Dataset Consolidation` playbook) — see the
+[pack README](../Packs/YaraDatasetManagement/README.md) for setup, the two consolidation
+modes, and **`YaraConsolidateApply`'s destructive-by-default behavior** (it has no dry-run
+mode; check with `YaraConsolidateStatus` first).
+
+**Detail:** [Datasets and Maintenance](topics/Datasets_and_Maintenance.md) — the overwrite
+model, why sharding and rotation both exist, the report's dataset states, all safety rails,
+and schema-change rules.
+
+## Sizing the run timeout for large scans — drain time, not just scan time
+
+The upload of matched rows happens on a background queue that keeps working **after the scan
+itself finishes** — a scan reports "completed" as soon as the last file is checked, but
+queued rows can still take minutes to actually reach the dataset. Measured live on a
+93,137-file scan: **169 seconds to scan, 6 minutes 41 seconds to drain** the upload queue —
+the drain outlasted the scan itself by roughly 2.4x.
+
+**If the Action Center run's timeout only covers the scan, not the drain, queued match rows
+are lost when the platform kills the payload** — the scan's own terminal lifecycle row still
+gets through (it is sent immediately, ahead of the queue, specifically so consolidation can
+always tell a scan finished even if this happens), but rows still waiting in the upload queue
+at that moment never send, and `dataset_delivery.undelivered` in the run's summary is the
+only record that it happened.
+
+**Size the timeout for drain, not scan duration.** As a starting point: scan time plus 10
+minutes covers the measured worst case with margin; a very large scan (millions of files) on
+a slow link should budget more. There is no dynamic signal to poll for "drain is done" from
+outside the endpoint — the summary file is written only once the run (including its drain)
+has fully finished.
 
 ---
 

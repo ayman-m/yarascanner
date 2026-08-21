@@ -1,6 +1,6 @@
 # Scan Cancellation — technical detail
 
-*Applies to scanner **v2.1.0**. History of changes: [release notes](../../../CHANGELOG.md).*
+*Applies to scanner **3.4.0**. History of changes: [release notes](../../../CHANGELOG.md).*
 
 Companion to the XDR YARA Scanner Guide. Read this if you need to stop scans at scale, or
 to understand why a cancelled scan can still appear to be running.

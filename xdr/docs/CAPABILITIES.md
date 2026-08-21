@@ -1,8 +1,16 @@
 # XDR Scanner — Capability Reference
 
-`xdr_yara_scanner.py` **v3.3.0** · Cortex XDR edition (public-API delivery: Insert Parsed
-Alerts + XQL lookup datasets). The XSIAM edition has its own:
+`xdr_yara_scanner.py` **v3.3.0** (see Provenance below) · Cortex XDR edition (public-API
+delivery: Insert Parsed Alerts + XQL lookup datasets). The XSIAM edition has its own:
 [`docs/xsiam/CAPABILITIES.md`](../../xsiam/docs/CAPABILITIES.md).
+
+> **Shipped scanner is now 3.4.0.** This enumeration was audited against the pinned v3.3.0
+> snapshot described in Provenance and has not been re-verified against 3.4.0's specific
+> changes (schema v4 default enforcement, the matches-dataset overwrite model, the terminal
+> lifecycle row now sent inline, and a fix to the upload worker's shutdown drain). Treat
+> entries touching dataset naming/schema-version defaults, upload delivery, or the terminal
+> lifecycle row as needing a fresh check against source before relying on them; the rest of
+> this enumeration is not believed to have changed.
 
 ## What this file is
 

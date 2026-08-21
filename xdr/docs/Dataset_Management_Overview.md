@@ -2,6 +2,15 @@
 
 *Customer-facing overview. Cortex XDR only.*
 
+> **Superseded.** This page predates the v4 scanner's overwrite model and describes an
+> earlier design where the objective was deleting every per-host dataset once its scan
+> finished. Since v4 (scanner 3.4.0+), the per-host **matches** dataset is meant to persist
+> permanently as the deep-dive source — it is overwritten each scan, not deleted — and only
+> the **scans** (lifecycle) dataset still rotates and needs age-based cleanup. For current,
+> accurate detail see [Datasets and Maintenance](topics/Datasets_and_Maintenance.md) and the
+> [pack README](../Packs/YaraDatasetManagement/README.md). The "why per-host, not shared"
+> reasoning immediately below is unaffected by this change and still applies.
+
 ---
 
 ## The problem it solves

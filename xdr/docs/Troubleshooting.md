@@ -1,6 +1,6 @@
 # Troubleshooting — XDR YARA Scanner
 
-Applies to scanner **v2.1.0**. Companion to the XDR YARA Scanner Guide.
+Applies to scanner **3.4.0**. Companion to the XDR YARA Scanner Guide.
 
 Before anything else, confirm which build the endpoint ran: `scanner_version` in
 `scan_summary_<run_id>.json`, or the `VERSION` line at the top of
