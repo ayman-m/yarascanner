@@ -832,7 +832,12 @@ def parse_dataset_name(name):
                 host = rest
     return {"name": name, "kind": m.group("kind"),
             "version": int(m.group("version")), "host": host, "month": month,
-            "scan_target": scan_target}
+            "scan_target": scan_target,
+            # v4 is where matches stopped rotating and became overwrite-per-scan. On v2/v3 an
+            # unsuffixed matches dataset really was unrotated and really did grow, so the old
+            # warning is still the correct advice for a tenant pinned to those versions.
+            "overwrite": (m.group("kind") == "matches" and int(m.group("version")) >= 4
+                          and not month and not scan_target)}
 
 
 def months_between(older_yyyymm, newer_yyyymm):
@@ -876,6 +881,12 @@ def select_rotated_for_deletion(current_names, older_than_months, now_yyyymm):
             skipped.append("%s: per-scan consolidated target - consolidation OUTPUT, not a "
                            "rotation shard, and after the source shards were deleted it is "
                            "the only copy of that scan" % name)
+            continue
+        if info["overwrite"]:
+            skipped.append("%s: permanent per-host matches dataset - the scanner REPLACES it "
+                           "wholesale at the start of every scan, so it is bounded by that "
+                           "overwrite rather than by rotation, and CONFIG_LOOKUP_ROTATION "
+                           "does not apply to it" % name)
             continue
         if not info["month"]:
             if has_rotated_sibling(name, current_names):
@@ -1031,7 +1042,7 @@ def render_report(current, legacy, newer, now_yyyymm):
     lines = ["YARA lookup datasets (schema v%s current, now %s)" % (schema, now_yyyymm), ""]
     lines.append("%-52s %-8s %-14s %6s" % ("dataset", "kind", "host", "age"))
     lines.append("-" * 84)
-    unrotated, abandoned, consolidated = [], [], []
+    unrotated, abandoned, consolidated, overwritten = [], [], [], []
     for name in current:
         info = parse_dataset_name(name)
         if info is None:
@@ -1040,6 +1051,9 @@ def render_report(current, legacy, newer, now_yyyymm):
         if info["scan_target"]:
             age = "scan"
             consolidated.append(name)
+        elif info["overwrite"]:
+            age = "live"
+            overwritten.append(name)
         elif info["month"]:
             age = "%dmo" % months_between(info["month"], now_yyyymm)
         else:
@@ -1063,6 +1077,18 @@ def render_report(current, legacy, newer, now_yyyymm):
             % len(consolidated),
             "      consolidation OUTPUT: unrotated by design, finished, not growing, and",
             "      often a scan's only surviving copy. Never a cleanup candidate.",
+        ]
+    if overwritten:
+        lines += [
+            "",
+            "%d dataset(s) are PERMANENT per-host matches datasets. The scanner replaces"
+            % len(overwritten),
+            "      each one wholesale at the start of every scan, so they hold exactly one",
+            "      scan and are bounded by that overwrite, not by rotation. An unsuffixed",
+            "      name is their correct steady state - CONFIG_LOOKUP_ROTATION governs the",
+            "      SCANS datasets only and cannot change these. Never a cleanup candidate.",
+            "      A matches dataset that DOES carry a month predates this model and is",
+            "      ordinary deletable debris once it ages out of the window.",
         ]
     if abandoned:
         lines += [
@@ -1139,13 +1165,15 @@ def report_datasets(client, now_yyyymm=None):
 
     Returns the rendered text under "report", plus the same information structured for
     context in three states that need different advice:
+      overwrite     a permanent per-host matches dataset - replaced wholesale at the start
+                    of every scan, so unsuffixed is its correct steady state
       frozen        unsuffixed, but rotated siblings exist - a pre-rotation leftover
       not_rotated   unsuffixed with no rotated siblings - rotation is off and it will grow
       consolidated  a per-scan target (…_v<N>_scan_<slug>) - finished and immutable by design
     """
     now_yyyymm = now_yyyymm or datetime.date.today().strftime("%Y%m")
     current, legacy, newer = classify_yara_datasets(client)
-    datasets, frozen, not_rotated, consolidated = [], [], [], []
+    datasets, frozen, not_rotated, consolidated, overwrite = [], [], [], [], []
     for name in current:
         info = parse_dataset_name(name)
         if info is None:
@@ -1155,6 +1183,9 @@ def report_datasets(client, now_yyyymm=None):
         if info["scan_target"]:
             state, age = "consolidated", None
             consolidated.append(name)
+        elif info["overwrite"]:
+            state, age = "overwrite", None
+            overwrite.append(name)
         elif info["month"]:
             state, age = "rotated", months_between(info["month"], now_yyyymm)
         else:
@@ -1176,6 +1207,7 @@ def report_datasets(client, now_yyyymm=None):
         "frozen": frozen, "frozen_count": len(frozen),
         "not_rotated": not_rotated, "not_rotated_count": len(not_rotated),
         "consolidated": consolidated, "consolidated_count": len(consolidated),
+        "overwrite": overwrite, "overwrite_count": len(overwrite),
         "legacy": legacy, "legacy_count": len(legacy),
         "newer": newer, "newer_count": len(newer),
     }

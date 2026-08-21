@@ -63,6 +63,14 @@ outputs:
 - contextPath: Yara.Report.consolidated_count
   description: Number of per-scan consolidated targets.
   type: Number
+- contextPath: Yara.Report.overwrite
+  description: Permanent per-host matches datasets (v4+) — the scanner replaces each one
+    wholesale at the start of every scan, so an unsuffixed name is their correct steady
+    state and CONFIG_LOOKUP_ROTATION does not apply. Never a cleanup candidate.
+  type: String
+- contextPath: Yara.Report.overwrite_count
+  description: Number of permanent per-host matches datasets.
+  type: Number
 - contextPath: Yara.Report.legacy
   description: Datasets on an older/unversioned schema (deletable by YaraCleanup with
     delete_legacy=true).

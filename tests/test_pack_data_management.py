@@ -642,6 +642,90 @@ def test_rail3_never_deletes_an_unsuffixed_dataset():
     assert any(ds in s and "not rotated" in s for s in r["skipped"])
 
 
+# ------------------------------------------- the v4 overwrite matches dataset
+# Since the scanner started overwriting the per-host matches dataset at the start of every
+# scan, `yara_scanner_matches_v4_<host>` carries no month BY DESIGN. The pre-v4 classifier
+# read "no month" as "rotation is off, this grows without bound" and told the operator to
+# set CONFIG_LOOKUP_ROTATION="monthly" — advice that is both wrong (the dataset is bounded
+# by the overwrite) and unactionable (that setting governs the SCANS datasets only).
+
+def _classify_at_v4(impl, names):
+    impl.set_schema_version("4")
+    try:
+        return impl.report_datasets(FakeTenant(names), now_yyyymm=NOW_YYYYMM)
+    finally:
+        impl.set_schema_version(TEST_SCHEMA_VERSION)
+
+
+def test_the_v4_matches_dataset_is_not_reported_as_unrotated():
+    ds = "yara_scanner_matches_v4_hostA_abc123"
+    r = _classify_at_v4(R, [ds])
+    assert r["overwrite"] == [ds], r["overwrite"]
+    assert r["not_rotated"] == [] and r["frozen"] == []
+    assert [d["state"] for d in r["datasets"]] == ["overwrite"]
+
+
+def test_the_overwrite_dataset_is_never_a_deletion_candidate():
+    """It was already protected — an unsuffixed name has never been selectable. What changed
+    is the REASON, which previously told the operator to enable a setting that does not apply
+    to this dataset and would not have changed its name if it did."""
+    ds = "yara_scanner_matches_v4_hostA_abc123"
+    R.set_schema_version("4")
+    try:
+        cands, skipped = R.select_rotated_for_deletion([ds], older_than_months=0,
+                                                       now_yyyymm=NOW_YYYYMM)
+    finally:
+        R.set_schema_version(TEST_SCHEMA_VERSION)
+    assert cands == []
+    reason = next(s for s in skipped if ds in s)
+    assert "REPLACES it" in reason
+    assert "CONFIG_LOOKUP_ROTATION" not in reason or "does not apply" in reason
+
+
+def test_a_dated_v4_matches_dataset_is_still_ordinary_debris():
+    """The pre-overwrite naming left dated matches datasets behind. Those are NOT the live
+    dataset and must stay deletable once they age out, or the leftovers are unreachable."""
+    ds = "yara_scanner_matches_v4_hostA_abc123_202601"
+    R.set_schema_version("4")
+    try:
+        cands, _ = R.select_rotated_for_deletion([ds], older_than_months=0,
+                                                 now_yyyymm=NOW_YYYYMM)
+    finally:
+        R.set_schema_version(TEST_SCHEMA_VERSION)
+    assert cands == [ds]
+
+
+def test_only_matches_and_only_from_v4_count_as_overwrite():
+    """Both boundaries. SCANS still rotates monthly at v4, so an unsuffixed scans dataset is
+    genuinely unrotated; and on v2/v3 matches rotated too, so the old warning is still right
+    for a tenant pinned there. Both models' datasets coexist during a rollout."""
+    scans_v4 = "yara_scanner_scans_v4_hostA_abc123"
+    R.set_schema_version("4")
+    try:
+        r = R.report_datasets(FakeTenant([scans_v4]), now_yyyymm=NOW_YYYYMM)
+    finally:
+        R.set_schema_version(TEST_SCHEMA_VERSION)
+    assert r["overwrite"] == [] and r["not_rotated"] == [scans_v4]
+
+    matches_v3 = "yara_scanner_matches_v3_hostA_abc123"
+    R.set_schema_version("3")
+    try:
+        r = R.report_datasets(FakeTenant([matches_v3]), now_yyyymm=NOW_YYYYMM)
+    finally:
+        R.set_schema_version(TEST_SCHEMA_VERSION)
+    assert r["overwrite"] == [] and r["not_rotated"] == [matches_v3]
+
+
+@pytest.mark.parametrize("impl", SHIPPING_IMPLS)
+def test_every_automation_classifies_the_overwrite_dataset_alike(impl):
+    """parse_dataset_name is carried in all five; a fix that reaches only one is the exact
+    failure mode the drift gate exists for."""
+    info = impl.parse_dataset_name("yara_scanner_matches_v4_hostA_abc123")
+    assert info["overwrite"] is True
+    assert impl.parse_dataset_name("yara_scanner_scans_v4_hostA_abc123")["overwrite"] is False
+    assert impl.parse_dataset_name("yara_scanner_matches_v2_hostA")["overwrite"] is False
+
+
 def test_rail4_never_deletes_a_newer_schema_version():
     """A host running a stale YARA_LOOKUP_SCHEMA_VER must never delete a future schema's
     data — classification, not selection, is what keeps it out of reach."""
