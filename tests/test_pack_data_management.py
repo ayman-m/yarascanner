@@ -321,6 +321,14 @@ def _prune(client, **kw):
     return K.prune_datasets(client, **kw)
 
 
+# The version this suite's `_v2_` dataset fixtures are written against. Deliberately NOT
+# DEFAULT_SCHEMA_VERSION: pinning the suite to whatever the automations happen to ship makes
+# every classification test silently change meaning the day that default is bumped. What the
+# shipped default should BE is asserted once, in
+# test_the_shipped_default_tracks_the_scanners_schema_version.
+TEST_SCHEMA_VERSION = "2"
+
+
 @pytest.fixture(autouse=True)
 def _reset_schema_version():
     """set_schema_version writes a module global AND os.environ, both of which outlive the
@@ -329,9 +337,14 @@ def _reset_schema_version():
     calling the library directly does not, so pin it here rather than let test order decide
     which schema version a report is rendered against.
     """
-    K.set_schema_version(K.DEFAULT_SCHEMA_VERSION)
+    # Every automation carries its OWN YARA_SCHEMA_VERSION global — resetting one module's
+    # copy leaves the other four holding whatever the previous test set, which is how these
+    # tests silently became order-dependent. Reset all of them.
+    for _m in SHIPPING_MODULES.values():
+        _m.set_schema_version(TEST_SCHEMA_VERSION)
     yield
-    K.set_schema_version(K.DEFAULT_SCHEMA_VERSION)
+    for _m in SHIPPING_MODULES.values():
+        _m.set_schema_version(TEST_SCHEMA_VERSION)
 
 
 # ------------------------------------------------------------- port fidelity
@@ -516,12 +529,47 @@ def test_pack_classify_yara_datasets_matches_xdr_action_center(impl):
     assert impl.classify_yara_datasets(FakeTenant(names)) == ac.classify_yara_datasets()
 
 
+def _scanner_schema_default():
+    """The scanner's LOOKUP_SCHEMA_VERSION fallback, read from source. Importing the scanner
+    would drag in yara/psutil, which this suite deliberately does not require."""
+    src = open(os.path.join(_REPO, "xdr", "xdr_yara_scanner.py")).read()
+    m = re.search(r'^LOOKUP_SCHEMA_VERSION\s*=\s*os\.environ\.get\(\s*"YARA_LOOKUP_SCHEMA_VER"\s*,\s*"(\d+)"',
+                  src, re.M)
+    assert m, "could not find LOOKUP_SCHEMA_VERSION in xdr_yara_scanner.py"
+    return m.group(1)
+
+
+@pytest.mark.parametrize("automation", SHIPPING)
+def test_the_shipped_default_tracks_the_scanners_schema_version(automation):
+    """The scanner NAMES datasets `..._v<LOOKUP_SCHEMA_VERSION>_...`; these automations decide
+    which of those names count as current from their own default. When the two disagree every
+    live dataset classifies as "newer", and the tooling's correct response to "newer" is to
+    touch nothing — so a run reports 0 candidates and exits 0. It looks like a clean no-op,
+    not a misconfiguration, which is exactly why this needs a gate rather than a reader.
+    """
+    want = _scanner_schema_default()
+    got = SHIPPING_MODULES[automation].DEFAULT_LOOKUP_SCHEMA_VERSION
+    assert got == want, (
+        "%s ships DEFAULT_LOOKUP_SCHEMA_VERSION=%r but the scanner writes v%s datasets — "
+        "every live dataset would classify as 'newer' and be silently skipped"
+        % (automation, got, want))
+
+
+def test_the_cli_default_tracks_the_scanners_schema_version():
+    """Same gate for the operator CLI, which classifies from its own module-level copy."""
+    assert AC.YARA_SCHEMA_VERSION == _scanner_schema_default()
+
+
 @pytest.mark.parametrize("impl", SHIPPING_IMPLS)
 def test_set_schema_version_moves_newer_datasets_into_current(impl):
     """XSOAR containers have no YARA_LOOKUP_SCHEMA_VER env var, so the version the CLI
     reads from the environment has to be passable as an argument instead."""
     names = ["yara_scanner_matches_v3_h_202601"]
     try:
+        # Set explicitly. The autouse fixture resets the CLI library's global, not each
+        # automation's own copy, so without this the baseline is whatever the previous
+        # parametrised case left behind.
+        impl.set_schema_version("2")
         cur, legacy, newer = impl.classify_yara_datasets(FakeTenant(names))
         assert (cur, newer) == ([], names)            # v3 > assumed v2 -> never pruned
         impl.set_schema_version("3")
@@ -852,10 +900,12 @@ def test_the_schema_version_does_not_leak_into_the_next_run():
     scope of the next run that passes none."""
     import YaraReport
     ds = "yara_scanner_matches_v3_h_202601"
-    _run_automation(YaraReport, {"schema_version": "3"}, FakeTenant([ds]))
-    out = _run_automation(YaraReport, {}, FakeTenant([ds]))
-    assert out.outputs["schema_version"] == K.DEFAULT_SCHEMA_VERSION
-    assert out.outputs["newer"] == [ds]        # back to v3 > assumed v2
+    _run_automation(YaraReport, {"schema_version": "3"}, FakeTenant([ds]), pin_schema=False)
+    out = _run_automation(YaraReport, {}, FakeTenant([ds]), pin_schema=False)
+    # Asserted against the SHIPPED default rather than a literal: the point of this test is
+    # that run 2 falls back, not that the fallback happens to be any particular version.
+    assert out.outputs["schema_version"] == YaraReport.DEFAULT_LOOKUP_SCHEMA_VERSION
+    assert out.outputs["schema_version"] != "3"
 
 
 def test_a_malformed_argument_fails_with_this_scripts_own_message():
@@ -1368,9 +1418,18 @@ def test_the_context_prefix_follows_the_packs_own_convention():
 
 
 # --------------------------------------------------------- automation harness
-def _run_automation(module, args, client):
+def _run_automation(module, args, client, pin_schema=True):
     """Drive an automation's main() with stubbed platform globals, and hand back the single
-    CommandResults it returned."""
+    CommandResults it returned.
+
+    schema_version defaults to TEST_SCHEMA_VERSION, not to the automation's shipped
+    DEFAULT_LOOKUP_SCHEMA_VERSION: this suite's dataset fixtures are `_v2_` names, and
+    inheriting the shipped default would silently reclassify every one of them as legacy
+    the day that default is bumped. Tests that pass schema_version explicitly still win.
+    """
+    args = dict(args)
+    if pin_schema:
+        args.setdefault("schema_version", TEST_SCHEMA_VERSION)
     demistomock.args_value = dict(args)
     demistomock.commands = []
     del CommonServerPython.results[:]

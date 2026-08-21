@@ -45,7 +45,7 @@ args:
   - 'true'
   - 'false'
 - name: schema_version
-  description: The scanner's current lookup schema version (YARA_LOOKUP_SCHEMA_VER on the endpoints; "2" if unset). Must be a whole number — a non-numeric value is rejected outright, because it would silently reclassify every live dataset as "legacy". Datasets on a HIGHER version are classified as "newer" and are never deleted; if this is stale-LOW the run prunes little and says which datasets rail 4 vetoed. If it is stale-HIGH, live datasets classify as legacy — the live recency and consolidation rails are what stop that from deleting them, and they are reported as skips.
+  description: The scanner's current lookup schema version (YARA_LOOKUP_SCHEMA_VER on the endpoints; "4" if unset). Must be a whole number — a non-numeric value is rejected outright, because it would silently reclassify every live dataset as "legacy". Datasets on a HIGHER version are classified as "newer" and are never deleted; if this is stale-LOW the run prunes little and says which datasets rail 4 vetoed. If it is stale-HIGH, live datasets classify as legacy — the live recency and consolidation rails are what stop that from deleting them, and they are reported as skips.
   required: false
   isArray: false
   default: false
@@ -159,7 +159,7 @@ script: |
   # Lookup schema version assumed when the schema_version argument is left empty. Set it to the
   # version the fleet actually writes: too low and nothing is ever pruned, too high and live
   # datasets are classified as legacy.
-  DEFAULT_LOOKUP_SCHEMA_VERSION = "2"
+  DEFAULT_LOOKUP_SCHEMA_VERSION = "4"
 
   # Safety rail 6, the recency floor. min_quiet_hours=0 would DISABLE the rail rather than
   # relax it, so the argument is floored at MIN_ALLOWED_QUIET_HOURS.
@@ -1156,7 +1156,7 @@ script: |
 
   def render_report(current, legacy, newer, now_yyyymm):
       """Human-readable inventory. Ages are whole months."""
-      schema = os.environ.get("YARA_LOOKUP_SCHEMA_VER", "2")
+      schema = os.environ.get("YARA_LOOKUP_SCHEMA_VER", "4")
       lines = ["YARA lookup datasets (schema v%s current, now %s)" % (schema, now_yyyymm), ""]
       lines.append("%-52s %-8s %-14s %6s" % ("dataset", "kind", "host", "age"))
       lines.append("-" * 84)

@@ -40,7 +40,10 @@ import requests
 # YARA lookup-dataset naming (mirrors the scanner so the keep-set matches what it writes):
 #   current  -> yara_scanner_(matches|scans)_v<VER>[_<shard>]
 #   legacy   -> the shared yara_scanner_matches/_scans, old yara_matches_*, and any v1 shards
-YARA_SCHEMA_VERSION = (os.environ.get("YARA_LOOKUP_SCHEMA_VER", "2").strip() or "2")
+# Must match the scanner's LOOKUP_SCHEMA_VERSION default and the pack automations'
+# DEFAULT_LOOKUP_SCHEMA_VERSION; a stale value here reclassifies every live dataset
+# as "newer" and the tooling then correctly refuses to touch any of them.
+YARA_SCHEMA_VERSION = (os.environ.get("YARA_LOOKUP_SCHEMA_VER", "4").strip() or "4")
 YARA_OWNED_RE = re.compile(r"^(yara_scanner_(matches|scans)(_.*)?|yara_(matches|scans)_.*)$")
 CURRENT_RE = re.compile(r"^yara_scanner_(matches|scans)_v%s(_.*)?$" % re.escape(YARA_SCHEMA_VERSION))
 

@@ -1,7 +1,7 @@
 args:
 - name: schema_version
   description: The scanner's current lookup schema version (YARA_LOOKUP_SCHEMA_VER
-    on the endpoints; "2" if unset). Must be a whole number — a non-numeric value is
+    on the endpoints; "4" if unset). Must be a whole number — a non-numeric value is
     rejected outright. Datasets on a HIGHER version are reported under "newer schema"
     and are never pruned by YaraCleanup — if this is stale, everything lands in that
     bucket.

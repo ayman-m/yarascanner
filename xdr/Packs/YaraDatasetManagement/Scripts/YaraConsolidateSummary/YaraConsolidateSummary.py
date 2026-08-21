@@ -39,7 +39,7 @@ DEFAULT_XDR_API_URL = "replace_with_xdr_api_url"
 
 # Lookup schema version assumed when the schema_version argument is left empty. It also
 # selects the query shape: v4 expands the `rules` JSON array, v2 and v3 do not.
-DEFAULT_LOOKUP_SCHEMA_VERSION = "2"
+DEFAULT_LOOKUP_SCHEMA_VERSION = "4"
 
 DEFAULT_RETENTION_HOURS = 24        # a scan with no terminal lifecycle row is finished past this
 _WRITE_BATCH = 500                  # rows per lookups/add_data call
@@ -1032,7 +1032,7 @@ def select_legacy_for_deletion(legacy_names, newer_names=(), now_yyyymm=None):
 
 def render_report(current, legacy, newer, now_yyyymm):
     """Human-readable inventory. Ages are whole months."""
-    schema = os.environ.get("YARA_LOOKUP_SCHEMA_VER", "2")
+    schema = os.environ.get("YARA_LOOKUP_SCHEMA_VER", "4")
     lines = ["YARA lookup datasets (schema v%s current, now %s)" % (schema, now_yyyymm), ""]
     lines.append("%-52s %-8s %-14s %6s" % ("dataset", "kind", "host", "age"))
     lines.append("-" * 84)

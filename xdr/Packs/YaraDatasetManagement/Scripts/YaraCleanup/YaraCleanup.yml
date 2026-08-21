@@ -60,7 +60,7 @@ args:
   - 'false'
 - name: schema_version
   description: The scanner's current lookup schema version (YARA_LOOKUP_SCHEMA_VER on
-    the endpoints; "2" if unset). Must be a whole number — a non-numeric value is
+    the endpoints; "4" if unset). Must be a whole number — a non-numeric value is
     rejected outright, because it would silently reclassify every live dataset as
     "legacy". Datasets on a HIGHER version are classified as "newer" and are never
     deleted; if this is stale-LOW the run prunes little and says which datasets rail 4

@@ -32,6 +32,10 @@ DEFAULT_XDR_API_URL = "replace_with_xdr_api_url"
 DEFAULT_QUIET_SECS = 900            # a finished scan's newest row must be older than this
 DEFAULT_ROW_CEILING = 2_000_000     # a scan bigger than this is reported, never half-merged
 DEFAULT_ABANDONED_SECS = 24 * 3600  # a non-terminal scan silent this long counts as finished
+
+# Lookup schema version assumed when the schema_version argument is left empty.
+# Must match the scanner's YARA_LOOKUP_SCHEMA_VER on the endpoints.
+DEFAULT_LOOKUP_SCHEMA_VERSION = "4"
 # ############################################################################
 
 # ============================================================================
@@ -730,7 +734,9 @@ PRUNE_LOCK_STALE_SECS = 6 * 3600       # a prune judges another run's lock far m
 
 # Dataset-name classification. The tenant's script container has no YARA_LOOKUP_SCHEMA_VER,
 # so main() always sets the version explicitly through set_schema_version().
-YARA_SCHEMA_VERSION = (os.environ.get("YARA_LOOKUP_SCHEMA_VER", "2").strip() or "2")
+YARA_SCHEMA_VERSION = (os.environ.get("YARA_LOOKUP_SCHEMA_VER",
+                                      DEFAULT_LOOKUP_SCHEMA_VERSION).strip()
+                       or DEFAULT_LOOKUP_SCHEMA_VERSION)
 YARA_OWNED_RE = re.compile(r"^(yara_scanner_(matches|scans)(_.*)?|yara_(matches|scans)_.*)$")
 CURRENT_RE = re.compile(r"^yara_scanner_(matches|scans)_v%s(_.*)?$" % re.escape(YARA_SCHEMA_VERSION))
 
@@ -1017,7 +1023,7 @@ def select_legacy_for_deletion(legacy_names, newer_names=(), now_yyyymm=None):
 
 def render_report(current, legacy, newer, now_yyyymm):
     """Human-readable inventory. Ages are whole months."""
-    schema = os.environ.get("YARA_LOOKUP_SCHEMA_VER", "2")
+    schema = os.environ.get("YARA_LOOKUP_SCHEMA_VER", "4")
     lines = ["YARA lookup datasets (schema v%s current, now %s)" % (schema, now_yyyymm), ""]
     lines.append("%-52s %-8s %-14s %6s" % ("dataset", "kind", "host", "age"))
     lines.append("-" * 84)

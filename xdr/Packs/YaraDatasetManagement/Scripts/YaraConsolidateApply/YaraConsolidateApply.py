@@ -39,6 +39,10 @@ DEFAULT_ABANDONED_SECS = 24 * 3600  # a non-terminal scan silent this long count
 _WRITE_BATCH = 500                  # rows per lookups/add_data call
 DELETE_CONCURRENCY = 12             # source shards deleted in parallel
 DEFAULT_LOCK_STALE_SECS = 2 * 3600  # another run's lock is treated as abandoned past this age
+
+# Lookup schema version assumed when the schema_version argument is left empty.
+# Must match the scanner's YARA_LOOKUP_SCHEMA_VER on the endpoints.
+DEFAULT_LOOKUP_SCHEMA_VERSION = "4"
 # ############################################################################
 
 # ============================================================================
@@ -734,7 +738,9 @@ PRUNE_LOCK_STALE_SECS = 6 * 3600       # a prune judges another run's lock far m
 
 # Dataset-name classification. The tenant's script container has no YARA_LOOKUP_SCHEMA_VER,
 # so main() always sets the version explicitly through set_schema_version().
-YARA_SCHEMA_VERSION = (os.environ.get("YARA_LOOKUP_SCHEMA_VER", "2").strip() or "2")
+YARA_SCHEMA_VERSION = (os.environ.get("YARA_LOOKUP_SCHEMA_VER",
+                                      DEFAULT_LOOKUP_SCHEMA_VERSION).strip()
+                       or DEFAULT_LOOKUP_SCHEMA_VERSION)
 YARA_OWNED_RE = re.compile(r"^(yara_scanner_(matches|scans)(_.*)?|yara_(matches|scans)_.*)$")
 CURRENT_RE = re.compile(r"^yara_scanner_(matches|scans)_v%s(_.*)?$" % re.escape(YARA_SCHEMA_VERSION))
 
@@ -1021,7 +1027,7 @@ def select_legacy_for_deletion(legacy_names, newer_names=(), now_yyyymm=None):
 
 def render_report(current, legacy, newer, now_yyyymm):
     """Human-readable inventory. Ages are whole months."""
-    schema = os.environ.get("YARA_LOOKUP_SCHEMA_VER", "2")
+    schema = os.environ.get("YARA_LOOKUP_SCHEMA_VER", "4")
     lines = ["YARA lookup datasets (schema v%s current, now %s)" % (schema, now_yyyymm), ""]
     lines.append("%-52s %-8s %-14s %6s" % ("dataset", "kind", "host", "age"))
     lines.append("-" * 84)
