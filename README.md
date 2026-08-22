@@ -43,17 +43,17 @@ or to the repository itself:
 | **`tests/`** | Most tests exercise **both** editions from one file, via a shared `EDITIONS` list. They are the mechanism that stops the two scanners drifting apart, so they belong to the pair — splitting them would mean duplicating them (they drift) or breaking them (they stop guarding). |
 | **`CHANGELOG.md`** | One chronology. Many entries are fixes applied to both editions together; splitting it would duplicate those and lose the ordering that shows when a fix crossed over. |
 | `encode_rules.py`, `test_rules.yar` | Edition-neutral: a rules base64-encoder and the sample ruleset both quick starts use. |
-| `tools/`, `RELEASING.md`, `conftest.py` | Repository machinery — pack build, release process, and the `sys.path` shim that puts both editions on the import path. Never shipped to a tenant. |
+| `tools/`, `conftest.py` | Repository machinery — pack build and the `sys.path` shim that puts both editions on the import path. Never shipped to a tenant. |
 
 ```
 .
 ├── xdr/     xdr_yara_scanner.py · xdr_action_center.py · xdr_consolidate.py
 │            xdr_data_management.py · Packs/ (dataset-management pack)
-│            playbooks/ · simulation/ · docs/ · dashboards/ · widgets/
+│            playbooks/ · docs/ · dashboards/ · widgets/
 ├── xsiam/   xsiam_yara_scanner.py · parsing_rules/
 │            docs/ · dashboards/ · widgets/
 ├── tests/   dual-edition test suite
-└── tools/  conftest.py  CHANGELOG.md  RELEASING.md  encode_rules.py  test_rules.yar
+└── tools/  conftest.py  CHANGELOG.md  encode_rules.py  test_rules.yar
 ```
 
 ## Running the tests

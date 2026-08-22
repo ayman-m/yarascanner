@@ -1,7 +1,7 @@
 # Capacity — how many machines can one scan cover?
 
-Every number here is measured on `api-emea-cxdrp` against real scans on 2026-08-20, not
-modelled. Where something is extrapolated it says so.
+Every number here is measured on a live Cortex XDR tenant against real scans on 2026-08-20,
+not modelled. Where something is extrapolated it says so.
 
 ## The hard limit
 

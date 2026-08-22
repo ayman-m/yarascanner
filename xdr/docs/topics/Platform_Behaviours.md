@@ -5,9 +5,9 @@ documented platform limit or a behaviour measured live on this tenant; where a n
 measured, the measurement is the fact and is kept.*
 
 This file exists so the shipping scripts do not have to carry it. `xdr_yara_scanner.py` and the
-five `YaraDatasetManagement` automations are customer-facing: their comments describe what the
-code does, not how the platform was found to behave. **Anything a maintainer needs to know about
-the platform before changing those files is here.**
+five `YaraDatasetManagement` automations focus their comments on what the code does, not on how
+the platform was found to behave. **Anything you need to know about the platform's own quirks
+and limits before relying on those scripts' behavior is here.**
 
 Related documents, which this one deliberately does **not** repeat:
 
@@ -18,6 +18,7 @@ Related documents, which this one deliberately does **not** repeat:
 | [Scan_Cancellation.md](Scan_Cancellation.md) | Console Cancel vs. the `cancel` entry point, and orphaned lifecycle rows |
 | [Rule_Compatibility.md](Rule_Compatibility.md) | Which YARA modules and libyara versions each agent ships |
 | [CPU_Impact_Control.md](CPU_Impact_Control.md) | The CPU governor and what it does and does not promise |
+| [API_Permissions.md](API_Permissions.md) | Least-privilege API key roles for the scanner, automation and dataset-management pack |
 | [../CAPACITY.md](../CAPACITY.md) | Measured bytes-per-row and how many hosts fit in the 50 MB cap |
 | [../design/Dataset_Management_v2_Design.md](../design/Dataset_Management_v2_Design.md) | The 50 MB cap and 1,000,000-row truncation as design constraints |
 
@@ -51,7 +52,7 @@ different bodies, so an under-permissioned key is not silently read as a missing
 Management but not Query Center can write rows and delete datasets but cannot run the
 enumeration query the scanner's start-of-scan overwrite depends on — the overwrite then degrades
 to a logged no-op and the dataset grows unbounded, while the scan itself still succeeds. See
-`.claude/skills/xdr-action-center-api/references/api-permissions.md`.
+[API_Permissions.md](API_Permissions.md).
 
 **There is no generic REST bridge on this tenant.** The Cortex Core - IR integration's
 `demisto-api-post` / `core-api-post` commands are **not registered** here at all (searching

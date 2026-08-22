@@ -8,10 +8,6 @@ actually fire**.
 
 Everything here uses the **console and XQL only**. No repo scripts, no API client.
 
-> **Not the same thing as [`TEST_PLAN.md`](TEST_PLAN.md).** That is the exhaustive
-> capability-coverage matrix (467 capabilities, three rounds) — an engineering artifact.
-> This is the afternoon's work that convinces *you* it runs correctly here.
-
 | Part | What it proves | Time | Destructive? |
 |---|---|---|---|
 | [A](#part-a--deployment-checks) | Deployment and credentials are right | 10 min | No |

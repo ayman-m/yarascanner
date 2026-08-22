@@ -81,14 +81,14 @@ the running scan stops within ~5s and writes a terminal `cancelled` row to `yara
 
 ## Verify a run
 
-After the playbook runs, matches and lifecycle rows land in the lookup datasets. Verify with the
-bundled skill:
+After the playbook runs, matches and lifecycle rows land in the lookup datasets. Verify in XQL:
 
-```bash
-.claude/skills/xdr-yara-scan-test/scripts/verify.py --hostname <host>
+```
+dataset = yara_scanner_scans | filter hostname = "<host>" | sort desc event_timestamp_ms
 ```
 
-or in XQL: `dataset = yara_scanner_scans | filter hostname = "<host>" | sort desc event_timestamp_ms`.
+See [Manual_Validation_Runbook.md](../docs/Manual_Validation_Runbook.md) for the full hands-on
+validation walkthrough.
 
 ## Alternative — no playbook engine
 

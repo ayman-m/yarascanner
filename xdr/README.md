@@ -87,7 +87,7 @@ has zero working widgets over its consolidated data and will need its own.
 
 ## Sizing
 
-Measured on `api-emea-cxdrp`, 2026-08-20, schema v4. Two scans, same rules, one Linux host:
+Measured on a live Cortex XDR tenant, 2026-08-20, schema v4. Two scans, same rules, one Linux host:
 
 |  | `/usr` | `/etc` |
 |---|---|---|
@@ -163,19 +163,16 @@ facility** — there is no built-in way to run this on a timer.
 - **[docs/CAPACITY.md](docs/CAPACITY.md)** — the full sizing measurements behind the table above.
 - **[docs/Troubleshooting.md](docs/Troubleshooting.md)** — when something looks wrong.
 - **[docs/topics/](docs/topics/)** — CPU impact, cancellation, datasets and maintenance, rule
-  compatibility, known limitations.
+  compatibility, known limitations, API key permissions.
 - **[docs/CAPABILITIES.md](docs/CAPABILITIES.md)** — every catalogued capability and how to
-  observe it on a live scan. **[docs/TEST_PLAN.md](docs/TEST_PLAN.md)** and
-  **[docs/rounds/](docs/rounds/)** — acceptance criteria and what each live round found.
-- **[docs/design/Dataset_Management_v2_Design.md](docs/design/Dataset_Management_v2_Design.md)** —
-  why the dataset model is shaped this way.
+  observe it on a live scan.
 
 ## What else is in this folder
 
 `xdr_action_center.py` (API toolkit — deliver, track, verify, cancel), `xdr_consolidate.py`
 (pure consolidation logic, unit-tested), `xdr_data_management.py` (CLI for consolidation and
-retention), `playbooks/` (Action Center runner and canceller), `simulation/` (fleet and scan
-simulators), `dashboards/` and `widgets/`. None of these are uploaded to the tenant.
+retention), `playbooks/` (Action Center runner and canceller), `dashboards/` and `widgets/`.
+None of these are uploaded to the tenant.
 
 ## Tests
 

@@ -73,8 +73,7 @@ Three consequences worth knowing before you run anything:
   enumerates the stale `scan_id`s with one XQL. Without `investigation_query_view` every
   scan 403s on that enumeration, fails safe, and the dataset quietly goes back to
   accumulating — the scan log says so and nothing else will. See
-  [api-permissions.md](../../../.claude/skills/xdr-action-center-api/references/api-permissions.md),
-  Key 1.
+  [API_Permissions.md](../../docs/topics/API_Permissions.md), Key 1.
 * **One open question, and it cannot bite here.** Whether `remove_data` re-stamps
   `_insert_time` on *surviving* rows is unresolved (`../../docs/topics/Known_Limitations.md:66`).
   The overwrite is a full flush of every previous `scan_id`, so no row survives it for a
@@ -387,7 +386,7 @@ DEFAULT_XDR_API_URL = "replace_with_xdr_api_url"
 ```
 
 Use an **Advanced**-type key and set an expiry — see
-[api-permissions.md](../../../.claude/skills/xdr-action-center-api/references/api-permissions.md)
+[API_Permissions.md](../../docs/topics/API_Permissions.md)
 for the least-privilege recipe used elsewhere in this project (the automation key needs
 script-execution/Action Center/query components; it deliberately should **not** be granted
 Data Management, per that doc — but this pack's `CoreApiClient` does need Data Management,
@@ -400,7 +399,7 @@ Use an **Advanced**-type key and set an expiry.
 
 Custom role — **Data Management** + **Query Center**, nothing else. No endpoint scope, no
 script components, no External Issues Mapping. This is "Key 3" in
-[api-permissions.md](../../.claude/skills/xdr-action-center-api/references/api-permissions.md),
+[API_Permissions.md](../../docs/topics/API_Permissions.md),
 where the full per-API mapping and the machine keys for `POST /platform/iam/v1/role` live.
 
 Three things about this tenant's RBAC that determine the answer, enumerated live from

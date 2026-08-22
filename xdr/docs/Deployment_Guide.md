@@ -278,11 +278,11 @@ flow using the built-in **Cortex Core - IR** integration (`core-get-scripts` →
 `core-get-endpoints` → `core-script-run`). Import them via console custom content and
 run manually or as a scheduled **Job**. See `playbooks/README.md`.
 
-## 8.4 Testing without a UI upload
+## 8.4 Validating before a production rollout
 
-The bundled skill `.claude/skills/xdr-yara-scan-test/` runs the scanner on an endpoint
-via `run_snippet_code_script` (no library upload) and verifies the datasets — useful for
-validating rules/credentials before a production rollout.
+See [Manual_Validation_Runbook.md](Manual_Validation_Runbook.md) — a console-and-XQL-only
+procedure that proves credentials, delivery and the dataset safety rails all work on your
+own tenant before you roll the scanner out to a fleet.
 
 ---
 

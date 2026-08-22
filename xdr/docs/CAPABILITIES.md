@@ -14,15 +14,8 @@ delivery: Insert Parsed Alerts + XQL lookup datasets). The XSIAM edition has its
 
 ## What this file is
 
-A reference for what the scanner can do today, and the shape new capabilities get recorded
-in. It exists for two jobs:
-
-1. **Onboarding and support** — what exists, what controls it, what a flag actually changes.
-2. **Test design** — every scan trial's success criteria are drawn from the *Observe* field
-   below. A capability nobody can observe on a live scan cannot be a test criterion, which
-   is why unobservable ones are marked rather than quietly listed as working.
-
-Update it in the same commit that changes behaviour.
+A reference for what the scanner can do today: what exists, what controls it, what a flag
+actually changes, and how to confirm it ran on a live scan.
 
 ## How to read an entry
 
@@ -82,9 +75,7 @@ not preserved — it was measured to cost up to 65.9x scan time while protecting
 | &nbsp;&nbsp;Scan Lifecycle, Control & Error Handling | 82 |
 | ⚠ Observability gaps | 30 |
 
-**30 capability entries carry an inline ⚠ OBSERVABILITY GAP marker**, down from the 40 originally recorded. Two further occurrences of the marker — in the legend above and under *Observability status* — are not entries and are not counted here or in the table.
-
-Every number in the table above, and the marker count in this paragraph, is DERIVED by parsing this file. They are not maintained by hand, because hand-maintained totals in this document have drifted repeatedly — most recently by one entry, introduced and caught inside a single working session.
+**30 capability entries carry an inline ⚠ OBSERVABILITY GAP marker** — the capability works but leaves no evidence trail on a live scan. The one further occurrence, in the legend above, is not an entry and is not counted here or in the table.
 
 The closed ones were never really broken. `setup_logging()` used to
 remove every root handler and pin `WARNING`, so all 43 `logging.info(...)` calls in this
@@ -4018,134 +4009,4 @@ carries over without translation.
 
 ---
 
-# Observability status
-
-Every entry once marked ⚠ OBSERVABILITY GAP was re-triaged against the current source.
-"Unobservable" turned out to conflate three different problems with three different
-fixes, which is why they are separated here rather than counted as one number.
-
-| Outcome | Count | Meaning |
-|---|---|---|
-| Closed | 10 | Evidence exists. The capability was always observable once root logging had a disk sink; only the wording was stale. |
-| Needs instrumentation | 7 | Runs, records nothing anywhere. Real work, listed below with what would close each. |
-| Unverified-dead | 18 | Believed unreachable — **not deleted, and not safe to delete on this evidence.** See the warning below. |
-
-## Needs instrumentation
-
-These execute and leave no trace at any log level. Each line names the minimal
-change that would make the capability assertable on a live scan.
-
-- **Duplicate module probe on a fresh compile (wasted work)** — Add one INFO line inside _get_available_yara_modules immediately before `return available` (line 5459): logging.info(f"YARA module probe: {len(test_modules)} candidates compiled, {len(available)} available"). Two of these lines in logs/diagnostics_<run_id>.log for one run proves the duplicate pass; one line means a cache HIT. (The real fix is to pass the modules computed at 5662 into _compile_yara_rules and drop the second probe — the log line is what makes either state visible.)
-- **Everything before the first rule declaration is discarded (except imports)** — In _split_yara_rules, right after the rule_starts loop (insert at line 5924, next to the existing `Found {N} rule start positions` info), emit: `if rule_starts:` compute `dropped = [l for l in lines[:rule_starts[0][0]] if l.strip() and not l.strip().startswith(('import ','include ','//'))]` and, when non-empty, `logging.info(f"Discarded {len(dropped)} non-import line(s) before the first rule declaration")`. That one line in logs/diagnostics_<run_id>.log turns the discard from an inferred count-gap into a direct measurement.
-- **Unknown platform has no directory skip list at all** — Add one field to scan_config_data in scan_system (dict at lines 6934-6942, logged at 6945): `'platform_skip_paths': len(getattr(self.config, 'skip_paths', ()))` (optionally alongside `'platform': platform.system()`). That makes the "Scan configuration established" entry in statistics_<run_id>.log state the skip-list size directly on every run — 0 proves the unknown-platform branch, non-zero proves the platform list loaded — instead of requiring the negative inference from a missing skip_breakdown key.
-- **Junction / reparse-point detection (_is_junction_or_symlink)** — Instrument the pruning site at line 7021 in scan_system: capture the removed entries before filtering, e.g. `pruned = [d for d in dirs if _should_skip_junction(os.path.join(root, d))]`, then `dirs[:] = [d for d in dirs if d not in pruned]` and, under `self.lock_counts`, `self.skip_reasons["Junction/symlink dir prune"] += len(pruned)` plus `self.junction_skip_count += len(pruned)`. That surfaces it in the skip_breakdown of the "Skip reasons" statistics entry (6774-6777) and in the existing junction_skips fields, no new file or field needed.
-- **Log-file deletion failures are tolerated, not fatal** — NEEDS_INSTR, and the minimal fix is a channel swap, not a new log line: in _prune_old_scan_logs replace the bare logging calls with the class's own helper - 4728 -> self._log(f"Cannot remove log file (in use): {path}"), 4731 -> self._log(f"Cannot remove log file {path}: {e}"), 4733-4736 -> self._log("Log retention applied: ..."), 4738 -> self._log(f"Log retention: {failed} log files could not be removed"). Since 7381 passes log_manager in, all four then land in logs/system_<run_id>.log. (Alternative, broader fix: move setup_logging(config) from 7461 to before cleanup_manager.initial_cleanup() at 7383 so the diagnostics handler exists during startup cleanup - that also closes every other pre-7461 logging.info.)
-- **macOS case-sensitivity probe writes and deletes /tmp/CaSe_TeSt_YaRa_<pid> per scanned file** — NEEDS_INSTR. Minimal: memoize + log once in _is_case_sensitive_fs - add a module-level cache (e.g. `_CASE_SENSITIVE_FS = None`) and, on the first Darwin evaluation, emit logging.info(f"Case-sensitivity probe (/tmp/CaSe_TeSt_YaRa_{os.getpid()}): case_sensitive={result}") plus logging.info on the except arm at 536-537 recording the probe failure before returning False. Because every caller path runs inside the scanner (after setup_logging at 7461), that line lands in logs/diagnostics_<run_id>.log. Ideally also add a `case_sensitive_fs` boolean to scan_summary so the decision is visible without reading the log.
-- **Alert channel's startup narration is unreachable - uploads log never records whether alerts are on** — NEEDS_INSTR. Minimal: give ResultsUploader.__init__ a `log_manager=None` parameter and pass self.log_manager at the 5112 construction site (mirroring LookupDatasetUploader at 5113), then drop the now-redundant late attach at 5120. Cheaper one-line alternative that needs no signature change: replace the guarded calls at 3290-3291, 3296-3297, 3300-3301, 3307-3308 with plain logging.info(...) - construction at 5112 happens after setup_logging (7461), so those records land in logs/diagnostics_<run_id>.log.
-
-## Unverified-dead — do not delete on this evidence
-
-These are believed unreachable. They were **not** removed, and the list should not be
-acted on as-is.
-
-A triage pass classified them, then an independent adversarial pass tried to refute
-each one and overturned 6 of 32 — including `_yara_callback`, which is wired into the
-only `rules.match()` call and is the hottest function in the process, and
-`lock_throttle`, which is taken from two threads on every scan-lifecycle row.
-
-A single manual spot-check of the SURVIVORS then found another false positive:
-"unnamed-rule fallback naming" was marked dead with instructions to delete the
-`else f"rule_{i}"` arms, but `rule { condition: true }` parses to `name=None`, the
-name regex fails against that body, and an unnamed rule is a YARA SyntaxError — so the
-fallback fires on exactly the compile-failure path where naming the offending rule
-matters most. Deleting it would make a malformed pack report a failure with no name.
-
-The methodological reason both passes missed it: they hunted for CALLERS, which is the
-right test for "is this function ever invoked" and the wrong one for a dead BRANCH
-inside a live function. Reachability of a branch is settled by constructing the input
-that drives execution down it, not by grepping for references.
-
-Anything below needs that branch-level check before removal:
-
-- _is_valid_rule_structure — DEAD CODE
-- Dead hook: _discover_all_targets override branch
-- The scanner's own output log path is excluded from scanning
-- Windows drive-letter exclusion list (present but permanently empty)
-- DEAD CODE: Windows wildcard pattern skip list never matches anything
-- DEAD: total_files_found and files_per_target are computed then discarded
-- DEAD CODE: idle-tier ("os") priority branch
-- DEAD CONSTANT: WORKER_GET_TIMEOUT_SECS
-- DEAD CONSTANT: CANCEL_DRAIN_DEADLINE_SECS
-- DEAD CONFIG: batch_size / performance_log_interval / statistics_upload_interval
-- DEAD CODE: _get_scanner_stats aggregate
-- DEAD CODE: periodic scan-status upload
-- Per-file permission denials accumulate in an unbounded list that nothing ever reads
-- DEAD CODE: ScanStatusUploader.upload_scan_status() is never called and is double-gated off
-- CANCEL_DRAIN_DEADLINE_SECS - dead constant
-- ResultsUploader.upload_results - dead finalisation path
-- CircuitBreaker class - defined, never instantiated
-
----
-
-# Provenance
-
-Enumerated across six dimensions, then adversarially re-verified entry by entry against an
-immutable snapshot of the scanner (v3.3.0, 7,785 lines, sha256 `4ced74193d228e42`).
-
-The re-verification was not routine. The original enumeration read the scanner from the
-repository working tree while a parallel session switched branches underneath it, so
-different agents saw two different versions of the file (7,785 vs 7,781 lines, differing by
-~300 lines). The re-verification pass against the pinned snapshot corrected
-**407 line references** and **33 substantive claims**, and dropped
-9 entries as duplicates or unfounded — which is the measure of how much of the
-first pass was unreliable.
-
-The lesson, recorded because it will recur: in a repository whose working tree is shared
-with another session, **the filesystem is not a stable source of truth**. Pin the version
-(`git show <ref>:<path>`, or a read-only snapshot) before enumerating anything against it.
-
-Of the original 456 entries, 455 were confirmed line-by-line against the pinned file.
-
-## Completeness and accuracy audit
-
-A later pass audited the catalogue against the scanner as it stands, mechanically where
-possible and by a six-way parallel sweep for completeness. What it established:
-
-**Structure is sound.** All entries parse, every one carrying Control, Observe and Source;
-the per-section counts agree with the table above because both come from the same parse.
-
-**Observe fields hold up.** Every quoted literal that looked absent on a first pass turned
-out to be present once f-string placeholders were accounted for. This matters more than
-any other field: acceptance criteria are written from *Observe*.
-
-**Source LINE NUMBERS do not hold up, and it does not matter much.** Of 56 checkable
-`symbol() line N` references, zero were within five lines of the truth and all 56 were
-40+ off, clustering near 194. This is not an XDR defect — the XSIAM catalogue measures
-51 of 56 the same way, and it supported 297 acceptance criteria regardless, because
-criteria come from *Observe* and the symbol NAMES are correct. **New and rewritten entries
-therefore cite symbols and test files rather than line numbers**, which is the only part
-of a reference that survives the next commit. Roughly 2,900 further bare line numbers
-remain in older entries; they should be dropped as those entries are next touched, not
-mass-edited.
-
-**Dead-code claims are still true.** Every symbol-level DEAD CODE / DEAD CONSTANT claim
-was re-checked for call sites and all survived. Branch-level claims were left to a human,
-as the section above insists.
-
-**Eleven capabilities were missing**, found by a six-dimension sweep whose proposals were
-each adversarially refuted before acceptance (21 proposed, 15 confirmed, 6 refuted; the
-15 deduplicated to 11 distinct capabilities seen from several dimensions). Four were
-behaviour added on this branch and not yet written up — the failure this file's closing
-line warns about, committed by its own maintainer. Two were defects rather than
-omissions, and were fixed: the root diagnostics FileHandler was never closed before host
-cleanup, and every logger-setup failure path announced itself on stdout, whose 10,240-char
-budget belongs to the SCAN_RESULT line.
-
-**Counts are now derived, not typed.** The At-a-glance table and the marker count are
-produced by parsing this file. The prompt for that was drift introduced and caught inside
-a single session.
-
----
-
-*Keep this current in the same commit that changes behaviour — a stale capability
-reference is worse than none, because it is trusted.*
+*Generated from a source enumeration of `xdr_yara_scanner.py`. Update it in the same commit that changes behaviour — a stale capability reference is worse than none, because it is trusted.*

@@ -5,16 +5,8 @@ The XDR edition has its own: [`docs/xdr/CAPABILITIES.md`](../../xdr/docs/CAPABIL
 
 ## What this file is
 
-A reference for what the scanner can do today, and the shape new capabilities get recorded
-in. It exists for two jobs:
-
-1. **Onboarding and support** — what exists, what controls it, what a flag actually changes.
-2. **Test design** — every scan trial's success criteria are drawn from the *Observe* field
-   below. A capability nobody can observe on a live scan cannot be a test criterion, which
-   is why unobservable ones are marked rather than quietly listed as working.
-
-Derived by enumerating the source directly, then auditing the result three ways
-(completeness, accuracy, observability). Update it in the same commit that changes behaviour.
+A reference for what the scanner can do today: what exists, what controls it, what a flag
+actually changes, and how to confirm it ran on a live scan.
 
 ## How to read an entry
 
@@ -47,11 +39,9 @@ Two markers flag work, not documentation:
 | ⚠ Control gaps (verified) | 27 |
 | ⚠ Observability gaps | 17 |
 
-**17 open observability gaps**, after triage — down from the 40 this inventory
-originally recorded. The closed ones were never really broken: their evidence was an
-info-level log that reached nothing until root logging gained a disk sink. See
-*Observability status* below for the split between what still needs instrumentation and
-what is believed dead. Inline ⚠ markers are a subset — the section below is authoritative.
+**17 capability entries carry an inline ⚠ OBSERVABILITY GAP marker** — the capability works
+but leaves no evidence trail on a live scan. The closed ones were never really broken: their
+evidence was an info-level log that reached nothing until root logging gained a disk sink.
 
 ---
 
@@ -2559,142 +2549,4 @@ control-loop tuning, not policy, and the policy knobs above them are exposed.
 
 ---
 
-# Observability status
-
-Every entry once marked ⚠ OBSERVABILITY GAP was re-triaged against the current source.
-"Unobservable" turned out to conflate three different problems with three different
-fixes, which is why they are separated here rather than counted as one number.
-
-| Outcome | Count | Meaning |
-|---|---|---|
-| Closed | 25 | Evidence exists. The capability was always observable once root logging had a disk sink; only the wording was stale. |
-| Needs instrumentation | 9 | Runs, records nothing anywhere. Real work, listed below with what would close each. |
-| Unverified-dead | 8 | Believed unreachable — **not deleted, and not safe to delete on this evidence.** See the warning below. |
-
-## Needs instrumentation
-
-These execute and leave no trace at any log level. Each line names the minimal
-change that would make the capability assertable on a live scan.
-
-- **Initial cleanup at scan start** — Minimal fix, no ordering change: in CleanupManager.initial_cleanup, replace the three bare calls with the manager's own channel - line 4120 -> `self._log("Starting initial cleanup of old data...")`, line 4136 -> `self._log(f"Removed: {path}")`, line 4151 -> `self._log("Initial cleanup completed successfully", {"paths_cleaned": len(paths_to_clean)})`. All three then land in logs/system_<run_id>.log, which already exists at that point (LogManager is built before CleanupManager in main). Do NOT rely on diagnostics_<run_id>.log here - setup_logging has not run yet.
-- **Log/summary retention across runs** — Route it through the LogManager that CleanupManager already holds: change line 4110 to `self._log(f"Log retention applied: kept last {keep_count} scans ({len(keep_run_ids)} run IDs including current), removed {removed} files", {"keep_scans": keep_count, "run_ids_kept": len(keep_run_ids), "files_removed": removed, "files_failed": failed})` and line 4114 to `self._log(f"Log retention: {failed} files could not be removed", level="error")`. Both land in system_<run_id>.log / scan_errors_<run_id>.log, which exist before initial_cleanup runs. Moving setup_logging(config) above line 6212 in main() would also work and would fix item 44 at the same time, but it changes startup ordering; the _log route is the lower-risk minimum.
-- **Governor sampling cadence (rate limit)** — Instrument _sample_governor (line 4887). Add `self._governor_sample_count = 0` beside line 4408, then immediately after line 4898 insert `self._governor_sample_count += 1` and capture the gap, e.g. `_gap = now - _prev` where `_prev = self.last_governor_sample` is read before line 4898. Add both to the payload already emitted at 4917-4920 by extending `s_` with `{'samples_taken': self._governor_sample_count, 'secs_since_last_sample': round(_gap, 3), 'sample_interval_secs': self.config.throttle_check_interval_secs}`. performance_<run_id>.log then shows sampling cadence directly and the criterion becomes "secs_since_last_sample is never below throttle_check_interval_secs (default 0.5)" - no debug build required.
-- **Upload channels can be disabled independently** — Minimal instrumentation for the live half: give ResultsUploader.__init__ a `log_manager=None` parameter (3174) and set `self.log_manager = log_manager` before the `if UPLOAD_RESULTS: self._start_upload_thread()` at 3208-3209, then pass it at the construction site (line 4353 -> `ResultsUploader(config, log_manager=self.log_manager)`) and drop the now-redundant assignment at 4360; lines 3232/3236/3242 then land in uploads_<run_id>.log. Cheaper alternative that needs no wiring: change those three calls to `logging.info(...)`, which now reaches diagnostics_<run_id>.log. Separately, the dead method ResultsUploader.upload_results (3501-3559) — including the 'Upload disabled' line at 3557 — is safe to delete; do not cite it as evidence. The scanner_initialization upload_enabled/telemetry_upload_enabled half of the entry stays as-is.
-- **Circuit breaker on the telemetry channel** — Minimal instrumentation: in CircuitBreaker.on_failure (1202-1210), emit on the two transitions into 'open' (after 1207 and after 1210) `logging.warning(f"Telemetry circuit opened after {self.consecutive_failures} consecutive failures; pausing uploads for {self.reset_timeout}s")`, and in allow() (1188-1189) log the half-open probe — both now land in diagnostics_<run_id>.log; optionally add a `circuit_opens` counter to WebhookUploader.upload_stats so it surfaces in the upload statistics summary. Then rewrite Observe to induce it with a rejected-but-reachable collector (wrong API key → non-2xx outside 408/429/5xx, hitting line 3765) rather than a dead one, and state explicitly that an unreachable collector does NOT open the circuit. Separately flag as a design question — not an observability fix — whether the ConnectionError/Timeout branch at 3767 should call on_failure() once MAX_RETRIES_PER_ITEM (=2, line 157) is exhausted.
-- **Log/summary retention across runs** — Minimal fix, either one: (a) in CleanupManager._prune_old_scan_logs, replace the logging.info at 4110-4113 with `self._log(...)` so the same text lands in logs/system_<run_id>.log via the channel already wired at 6211/4039-4050; or (b) move `setup_logging(config)` from 6342 to immediately after `config.log_manager = log_manager` (6206), before `cleanup_manager.initial_cleanup()` at 6213 - safe because _prune_old_scan_logs preserves the current run_id (4063 regex + keep_run_ids), so the just-created diagnostics_<run_id>.log is not pruned. Until then Observe must say: verify retention by listing logs/ and counting distinct run_ids, not by grepping for the message.
-- **Initial cleanup at scan start** — Minimal instrumentation: convert the three logging.info calls in CleanupManager.initial_cleanup (4120, 4136, 4151) to `self._log(...)` - the method already exists at 4039-4054 and routes to log_manager.log_system, and cleanup_manager is constructed with the real log_manager at 6211 - so they land in logs/system_<run_id>.log. Equivalent alternative: hoist `setup_logging(config)` from 6342 to just after 6206 so the diagnostics handler exists before 6213. Until one of those lands, Observe should say only `Some cleanup operations failed - continuing with scan` (stderr) and `Initial cleanup completed` (system_<run_id>.log, emitted by main() at 6214) are checkable.
-- **macOS case-sensitivity probe file written to /tmp for every file that reaches the scan body** — Two minimal edits, both small. (1) Memoise and log the probe once: wrap _is_case_sensitive_fs (671) in functools.lru_cache(maxsize=1) and add, just before the Darwin `return not exists_lower` at 682, `logging.info(f"FS case-sensitivity probe: {test_file} -> case_sensitive={not exists_lower}")` (plus a logging.warning in the bare except at 683-684 naming the failure) - both then land in diagnostics_<run_id>.log via the handler at 6057-6061, and the /tmp write drops from once-per-file to once-per-run. (2) Add `"fs_case_sensitive": _is_case_sensitive_fs()` to the write_scan_summary dict in main()'s finally block (near the existing entries at 6765-6790) so the value is recorded per run. Separately note that unique_real_paths (5495) and unique_paths_scanned (5521) are hardcoded-0 telemetry while track_real_paths is False at 2854 - they should be dropped or the flag made configurable, but that is its own item.
-- **File-descriptor leak sampling (skipped on every matched file, and on every skipped file)** — Rewrite Observe to state the default-off gate first (flip ENABLE_FD_MONITOR at 248 to True in the uploaded script - env vars are not settable via Action Center), then add the missing sample record: in scan_file's FD block, emit one line per sample regardless of thresholds, e.g. immediately after the reset at 5065 add `self.log_manager.log_system(f"FD sample: files_since_check={self.fd_check_interval}, current={current_fds}, delta={fd_increase}")` (move it inside the num_fds try at 5071 so current_fds is bound), and make the increment atomic by taking self.lock_counts around 5063. Also add a `fd_samples_taken` counter incremented at 5065 and surface it in write_scan_summary (dict at 6765-6790) so the sample count can be compared against files_scanned/1000 - that is what proves the matched-file and early-return skips, since a run where every file matches would otherwise show zero samples with no explanation.
-
-## Unverified-dead — do not delete on this evidence
-
-These are believed unreachable. They were **not** removed, and the list should not be
-acted on as-is.
-
-A triage pass classified them, then an independent adversarial pass tried to refute
-each one and overturned 6 of 32 — including `_yara_callback`, which is wired into the
-only `rules.match()` call and is the hottest function in the process, and
-`lock_throttle`, which is taken from two threads on every scan-lifecycle row.
-
-A single manual spot-check of the SURVIVORS then found another false positive:
-"unnamed-rule fallback naming" was marked dead with instructions to delete the
-`else f"rule_{i}"` arms, but `rule { condition: true }` parses to `name=None`, the
-name regex fails against that body, and an unnamed rule is a YARA SyntaxError — so the
-fallback fires on exactly the compile-failure path where naming the offending rule
-matters most. Deleting it would make a malformed pack report a failure with no name.
-
-The methodological reason both passes missed it: they hunted for CALLERS, which is the
-right test for "is this function ever invoked" and the wrong one for a dead BRANCH
-inside a live function. Reachability of a branch is settled by constructing the input
-that drives execution down it, not by grepping for references.
-
-Anything below needs that branch-level check before removal:
-
-- Unnamed-rule fallback naming
-- Rule-count propagation into scan telemetry (valid/failed on scan_status)
-- Scan-rate reporting item (5): scan_rate_files_per_second on scan_status
-- Diagnostic-preserving cleanup suppression
-- $? placeholder for a match with no string ID
-- Rule-count propagation into scan telemetry (scan_status half)
-- Scan-rate reporting item (5) — scan_rate on scan_status
-- Dead cached-hit dict ingestion path in match-field extraction
-
----
-
-# Known issues in this inventory
-
-Raised by three independent audits of the enumeration.
-
-**Closed:** 35 uncatalogued capabilities and 24 miscatalogued entries. Each was deduplicated across the three audits,
-re-derived from source, and either folded in as a real entry or — where the audit claim
-was itself wrong — refuted with the deciding line. Audit prose was not trusted as input.
-
-### The root logger is silent — most `logging.info` evidence does not exist
-
-**Root cause fixed; the per-entry markers below are now stale.** `setup_logging()` used
-to remove every root handler and pin `WARNING`, so all 40 `logging.info(...)` calls in
-this file reached nothing on any host — which is what made the capabilities below
-untestable. Root now carries an INFO `FileHandler` writing to
-`logs/diagnostics_<run_id>.log`, while stdout stays clean (Action Center truncates stdout
-at 10,240 chars, which is why the original suppression existed).
-
-The entries below therefore still carry ⚠ OBSERVABILITY GAP markers that no longer
-apply. Re-deriving each *Observe* field against the new sink is outstanding work; until
-that pass runs, treat a marked entry as "evidence exists in diagnostics_<run_id>.log,
-wording not yet updated" rather than "unobservable".
-
-Two such cases were fixed while writing this file (the evidence-ZIP dedupe and the
-metadata-only packaging line, both now routed through `LogManager`). The remaining
-17 are listed below — they are the single largest blocker to testing this scanner,
-because each is a behaviour that works and cannot be proven to have worked.
-
-### Observability gaps (40)
-
-*Capability exists; nothing on a live scan proves it ran.*
-
-- CROSS-CUTTING: every `logging.info(...)` in this file reaches nothing. `setup_logging()` (5882-5896) removes all root handlers and pins the root level at WARNING, and before it runs the root logger is already at its default WARNING with no handlers. WARNING/ERROR still surface on stderr via basicConfig/lastResort; INFO does not, anywhere. The rules dimension noted this for `_debug_rule_analysis` but the other five dimensions kept writing observe notes against root-logger INFO lines. Every entry below inherits this defect.
-- rules, "Comment- and string-aware pack parser": the whole test is anchored on comparing the `Found N rule start positions` count — a `logging.info` at line 4663. Nothing writes it. (The `total_rules_found` half of the comparison, from main()'s `YARA Rules loaded` system event, does work.)
-- rules, "Per-rule trial compile then namespaced whole-pack compile": `Successfully built ruleset with N rules (M failed) (K skipped - missing modules)` is `logging.info(success_msg)` at 4611-4618. Never written to any log file or stderr.
-- traversal, "Unknown-platform target fallback": `Using default Unix target: ['/']` is `logging.info` at 5278. Unobservable. (The `Unknown platform - manual target specification required` half is an error_logger warning and does land in yara_processing_<run_id>.log.)
-- storage, "Initial cleanup at scan start": `Starting initial cleanup of old data...`, one `Removed: <path>` per entry, and `Initial cleanup completed successfully` are all `logging.info` (4002-4014, 4029). Only the PermissionError warnings and `Some cleanup operations failed` reach stderr. The system-log line `Initial cleanup completed` (main, 6030) is the only durable signal.
-- storage and lifecycle, "Log/summary retention across runs": `Log retention applied: kept last N scans (M run IDs including current), removed X log files` is `logging.info` at 3991-3995. Unobservable. Only the `Cannot remove log file (in use)` / `Log retention: F log files could not be removed` warnings reach stderr — and `_prune_old_scan_logs` runs from `initial_cleanup()` before `setup_logging`, so even those depend on basicConfig having been installed by an earlier module-level `logging.warning`.
-- storage, "Matched-file copy toggle (COLLECT_MATCHED_FILES)": `Evidence: COLLECT_MATCHED_FILES=false - packaging metadata only (...)` is `logging.info` at 3913-3916. Unobservable; the ZIP contents are the only real signal.
-- storage, "Content-addressed dedupe of packaged matched files": `Evidence ZIP: N unique file(s) packaged, M duplicate copy(ies) skipped` is `logging.info` at 3926-3930. Unobservable. (`Error adding file to zip <path>: <err>` is logging.error and does reach stderr.)
-- storage, "Windows scheduled cleanup task (CleanupScript)": `Windows cleanup task scheduled for HH:MM` is `logging.info` at 4147, and the paired `Windows cleanup task scheduled successfully` sits behind the dead `config.log_manager` guard (4076-4077). Only `schtasks /query` on the endpoint and main()'s `Cleanup task/service scheduled successfully` (6363) are observable.
-- storage, "Linux systemd cleanup unit": `Linux cleanup service created and started` is `logging.info` at 4183, and `Linux cleanup service scheduled successfully` is behind the same dead guard (4080-4081). Only `systemctl status` and main()'s generic success line are observable.
-- lifecycle, "scan_status lifecycle values and the terminal status": "the local line `Scan status changed to: <value>` via the root logger" — `logging.info` at 3560. Unobservable locally; only the uploaded `scan_status` events exist, and those additionally require UPLOAD_RESULTS + UPLOAD_NON_MATCH_DATA + a non-empty API_ENDPOINT + `webhook_uploader` having been wired on by main().
-- storage/rules, cleanup-suppression system-log lines: `Critical errors detected - skipping cleanup to preserve diagnostic data` (with `{'preserve_logs': True}`) and `No alerts found, skipping cleanup scheduling` (4053-4065) are both inside `if hasattr(self.config, 'log_manager')`, which is permanently False — and their `logging.info` twins are suppressed. Neither ever appears in system_<run_id>.log. The only durable evidence of suppression is main()'s `Cleanup skipped due to critical YARA processing errors` and the absence of the scheduled task/unit.
-- performance, "Governor sampling cadence (rate limit)": the stated test is "with a debug build, `last_governor_sample` advances at most every 0.5s". There is no debug build and nothing exposes `last_governor_sample` — no log line, no event field. The only real handle on the sampling rate is the emission cadence, which is separately governed by the 0.25 change threshold and GOVERNOR_HEARTBEAT_SECS.
-- rules / 'Rule input size cap': the observe note says it "surfaces as the `Critical startup error:` stderr block and exit code 1 (no run_id / logs dir content, because it fires before ErrorLogger emits anything else)". Both halves fail. ScanConfig is constructed inside main()'s try, so a ValueError('YARA rules input too large') is caught by main()'s `except Exception` and surfaces as 'YARA Scanner Critical Error: Critical scanner error: ...' plus 'SCAN_STATUS: ERROR' on stderr, returning 'Scan failed: 0 files scanned \| ... \| Critical error occurred'. 'Critical startup error:' only covers exceptions escaping main() in the __main__ block. And ErrorLogger is constructed BEFORE the decode (line ~2704), so logs/yara_processing_<run_id>.log already exists with its 4-line banner plus 'CRITICAL: Failed to decode YARA rules: YARA rules input too large'.
-- rules / 'Unnamed-rule fallback naming': `Rule Name: rule_7` in a compilation-failure block and the filename failed_rules/failed_rule_rule_7.yar cannot be produced. _clean_rule_content's guard regex `^\s*(?:(?:private\|global)\s+)*rule\s+\w+` drops any block without a name (logging 'Rule rule_N doesn't start with...'), so every block reaching _compile_yara_rules matches `rule\s+(\w+)` and display_name is always the real name - the `f"rule_{i}"` fallback at line ~4479 is dead. The placeholder only ever appears in the suppressed logging.warning text.
-- rules / 'Comment- and string-aware pack parser': it instructs comparing the `Found N rule start positions` count against total_rules_found. That line is a logging.info in _split_yara_rules (line ~4661) and the root logger is at WARNING with no handlers (setup_logging, 5882-5896) - it is written nowhere, exactly as the doc itself notes for 'Found N unique import statements'. Only the total_rules_found half of the comparison is observable.
-- rules / 'Rule-count propagation into scan telemetry': `scan_status` event fields valid_rules_count / failed_rules_count never appear. ScanStatusUploader.upload_scan_status(scanner_stats=None) only adds that block `if scanner_stats:`, and every one of the 9 call sites goes through set_status(), which calls upload_scan_status() with no argument - as the lifecycle 'scan_status event payload' entry correctly states. Only the six base fields are ever emitted.
-- performance / 'Scan-rate reporting in the terminal artefacts', item (5): `scan_rate_files_per_second` in 'periodic scan_status events'. Same root cause - it is only set inside the `if scanner_stats:` branch, which is never taken. Additionally scan_status is emitted on lifecycle transitions only (starting/initializing/starting_workers/scanning/finishing/terminal), never on a timer, so 'periodic' is doubly wrong. Items (1)-(4) are fine.
-- delivery / 'One merged alert event per matched file': the test criterion "XQL type='alert' for one scan_id: count must equal the number of distinct matched file paths" is off by one on any scan with detections. There are two log_alert() call sites: the per-file event in scan_file (line 4922) and the 'Top detection rules: ...' summary in _log_final_results (line 5399), which also lands as type='alert'. The grep of alerts_<run_id>.log for 'YARA matches found in' is the reliable half.
-- delivery / 'Upload channels can be disabled independently': neither uploads-log line can be observed. 'Upload disabled - N matches saved locally' lives in ResultsUploader.upload_results(), which is dead code - it has no caller anywhere in the file (the class's own docstring says so). 'API_ENDPOINT not configured - real-time match upload disabled' is emitted from _start_upload_thread() guarded by `if self.log_manager:`, but log_manager is still None during ResultsUploader.__init__ (YaraScanner assigns results_uploader.log_manager only on the next-but-one statement, line ~4238), so it is silently discarded - as are 'Starting real-time upload thread...' and 'Real-time upload thread started successfully'. The scanner_initialization upload_enabled / telemetry_upload_enabled half of the entry is fine.
-- delivery / 'Queue-full handling on the findings channel': 'Upload queue full - skipping real-time upload for finding' cannot fire from queue pressure. self.upload_queue = Queue() is unbounded (the entry says so itself), so put(..., timeout=1.0) never raises Full; the message is printed from a broad `except Exception` that in practice only catches a serialization failure. Same for the telemetry channel's unbounded queue.
-- rules / 'Diagnostic-preserving cleanup suppression': the named trigger cannot produce the named log line. main() computes the identical `has_critical_errors = (error_logger.has_errors and error_logger.valid_rules_count == 0)` and skips calling schedule_final_cleanup() entirely, logging 'Cleanup skipped due to critical YARA processing errors' instead; and valid_rules_count == 0 aborts the run during compilation anyway. 'Critical errors detected - skipping cleanup to preserve diagnostic data' is reachable only through the >50% error-log-ratio branch.
-- storage / 'Uncapped per-string-ID census in the alert text': the parenthetical "a match with no string ID renders as `$?`" is unreachable on a live scan. _write_alerts consumes strings produced by _iter_hit_fields -> _normalize_match_strings, which always coerces the identifier with str(...) and substitutes the literal 'unknown' when absent - sid is never None. The census itself, 'Total string hits: N', and the sum-equals-total assertion are all fine.
-- rules / 'Comment- and string-aware pack parser': `Found N rule start positions` (line 4663) is a bare logging.info on the root logger, which setup_logging pins at WARNING with no handlers - it is written nowhere. Only the second half (total_rules_found in the 'YARA Rules loaded' system event) is usable, and that is the pre-split census, not the compile-path count the entry wants to compare against.
-- rules / 'Per-rule trial compile then namespaced whole-pack compile': `Successfully built ruleset with N rules (M failed) (K skipped - missing modules)` is emitted by logging.info ONLY (lines 4611-4615) and never mirrored to error_logger, so it appears in no file and on no stream. The running.json 'compiling' to first-worker-start half does work.
-- rules / 'Unnamed-rule fallback naming': the rule_N placeholder is unreachable. _clean_rule_content's guard regex `^\s*(?:(?:private\|global)\s+)*rule\s+\w+` (line 4319) drops any block where 'rule' is not followed by a \w+ token, so nothing arriving at _compile_yara_rules can fail its `re.search(r'rule\s+(\w+)')` (line 4479). No 'Rule Name: rule_7' failure block and no failed_rule_rule_7.yar can ever be produced.
-- rules / 'Rule-count propagation into scan telemetry' (scan_status half): valid_rules_count / failed_rules_count are never emitted on scan_status. upload_scan_status only adds them when scanner_stats is truthy (lines 3528-3537), and all nine set_status() call sites (5621, 5725, 5747, 5773, 5870, 6254, 6257, 6278, 6457) call upload_scan_status() with no argument. Every scan_status row carries only the six base fields.
-- delivery / 'Scan-rate reporting in the terminal artefacts', item (5): scan_rate_files_per_second in scan_status events - same cause as above, never emitted. Also scan_status events are per-transition, not 'periodic'. Items (1)-(4) are fine.
-- delivery x3 / wrong alert directory: 'Uncapped per-string-ID census in the finding (match_ids)', 'Condition-only match representation' and 'Local alert file as the uncapped offset record' all point at <scanner_dir>/alerts/<rule>.txt. The on-disk directory is `alert` (singular) - os.path.join(self.scanner_dir, "alert") at line 2697, written at 5159. Only the evidence ZIP uses an `alerts/` member prefix (line 3921). Each cross-check would look in a directory that does not exist.
-- delivery / 'Circuit breaker on the telemetry channel': the recipe 'with a dead collector' cannot open the circuit. _process_standard_batch calls _circuit.on_failure() only on a non-retryable HTTP status (line 3687) or an unexpected exception (3692); requests.Timeout / requests.ConnectionError (3689) and the retryable set 408/429/500/502/503/504 (3684) never touch it. An unreachable collector yields ConnectionError, so the breaker stays closed for the whole run and no 40 s quiet windows appear.
-- delivery / 'Throttled upload logging': the upload_err bucket is logged via _throttled_log's DEFAULT level='error' (call sites 3243, 3256, 3262), which routes to log_error and lands in scan_errors_<run_id>.log, not uploads_<run_id>.log. Only upload_ok, upload_retry and upload_neterr pass level='upload'. Grepping uploads_<run_id>.log for the 20 full errors and the '[upload_err] further similar messages suppressed' line finds nothing.
-- storage / 'Matched-file copy toggle (COLLECT_MATCHED_FILES)': 'the root logger records Evidence: COLLECT_MATCHED_FILES=false - packaging metadata only...' - that is logging.info (line 3913), suppressed by setup_logging. The unzip -l half of the check works.
-- storage / 'Content-addressed dedupe of packaged matched files': 'the root logger prints Evidence ZIP: N unique file(s) packaged, M duplicate copy(ies) skipped' - logging.info (line 3926), suppressed. The bare-hex arcnames and entry-count comparison still work; 'Error adding file to zip' is logging.error and does reach stderr.
-- storage / 'Log/summary retention across runs' and lifecycle / 'Artefact retention across runs': 'Log retention applied: kept last N scans (M run IDs including current), removed X log files' is logging.info (line 3992), suppressed. Only the WARNING-level 'Cannot remove log file (in use)' and 'Log retention: N log files could not be removed' reach stderr. Verify retention by listing logs/ instead.
-- storage / 'Initial cleanup at scan start': 'Starting initial cleanup of old data...' (4002), 'Removed: <path>' (4018) and 'Initial cleanup completed successfully' (4033) are all logging.info, suppressed. Observable substitutes: the WARNING 'Some cleanup operations failed - continuing with scan' (4031) and the system-log line 'Initial cleanup completed' emitted by main() at line 6030.
-- storage / 'Windows scheduled cleanup task (CleanupScript)': 'The root logger prints Windows cleanup task scheduled for HH:MM' - logging.info (line 4147), suppressed. schtasks /query and the system-log 'Windows cleanup task scheduled successfully' are the working checks.
-- storage / 'Linux systemd cleanup unit': 'Root logger prints Linux cleanup service created and started' - logging.info (line 4183), suppressed. systemctl status and the system-log 'Linux cleanup service scheduled successfully' work.
-- traversal / 'Unknown-platform target fallback': the second observable, `Using default Unix target: ['/']` (line 5278), is logging.info and suppressed. The 'Unknown platform - manual target specification required' warning does land in yara_processing_<run_id>.log (error_logger.warning, line 3084), so only half the entry stands.
-- lifecycle / 'scan_status lifecycle values and the terminal status': (a) the local line 'Scan status changed to: <value>' is logging.info (line 3560), suppressed - scan_status is collector-only. (b) The stated test criterion ('every run ends with exactly one terminal value') fails on main()'s outer critical-error path (6466+): it writes 'SCAN_STATUS: ERROR' to stderr and queues a scan_completion_summary with status='critical_error', but never calls set_status, so the last scan_status row can remain 'finishing'.
-- lifecycle / 'Fatal worker failure path': not reproducible on a live scan. scan_file already wraps everything in `except Exception` (4972), and _worker's inner `except Exception ... continue` (4737-4744) swallows the rest, so the outer handler that logs 'Worker <id> fatal error:' and calls _mark_scan_failed (4746-4749) is effectively unreachable. There is no way to drive the run to 'Scan stopped due to fatal failures' / outcome='failed' through this path.
-
----
-
-*Generated from a source enumeration of `xsiam_yara_scanner.py`, audited for completeness,
-accuracy and observability. Keep it current in the same commit that changes behaviour —
-a stale capability reference is worse than none, because it is trusted.*
+*Generated from a source enumeration of `xsiam_yara_scanner.py`. Update it in the same commit that changes behaviour — a stale capability reference is worse than none, because it is trusted.*

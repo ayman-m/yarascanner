@@ -180,8 +180,7 @@ not via these role APIs — it is not an RBAC key.
 
 ### Option B — fully via public API (IAM Platform APIs)
 
-The whole thing is scriptable — `scripts/manage_role_key.py` in this skill wraps it. The
-raw calls (all verified live):
+The whole thing is scriptable. The raw calls (all verified live):
 
 ```bash
 # 1) discover the exact machine keys for your tenant + their dependencies

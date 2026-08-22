@@ -33,12 +33,6 @@ back-pressure and different books.
 
 - **[docs/CAPABILITIES.md](docs/CAPABILITIES.md)** — every catalogued capability, what
   controls it, and how to observe it on a live scan.
-- **[docs/TEST_PLAN.md](docs/TEST_PLAN.md)** — the acceptance criteria, agreed before any
-  scan runs.
-- **[docs/TEST_TRACKING.md](docs/TEST_TRACKING.md)** — per-capability status: 276 of 297
-  criteria executed, 0 failures.
-- **[docs/rounds/](docs/rounds/)** — what each live round actually found, including the
-  eight defects the acceptance work surfaced.
 
 ## Tests
 
