@@ -608,6 +608,11 @@ Every one of these was observed live during validation.
 
 ## 15. Pre-flight checklist
 
+> Running this yourself? [**Manual Validation Runbook**](Manual_Validation_Runbook.md)
+> turns the checks below into an executable procedure — console and XQL only, with
+> expected output and a pass/fail line for each step.
+
+
 **Before the first scan**
 
 - [ ] Scanner uploaded; confirm `scanner_version` in a summary reads **3.4.0**
