@@ -1,0 +1,552 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="description" content="Hands-on procedure to validate the Cortex XDR YARA scanner on your own tenant.">
+<title>YARA Validation Runbook</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=JetBrains+Mono:wght@400;500&display=swap">
+
+<style>
+:root{
+  --ground:#F5F6F8; --surface:#FFFFFF; --surface-2:#FAFBFC;
+  --ink:#14181E; --ink-2:#454E59; --ink-3:#6E7883;
+  --rule:#DBDFE5; --rule-soft:#EAEDF1;
+  --amber:#A85C05; --amber-edge:#C98A2E; --amber-wash:#FBF3E6;
+  --teal:#1F615D; --teal-edge:#3E8C87; --teal-wash:#EAF2F1;
+  --crit:#9B2718; --crit-edge:#C0503F; --crit-wash:#FBEDEB;
+  --code-bg:#EFF1F4; --code-ink:#243040;
+  --sel:#FBE3BC;
+}
+@media (prefers-color-scheme:dark){ :root:not([data-theme="light"]){
+  --ground:#0C1014; --surface:#12181F; --surface-2:#161D25;
+  --ink:#E3E8EE; --ink-2:#A6B1BD; --ink-3:#7B8692;
+  --rule:#232B35; --rule-soft:#1A212A;
+  --amber:#E9A94A; --amber-edge:#8A6120; --amber-wash:#20180B;
+  --teal:#5FB4AE; --teal-edge:#2F6A66; --teal-wash:#0F1D1C;
+  --crit:#E77364; --crit-edge:#8C3A2E; --crit-wash:#22110F;
+  --code-bg:#161E27; --code-ink:#C7D2DE;
+  --sel:#4A3714;
+}}
+:root[data-theme="dark"]{
+  --ground:#0C1014; --surface:#12181F; --surface-2:#161D25;
+  --ink:#E3E8EE; --ink-2:#A6B1BD; --ink-3:#7B8692;
+  --rule:#232B35; --rule-soft:#1A212A;
+  --amber:#E9A94A; --amber-edge:#8A6120; --amber-wash:#20180B;
+  --teal:#5FB4AE; --teal-edge:#2F6A66; --teal-wash:#0F1D1C;
+  --crit:#E77364; --crit-edge:#8C3A2E; --crit-wash:#22110F;
+  --code-bg:#161E27; --code-ink:#C7D2DE;
+  --sel:#4A3714;
+}
+
+*{box-sizing:border-box}
+html{scroll-behavior:smooth; scroll-padding-top:1rem; -webkit-text-size-adjust:100%}
+@media (prefers-reduced-motion:reduce){ html{scroll-behavior:auto} *{transition:none!important} }
+body{
+  margin:0; background:var(--ground); color:var(--ink);
+  font-family:"Source Serif 4","Iowan Old Style",Georgia,serif;
+  font-size:17px; line-height:1.6; -webkit-font-smoothing:antialiased;
+}
+::selection{background:var(--sel); color:var(--ink)}
+.wrap{max-width:760px; margin:0 auto; padding:0 1.15rem}
+
+/* ---------- masthead ---------- */
+.mast{background:var(--surface); border-bottom:1px solid var(--rule)}
+.mast .wrap{padding:2.5rem 1.15rem 1.75rem}
+.eyebrow{font-family:Archivo,system-ui,sans-serif; font-size:.68rem; font-weight:600;
+  letter-spacing:.16em; text-transform:uppercase; color:var(--amber); margin:0 0 .85rem}
+h1{font-family:Archivo,system-ui,sans-serif; font-weight:700;
+  font-size:clamp(1.85rem,7vw,2.7rem); line-height:1.07; letter-spacing:-.02em;
+  margin:0 0 .8rem; text-wrap:balance}
+.standfirst{font-size:1.06rem; color:var(--ink-2); margin:0 0 1.4rem}
+.standfirst strong{color:var(--ink); font-weight:600}
+.meta{display:flex; flex-wrap:wrap; gap:.45rem}
+.chip{font-family:Archivo,system-ui,sans-serif; font-size:.7rem; font-weight:600;
+  letter-spacing:.06em; padding:.3rem .6rem; border:1px solid var(--rule);
+  background:var(--surface-2); color:var(--ink-2); border-radius:3px}
+.chip.hot{color:var(--crit); border-color:var(--crit-edge)}
+
+/* ---------- overview table ---------- */
+.scroll{overflow-x:auto; margin:0 0 1.2rem; border:1px solid var(--rule); background:var(--surface)}
+table{border-collapse:collapse; width:100%; font-size:.86rem; font-variant-numeric:tabular-nums}
+th,td{padding:.55rem .75rem; text-align:left; vertical-align:top; border-bottom:1px solid var(--rule-soft)}
+thead th{font-family:Archivo,system-ui,sans-serif; font-size:.63rem; font-weight:600;
+  letter-spacing:.11em; text-transform:uppercase; color:var(--ink-3);
+  border-bottom:1px solid var(--rule); background:var(--surface-2); white-space:nowrap}
+tbody tr:last-child td{border-bottom:0}
+td a{font-weight:600}
+
+main{padding:1.75rem 0 4rem}
+
+/* ---------- part ---------- */
+.part{scroll-margin-top:1rem; margin:0 0 2.75rem}
+.part-head{border-top:2px solid var(--ink); padding-top:1.1rem; margin:0 0 1.2rem}
+.part-head .id{font-family:"JetBrains Mono",monospace; font-size:.76rem; font-weight:500;
+  color:var(--amber); display:block; margin-bottom:.35rem}
+.part-head h2{font-family:Archivo,system-ui,sans-serif; font-weight:700; font-size:1.5rem;
+  line-height:1.16; letter-spacing:-.012em; margin:0 0 .55rem; text-wrap:balance}
+.part-head p{margin:0 0 .6rem; color:var(--ink-2); font-size:.98rem}
+.badges{display:flex; flex-wrap:wrap; gap:.4rem}
+.badge{font-family:Archivo,system-ui,sans-serif; font-size:.65rem; font-weight:700;
+  letter-spacing:.1em; text-transform:uppercase; padding:.2rem .5rem; border-radius:3px;
+  border:1px solid currentColor}
+.badge.time{color:var(--ink-3)} .badge.safe{color:var(--teal)} .badge.danger{color:var(--crit)}
+
+/* ---------- step ---------- */
+.step{border:1px solid var(--rule); background:var(--surface); border-radius:4px;
+  margin:0 0 1rem; overflow:hidden}
+.step > .sh{display:flex; gap:.6rem; align-items:baseline; padding:.8rem .95rem;
+  background:var(--surface-2); border-bottom:1px solid var(--rule)}
+.step > .sh .n{font-family:"JetBrains Mono",monospace; font-size:.78rem; font-weight:500;
+  color:var(--amber); flex:none}
+.step > .sh .t{font-family:Archivo,system-ui,sans-serif; font-weight:600; font-size:1rem;
+  line-height:1.3; letter-spacing:-.006em}
+.step .sb{padding:.9rem .95rem}
+.step .sb > :last-child{margin-bottom:0}
+.lead{display:block; font-family:Archivo,system-ui,sans-serif; font-size:.64rem;
+  font-weight:700; letter-spacing:.13em; text-transform:uppercase; margin:0 0 .3rem}
+.lead.do{color:var(--ink-3)} .lead.exp{color:var(--teal)} .lead.fail{color:var(--crit)}
+.blk{margin:0 0 .85rem}
+.blk:last-child{margin-bottom:0}
+.blk p{margin:0 0 .5rem}
+.blk p:last-child{margin-bottom:0}
+
+p{margin:0 0 .85rem}
+a{color:var(--amber); text-underline-offset:2px}
+a:focus-visible{outline:2px solid var(--amber); outline-offset:2px}
+strong{font-weight:600}
+ul{margin:0 0 .85rem; padding-left:1.2rem}
+li{margin:0 0 .35rem}
+code{font-family:"JetBrains Mono",ui-monospace,monospace; font-size:.84em;
+  background:var(--code-bg); color:var(--code-ink); padding:.1em .34em; border-radius:2px;
+  overflow-wrap:break-word}
+pre{background:var(--code-bg); border:1px solid var(--rule); border-left:2px solid var(--teal-edge);
+  padding:.8rem .9rem; overflow-x:auto; margin:0 0 .85rem}
+pre code{background:none; padding:0; font-size:.78rem; line-height:1.6; color:var(--code-ink)}
+
+/* ---------- callouts ---------- */
+.call{border:1px solid var(--rule); border-left:3px solid var(--ink-3);
+  background:var(--surface); padding:.85rem .95rem; margin:0 0 1rem; border-radius:3px}
+.call > :last-child{margin-bottom:0}
+.call .lbl{font-family:Archivo,system-ui,sans-serif; font-size:.63rem; font-weight:700;
+  letter-spacing:.13em; text-transform:uppercase; color:var(--ink-3); display:block; margin:0 0 .4rem}
+.call.warn{border-left-color:var(--amber-edge); background:var(--amber-wash)}
+.call.warn .lbl{color:var(--amber)}
+.call.crit{border-left-color:var(--crit-edge); background:var(--crit-wash)}
+.call.crit .lbl{color:var(--crit)}
+.call.ok{border-left-color:var(--teal-edge); background:var(--teal-wash)}
+.call.ok .lbl{color:var(--teal)}
+
+/* ---------- checklists ---------- */
+.ck{list-style:none; padding:0; margin:0 0 1rem}
+.ck li{display:grid; grid-template-columns:1.35rem 1fr; gap:.45rem; align-items:start;
+  padding:.4rem 0; margin:0; font-size:.95rem; border-bottom:1px solid var(--rule-soft)}
+.ck li:last-child{border-bottom:0}
+.ck li::before{content:""; width:.9rem; height:.9rem; margin-top:.3rem;
+  border:1.5px solid var(--ink-3); border-radius:2px; display:block; flex:none}
+.ck li .rid{font-family:"JetBrains Mono",monospace; font-size:.74rem; color:var(--amber);
+  margin-right:.35rem}
+
+footer{border-top:1px solid var(--rule); padding:1.4rem 0 3rem; color:var(--ink-3); font-size:.8rem}
+</style>
+
+
+</head>
+<body>
+<header class="mast"><div class="wrap">
+  <p class="eyebrow">Scanner 3.4.0 · Schema v4</p>
+  <h1>Manual Validation Runbook</h1>
+  <p class="standfirst">Prove the scanner and dataset management work on <strong>your</strong>
+    tenant — and that the <strong>safety rails actually fire</strong>. Console and XQL only.</p>
+  <div class="meta">
+    <span class="chip">≈ 2½ hours</span>
+    <span class="chip">8 parts · 23 checks</span>
+    <span class="chip">No scripts required</span>
+    <span class="chip hot">Part F deletes data</span>
+  </div>
+</div></header>
+
+<div class="wrap"><main>
+
+<div class="scroll"><table>
+<thead><tr><th>Part</th><th>Proves</th><th>Time</th><th>Destructive</th></tr></thead>
+<tbody>
+<tr><td><a href="#pa">A</a></td><td>Deployment and credentials are right</td><td>10 min</td><td>No</td></tr>
+<tr><td><a href="#pb">B</a></td><td>A scan lands data end to end</td><td>15 min</td><td>No</td></tr>
+<tr><td><a href="#pc">C</a></td><td>The dataset is overwritten, not appended</td><td>10 min</td><td>No</td></tr>
+<tr><td><a href="#pd">D</a></td><td>Delivery at volume; your own drain ratio</td><td>45 min</td><td>No</td></tr>
+<tr><td><a href="#pe">E</a></td><td>Inventory and readiness reporting</td><td>10 min</td><td>No</td></tr>
+<tr><td><a href="#pf">F</a></td><td>The merge verifies before deleting</td><td>30 min</td><td><strong>Yes</strong></td></tr>
+<tr><td><a href="#pg">G</a></td><td>The guards actually stop things</td><td>20 min</td><td>Partly</td></tr>
+<tr><td><a href="#ph">H</a></td><td>Sign-off sheet</td><td>—</td><td>—</td></tr>
+</tbody></table></div>
+
+<div class="call"><span class="lbl">Before you start</span>
+<ul style="margin-bottom:.5rem">
+<li>A <strong>test endpoint</strong> you may scan freely. Not production.</li>
+<li>Console access to <strong>Action Center</strong> and <strong>XQL Search</strong>.</li>
+<li>Scanner uploaded with a <strong>Standard</strong> key; 5 automations with an <strong>Advanced (HMAC)</strong> key.</li>
+<li>A base64 YARA rule file you <strong>know</strong> will match something.</li>
+</ul>
+<p><strong>A rule that matches nothing makes most of this untestable.</strong> For a throwaway
+test rule, a broad string like <code>"localhost"</code> or <code>"Copyright"</code> matches on
+any host. Validation only — never ship it.</p></div>
+
+<div class="call ok"><span class="lbl">Find your dataset names first</span>
+<p>Settings → Data Management → Dataset Management, filter <code>yara_scanner</code>. You want a pair:</p>
+<pre><code>yara_scanner_matches_v4_&lt;host&gt;_&lt;6hex&gt;          ← no month. Correct.
+yara_scanner_scans_v4_&lt;host&gt;_&lt;6hex&gt;_&lt;YYYYMM&gt;   ← month. Also correct.</code></pre>
+<p>They <strong>will not exist until your first scan</strong> — the scanner creates them.
+Below, <code>MATCHES</code> and <code>SCANS</code> mean those two names.</p></div>
+
+<!-- ═══════════ A ═══════════ -->
+<section class="part" id="pa">
+  <div class="part-head"><span class="id">PART A</span>
+    <h2>Deployment checks</h2>
+    <p>No scans yet. Cheap, and catches the config mistakes that waste an afternoon.</p>
+    <div class="badges"><span class="badge time">10 min</span><span class="badge safe">Non-destructive</span></div>
+  </div>
+
+  <div class="step"><div class="sh"><span class="n">A1</span><span class="t">Scanner version</span></div><div class="sb">
+    <div class="blk"><span class="lead do">Do</span><p>Action Center → Scripts → your scanner → check <code>__version__</code> in the body.</p></div>
+    <div class="blk"><span class="lead exp">Expect</span><p><code>3.4.0</code></p></div>
+    <div class="blk"><span class="lead fail">Fails if</span><p>Anything lower. Later parts assume v4 behaviour older builds don't have.</p></div>
+  </div></div>
+
+  <div class="step"><div class="sh"><span class="n">A2</span><span class="t">Five automations, and no stragglers</span></div><div class="sb">
+    <div class="blk"><span class="lead do">Do</span><p>Settings → Automations, search <code>Yara</code>.</p></div>
+    <div class="blk"><span class="lead exp">Expect</span><p>Exactly five: <code>YaraReport</code>, <code>YaraConsolidateStatus</code>, <code>YaraConsolidateApply</code>, <code>YaraConsolidateSummary</code>, <code>YaraCleanup</code>.</p></div>
+    <div class="blk"><span class="lead fail">Fails if</span><p>You see <code>YaraConsolidateFast</code> — removed; you're on an old pack.</p></div>
+  </div></div>
+
+  <div class="step"><div class="sh"><span class="n">A3</span><span class="t">Credentials — fastest test that finds a wrong key</span></div><div class="sb">
+    <div class="blk"><span class="lead do">Do</span><pre><code>!YaraReport</code></pre></div>
+    <div class="blk"><span class="lead exp">Expect</span><p>A dataset inventory table. On a fresh tenant it may legitimately say <em>0 current-schema datasets</em> — still a <strong>pass</strong>, because it proves the key authenticated.</p></div>
+    <div class="blk"><span class="lead fail">Fails if</span><p><code>HTTP 401</code>. A Standard key in an Advanced slot, a typo, or a rotated key — the message can't distinguish them. Regenerate an <strong>Advanced</strong> key and re-edit <strong>all five</strong>.</p></div>
+  </div></div>
+
+  <div class="step"><div class="sh"><span class="n">A4</span><span class="t">Scanner key has Query Center</span></div><div class="sb">
+    <div class="blk"><span class="lead do">Do</span><p>Settings → Configurations → API Keys → your <strong>scanner</strong> key's role. Confirm <strong>Query Center</strong> (<code>investigation_query_view</code>) alongside External Issues Mapping and Data Management.</p></div>
+    <div class="blk"><span class="lead fail">Fails if</span><p>Absent. The scan still runs and still writes — but the start-of-scan overwrite 403s, fails safe, and the dataset quietly accumulates. Part C is where you'd find out the hard way.</p></div>
+  </div></div>
+</section>
+
+<!-- ═══════════ B ═══════════ -->
+<section class="part" id="pb">
+  <div class="part-head"><span class="id">PART B</span>
+    <h2>First scan</h2>
+    <div class="badges"><span class="badge time">15 min</span><span class="badge safe">Non-destructive</span></div>
+  </div>
+
+  <div class="step"><div class="sh"><span class="n">B1</span><span class="t">Run a small scan</span></div><div class="sb">
+    <div class="blk"><span class="lead do">Do</span>
+      <p>Action Center → your scanner → Run, targeting the test endpoint.
+      <code>scan_folder</code>: something small — <code>/etc</code> on Linux,
+      <code>C:\Windows\System32\drivers\etc</code> on Windows. <code>alert_severity</code>: <code>low</code>.</p>
+      <p>Set the action <strong>timeout to 30 minutes</strong> even though this is quick — Part D
+      explains why, and there's no reason to learn it on your first run.</p></div>
+    <div class="blk"><span class="lead exp">Expect</span><pre><code>SCAN_RESULT: Scan completed: &lt;N&gt; files scanned |
+  0 rules failed compilation | &lt;M&gt; matches found | ...</code></pre></div>
+    <div class="blk"><span class="lead fail">Fails if</span><p><code>0 rules failed compilation</code> isn't 0 → your rules use a module the agent's YARA lacks (4.1.0 on Windows/macOS, <strong>3.11.0</strong> on Linux). Fix before continuing — everything downstream needs matches.</p></div>
+  </div></div>
+
+  <div class="step"><div class="sh"><span class="n">B2</span><span class="t">Lifecycle rows landed</span></div><div class="sb">
+    <div class="blk"><span class="lead do">Do</span><pre><code>dataset = &lt;SCANS&gt;
+| fields scan_id, status, files_scanned, _insert_time
+| sort desc _insert_time
+| limit 10</code></pre></div>
+    <div class="blk"><span class="lead exp">Expect</span><p>At least two rows for one <code>scan_id</code> — <code>initiated</code> and a terminal <code>completed</code>.</p></div>
+    <div class="blk"><span class="lead fail">Fails if</span><p>No <code>completed</code> row. Either still running, or the payload was killed — check for the summary file (B4); its absence confirms a kill.</p></div>
+    <div class="call ok" style="margin-top:.6rem"><span class="lbl">Not a bug</span>
+    <p>Rows may appear <strong>out of order</strong> — <code>completed</code> can carry an earlier
+    <code>_insert_time</code> than <code>initiated</code>. Deliberate: the terminal row is sent
+    inline, ahead of the upload queue, so it survives even if the queue never drains.</p></div>
+  </div></div>
+
+  <div class="step"><div class="sh"><span class="n">B3</span><span class="t">Match rows landed</span></div><div class="sb">
+    <div class="blk"><span class="lead do">Do</span><pre><code>dataset = &lt;MATCHES&gt;
+| comp count() as rows, sum(rule_count) as rule_file_pairs,
+       sum(match_total) as string_hits by scan_id</code></pre></div>
+    <div class="blk"><span class="lead exp">Expect</span><p>One row, one <code>scan_id</code>, <code>rows</code> &gt; 0.</p>
+      <p><strong>Reading it:</strong> these three deliberately differ. <code>rows</code> is matched
+      <em>files</em>; <code>rule_file_pairs</code> is the (rule, file) findings behind them;
+      <code>string_hits</code> is every individual string match.
+      <code>rows ≤ rule_file_pairs ≤ string_hits</code> is the v4 grain working — <strong>not</strong> loss.</p></div>
+    <div class="blk"><span class="lead fail">Fails if</span><p>More than one <code>scan_id</code> (only one scan has run), or <code>rows</code> is 0 while the scan reported matches.</p></div>
+  </div></div>
+
+  <div class="step"><div class="sh"><span class="n">B4</span><span class="t">Delivery accounting on the endpoint</span></div><div class="sb">
+    <div class="blk"><span class="lead do">Do</span><p>Read the summary file on the endpoint:</p>
+      <pre><code>Windows  C:\yara_scanner\logs\scan_summary_&lt;run_id&gt;.json
+Linux    /opt/yara_scanner/logs/scan_summary_&lt;run_id&gt;.json
+macOS    /usr/local/yara_scanner/logs/scan_summary_&lt;run_id&gt;.json</code></pre></div>
+    <div class="blk"><span class="lead exp">Expect</span>
+      <pre><code>"scanner_version": "3.4.0",
+"outcome": "completed",
+"delivery_shortfall": "",
+"dataset_delivery": { "queued": N, "records_added": N,
+                      "undelivered": 0, ... }</code></pre>
+      <p>The two that matter: <code>delivery_shortfall</code> is an <strong>empty string</strong>, and <code>queued == records_added</code>.</p></div>
+    <div class="blk"><span class="lead fail">Fails if</span>
+      <p><code>delivery_shortfall</code> non-empty → rows never reached the tenant. It names how many and confirms the findings are complete in the endpoint's local logs. Usually a too-short timeout — see Part D.</p>
+      <p>File missing entirely → the run was killed before finishing. It's written <em>after</em> the drain, so its absence is itself the diagnosis.</p></div>
+  </div></div>
+</section>
+
+<!-- ═══════════ C ═══════════ -->
+<section class="part" id="pc">
+  <div class="part-head"><span class="id">PART C</span>
+    <h2>Prove the overwrite</h2>
+    <p>The behaviour most people don't believe until they see it.</p>
+    <div class="badges"><span class="badge time">10 min</span><span class="badge safe">Non-destructive</span></div>
+  </div>
+
+  <div class="step"><div class="sh"><span class="n">C1</span><span class="t">Note the current state</span></div><div class="sb">
+    <div class="blk"><span class="lead do">Do</span><pre><code>dataset = &lt;MATCHES&gt; | comp count() as rows by scan_id</code></pre>
+    <p>Write down the <code>scan_id</code> and <code>rows</code>.</p></div>
+  </div></div>
+
+  <div class="step"><div class="sh"><span class="n">C2</span><span class="t">Scan the same host again</span></div><div class="sb">
+    <div class="blk"><span class="lead do">Do</span><p>Run <strong>exactly the same scan</strong> as B1 — same host, folder, rules.</p></div>
+  </div></div>
+
+  <div class="step"><div class="sh"><span class="n">C3</span><span class="t">Confirm replacement, not accumulation</span></div><div class="sb">
+    <div class="blk"><span class="lead do">Do</span><p>The same query as C1.</p></div>
+    <div class="blk"><span class="lead exp">Expect</span><p>Still <strong>exactly one</strong> <code>scan_id</code> — the <strong>new</strong> one. The first scan's rows are gone.</p></div>
+    <div class="blk"><span class="lead fail">Fails if</span><p>Two <code>scan_id</code>s → the overwrite didn't happen. Check A4 (Query Center). Without it the flush 403s silently and the dataset accumulates — precisely what this test exists to catch.</p></div>
+  </div></div>
+
+  <div class="step"><div class="sh"><span class="n">C4</span><span class="t">Confirm the scans dataset did the opposite</span></div><div class="sb">
+    <div class="blk"><span class="lead do">Do</span><pre><code>dataset = &lt;SCANS&gt; | comp count() as rows by scan_id</code></pre></div>
+    <div class="blk"><span class="lead exp">Expect</span><p><strong>Two</strong> <code>scan_id</code>s — both scans. The lifecycle dataset is append-only and must <em>not</em> be overwritten.</p></div>
+    <div class="call ok" style="margin-top:.6rem"><span class="lbl">Together</span>
+    <p>C3 and C4 are the whole dataset model in two queries: <strong>matches replaced, scans accumulated.</strong></p></div>
+  </div></div>
+</section>
+
+<!-- ═══════════ D ═══════════ -->
+<section class="part" id="pd">
+  <div class="part-head"><span class="id">PART D</span>
+    <h2>Delivery under load</h2>
+    <p>Finds the problem most likely to cost you data in production.</p>
+    <div class="badges"><span class="badge time">45 min</span><span class="badge safe">Non-destructive</span></div>
+  </div>
+
+  <div class="step"><div class="sh"><span class="n">D1</span><span class="t">A scan large enough to queue a real backlog</span></div><div class="sb">
+    <div class="blk"><span class="lead do">Do</span><p>Run against <code>/usr</code> (Linux) or <code>C:\Windows</code> (Windows). Set the timeout <strong>generously — 60 minutes</strong>; you're testing delivery here, not timeout behaviour. <strong>Note the wall-clock time</strong> from launch to the action completing.</p></div>
+  </div></div>
+
+  <div class="step"><div class="sh"><span class="n">D2</span><span class="t">Compare scan time against total time</span></div><div class="sb">
+    <div class="blk"><span class="lead do">Do</span><p>In the summary JSON, read <code>duration_secs</code>. Compare to your measured wall-clock.</p></div>
+    <div class="blk"><span class="lead exp">Expect</span><p>Wall-clock <strong>meaningfully longer</strong> than <code>duration_secs</code>. That gap is upload drain.</p>
+      <p><strong>Reference:</strong> a 93,137-file scan took <strong>169 s to scan</strong> and
+      <strong>401 s to drain</strong> — 2.4×. Your ratio will differ; the <em>existence</em> of the gap is the point.</p></div>
+  </div></div>
+
+  <div class="step"><div class="sh"><span class="n">D3</span><span class="t">Confirm nothing was lost</span></div><div class="sb">
+    <div class="blk"><span class="lead do">Do</span><p>Check <code>delivery_shortfall</code> and <code>dataset_delivery</code> as in B4.</p></div>
+    <div class="blk"><span class="lead exp">Expect</span><p>Shortfall empty, <code>undelivered: 0</code>.</p></div>
+  </div></div>
+
+  <div class="step"><div class="sh"><span class="n">D4</span><span class="t">Now size your real timeout</span></div><div class="sb">
+    <div class="blk"><span class="lead do">Do</span><p>You've just measured your own scan-to-drain ratio, on your hardware and link. Use it:</p>
+      <pre><code>action timeout ≥ expected scan + measured drain + margin</code></pre>
+      <p><strong>Starting point: scan estimate + 10 minutes.</strong> Drain internals cap at 600 s, but a large backlog plus retries can approach it.</p></div>
+    <div class="call warn" style="margin-top:.6rem"><span class="lbl">Optional — prove the failure mode</span>
+      <p>Re-run D1 with the timeout deliberately short (say 5 min on a scan you know runs longer).
+      Expect: the action is killed, <strong>no summary file is written</strong>, and the scans
+      dataset <em>still</em> receives its terminal row. That last part is the inline-send working.</p></div>
+  </div></div>
+</section>
+
+<!-- ═══════════ E ═══════════ -->
+<section class="part" id="pe">
+  <div class="part-head"><span class="id">PART E</span>
+    <h2>Dataset management — read-only</h2>
+    <div class="badges"><span class="badge time">10 min</span><span class="badge safe">Non-destructive</span></div>
+  </div>
+
+  <div class="step"><div class="sh"><span class="n">E1</span><span class="t">Inventory</span></div><div class="sb">
+    <div class="blk"><span class="lead do">Do</span><pre><code>!YaraReport</code></pre></div>
+    <div class="blk"><span class="lead exp">Expect</span><p>Every <code>yara_scanner_*</code> dataset with kind, host and state. Your live matches dataset should read as a <strong>permanent / overwrite</strong> dataset — <em>not</em> "not rotated".</p></div>
+    <div class="blk"><span class="lead fail">Fails if</span><p>It says <code>not rotated (no YYYYMM) — set CONFIG_LOOKUP_ROTATION="monthly"</code> for your <strong>v4</strong> matches dataset. Wrong for v4 — you're on an old pack. (For a v2/v3 dataset that message is correct.)</p></div>
+  </div></div>
+
+  <div class="step"><div class="sh"><span class="n">E2</span><span class="t">Readiness</span></div><div class="sb">
+    <div class="blk"><span class="lead do">Do</span><pre><code>!YaraConsolidateStatus</code></pre></div>
+    <div class="blk"><span class="lead exp">Expect</span><p>Eligible scan count, plus any in progress or blocked, with reasons.</p>
+      <p><strong>Reading it:</strong> a scan you <em>just</em> ran often shows as <strong>not</strong>
+      eligible. Correct — a 900-second quiet period stops consolidation racing a still-draining
+      uploader. Wait it out rather than working around it.</p></div>
+  </div></div>
+</section>
+
+<!-- ═══════════ F ═══════════ -->
+<section class="part" id="pf">
+  <div class="part-head"><span class="id">PART F</span>
+    <h2>Consolidation</h2>
+    <div class="badges"><span class="badge time">30 min</span><span class="badge danger">Deletes data</span></div>
+  </div>
+
+  <div class="call crit"><span class="lbl">This part deletes data</span>
+    <p><code>YaraConsolidateApply</code> <strong>has no dry-run mode</strong>. There is no
+    <code>execute</code> argument. A bare invocation merges and deletes source shards immediately.</p>
+    <p>Run against <strong>test scans you are willing to lose</strong>. Deleted datasets cannot be
+    recovered — the platform has no undo.</p></div>
+
+  <div class="step"><div class="sh"><span class="n">F1</span><span class="t">Preview first (safe)</span></div><div class="sb">
+    <div class="blk"><span class="lead do">Do</span><pre><code>!YaraConsolidateStatus</code></pre>
+    <p>Note the eligible <code>scan_id</code>s — exactly what F3 will consume.</p></div>
+  </div></div>
+
+  <div class="step"><div class="sh"><span class="n">F2</span><span class="t">Summary mode first (non-destructive)</span></div><div class="sb">
+    <div class="blk"><span class="lead do">Do</span><pre><code>!YaraConsolidateSummary execute="false"</code></pre>
+    <p>Then for real:</p><pre><code>!YaraConsolidateSummary execute="true"</code></pre></div>
+    <div class="blk"><span class="lead exp">Expect</span><p>Dry run reports what it <em>would</em> write. The real run writes to <code>yara_scanner_summary_v4_scan_&lt;id&gt;</code> and reports <strong><code>host shards deleted: 0</code></strong> — summary mode never deletes.</p>
+      <p><strong>Verify the source survived:</strong></p>
+      <pre><code>dataset = &lt;MATCHES&gt; | comp count() as rows by scan_id</code></pre>
+      <p>Unchanged. That's the proof summary mode is safe to schedule.</p></div>
+  </div></div>
+
+  <div class="step"><div class="sh"><span class="n">F3</span><span class="t">Full consolidation (destructive)</span></div><div class="sb">
+    <div class="blk"><span class="lead do">Do</span><pre><code>!YaraConsolidateApply max_scans="4"</code></pre>
+    <p>Pass <code>max_scans</code> explicitly the first time even though 4 is the default — it makes the bound visible in the War Room record.</p></div>
+    <div class="blk"><span class="lead exp">Expect</span><p><code>N scan(s) consolidated</code>, and if more remain, <em>"Pass was bounded… Run again to continue."</em></p>
+      <p><strong>Verify:</strong></p>
+      <pre><code>dataset = yara_scanner_matches_v4_scan_&lt;slug&gt; | comp count() as rows</code></pre>
+      <p>The count should match what the source held.</p></div>
+  </div></div>
+
+  <div class="step"><div class="sh"><span class="n">F4</span><span class="t">Confirm the run was recorded</span></div><div class="sb">
+    <div class="blk"><span class="lead do">Do</span><pre><code>dataset = yara_scanner_consolidation_runs
+| fields _insert_time, status, consolidated_count, failed_count
+| sort desc _insert_time | limit 5</code></pre></div>
+    <div class="blk"><span class="lead exp">Expect</span><p>A <strong><code>started</code></strong> row <em>and</em> a terminal row (<code>success</code> / <code>partial_failure</code>).</p>
+      <p><strong>Reading it:</strong> a <code>started</code> row with <strong>no</strong> terminal row means a pass was killed — or is still running. That pairing is the diagnostic you'll rely on in production.</p></div>
+  </div></div>
+
+  <div class="step"><div class="sh"><span class="n">F5</span><span class="t">Drain the backlog</span></div><div class="sb">
+    <div class="blk"><span class="lead do">Do</span><p>If F3 said more remained, run it again until it stops saying so.</p></div>
+    <div class="blk"><span class="lead exp">Expect</span><p>Each pass consolidates up to <code>max_scans</code> and reports what's left. <strong>It does not resume itself</strong> — by design, not a bug.</p></div>
+  </div></div>
+</section>
+
+<!-- ═══════════ G ═══════════ -->
+<section class="part" id="pg">
+  <div class="part-head"><span class="id">PART G</span>
+    <h2>Prove the safety rails fire</h2>
+    <p>The most valuable part. A guard you have never seen trigger is a guard you are trusting on faith.</p>
+    <div class="badges"><span class="badge time">20 min</span><span class="badge danger">Partly destructive</span></div>
+  </div>
+
+  <div class="step"><div class="sh"><span class="n">G1</span><span class="t">The consolidation lock</span></div><div class="sb">
+    <div class="blk"><span class="lead do">Do</span><p>Start <code>!YaraConsolidateApply</code> and, while it runs, start a <strong>second</strong> one from another War Room tab.</p></div>
+    <div class="blk"><span class="lead exp">Expect</span><p><em>"Skipped this pass — the consolidation lock is held by another concurrent run."</em> and nothing touched.</p>
+      <p><strong>Why it matters:</strong> without this, two runs could both delete sources after only one wrote a target.</p></div>
+  </div></div>
+
+  <div class="step"><div class="sh"><span class="n">G2</span><span class="t">Cleanup refuses to delete without opt-in</span></div><div class="sb">
+    <div class="blk"><span class="lead do">Do</span><pre><code>!YaraCleanup older_than_months="0"</code></pre></div>
+    <div class="blk"><span class="lead exp">Expect</span><p>A report of what it <em>would</em> delete, and <strong>nothing deleted</strong> — <code>execute</code> defaults false. Verify the named datasets still exist.</p></div>
+  </div></div>
+
+  <div class="step"><div class="sh"><span class="n">G3</span><span class="t">Cleanup will not touch your live matches dataset</span></div><div class="sb">
+    <div class="blk"><span class="lead do">Do</span><p>In the G2 output, find your live <code>MATCHES</code> dataset.</p></div>
+    <div class="blk"><span class="lead exp">Expect</span><p>It appears in the <strong>skipped</strong> list, reading:</p>
+      <pre><code>permanent per-host matches dataset - the scanner
+REPLACES it wholesale ...</code></pre></div>
+    <div class="blk"><span class="lead fail">Fails if</span><p>It appears as a deletion <em>candidate</em>. Stop — do not run <code>YaraCleanup</code> with <code>execute=true</code>. That guard protects your deep-dive source.</p></div>
+  </div></div>
+
+  <div class="step"><div class="sh"><span class="n">G4</span><span class="t">Cooperative cancel writes a terminal row</span></div><div class="sb">
+    <div class="blk"><span class="lead do">Do</span><p>Start a long scan. While it runs, run the same script with <strong>Entry Point = <code>cancel</code></strong> (no inputs) on the same endpoint.</p></div>
+    <div class="blk"><span class="lead exp">Expect</span><p>Within ~5 s it stops with <code>Scan cancelled by operator</code>, and:</p>
+      <pre><code>dataset = &lt;SCANS&gt; | fields scan_id, status
+| sort desc _insert_time | limit 5</code></pre>
+      <p>shows a terminal <strong><code>cancelled</code></strong> row.</p></div>
+    <div class="call warn" style="margin-top:.6rem"><span class="lbl">Contrast — not on a scan you care about</span>
+      <p>The Action Center <strong>console Cancel</strong> button hard-kills the payload and writes
+      <strong>no</strong> terminal row, leaving the scan showing <code>running</code> until the 24-hour
+      abandoned cutoff. That difference is exactly why the <code>cancel</code> entry point exists.</p></div>
+  </div></div>
+
+  <div class="step"><div class="sh"><span class="n">G5</span><span class="t">Schema-version mismatch — the two directions differ</span></div><div class="sb">
+    <div class="blk"><span class="lead do">Do (safe direction — too LOW)</span><pre><code>!YaraConsolidateStatus schema_version="2"</code></pre></div>
+    <div class="blk"><span class="lead exp">Expect</span><p><strong>0 current</strong>, and your v4 datasets reported as <strong>newer schema — never pruned</strong>. Nothing touched.</p>
+      <p><strong>Why:</strong> anything newer than the assumed current version is something this build doesn't understand, so it refuses to act. This is the safe failure, and the one you'll hit in practice. It is also <strong>silent</strong> — a run reporting 0 candidates and exiting cleanly can mean a version mismatch rather than an empty backlog.</p></div>
+    <div class="call crit" style="margin-top:.6rem"><span class="lbl">The other direction is not safe — don't test it casually</span>
+      <p>Setting <code>schema_version</code> <strong>too HIGH</strong> (say <code>9</code> against v4 data)
+      reclassifies every live dataset as <strong>legacy</strong> — and legacy <em>is</em> eligible for
+      deletion via <code>YaraCleanup</code>'s delete-legacy path.</p>
+      <p><strong>Rails still stand between that and loss:</strong> blanket legacy deletion is refused
+      outright if any newer-schema dataset exists; unsuffixed datasets (yours is one) are never
+      candidates; per-scan targets, the current month and future months are never candidates;
+      <code>execute</code> still defaults false. Verify by <em>reading the skip reasons</em>, not by
+      running a real delete.</p></div>
+  </div></div>
+</section>
+
+<!-- ═══════════ H ═══════════ -->
+<section class="part" id="ph">
+  <div class="part-head"><span class="id">PART H</span>
+    <h2>Sign-off</h2>
+    <div class="badges"><span class="badge time">23 checks</span></div>
+  </div>
+  <ul class="ck">
+    <li><span><span class="rid">A1</span>Scanner reports <code>3.4.0</code></span></li>
+    <li><span><span class="rid">A2</span>Exactly five automations, no <code>Fast</code></span></li>
+    <li><span><span class="rid">A3</span><code>!YaraReport</code> authenticates</span></li>
+    <li><span><span class="rid">A4</span>Scanner key has Query Center</span></li>
+    <li><span><span class="rid">B1</span>Scan completes, 0 rules failed compilation</span></li>
+    <li><span><span class="rid">B2</span><code>initiated</code> + terminal rows present</span></li>
+    <li><span><span class="rid">B3</span>Match rows present, one <code>scan_id</code></span></li>
+    <li><span><span class="rid">B4</span><code>delivery_shortfall</code> empty, <code>queued == added</code></span></li>
+    <li><span><span class="rid">C3</span>Second scan <strong>replaces</strong> — still one <code>scan_id</code></span></li>
+    <li><span><span class="rid">C4</span>Scans dataset <strong>accumulated</strong> — two <code>scan_id</code>s</span></li>
+    <li><span><span class="rid">D2</span>Drain gap observed and measured</span></li>
+    <li><span><span class="rid">D3</span>No shortfall at volume</span></li>
+    <li><span><span class="rid">D4</span>Production timeout sized from your own measurement</span></li>
+    <li><span><span class="rid">E1</span>Live matches dataset reported as permanent</span></li>
+    <li><span><span class="rid">E2</span>Quiet-period deferrals reported correctly</span></li>
+    <li><span><span class="rid">F2</span>Summary wrote rows and deleted <strong>nothing</strong></span></li>
+    <li><span><span class="rid">F3</span>Apply merged and verified before deleting</span></li>
+    <li><span><span class="rid">F4</span><code>started</code> + terminal rows both recorded</span></li>
+    <li><span><span class="rid">G1</span>Second concurrent Apply refused on the lock</span></li>
+    <li><span><span class="rid">G2</span>Cleanup dry-run deleted nothing</span></li>
+    <li><span><span class="rid">G3</span>Cleanup skipped the live matches dataset</span></li>
+    <li><span><span class="rid">G4</span>Cooperative cancel wrote a <code>cancelled</code> row</span></li>
+    <li><span><span class="rid">G5</span>Too-low fails safe; too-high hazard understood</span></li>
+  </ul>
+
+  <div class="call warn"><span class="lbl">Before production</span>
+  <ul style="margin-bottom:0">
+    <li>Timeout sized from <strong>your</strong> D2 measurement, not the reference figure</li>
+    <li>Consolidation mode chosen — <strong>Summary</strong> (safe) or <strong>Full</strong> (destructive)</li>
+    <li>Everyone who can run automations knows <strong><code>Apply</code> has no dry-run mode</strong></li>
+    <li><code>YaraCleanup</code> scheduled — if at all — in its <strong>own</strong> window, never alongside the merge</li>
+    <li>Test rules removed; only real detection content ships</li>
+    <li>A plan for draining a backlog larger than one bounded pass</li>
+  </ul></div>
+</section>
+
+<section class="part">
+  <div class="part-head"><span class="id">IF SOMETHING FAILS</span>
+    <h2>The three that account for most first-run surprises</h2>
+  </div>
+  <div class="scroll"><table>
+  <thead><tr><th>Symptom</th><th>Almost always</th></tr></thead>
+  <tbody>
+  <tr><td>Rows missing, <code>delivery_shortfall</code> non-empty</td><td>Action timeout too short — expired mid-drain (Part D)</td></tr>
+  <tr><td>Matches dataset accumulating scans</td><td>Scanner key missing <strong>Query Center</strong> (A4)</td></tr>
+  <tr><td>Consolidation reports 0 candidates, exits clean</td><td><code>schema_version</code> mismatch, or the 900 s quiet period (E2)</td></tr>
+  </tbody></table></div>
+</section>
+
+</main></div>
+
+<footer><div class="wrap">YARA Scanner for Cortex XDR · scanner 3.4.0 · schema v4 · console and XQL only</div></footer>
+
+</body>
+</html>

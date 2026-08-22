@@ -1,0 +1,736 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="description" content="Operational reference for the Cortex XDR YARA scanner: measured limits, caveats and failure modes.">
+<title>YARA Scanner Field Guide</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=JetBrains+Mono:wght@400;500&display=swap">
+
+<style>
+:root{
+  --ground:#F5F6F8; --surface:#FFFFFF; --surface-2:#FAFBFC;
+  --ink:#14181E; --ink-2:#454E59; --ink-3:#6E7883;
+  --rule:#DBDFE5; --rule-soft:#EAEDF1;
+  --amber:#A85C05; --amber-edge:#C98A2E; --amber-wash:#FBF3E6;
+  --teal:#1F615D; --teal-wash:#EAF2F1;
+  --crit:#9B2718; --crit-edge:#C0503F; --crit-wash:#FBEDEB;
+  --code-bg:#EFF1F4; --code-ink:#243040;
+  --sel:#FBE3BC;
+}
+@media (prefers-color-scheme:dark){ :root:not([data-theme="light"]){
+  --ground:#0C1014; --surface:#12181F; --surface-2:#161D25;
+  --ink:#E3E8EE; --ink-2:#A6B1BD; --ink-3:#7B8692;
+  --rule:#232B35; --rule-soft:#1A212A;
+  --amber:#E9A94A; --amber-edge:#8A6120; --amber-wash:#20180B;
+  --teal:#5FB4AE; --teal-wash:#0F1D1C;
+  --crit:#E77364; --crit-edge:#8C3A2E; --crit-wash:#22110F;
+  --code-bg:#161E27; --code-ink:#C7D2DE;
+  --sel:#4A3714;
+}}
+:root[data-theme="dark"]{
+  --ground:#0C1014; --surface:#12181F; --surface-2:#161D25;
+  --ink:#E3E8EE; --ink-2:#A6B1BD; --ink-3:#7B8692;
+  --rule:#232B35; --rule-soft:#1A212A;
+  --amber:#E9A94A; --amber-edge:#8A6120; --amber-wash:#20180B;
+  --teal:#5FB4AE; --teal-wash:#0F1D1C;
+  --crit:#E77364; --crit-edge:#8C3A2E; --crit-wash:#22110F;
+  --code-bg:#161E27; --code-ink:#C7D2DE;
+  --sel:#4A3714;
+}
+
+*{box-sizing:border-box}
+html{scroll-behavior:smooth; scroll-padding-top:1.5rem}
+@media (prefers-reduced-motion:reduce){ html{scroll-behavior:auto} *{animation:none!important; transition:none!important} }
+body{
+  margin:0; background:var(--ground); color:var(--ink);
+  font-family:"Source Serif 4","Iowan Old Style",Georgia,serif;
+  font-size:17px; line-height:1.62;
+  -webkit-font-smoothing:antialiased;
+}
+::selection{background:var(--sel); color:var(--ink)}
+
+.wrap{max-width:1180px; margin:0 auto; padding:0 1.5rem}
+
+/* ---------- masthead ---------- */
+.mast{border-bottom:1px solid var(--rule); background:var(--surface)}
+.mast .wrap{padding-top:3.25rem; padding-bottom:2rem}
+.eyebrow{
+  font-family:Archivo,system-ui,sans-serif; font-size:.7rem; font-weight:600;
+  letter-spacing:.16em; text-transform:uppercase; color:var(--amber); margin:0 0 .9rem;
+}
+h1{
+  font-family:Archivo,system-ui,sans-serif; font-weight:700;
+  font-size:clamp(2.1rem,5vw,3.1rem); line-height:1.06; letter-spacing:-.022em;
+  margin:0 0 .85rem; text-wrap:balance;
+}
+.standfirst{
+  font-size:1.14rem; color:var(--ink-2); max-width:64ch; margin:0 0 1.6rem;
+}
+.standfirst strong{color:var(--ink); font-weight:600}
+
+.facts{
+  display:flex; flex-wrap:wrap; gap:0; border:1px solid var(--rule);
+  background:var(--surface-2); font-family:"JetBrains Mono",ui-monospace,monospace;
+}
+.fact{padding:.7rem 1.1rem; border-right:1px solid var(--rule); flex:1 1 auto; min-width:150px}
+.fact:last-child{border-right:0}
+.fact dt{
+  font-family:Archivo,system-ui,sans-serif; font-size:.63rem; font-weight:600;
+  letter-spacing:.13em; text-transform:uppercase; color:var(--ink-3); margin:0 0 .25rem;
+}
+.fact dd{margin:0; font-size:.9rem; font-weight:500; color:var(--ink); font-variant-numeric:tabular-nums}
+
+/* ---------- shell ---------- */
+.shell{display:grid; grid-template-columns:238px minmax(0,1fr); gap:3.25rem; align-items:start}
+@media (max-width:940px){ .shell{grid-template-columns:1fr; gap:1.5rem} }
+
+nav.toc{position:sticky; top:1.5rem; padding:2.25rem 0 2rem; max-height:calc(100vh - 3rem); overflow-y:auto}
+@media (max-width:940px){
+  nav.toc{position:static; max-height:none; border-bottom:1px solid var(--rule); padding-bottom:1.25rem}
+}
+.toc h2{
+  font-family:Archivo,system-ui,sans-serif; font-size:.65rem; font-weight:600;
+  letter-spacing:.15em; text-transform:uppercase; color:var(--ink-3);
+  margin:0 0 .85rem; padding-bottom:.6rem; border-bottom:1px solid var(--rule);
+}
+.toc ol{list-style:none; margin:0; padding:0; counter-reset:t}
+.toc li{counter-increment:t; margin:0}
+.toc a{
+  display:grid; grid-template-columns:1.9rem 1fr; gap:.2rem; align-items:baseline;
+  padding:.32rem 0; color:var(--ink-2); text-decoration:none;
+  font-family:Archivo,system-ui,sans-serif; font-size:.855rem; line-height:1.35;
+  border-bottom:1px solid transparent;
+}
+.toc a::before{
+  content:counter(t,decimal-leading-zero);
+  font-family:"JetBrains Mono",monospace; font-size:.7rem; color:var(--ink-3);
+  font-variant-numeric:tabular-nums;
+}
+.toc a:hover{color:var(--amber)}
+.toc a:hover::before{color:var(--amber)}
+.toc a:focus-visible{outline:2px solid var(--amber); outline-offset:2px}
+
+main{padding:2.25rem 0 5rem; min-width:0}
+
+/* ---------- sections ---------- */
+section{scroll-margin-top:1.5rem; margin:0 0 3.1rem}
+section > *{max-width:70ch}
+h2.sec{
+  font-family:Archivo,system-ui,sans-serif; font-weight:700;
+  font-size:1.62rem; line-height:1.18; letter-spacing:-.014em;
+  margin:0 0 1.1rem; padding-top:1.5rem; border-top:2px solid var(--ink);
+  text-wrap:balance; display:grid; grid-template-columns:2.4rem 1fr; gap:.3rem;
+}
+h2.sec .n{
+  font-family:"JetBrains Mono",monospace; font-size:.82rem; font-weight:500;
+  color:var(--amber); padding-top:.42rem; font-variant-numeric:tabular-nums;
+}
+h3{
+  font-family:Archivo,system-ui,sans-serif; font-weight:600; font-size:1.09rem;
+  letter-spacing:-.006em; margin:2rem 0 .7rem; color:var(--ink); text-wrap:balance;
+}
+p{margin:0 0 1rem}
+a{color:var(--amber); text-underline-offset:2px}
+a:focus-visible{outline:2px solid var(--amber); outline-offset:2px}
+strong{font-weight:600}
+ul,ol{margin:0 0 1rem; padding-left:1.25rem}
+li{margin:0 0 .42rem}
+hr{border:0; border-top:1px solid var(--rule); margin:2.5rem 0}
+
+code{
+  font-family:"JetBrains Mono",ui-monospace,monospace; font-size:.845em;
+  background:var(--code-bg); color:var(--code-ink); padding:.1em .34em; border-radius:2px;
+}
+pre{
+  background:var(--code-bg); border:1px solid var(--rule); border-left:2px solid var(--teal);
+  padding:1rem 1.1rem; overflow-x:auto; margin:0 0 1.2rem; max-width:none;
+}
+pre code{background:none; padding:0; font-size:.815rem; line-height:1.62; color:var(--code-ink)}
+
+/* ---------- tables ---------- */
+.scroll{overflow-x:auto; margin:0 0 1.3rem; max-width:none; border:1px solid var(--rule); background:var(--surface)}
+table{border-collapse:collapse; width:100%; font-size:.875rem; font-variant-numeric:tabular-nums}
+th,td{padding:.6rem .85rem; text-align:left; vertical-align:top; border-bottom:1px solid var(--rule-soft)}
+thead th{
+  font-family:Archivo,system-ui,sans-serif; font-size:.66rem; font-weight:600;
+  letter-spacing:.11em; text-transform:uppercase; color:var(--ink-3);
+  border-bottom:1px solid var(--rule); background:var(--surface-2); white-space:nowrap;
+}
+tbody tr:last-child td{border-bottom:0}
+td code{font-size:.8em}
+
+/* ---------- callouts ---------- */
+.call{
+  border:1px solid var(--rule); border-left:3px solid var(--ink-3);
+  background:var(--surface); padding:.95rem 1.15rem; margin:0 0 1.3rem;
+}
+.call > :last-child{margin-bottom:0}
+.call .lbl{
+  font-family:Archivo,system-ui,sans-serif; font-size:.63rem; font-weight:700;
+  letter-spacing:.14em; text-transform:uppercase; color:var(--ink-3);
+  display:block; margin:0 0 .45rem;
+}
+.call.warn{border-left-color:var(--amber-edge); background:var(--amber-wash)}
+.call.warn .lbl{color:var(--amber)}
+.call.crit{border-left-color:var(--crit-edge); background:var(--crit-wash)}
+.call.crit .lbl{color:var(--crit)}
+.call.ok{border-left-color:var(--teal); background:var(--teal-wash)}
+.call.ok .lbl{color:var(--teal)}
+
+/* key-point list in §1 */
+.keys{list-style:none; padding:0; margin:0 0 1rem; counter-reset:k}
+.keys li{
+  counter-increment:k; display:grid; grid-template-columns:2rem 1fr; gap:.35rem;
+  padding:.85rem 0; border-bottom:1px solid var(--rule-soft); margin:0;
+}
+.keys li:last-child{border-bottom:0}
+.keys li::before{
+  content:counter(k); font-family:"JetBrains Mono",monospace; font-size:.78rem;
+  font-weight:500; color:var(--amber); padding-top:.15rem;
+}
+.keys b{font-family:Archivo,system-ui,sans-serif; font-weight:600; font-size:.98rem; display:block; margin-bottom:.12rem}
+
+/* checklist */
+.ck{list-style:none; padding:0; margin:0 0 1.2rem}
+.ck li{
+  display:grid; grid-template-columns:1.5rem 1fr; gap:.4rem; align-items:start;
+  padding:.36rem 0; margin:0; font-size:.955rem;
+}
+.ck li::before{
+  content:""; width:.95rem; height:.95rem; margin-top:.32rem;
+  border:1.5px solid var(--ink-3); border-radius:2px; display:block;
+}
+.tag{
+  display:inline-block; font-family:Archivo,system-ui,sans-serif; font-size:.6rem;
+  font-weight:700; letter-spacing:.1em; text-transform:uppercase;
+  padding:.14em .5em; border:1px solid currentColor; vertical-align:.12em; white-space:nowrap;
+}
+.tag.no{color:var(--crit)} .tag.yes{color:var(--teal)} .tag.warnt{color:var(--amber)}
+
+footer{border-top:1px solid var(--rule); padding:1.6rem 0 3rem; color:var(--ink-3); font-size:.83rem}
+footer .wrap{display:flex; flex-wrap:wrap; gap:.5rem 2rem; justify-content:space-between}
+</style>
+
+
+</head>
+<body>
+<header class="mast">
+  <div class="wrap">
+    <p class="eyebrow">Cortex XDR · Scanner 3.4.0</p>
+    <h1>YARA Scanner Field Guide</h1>
+    <p class="standfirst">
+      What isn't obvious from the config file: what the platform does that you can't change,
+      what the scanner does about it, what it costs, and where it will surprise you.
+      <strong>Every figure here was measured on a live tenant</strong> — anything unverified
+      says so.
+    </p>
+    <dl class="facts">
+      <div class="fact"><dt>Scanner</dt><dd>3.4.0</dd></div>
+      <div class="fact"><dt>Schema</dt><dd>v4</dd></div>
+      <div class="fact"><dt>Automations</dt><dd>5</dd></div>
+      <div class="fact"><dt>Playbook</dt><dd>v4</dd></div>
+      <div class="fact"><dt>Dataset cap</dt><dd>50 MB</dd></div>
+      <div class="fact"><dt>Task timeout</dt><dd>900 s</dd></div>
+    </dl>
+  </div>
+</header>
+
+<div class="wrap shell">
+<nav class="toc" aria-label="Contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#s1">Read this first</a></li>
+    <li><a href="#s2">Platform constraints</a></li>
+    <li><a href="#s3">What a scan does</a></li>
+    <li><a href="#s4">The dataset model</a></li>
+    <li><a href="#s5">The drain problem</a></li>
+    <li><a href="#s6">Delivery accounting</a></li>
+    <li><a href="#s7">The five automations</a></li>
+    <li><a href="#s8">Consolidation mechanics</a></li>
+    <li><a href="#s9">The lock</a></li>
+    <li><a href="#s10">Cancellation</a></li>
+    <li><a href="#s11">Capacity planning</a></li>
+    <li><a href="#s12">Credentials</a></li>
+    <li><a href="#s13">Failure modes</a></li>
+    <li><a href="#s14">Limits &amp; open questions</a></li>
+    <li><a href="#s15">Pre-flight checklist</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="s1">
+<h2 class="sec"><span class="n">01</span><span>Read this first</span></h2>
+<p>Five things account for most of the operational pain. If you read nothing else:</p>
+<ol class="keys">
+  <li><span><b>The run timeout must cover upload drain, not just scan time.</b>
+    A scan reports “done” when the last file is checked, but queued match rows keep uploading
+    afterwards — measured at <strong>169 s of scanning followed by 6 m 41 s of draining</strong>.
+    Size the Action Center timeout for both or you lose queued rows. <a href="#s5">§5</a></span></li>
+  <li><span><b><code>YaraConsolidateApply</code> has no dry-run mode and deletes on its first run.</b>
+    There is no <code>execute</code> argument. A bare invocation with no arguments merges and
+    deletes source shards immediately. <code>YaraConsolidateStatus</code> is the read-only
+    equivalent — check with it first. <a href="#s7">§7</a></span></li>
+  <li><span><b>One consolidation pass is bounded and does not self-drain.</b>
+    Default <code>max_scans</code> is <strong>4</strong>. A larger backlog needs the automation
+    re-run, or the cap raised. The playbook does not loop. <a href="#s8">§8</a></span></li>
+  <li><span><b>The matches dataset is permanent and overwritten, not rotated.</b>
+    One per host, no month suffix, replaced wholesale at the start of every scan. It is the
+    deep-dive source. Anything telling you to “turn on rotation” for it is out of date. <a href="#s4">§4</a></span></li>
+  <li><span><b>A timed-out API call does not mean the script stopped.</b>
+    Observed live: a consolidation run whose caller timed out kept executing server-side for
+    roughly two hours afterwards. Treat a caller timeout as <em>unknown</em>, never
+    <em>dead</em>. <a href="#s9">§9</a></span></li>
+</ol>
+</section>
+
+<section id="s2">
+<h2 class="sec"><span class="n">02</span><span>Platform constraints you cannot change</span></h2>
+<p>These are properties of Cortex XDR’s APIs. Every design decision downstream exists because of one of them.</p>
+<div class="scroll"><table>
+<thead><tr><th>Constraint</th><th>Measured</th><th>Consequence</th></tr></thead>
+<tbody>
+<tr><td><code>lookups/add_data</code> is <strong>not concurrency-safe</strong></td><td>8 endpoints writing one dataset: <strong>~2 of 8 batches landed</strong>. Client-side jitter did not help.</td><td>One writer per dataset, enforced by per-host sharding. Rows are lost <em>silently</em> — the retry returns HTTP 200.</td></tr>
+<tr><td><code>add_data</code> merge time scales with <strong>dataset size</strong>, not payload size</td><td>15,000 rows → ~13 s/write · 77,000 rows → ~31 s/write</td><td>An unbounded append-only dataset eventually goes <strong>write-dead</strong>. Observed at ~77k rows.</td></tr>
+<tr><td>Lookup dataset hard cap</td><td><strong>50 MB</strong> per dataset</td><td>Caps rows per dataset. See <a href="#s11">§11</a>.</td></tr>
+<tr><td>XQL result truncation</td><td>Silent at <strong>1,000,000 rows</strong></td><td>A query over a very large dataset can return partial results with no error.</td></tr>
+<tr><td><code>delete_dataset</code> is slow</td><td><strong>~60 s</strong> server-side per dataset</td><td>Bulk cleanup is an hours-scale job. Different-dataset deletes don’t race, so they run 12-wide.</td></tr>
+<tr><td>Action Center <strong>script timeout is not a hard kill</strong></td><td>A run continued ~2 h past its 900 s timeout</td><td>See <a href="#s9">§9</a> and <a href="#s14">§14</a>.</td></tr>
+<tr><td>No public API to upload a library script</td><td>—</td><td>Scanner upload is a one-time manual console step.</td></tr>
+<tr><td>Alert ingestion budget</td><td>~600 alerts/min <strong>per API key</strong>, shared across all endpoints using it</td><td>Stagger large fleets; use a separate key per wave.</td></tr>
+</tbody></table></div>
+<div class="call warn"><span class="lbl">The silent-loss point is the important one</span>
+<p>Concurrent <code>add_data</code> writes don’t error — they return success and drop rows.
+Per-host sharding isn’t a preference, it’s the only configuration where delivery is provably
+complete (verified 8/8).</p></div>
+</section>
+
+<section id="s3">
+<h2 class="sec"><span class="n">03</span><span>What a scan actually does</span></h2>
+<h3>Sequence</h3>
+<ol>
+<li><strong>Resolve dataset names</strong> — <code>yara_scanner_matches_v4_&lt;host&gt;_&lt;6hex&gt;</code> and <code>yara_scanner_scans_v4_&lt;host&gt;_&lt;6hex&gt;_&lt;YYYYMM&gt;</code>.</li>
+<li><strong>Ensure datasets exist</strong> — creates them if absent; a first scan on a host is a no-op here.</li>
+<li><strong>Overwrite the matches dataset</strong> — enumerates <code>scan_id</code>s already present and removes every row from a <em>previous</em> scan. The current scan’s own ID is never a removal target.</li>
+<li><strong>Write the <code>initiated</code> lifecycle row.</strong></li>
+<li><strong>Compile rules</strong>, then walk and scan, with the CPU governor throttling throughout.</li>
+<li><strong>Heartbeat</strong> — a <code>running</code> lifecycle row every <strong>600 s</strong>.</li>
+<li><strong>Write the terminal lifecycle row</strong> (<code>completed</code> / <code>cancelled</code> / <code>failed</code>) — sent <strong>inline, ahead of the upload queue</strong>, so it lands even if the queue never drains.</li>
+<li><strong>Drain the upload queue</strong> — this can take minutes. See <a href="#s5">§5</a>.</li>
+<li><strong>Write <code>scan_summary_&lt;run_id&gt;.json</code></strong> with full delivery accounting.</li>
+</ol>
+
+<h3>Key defaults</h3>
+<div class="scroll"><table>
+<thead><tr><th>Setting</th><th>Default</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><code>CONFIG_CPU_GUARANTEE</code></td><td><code>headroom</code></td><td>Leaves <code>CONFIG_CPU_HEADROOM_PCT</code> = <strong>30%</strong> of the host free</td></tr>
+<tr><td><code>CONFIG_CPU_FLOOR_PCT</code></td><td><code>5</code></td><td>Never targets below this — guarantees progress</td></tr>
+<tr><td><code>CONFIG_WORKERS</code></td><td><code>2</code></td><td>Scanning is disk-bound too; more workers is not reliably faster</td></tr>
+<tr><td><code>CONFIG_ALERT_MAX_PER_SCAN</code></td><td><code>500</code></td><td>Beyond this, one rollup alert per rule</td></tr>
+<tr><td><code>CONFIG_ALERT_OFFSETS_PER_FINDING_MAX</code></td><td><code>50</code></td><td>Offsets rendered per finding in local alert files</td></tr>
+<tr><td><code>CONFIG_COLLECT_FILES</code></td><td><code>False</code></td><td>Metadata only; <code>True</code> copies matched files into an evidence ZIP</td></tr>
+<tr><td><code>CONFIG_HOST_CLEANUP</code></td><td><code>off</code></td><td>End-of-run local log/artifact cleanup</td></tr>
+<tr><td><code>SCANS_HEARTBEAT_SECS</code></td><td><code>600</code></td><td><code>running</code> row cadence</td></tr>
+<tr><td><code>LOOKUP_DATASET_BATCH_SIZE</code></td><td><code>500</code></td><td>Rows per POST — stays under gateway 502s</td></tr>
+</tbody></table></div>
+
+<h3>Measured scan performance</h3>
+<div class="scroll"><table>
+<thead><tr><th>Host</th><th>Target</th><th>Files</th><th>Detections</th><th>Scan time</th><th>Rate</th></tr></thead>
+<tbody>
+<tr><td>Windows Server 2022</td><td>full <code>C:\</code></td><td>935,824</td><td>2,574</td><td>1,912 s (~32 min)</td><td>490 f/s</td></tr>
+<tr><td>Windows Server 2022</td><td>full <code>C:\</code></td><td>636,743</td><td>2,643</td><td>1,622 s (~27 min)</td><td>393 f/s</td></tr>
+<tr><td>Linux (GCP e2)</td><td><code>/usr</code></td><td>93,137</td><td>19,447</td><td>169 s</td><td>551 f/s</td></tr>
+<tr><td>Linux (GCP e2)</td><td><code>/etc</code></td><td>1,449</td><td>164</td><td>2.5 s</td><td>580 f/s</td></tr>
+</tbody></table></div>
+<p>Rates cluster around <strong>400–580 files/s</strong> with the default 2 workers and headroom governor.</p>
+</section>
+
+<section id="s4">
+<h2 class="sec"><span class="n">04</span><span>The dataset model</span></h2>
+<h3>The two datasets have different lifecycles</h3>
+<pre><code>yara_scanner_matches_v4_&lt;host&gt;_&lt;6hex&gt;         PERMANENT — one per host, no month suffix.
+                                               Overwritten at the start of every scan.
+                                               Holds exactly the newest scan. Never rotates.
+
+yara_scanner_scans_v4_&lt;host&gt;_&lt;6hex&gt;_&lt;YYYYMM&gt;  APPEND-ONLY — rotates monthly.
+                                               Lifecycle events only, a few rows per scan.</code></pre>
+<p><strong>This asymmetry is deliberate and is the single most misunderstood part of the system.</strong></p>
+<ul>
+<li><strong>Matches</strong> is bounded by the <em>overwrite</em>: it can only ever hold one scan’s worth of rows, so it never needs rotation to stay small. Its name must stay stable because dashboards and the consolidation automations reference it, and it is the deep-dive source — the only place the per-file detail behind a consolidated summary row still lives.</li>
+<li><strong>Scans</strong> is bounded by <em>rotation</em>: it’s append-only (a handful of rows per scan) so it genuinely grows, and <code>CONFIG_LOOKUP_ROTATION = "monthly"</code> bounds it.</li>
+</ul>
+<p><code>CONFIG_LOOKUP_ROTATION</code> <strong>only affects the scans dataset.</strong> Setting it has no effect on matches whatsoever.</p>
+
+<h3>Why the overwrite is a row-flush, not delete-and-recreate</h3>
+<div class="scroll"><table>
+<thead><tr><th>Operation</th><th>Measured</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td><code>remove_data</code> filter flush</td><td><strong>10.0 s</strong> (~550 rows)</td><td>What the scanner does. Keeps the dataset object and schema alive.</td></tr>
+<tr><td><code>delete_dataset</code> + recreate</td><td><strong>190.2 s</strong> (delete alone: 187 s)</td><td><strong>19× slower</strong>, and drops the schema. Never used.</td></tr>
+<tr><td><code>add_lookup_data</code> write</td><td>44.7 s for 1,097 rows (3 batches)</td><td>At fleet scale the <em>write</em> dominates, not the flush.</td></tr>
+</tbody></table></div>
+<p><strong>The flush fails safe.</strong> Every failure is logged and swallowed — stale rows surviving is recoverable, a scan refusing to run because it couldn’t tidy up is not. The current scan’s <code>scan_id</code> is filtered out before any delete, so the worst case of a wrong enumeration is that too <em>few</em> rows are removed.</p>
+<div class="call crit"><span class="lbl">Unsupported configuration</span>
+<p><strong>Two concurrent scans on one host</strong> are not supported under the overwrite model.
+The second scan’s flush would delete the first’s rows — from the dataset’s point of view they
+<em>are</em> a previous scan.</p></div>
+
+<h3>Schema v4 — one row per file</h3>
+<p>v2 wrote one row per matched <strong>string</strong>. v3 wrote one per <strong>(rule, file)</strong> finding. v4 writes one per <strong>file</strong>, folding every rule that hit it into a <code>rules</code> JSON array.</p>
+<p><strong>Fields:</strong> <code>tenant_id</code>, <code>scan_id</code>, <code>hostname</code>, <code>os_info</code>, <code>os_type</code>, <code>ip_address</code>, <code>filename</code>, <code>file_size</code>, <code>file_sha256</code>, <code>file_creation_time</code>, <code>rules</code> (JSON array), <code>rule_count</code>, <code>match_total</code>, <code>severity</code> (highest across the file’s rules), <code>truncated</code>, <code>event_timestamp_ms</code>.</p>
+<p>Each <code>rules</code> entry: <code>rule</code>, <code>match_count</code>, <code>offsets</code>, <code>strings</code>, <code>string_ids</code>, <code>truncated</code>, <code>severity</code>.</p>
+<p><strong>Measured reduction</strong>, same underlying findings:</p>
+<div class="scroll"><table>
+<thead><tr><th>Scan</th><th>(rule, file) pairs</th><th>v4 rows</th><th>Reduction</th></tr></thead>
+<tbody>
+<tr><td>Windows full <code>C:\</code></td><td>2,574</td><td>1,485</td><td><strong>42%</strong></td></tr>
+<tr><td>Linux <code>/etc</code></td><td>5,241</td><td>2,714</td><td><strong>48%</strong></td></tr>
+</tbody></table></div>
+<div class="call"><span class="lbl">Why string_ids is an array, not an object</span>
+<p>YARA string identifiers begin with <code>$</code>, and <code>json_extract_scalar(x, "$.$ip")</code>
+is not valid JSONPath — an object keyed by identifier could be stored but never queried.
+It’s <code>[{id, count}]</code> for that reason.</p></div>
+
+<h3>Querying</h3>
+<p>Dashboards match <code>yara_scanner_matches*</code> / <code>yara_scanner_scans*</code> wildcards, so shards fan back in automatically. Filtering by <code>scan_id</code> or <code>hostname</code> behaves exactly as it would against one dataset.</p>
+<p>Expanding v4’s <code>rules</code> array in XQL:</p>
+<pre><code>dataset = yara_scanner_matches_v4_&lt;host&gt;_&lt;6hex&gt;
+| alter r = json_extract_array(rules, "$")
+| arrayexpand r
+| alter rule = json_extract_scalar(r, "$.rule")
+| comp count() as n by scan_id, hostname, rule</code></pre>
+</section>
+
+<section id="s5">
+<h2 class="sec"><span class="n">05</span><span>Sizing the run timeout — the drain problem</span></h2>
+<div class="call crit"><span class="lbl">Most likely thing to cost you data on a first large scan</span>
+<p>Match rows upload on a background queue that keeps working after scanning finishes. The scan
+reports “completed” as soon as the last file is checked — the queue may still hold thousands of rows.</p></div>
+<p><strong>Measured, on a 93,137-file scan:</strong></p>
+<pre><code>scan time:   169 seconds
+drain time:  6 minutes 41 seconds     ← 2.4× longer than the scan itself</code></pre>
+<p>If the Action Center action’s timeout expires mid-drain, the platform kills the payload and <strong>queued rows are never sent</strong>. In that measured run, 13,845 rows were still pending when the timeout hit.</p>
+
+<h3>What survives a mid-drain kill</h3>
+<div class="scroll"><table>
+<thead><tr><th>Data</th><th>Survives?</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>Terminal lifecycle row</td><td><span class="tag yes">Yes</span></td><td>Sent inline, ahead of the queue, specifically for this case</td></tr>
+<tr><td>Already-uploaded match rows</td><td><span class="tag yes">Yes</span></td><td>Already committed</td></tr>
+<tr><td>Queued match rows</td><td><span class="tag no">No</span></td><td>Never sent; counted in <code>dataset_delivery.undelivered</code></td></tr>
+<tr><td><code>scan_summary_&lt;run_id&gt;.json</code></td><td><span class="tag no">No</span></td><td>Written after the drain completes</td></tr>
+</tbody></table></div>
+<p>A missing summary file is itself a signal: the run was killed before finishing.</p>
+
+<h3>Guidance</h3>
+<p>Budget <strong>scan time + 10 minutes</strong> as a starting point. Very large scans on slow links need more. Drain budget internals: minimum <strong>150 s</strong>, scaled by backlog at <strong>45 s per batch</strong>, capped at <strong>600 s</strong>.</p>
+<p>There is no external signal to poll for “drain finished” — the summary file only appears once the whole run, drain included, is done.</p>
+</section>
+
+<section id="s6">
+<h2 class="sec"><span class="n">06</span><span>Delivery accounting — did my data land?</span></h2>
+<p>Every run writes <code>scan_summary_&lt;run_id&gt;.json</code> to the scanner’s <code>logs/</code> directory. The delivery counters <strong>always balance</strong>, by design:</p>
+<pre><code>queued == added + updated + skipped + unconfirmed + undelivered (+ failures × batch)</code></pre>
+<h3>The one field to check</h3>
+<p><strong><code>delivery_shortfall</code></strong> — empty string means everything queued arrived. Non-empty means findings exist only in the endpoint’s local logs. Example from a real killed run:</p>
+<pre><code>"delivery_shortfall": "dataset rows: 19 of 1523 NOT confirmed (19 never sent)
+                       — findings are complete in the local logs on this endpoint"</code></pre>
+<h3>Counter meanings</h3>
+<div class="scroll"><table>
+<thead><tr><th>Counter</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>records_added</code></td><td>Confirmed written</td></tr>
+<tr><td><code>undelivered</code></td><td>Still queued when the run ended — <strong>never attempted</strong></td></tr>
+<tr><td><code>send_failures</code></td><td>Attempted, failed permanently</td></tr>
+<tr><td><code>rows_unconfirmed</code></td><td>Read-timed-out; the server may have committed them anyway. Deliberately not retried, to avoid duplicates</td></tr>
+<tr><td><code>dropped</code></td><td>Queue was full or the uploader thread was dead</td></tr>
+</tbody></table></div>
+<p>A worked example, reconciled exactly:</p>
+<pre><code>1,523 queued  =  1,504 delivered  +  19 undelivered
+1,504 delivered = 1,501 match rows + initiated + 2 heartbeats</code></pre>
+<div class="call ok"><span class="lbl">Not a bug</span>
+<p><code>rows_unconfirmed</code> means a read timeout left the server mid-merge when the connection
+dropped. Blind retries would duplicate rows, so the scanner counts them as <em>fate unknown</em>
+rather than guessing.</p></div>
+</section>
+
+<section id="s7">
+<h2 class="sec"><span class="n">07</span><span>Dataset management: the five automations</span></h2>
+<div class="scroll"><table>
+<thead><tr><th>Automation</th><th>Writes?</th><th>Deletes?</th><th>Dry run?</th></tr></thead>
+<tbody>
+<tr><td><code>YaraReport</code></td><td>No</td><td>No</td><td>n/a — read-only</td></tr>
+<tr><td><code>YaraConsolidateStatus</code></td><td>No</td><td>No</td><td>n/a — read-only</td></tr>
+<tr><td><strong><code>YaraConsolidateApply</code></strong></td><td><strong>Yes</strong></td><td><strong>Yes</strong></td><td><span class="tag no">None exists</span></td></tr>
+<tr><td><code>YaraConsolidateSummary</code></td><td>Yes</td><td><strong>Never</strong></td><td>Yes, unless <code>execute=true</code></td></tr>
+<tr><td><code>YaraCleanup</code></td><td>No</td><td><strong>Yes</strong></td><td>Yes, unless <code>execute=true</code></td></tr>
+</tbody></table></div>
+<div class="call crit"><span class="lbl">YaraConsolidateApply is the exception</span>
+<p>It has <strong>no <code>execute</code> argument and no dry-run mode</strong>. <code>main()</code> runs with
+<code>dry_run=False</code> unconditionally. A bare <code>!YaraConsolidateApply</code> with zero arguments
+merges and deletes on its first run. Use <code>YaraConsolidateStatus</code> to preview.</p></div>
+
+<h3>The two consolidation modes</h3>
+<div class="scroll"><table>
+<thead><tr><th></th><th>Full detail (<code>Apply</code>)</th><th>Summary only (<code>Summary</code>)</th></tr></thead>
+<tbody>
+<tr><td>Target</td><td><code>yara_scanner_matches_v4_scan_&lt;id&gt;</code></td><td><code>yara_scanner_summary_v4_scan_&lt;id&gt;</code></td></tr>
+<tr><td>Row grain</td><td>Every matched-file row, verbatim</td><td>One row per <strong>(host, rule)</strong></td></tr>
+<tr><td>Columns</td><td>Full v4 schema</td><td><code>scan_id</code>, <code>hostname</code>, <code>rule</code>, <code>event_timestamp_ms</code></td></tr>
+<tr><td>Per-rule counts</td><td>n/a</td><td><strong>Deliberately absent</strong></td></tr>
+<tr><td>Source afterwards</td><td><strong>Deleted</strong> once verified</td><td><strong>Untouched</strong></td></tr>
+<tr><td>Read cost</td><td>Reads the shard’s rows</td><td>One XQL per shard, aggregated in-engine</td></tr>
+<tr><td>Default</td><td>Writes and deletes</td><td><strong>Dry run</strong></td></tr>
+</tbody></table></div>
+<p><strong>Summary</strong> is the safer default for fleet reporting — the per-host dataset stays in place, so any summary row can still be drilled into. <strong>Full detail</strong> is right when the per-scan dataset must answer file-level questions with no second lookup.</p>
+<div class="call warn"><span class="lbl">Not interchangeable after the fact</span>
+<p>Full mode deletes the per-host shard that summary mode preserves. The next scan on that host
+recreates it, so the loss is bounded — but until then that scan’s per-file detail is gone.</p></div>
+
+<h3>YaraCleanup’s safety rails</h3>
+<p>Nothing is deleted if it is: not a YARA dataset name · a per-scan consolidated target · a <strong>permanent per-host matches dataset</strong> · an abandoned pre-rotation dataset · genuinely unrotated · the current month · dated in the future · inside the retention window · written to more recently than <code>min_quiet_hours</code> · still holding an unconsolidated scan.</p>
+<p>Plus <strong>dry run unless <code>execute=true</code></strong>, and <code>older_than_months</code> has no default.</p>
+</section>
+
+<section id="s8">
+<h2 class="sec"><span class="n">08</span><span>Consolidation mechanics and safety rails</span></h2>
+<h3>The pipeline</h3>
+<pre><code>Status (read-only)  →  eligible scan IDs
+                       ↓
+Apply               →  create per-scan target
+                       copy this scan's rows from each source shard
+                       count target rows
+                       ↓
+                    verify: target_count == sum(source_counts)?
+                       ↓ yes                        ↓ no
+                    strip this scan's rows       count_mismatch —
+                    from sources; delete a       nothing deleted,
+                    shard once EVERY scan        reported for review
+                    in it is verified</code></pre>
+
+<h3>Verify-before-delete</h3>
+<p>A source shard is deleted <strong>only</strong> when the target’s row count equals the sum of its sources <em>and</em> every scan sharing that shard is verified. Any shortfall keeps every source.</p>
+<div class="call warn"><span class="lbl">What verification does not check</span>
+<p>It compares row <em>counts</em>, not row <em>content</em>. A corrupted write landing on the same
+count would pass. And <code>delete_dataset</code> has no undo — the platform offers no versioning or
+restore. Treat consolidation as one-way.</p></div>
+
+<h3>Gate outcomes</h3>
+<div class="scroll"><table>
+<thead><tr><th>Outcome</th><th>Meaning</th><th>Action</th></tr></thead>
+<tbody>
+<tr><td><code>verified</code></td><td>Counts match; sources deletable</td><td>None — success</td></tr>
+<tr><td><code>host_not_terminal</code></td><td>Scan has no terminal lifecycle row yet</td><td>Deferred; retried next pass</td></tr>
+<tr><td><code>within_quiet_period</code></td><td>Newest row younger than <code>quiet_secs</code> (900 s)</td><td>Deferred — the uploader may still be draining</td></tr>
+<tr><td><code>count_mismatch</code></td><td>Target ≠ sum of sources</td><td><strong>Nothing deleted.</strong> Investigate</td></tr>
+<tr><td><code>row_ceiling_exceeded</code></td><td>Scan exceeds 2,000,000 rows</td><td>Refused before writing, not half-built</td></tr>
+</tbody></table></div>
+<div class="call ok"><span class="lbl">count_mismatch is a safety feature</span>
+<p>It means the tool refused to delete data it couldn’t prove it had copied.</p></div>
+
+<h3>The bounded pass</h3>
+<p><code>max_scans</code> (default <strong>4</strong>) caps how many scans one invocation processes. <strong>Measured per-scan cost: ~128 seconds.</strong></p>
+<div class="scroll"><table>
+<thead><tr><th>Pass size</th><th>Time</th><th>% of 900 s timeout</th></tr></thead>
+<tbody>
+<tr><td>4 scans</td><td>403 s</td><td>45%</td></tr>
+<tr><td>5 scans</td><td>638 s</td><td>71%</td></tr>
+<tr><td>20 scans</td><td>~2,552 s (projected)</td><td><strong>283% — killed around scan 7</strong></td></tr>
+</tbody></table></div>
+<p>The default was originally 20. That was wrong and would have reliably reproduced a stuck-lock failure on a real backlog.</p>
+<div class="call warn"><span class="lbl">A bounded pass does not resume itself</span>
+<p>It reports <code>stopped_early</code>; drain a large backlog by re-running, or raise the cap after
+measuring your own per-scan cost. The playbook runs Apply exactly once per execution — it does
+not loop back.</p></div>
+
+<h3>Run history</h3>
+<p><code>yara_scanner_consolidation_runs</code> gets a <strong><code>started</code></strong> row before the merge and a terminal row (<code>success</code> / <code>partial_failure</code> / <code>crashed</code>) after. A <code>started</code> row with <strong>no</strong> matching terminal row means a pass was killed — or is still running.</p>
+</section>
+
+<section id="s9">
+<h2 class="sec"><span class="n">09</span><span>The consolidation lock</span></h2>
+<h3>How it works</h3>
+<p>The lock is a dataset (<code>yara_scanner_consolidation_lock</code>), not a real mutex primitive. Acquisition exploits the atomicity of dataset creation: whoever’s <code>create_lookup_dataset</code> returns “created” owns it; a second run gets “already exists” and stands down.</p>
+<p>Release is <code>delete_dataset</code>. <strong>Both are ordinary API calls</strong> — if the process dies, release never happens.</p>
+<h3>Why it exists</h3>
+<p>Consolidation merges then <strong>deletes</strong>. Two concurrent runs on the same scan could both delete sources after only one wrote a target. Plus <code>add_data</code> isn’t concurrency-safe. Passes are serialised tenant-wide.</p>
+<h3>Stale takeover</h3>
+<p><code>DEFAULT_LOCK_STALE_SECS</code> = <strong>20 minutes</strong>, sized against the 900 s task timeout. Past that, the next run treats the lock as abandoned and takes over.</p>
+<div class="call crit"><span class="lbl">A timed-out caller does not mean a stopped script</span>
+<p><strong>Observed live:</strong> a consolidation run whose HTTP caller timed out kept executing
+server-side for approximately <strong>two hours</strong>, eventually completing and writing its result —
+using whatever code was deployed when it <em>started</em>.</p>
+<p><strong>Consequences:</strong> a caller timeout tells you nothing about whether the run is still going.
+And because the stale window (20 min) is far shorter than that observed overrun, a genuinely
+long-running process <em>can</em> have its lock taken by a later run while still mid-write.</p>
+<p><strong>Before intervening manually</strong> — especially before clearing a lock — check
+<code>yara_scanner_consolidation_runs</code> for a <code>started</code> row with no terminal row, and watch
+whether dataset counts are still changing.</p></div>
+<h3>Clearing a stuck lock</h3>
+<p>Only after confirming nothing is actually running (no dataset churn over several minutes, no recent tracker activity). Delete the <code>yara_scanner_consolidation_lock</code> dataset — that <em>is</em> what release does. Or wait for the 20-minute stale window.</p>
+</section>
+
+<section id="s10">
+<h2 class="sec"><span class="n">10</span><span>Cancellation</span></h2>
+<p>Two ways to stop a scan; they behave <strong>very differently</strong>.</p>
+<div class="scroll"><table>
+<thead><tr><th>Method</th><th>Mechanism</th><th>Terminal row?</th><th>Result</th></tr></thead>
+<tbody>
+<tr><td><strong>Scanner <code>cancel</code> entry point</strong></td><td>Cooperative flag, detected within ~5 s</td><td><span class="tag yes">Yes</span> — <code>cancelled</code></td><td>Clean. Partial findings preserved and consolidatable</td></tr>
+<tr><td><strong>Action Center console Cancel</strong></td><td>Hard-kills the payload</td><td><span class="tag no">No</span></td><td>Lifecycle stuck at <code>running</code> forever</td></tr>
+</tbody></table></div>
+<p><strong>Always prefer the <code>cancel</code> entry point.</strong> Run the same library script with Entry Point = <code>cancel</code> (it takes no inputs).</p>
+<p>A console Cancel leaves an orphaned scan that shows as running indefinitely. The 24-hour abandoned-scan cutoff (<code>DEFAULT_ABANDONED_SECS</code>) eventually rescues it — its partial matches are consolidated rather than dropped — but for those 24 hours it is neither terminal nor abandoned, and it blocks its shard from cleanup.</p>
+</section>
+
+<section id="s11">
+<h2 class="sec"><span class="n">11</span><span>Capacity planning</span></h2>
+<h3>The binding constraint</h3>
+<p><strong>50 MB per lookup dataset.</strong> Everything else follows from it.</p>
+<div class="scroll"><table>
+<thead><tr><th>Row type</th><th>Measured size</th><th>Rows per 50 MB</th></tr></thead>
+<tbody>
+<tr><td>v4 match row (one per file)</td><td>~749 B</td><td>~70,000</td></tr>
+<tr><td>Summary row (host, rule)</td><td>~163 B</td><td>~321,000</td></tr>
+</tbody></table></div>
+<h3>Per-host matches dataset</h3>
+<p>Because it’s overwritten each scan, it only ever holds <strong>one scan’s</strong> matched files. A host would need ~70,000 matched files <em>in a single scan</em> to approach the cap. The measured worst case in testing was 14,500 rows — about 20% of capacity.</p>
+<h3>Summary datasets</h3>
+<p>The fleet limit is <strong>rules-matched-per-host, not host count</strong>. 321,000 (host, rule) pairs is a very large fleet unless rules are extremely noisy.</p>
+<h3>Dataset count</h3>
+<p>A fleet produces one matches dataset per host (permanent) plus one scans dataset per host per month. Control it with <code>CONFIG_LOOKUP_SHARD</code> — it accepts a literal label (<code>wave1</code>, <code>emea</code>), grouping hosts into a fixed number of buckets rather than one per endpoint.</p>
+<div class="call warn"><span class="lbl">Bucket carefully</span>
+<p>Choose bucket count so that few endpoints in the same bucket scan concurrently. The
+concurrent-write risk returns as writers-per-dataset rises above one. Set
+<code>CONFIG_LOOKUP_SHARD = "none"</code> only for a single scanning endpoint — at fleet scale that’s the
+configuration measured at 2/8 delivery.</p></div>
+<h3>The noisy-rule failure mode</h3>
+<p>A single over-broad rule on a 465,000-file Windows host produced <strong>36,243 string matches across 401 files</strong>. Alerts absorbed it cleanly (401 alerts — alerts are per <em>finding</em>, not per string). The dataset channel queued ~36,000 rows and 7,719 hit the drain budget.</p>
+<div class="call"><span class="lbl">That measurement predates v4</span>
+<p>Under v4’s one-row-per-file grain the same event would write <strong>401 rows, not 36,000</strong> — the
+row explosion is largely gone. What has <em>not</em> changed is the alert-budget pressure and the
+scan-time cost of a rule that matches far more than intended, so the mitigation still stands.</p></div>
+<p><strong>Mitigation is entirely on the rules.</strong> Test every new pack against one directory first and read <code>top_rules</code> in the summary. A rule matching hundreds of files in a small sample will match tens of thousands fleet-wide.</p>
+</section>
+
+<section id="s12">
+<h2 class="sec"><span class="n">12</span><span>Credentials and permissions</span></h2>
+<p><strong>Two different keys, two different types.</strong> Mixing them up produces an identical generic 401.</p>
+<div class="scroll"><table>
+<thead><tr><th>Component</th><th>Key type</th><th>Where</th></tr></thead>
+<tbody>
+<tr><td>Scanner (<code>xdr_yara_scanner.py</code>)</td><td><strong>Standard</strong></td><td><code>DEFAULT_XDR_API_KEY</code> / <code>_ID</code> / <code>_URL</code>, top of CUSTOMER CONFIG</td></tr>
+<tr><td>Pack automations (×5)</td><td><strong>Advanced (HMAC)</strong></td><td>Same three constants, top of each automation</td></tr>
+</tbody></table></div>
+<p><strong>This is five separate edits for the automations.</strong> Every automation is self-contained — the tenant resolves no cross-script imports, so there is no shared library to edit once.</p>
+<h3>Scanner key permissions</h3>
+<ul>
+<li><strong>External Issues Mapping</strong> (<code>external_alerts_action</code>) — for alert insertion</li>
+<li><strong>Data Management</strong> (<code>data_management_action</code>) — for datasets</li>
+<li><strong>Query Center</strong> (<code>investigation_query_view</code>) — <strong>required for the overwrite</strong></li>
+</ul>
+<div class="call crit"><span class="lbl">Without Query Center, the overwrite fails silently</span>
+<p>The start-of-scan flush enumerates stale <code>scan_id</code>s with one XQL. Without the permission it
+403s, fails safe, and the dataset quietly resumes accumulating. The only sign is a line in the
+scan log.</p></div>
+<h3>Editing deployed automations</h3>
+<p>Uploading a pack marks its items <code>system:true</code>, after which item-level API writes fail permanently with <code>Item is system and cannot be modified (100001)</code>. Re-import the whole pack rather than patching one script.</p>
+</section>
+
+<section id="s13">
+<h2 class="sec"><span class="n">13</span><span>Failure modes catalogue</span></h2>
+<p>Every one of these was observed live during validation.</p>
+<div class="scroll"><table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>What to do</th></tr></thead>
+<tbody>
+<tr><td>Scan “completed” but rows missing</td><td>Run timeout expired mid-drain</td><td>Check <code>delivery_shortfall</code>. Raise the timeout (<a href="#s5">§5</a>)</td></tr>
+<tr><td>Scan shows <code>running</code> forever</td><td>Console Cancel, or terminal row lost</td><td>24 h cutoff rescues it. Use the <code>cancel</code> entry point instead</td></tr>
+<tr><td>No <code>scan_summary_*.json</code></td><td>Run killed before completing</td><td>Confirms a mid-drain kill</td></tr>
+<tr><td>Consolidation reports 0 candidates, exits clean</td><td><code>schema_version</code> mismatch — datasets classify as “newer” and are correctly left alone</td><td>Ensure <code>schema_version</code> matches the scanner (<strong>4</strong>)</td></tr>
+<tr><td><code>count_mismatch</code> on a scan</td><td>Target ≠ sum of sources</td><td><strong>Safe</strong> — nothing deleted. Often a prior partial run</td></tr>
+<tr><td>“Lock held by another run”</td><td>Genuine concurrency, <strong>or</strong> a stale lock from a killed pass</td><td>Check the runs tracker before clearing (<a href="#s9">§9</a>)</td></tr>
+<tr><td>Consolidation stalls indefinitely</td><td>Pass killed at the task timeout holding the lock</td><td>Fixed by <code>max_scans</code> bounding. Clear the lock if confirmed dead</td></tr>
+<tr><td>Summary mode writes 0 rows</td><td>Scan still in progress (correctly skipped), or genuinely no matches</td><td>Check the skip reasons in the output</td></tr>
+<tr><td>401 on every automation call</td><td>Standard key in an Advanced-key slot, or rotated key</td><td>Regenerate an <strong>Advanced</strong> key; edit all five</td></tr>
+<tr><td>Dataset grows despite overwrite</td><td>Query Center permission missing on the <strong>scanner’s</strong> key</td><td>Grant <code>investigation_query_view</code></td></tr>
+<tr><td><code>add_data</code> rows silently skipped</td><td>Row carries a field outside the dataset’s schema</td><td>Schema can’t be altered in place — bump the version tag</td></tr>
+</tbody></table></div>
+</section>
+
+<section id="s14">
+<h2 class="sec"><span class="n">14</span><span>Known limitations and open questions</span></h2>
+<h3>Accepted limitations</h3>
+<ul>
+<li><strong>Verification compares counts, not content.</strong> A corrupted write on the right count passes.</li>
+<li><strong><code>delete_dataset</code> has no undo.</strong> No versioning, no restore.</li>
+<li><strong>Two concurrent scans on one host are unsupported</strong> — the second’s flush deletes the first’s rows.</li>
+<li><strong>The CLI path (<code>xdr_data_management.py --consolidate</code>) has no <code>max_scans</code> bound.</strong> It was not updated when the cap was added to the pack automations. Restrict scope with <code>--scan-id</code>.</li>
+<li><strong>A bounded pass doesn’t self-resume.</strong> Re-run to drain a backlog.</li>
+<li><strong>XQL truncates silently at 1,000,000 rows.</strong></li>
+</ul>
+<h3>Open questions — genuinely unresolved</h3>
+<div class="call warn"><span class="lbl">Stated as open, not smoothed over</span>
+<ul style="margin-bottom:0">
+<li><strong>Does <code>remove_data</code> re-stamp <code>_insert_time</code> on surviving rows?</strong> Unverified; settling it needs a destructive test against a real shard holding two scans. <strong>Not load-bearing</strong> for the overwrite, which flushes every previous <code>scan_id</code> so no row survives for a re-stamp to touch. It would matter to a partial, filtered removal.</li>
+<li><strong>Why a run outlived its task timeout by ~8×.</strong> Observed once, mechanism unexplained. The 20-minute stale-lock window assumes the declared timeout is roughly honoured; that assumption is not confirmed.</li>
+<li><strong><code>_insert_time</code>’s exact shape on a raw row pull</strong> (as opposed to the <code>max()</code> aggregation, which is verified). Degrades to “no signal” and is logged, so worst case is a logged reversion to pre-fix behaviour.</li>
+</ul></div>
+<h3>Environment-specific notes</h3>
+<ul>
+<li>Cortex <strong>XDR has no scheduled-Job facility</strong> — the playbook is triggered by a correlation rule, not a timer. (XSIAM differs.)</li>
+<li>Incident creation via <code>/xsoar/incident</code> is inert on XDR tenants.</li>
+<li>Long-running automations exceed the synchronous-execute gateway timeout; the run continues server-side regardless.</li>
+<li>YARA versions differ by agent: <strong>4.5.4</strong> local dev macOS, <strong>4.1.0</strong> Windows/macOS agents, <strong>3.11.0</strong> Linux agents. 3.11.0 predates match-API changes the scanner normalises around.</li>
+</ul>
+</section>
+
+<section id="s15">
+<h2 class="sec"><span class="n">15</span><span>Pre-flight checklist</span></h2>
+<h3>Before the first scan</h3>
+<ul class="ck">
+<li><span>Scanner uploaded; confirm <code>scanner_version</code> in a summary reads <strong>3.4.0</strong></span></li>
+<li><span><strong>Standard</strong> key in the scanner’s three config constants</span></li>
+<li><span>Scanner key has External Issues Mapping + Data Management + <strong>Query Center</strong></span></li>
+<li><span>Rules tested against <strong>one directory</strong> first; <code>top_rules</code> reviewed for noise</span></li>
+<li><span>Run timeout sized for <strong>scan + drain</strong> (start at scan estimate + 10 min)</span></li>
+<li><span><code>CONFIG_LOOKUP_SHARD</code> decided — per-host, or bucketed for a large fleet</span></li>
+</ul>
+<h3>After the first scan</h3>
+<ul class="ck">
+<li><span><code>delivery_shortfall</code> is empty in <code>scan_summary_&lt;run_id&gt;.json</code></span></li>
+<li><span>Terminal row present in the scans dataset</span></li>
+<li><span>Matches dataset holds exactly one <code>scan_id</code></span></li>
+<li><span>Row count is sane against the 50 MB / ~70,000-row ceiling</span></li>
+</ul>
+<h3>Before the first consolidation</h3>
+<ul class="ck">
+<li><span><strong>Advanced (HMAC)</strong> key in all five automations</span></li>
+<li><span><code>YaraReport</code> run — inventory understood</span></li>
+<li><span><code>YaraConsolidateStatus</code> run — eligible scans reviewed</span></li>
+<li><span>Mode decided: <strong>Summary</strong> (safe, non-destructive) or <strong>Full</strong> (destructive)</span></li>
+<li><span>Understood: <strong><code>Apply</code> has no dry run and deletes on first use</strong></span></li>
+<li><span><code>max_scans</code> left at 4 for the first pass; measure your own per-scan cost before raising</span></li>
+</ul>
+<h3>Ongoing</h3>
+<ul class="ck">
+<li><span>Watch <code>yara_scanner_consolidation_runs</code> for <code>started</code> rows without terminal rows</span></li>
+<li><span>Re-run consolidation until it stops reporting <code>stopped_early</code></span></li>
+<li><span>Schedule <code>YaraCleanup</code> separately from consolidation — never the same window</span></li>
+</ul>
+</section>
+
+</main>
+</div>
+
+<footer><div class="wrap">
+  <span>YARA Scanner for Cortex XDR · scanner 3.4.0 · schema v4</span>
+  <span>Every figure measured on a live tenant.</span>
+</div></footer>
+
+</body>
+</html>

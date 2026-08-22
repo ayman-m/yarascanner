@@ -37,8 +37,8 @@ deeper where operators usually need it:
 
 | Guide | Answers |
 |---|---|
-| **[Manual Validation Runbook](Manual_Validation_Runbook.md)** | ***"How do I prove it works on my tenant?"*** — a ~2½ hour hands-on procedure, console and XQL only. |
-| **[Operations Deep Dive](Operations_Deep_Dive.md)** | ***"What will surprise me in production?"*** — every measured limit, caveat and failure mode in one place. Read §1 before a first fleet scan. |
+| **[Manual Validation Runbook](Manual_Validation_Runbook.md)** ([standalone HTML](Manual_Validation_Runbook.html)) | ***"How do I prove it works on my tenant?"*** — a ~2½ hour hands-on procedure, console and XQL only. |
+| **[Operations Deep Dive](Operations_Deep_Dive.md)** ([standalone HTML](Operations_Deep_Dive.html)) | ***"What will surprise me in production?"*** — every measured limit, caveat and failure mode in one place. Read §1 before a first fleet scan. |
 | [CPU Impact Control](topics/CPU_Impact_Control.md) | *"Will this scan slow my machine, and how do you know?"* |
 | [Scan Cancellation](topics/Scan_Cancellation.md) | *"How do I stop a scan, and why does a cancelled one still show as running?"* |
 | [Rule Compatibility](topics/Rule_Compatibility.md) | *"Which YARA library does each agent ship, and why do my rules work locally but get skipped on the endpoint?"* |
