@@ -1616,6 +1616,8 @@ script: |
           return
 
       lines = ["{} scan(s) eligible to consolidate".format(status["eligible_count"])]
+      if status["eligible_count"]:
+          lines.append("  eligible: {}".format(", ".join(status["eligible_scan_ids"][:10])))
       if status["any_in_progress"]:
           lines.append("{} scan(s) still in progress: {}".format(
               len(status["pending_scan_ids"]), ", ".join(status["pending_scan_ids"][:10])))
