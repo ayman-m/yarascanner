@@ -21,6 +21,7 @@ manual CLI invocation.
 | `YaraConsolidateSummary` | Automation | **Mode B, summary only.** One row per (host, rule) — which rules fired on which host — into `yara_scanner_summary_v<VER>_scan_<slug>`. Four columns, no filenames, no per-rule counts. **Deletes nothing at all.** Dry run unless `execute=true`. |
 | `YaraReport` | Automation | Read-only inventory of every `yara_scanner_*` lookup dataset (kind, host, age, plus the legacy / newer-schema / consolidated buckets). One API call, no writes — safe any time. Writes to `Yara.Report.*`. |
 | `YaraCleanup` | Automation | Retention pruning — **deletes whole datasets**. Dry run by default; see below. |
+| `YaraWipeAllDatasets` | Automation | **Deletes every `yara_scanner_*` dataset on the tenant, unconditionally.** No scoping, no rules. **Not wired to the playbook or any other content item — run it by hand only.** See below. |
 
 ## The overwrite model — one permanent matches dataset per host
 
@@ -313,6 +314,35 @@ wrong, with different consequences:
   path uses — the live recency and consolidation checks in particular — each reported as a
   skip.
 
+## Resetting a tenant — `YaraWipeAllDatasets`
+
+`YaraCleanup` and `YaraConsolidateApply` protect a specific set of data on purpose: a live
+matches dataset is never a deletion candidate, and a per-scan consolidated target is never
+touched. Those protections exist because that data is normally irreplaceable. Occasionally
+— most often before a test cycle — you want the opposite: every `yara_scanner_*` dataset on
+the tenant gone, no exceptions. `YaraWipeAllDatasets` is that tool, and nothing else in this
+pack.
+
+**It is not a task in the playbook, and it never will be.** Import the playbook and it will
+never call this automation; the only way it runs is an operator invoking it directly from
+the War Room or Playground.
+
+It targets host matches and scan lifecycle datasets, old schema and new, per-scan
+consolidated targets, and summary datasets — every kind the other five automations
+recognise, plus any the classification patterns above don't (it matches on the bare
+`yara_scanner_` prefix, not on `matches`/`scans` specifically). It preserves exactly four
+names: the three run-log audit trails this pack's automations keep (including its own,
+`yara_scanner_wipe_runs`) and the consolidation lock, which it takes for the duration of an
+executed pass the same way `YaraConsolidateApply` does.
+
+| Argument | Default | What it does |
+|---|---|---|
+| `execute` | `false` | The deletion opt-in. Left `false`, reports what would be deleted and deletes nothing. |
+| `confirm` | *(none)* | Required when `execute=true`: must equal, exactly and case-sensitively, `DELETE ALL YARA DATASETS`. There is no scoping argument on this automation — no `older_than_months`, no host filter, no `schema_version` — so this phrase is the only thing standing between `execute=true` and every YARA dataset on the tenant. Get it wrong and nothing is deleted, whatever `execute` says. |
+
+Run the dry run first, read the full list it prints, and only then re-run with both
+arguments set.
+
 ## Deployment — pack install or console Import, not a bare item push
 
 **A playbook delivered via a raw `POST /playbook/save/yaml` push (e.g. plain
@@ -492,3 +522,16 @@ dataset = yara_scanner_cleanup_runs*
 
 (Lookup rows carry no `_time` — read `run_ts_ms` and derive `run_time`, same as the
 consolidation widget does.)
+
+### The wipe audit trail — `yara_scanner_wipe_runs`
+
+`YaraWipeAllDatasets` keeps its own record too, for the same reason `YaraCleanup` does not
+share `yara_scanner_consolidation_runs`. It diverges from `YaraCleanup`'s convention in one
+place, deliberately: **it records every invocation, dry run included**, not only executed
+passes. For a tool with no scoping argument at all, knowing who checked what a full wipe
+would delete, and when, is worth keeping even when nothing was actually deleted.
+
+Every run — `mode` (`dry_run` / `executed`) — writes one row: `run_ts_ms`, `total_found`,
+`to_delete_count`, `deleted_count`, `failed_count`, the `deleted` / `failed` dataset name
+lists, and `preserved`. Same best-effort write discipline as the other two logs: a failure
+to record never changes the run's real outcome.

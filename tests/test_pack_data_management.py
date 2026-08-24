@@ -430,31 +430,54 @@ def _pack_script_dirs():
     return found
 
 
-# There are no exemptions from the gate, and that is the point. This pack used to carry one
-# library script, YaraConsolidateCommon — a seventh content item that no automation imported
-# and no playbook task reached, exempted from the gate because a file that never runs cannot
-# usefully be gated. It was deleted once the gate was widened from that dead copy to the six
-# that actually run on the tenant. Every script directory left is a shipping automation, so
-# `found - set(SHIPPING)` below is now the whole test, with nothing subtracted from it.
-# Both were removed deliberately: the shared library because every automation is now
-# standalone and nothing imported it, and the Fast variant because Summary superseded it
-# as the cheap option -- leaving three overlapping consolidation modes was the confusion.
+# There are no exemptions from the gate for a script that ships untested, and that is still
+# the point. This pack used to carry one library script, YaraConsolidateCommon — a seventh
+# content item that no automation imported and no playbook task reached, exempted from the
+# gate because a file that never runs cannot usefully be gated. It was deleted once the gate
+# was widened from that dead copy to the five that shared xdr_data_management.py's
+# classify/select contract (schema_version, older_than_months, delete_legacy — the thing this
+# whole file and test_consolidation.py's sibling gate compare against the CLI).
+#
+# YaraWipeAllDatasets is not that contract. It has no selection rules, no schema_version, no
+# retention window — it is an unconditional wipe with exactly two arguments (execute,
+# confirm), so parametrising it into SHIPPING would either fail every schema/retention/
+# delete_legacy test here for a script that was never meant to have those arguments, or
+# require bolting on unused rule logic just to satisfy a comparison it has no business being
+# compared against. So it is covered by its OWN dedicated, equally-rigorous suite instead:
+# tests/test_wipe_all_datasets.py. OTHER_AUTOMATIONS below is that pointer, not an escape
+# hatch — every name in it must resolve to a real test file, checked in
+# test_every_other_automation_has_dedicated_coverage.
 _DELETED_LIBRARY = "YaraConsolidateCommon"
 _DELETED_AUTOMATIONS = ("YaraConsolidateCommon",)
+OTHER_AUTOMATIONS = {"YaraWipeAllDatasets": "test_wipe_all_datasets.py"}
 
 
 def test_no_automation_escapes_the_gate():
-    """SHIPPING is hand-maintained, and the gate is only as wide as that tuple. A seventh
-    automation added to the pack without being added there would ship ungated — invisibly,
-    because every existing case would still pass. So discover the pack from the filesystem
-    and require the two to agree."""
+    """SHIPPING (this file's classify/select contract) plus OTHER_AUTOMATIONS (anything
+    with its own dedicated suite) must account for every script directory in the pack. A
+    new automation added to neither would ship untested by anything — invisibly, because
+    every existing case would still pass. So discover the pack from the filesystem and
+    require the three to agree."""
     found = _pack_script_dirs()
-    ungated = sorted(found - set(SHIPPING))
+    accounted_for = set(SHIPPING) | set(OTHER_AUTOMATIONS)
+    ungated = sorted(found - accounted_for)
     assert not ungated, (
-        "these automations ship but are not in SHIPPING, so no drift gate covers them: %s "
-        "— add them to SHIPPING in %s" % (ungated, os.path.abspath(__file__)))
-    vanished = sorted(set(SHIPPING) - found)
-    assert not vanished, "SHIPPING names automations that are no longer in the pack: %s" % vanished
+        "these automations ship but are covered by nothing: %s — add them to SHIPPING if "
+        "they share xdr_data_management.py's contract, or to OTHER_AUTOMATIONS with a "
+        "dedicated test file otherwise, in %s" % (ungated, os.path.abspath(__file__)))
+    vanished = sorted(accounted_for - found)
+    assert not vanished, (
+        "SHIPPING/OTHER_AUTOMATIONS names automations no longer in the pack: %s" % vanished)
+
+
+def test_every_other_automation_has_dedicated_coverage():
+    """The other half of the gate OTHER_AUTOMATIONS widens: every file it points at must
+    actually exist, so pointing at a typo'd or deleted filename cannot silently stand in
+    for real coverage."""
+    for name, test_file in OTHER_AUTOMATIONS.items():
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), test_file)
+        assert os.path.isfile(path), (
+            "OTHER_AUTOMATIONS[%r] points at %s, which does not exist" % (name, path))
 
 
 def test_the_deleted_library_stays_deleted():

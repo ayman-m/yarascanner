@@ -668,7 +668,7 @@ scan log.</p></div>
 <ul>
 <li><strong>Verification compares counts, not content.</strong> A corrupted write on the right count passes.</li>
 <li><strong><code>delete_dataset</code> has no undo.</strong> No versioning, no restore.</li>
-<li><strong>Two concurrent scans on one host are unsupported</strong> — the second’s flush deletes the first’s rows.</li>
+<li><strong>Any re-scan of a host destroys the previous scan’s file-level matches</strong> — concurrent or sequential, at any interval. On v4 nothing archives them: full consolidation is blocked from the live matches dataset by design, and summary mode keeps only rule/host/timestamp, not filenames or offsets. Alerts already raised are unaffected. Consolidation cadence does not change this.</li>
 <li><strong>The CLI path (<code>xdr_data_management.py --consolidate</code>) has no <code>max_scans</code> bound.</strong> It was not updated when the cap was added to the pack automations. Restrict scope with <code>--scan-id</code>.</li>
 <li><strong>A bounded pass doesn’t self-resume.</strong> Re-run to drain a backlog.</li>
 <li><strong>XQL truncates silently at 1,000,000 rows.</strong></li>

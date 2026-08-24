@@ -166,6 +166,16 @@ too *few* rows are removed.
 > **Two concurrent scans on one host are not supported** under the overwrite model. The
 > second scan's flush would delete the first's rows — from the dataset's point of view they
 > *are* a previous scan.
+>
+> **Sequential re-scans destroy the previous scan's file detail too — and consolidation does
+> not prevent it.** The flush does not check whether the previous scan was archived, because on
+> v4 nothing archives it: `YaraConsolidateApply` is deliberately blocked from consuming the
+> live v4 matches dataset (doing so would recreate the unbounded per-scan growth the overwrite
+> model removed), and `YaraConsolidateSummary` reads it but keeps only `scan_id`, `hostname`,
+> `rule`, `event_timestamp_ms` — no filenames, no offsets. So a host's file-level findings live
+> in exactly one place and the next scan on that host replaces them, at any interval, whatever
+> your consolidation cadence. Alerts already raised are unaffected. Treat each scan's file
+> detail as valid until that host is scanned again.
 
 ### Schema v4 — one row per file
 

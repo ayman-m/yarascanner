@@ -1,0 +1,89 @@
+args:
+- name: execute
+  description: THE DELETION OPT-IN. Leave false (the default) for a dry run that
+    reports what would be deleted and deletes nothing. true, combined with a correct
+    confirm phrase, deletes every yara_scanner_* dataset on the tenant except this
+    pack's own run-log datasets and the consolidation lock.
+  required: false
+  isArray: false
+  default: false
+  defaultValue: 'false'
+  secret: false
+  auto: PREDEFINED
+  predefined:
+  - 'true'
+  - 'false'
+- name: confirm
+  description: Required when execute=true. Must equal, exactly and case-sensitively —
+    DELETE ALL YARA DATASETS — or nothing is deleted, regardless of execute. There is
+    no scoping argument on this automation (no older_than_months, no host filter, no
+    schema check), so this phrase is the only thing standing between execute=true and
+    every YARA dataset on the tenant.
+  required: false
+  isArray: false
+  default: false
+  secret: false
+comment: >-
+  Deletes EVERY yara_scanner_* lookup dataset on this tenant — host matches and scan
+  lifecycle, old schema and new, per-scan consolidated targets and summary datasets
+  alike. No scoping, no rules, no exceptions for schema version or dataset kind. This is
+  the one automation in the pack that recognises none of the other five's safety rails
+  (YaraCleanup never deletes a live matches dataset or a consolidated target;
+  YaraConsolidateApply is blocked from ever consuming one) — those protections exist
+  because that data is normally irreplaceable, and this script exists specifically to
+  override that, on purpose, for resetting a tenant to a clean slate before a test
+  cycle. NOT part of any playbook — run it by hand, from the Playground or War Room,
+  only when you deliberately want zero YARA data left on the tenant. Dry run by default:
+  without execute=true this only reports what it would delete. execute=true additionally
+  requires the confirm argument to equal an exact phrase, or nothing is deleted. Preserves
+  only its own audit trail (yara_scanner_wipe_runs), the other two run-logs
+  (yara_scanner_consolidation_runs, yara_scanner_cleanup_runs), and the consolidation
+  lock, which it takes itself for the duration of an executed pass.
+commonfields:
+  id: YaraWipeAllDatasets
+  version: -1
+enabled: true
+name: YaraWipeAllDatasets
+outputs:
+- contextPath: Yara.WipeAll.dry_run
+  description: Whether this was a dry run (true) or an executed deletion (false).
+  type: Boolean
+- contextPath: Yara.WipeAll.total_found
+  description: Every yara_scanner_* dataset found on the tenant, before exclusions.
+  type: Number
+- contextPath: Yara.WipeAll.to_delete_count
+  description: How many of those are candidates for deletion (total_found minus preserved).
+  type: Number
+- contextPath: Yara.WipeAll.to_delete
+  description: The full list of dataset names that would be (or were) deleted.
+  type: String
+- contextPath: Yara.WipeAll.deleted_count
+  description: How many were actually deleted. 0 on a dry run.
+  type: Number
+- contextPath: Yara.WipeAll.deleted
+  description: The dataset names actually deleted. Empty on a dry run.
+  type: String
+- contextPath: Yara.WipeAll.failed_count
+  description: How many deletions failed.
+  type: Number
+- contextPath: Yara.WipeAll.failed
+  description: Dataset names whose deletion failed, with the reason logged in the readable output.
+  type: String
+- contextPath: Yara.WipeAll.preserved
+  description: Dataset names never touched — this pack's own run-logs and the consolidation lock.
+  type: String
+- contextPath: Yara.WipeAll.lock_held_by_other_run
+  description: True if this run stood down because the consolidation lock was held by
+    another concurrent run — nothing was deleted in that case.
+  type: Boolean
+script: '-'
+system: false
+tags: []
+timeout: 1800
+type: python
+subtype: python3
+dockerimage: demisto/python3:3.11.10.116949
+fromversion: 6.5.0
+marketplaces:
+- xsoar
+- marketplacev2
