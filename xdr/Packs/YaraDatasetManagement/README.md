@@ -345,6 +345,16 @@ arguments set.
 
 ## Deployment — pack install or console Import, not a bare item push
 
+**Uploading an automation itself (as opposed to the scanner's Action Center script) has a
+working API**, unlike the scanner — see the Deployment Guide's callout at "Step 3 — Upload
+the Script to the Library" for the distinction. All six of this pack's automations were
+delivered as standalone items via `POST /xsoar/automation/import` (multipart, field `file` =
+the `unified/<Name>.yml`), using the **same Advanced key, HMAC-signed**, already used for
+every `/public_api/*` call in this project — verified live, `/xsoar/automation/search` and
+`/xsoar/automation/import` both accept it. This is scriptable end to end; it does not need
+the console. `POST /xsoar/automation/search {"query":"name:Yara*"}` lists what is currently
+registered.
+
 **A playbook delivered via a raw `POST /playbook/save/yaml` push (e.g. plain
 `demisto-sdk upload` of just the single playbook file) is stored and runnable by id, but it
 is an invisible private draft** — absent from `/playbook/search` and therefore from every

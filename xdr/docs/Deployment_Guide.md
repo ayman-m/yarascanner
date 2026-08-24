@@ -154,8 +154,14 @@ The `test_rules.yar` in this repo is a good starting point — its `MatchCalc` /
 
 # 7. Step 3 — Upload the Script to the Library
 
-Cortex XDR has **no public API to upload a library script**, so this is a one-time UI
-step. **Action Center → Scripts → New → Upload Script**, select `xdr_yara_scanner.py`.
+**This specific claim is scoped to Action Center's endpoint-script library, not to
+platform automations in general** — the `YaraDatasetManagement` pack's six automations
+*do* have a working upload API (`POST /xsoar/automation/import`); see the pack's own
+[README](../Packs/YaraDatasetManagement/README.md#deployment--pack-install-or-console-import-not-a-bare-item-push).
+Only the scanner itself, as an Action-Center-dispatched endpoint script, has no such path:
+Cortex XDR has **no public API to upload a library script** to Action Center, so this is a
+one-time UI step. **Action Center → Scripts → New → Upload Script**, select
+`xdr_yara_scanner.py`.
 
 Metadata:
 
