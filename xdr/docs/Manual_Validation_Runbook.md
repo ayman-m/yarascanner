@@ -320,6 +320,10 @@ pack. (For a v2/v3 dataset it is correct and expected.)
 
 **Expect:** a count of eligible scans, plus any still in progress or blocked, with reasons.
 
+**On a fresh or freshly-wiped tenant:** `0 scan(s) eligible to consolidate`, with every
+count `0` and every scan-ID list empty. That is the correct result, not a misconfiguration —
+a tenant with no host matches or scans datasets gives the gate nothing to evaluate.
+
 **Reading it:** a scan you *just* ran will often show as **not** eligible. That is correct —
 there is a 900-second quiet period so consolidation never races a still-draining uploader.
 Wait it out rather than working around it.

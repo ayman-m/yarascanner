@@ -491,6 +491,12 @@ merges and deletes on its first run. Use <code>YaraConsolidateStatus</code> to p
 <div class="call warn"><span class="lbl">Not interchangeable after the fact</span>
 <p>Full mode deletes the per-host shard that summary mode preserves. The next scan on that host
 recreates it, so the loss is bounded — but until then that scan’s per-file detail is gone.</p></div>
+<div class="call ok"><span class="lbl">Zeros on an empty tenant are correct</span>
+<p>On a tenant with no YARA datasets yet, summary mode is a clean no-op. Dry run and
+<code>execute=true</code> alike report <code>XQL calls: 0 (+1 dataset listing)</code>,
+<code>written: 0 | skipped: 0 | failed: 0 | file-level findings collapsed: 0</code> and
+<code>host shards deleted: 0</code>, with <code>written</code>, <code>skipped</code> and
+<code>query_modes</code> empty. Zero here is the correct result, not a misconfiguration.</p></div>
 
 <h3>YaraCleanup’s safety rails</h3>
 <p>Nothing is deleted if it is: not a YARA dataset name · a per-scan consolidated target · a <strong>permanent per-host matches dataset</strong> · an abandoned pre-rotation dataset · genuinely unrotated · the current month · dated in the future · inside the retention window · written to more recently than <code>min_quiet_hours</code> · still holding an unconsolidated scan.</p>
@@ -712,7 +718,7 @@ scan log.</p></div>
 <h3>Before the first consolidation</h3>
 <ul class="ck">
 <li><span><strong>Advanced (HMAC)</strong> key in all five automations</span></li>
-<li><span><code>YaraReport</code> run — inventory understood</span></li>
+<li><span><code>YaraReport</code> run — inventory understood. On a tenant with no YARA datasets yet the report is a legitimate empty one — the header reads <code>0 current-schema dataset(s), 0 legacy, 0 newer-schema (never pruned)</code> and the table's only body row is <code>(none)</code>. Correct, not a broken deployment</span></li>
 <li><span><code>YaraConsolidateStatus</code> run — eligible scans reviewed</span></li>
 <li><span>Mode decided: <strong>Summary</strong> (safe, non-destructive) or <strong>Full</strong> (destructive)</span></li>
 <li><span>Understood: <strong><code>Apply</code> has no dry run and deletes on first use</strong></span></li>

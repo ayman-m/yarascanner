@@ -337,6 +337,12 @@ dataset must answer file-level questions with no second lookup.
 > summary mode preserves. The next scan on that host recreates it, so the loss is bounded —
 > but until then that scan's per-file detail is gone.
 
+> **On a tenant with no YARA datasets yet, summary mode is a clean no-op.** Dry run and
+> `execute=true` alike report `XQL calls: 0 (+1 dataset listing)`,
+> `written: 0 | skipped: 0 | failed: 0 | file-level findings collapsed: 0` and
+> `host shards deleted: 0`, with `written`, `skipped` and `query_modes` empty. Zero here is
+> the correct result, not a misconfiguration.
+
 ### YaraCleanup's safety rails
 
 Nothing is deleted if it is: not a YARA dataset name · a per-scan consolidated target · a
@@ -654,7 +660,10 @@ Every one of these was observed live during validation.
 **Before the first consolidation**
 
 - [ ] **Advanced (HMAC)** key in all five automations
-- [ ] `YaraReport` run — inventory understood
+- [ ] `YaraReport` run — inventory understood. On a tenant with no YARA datasets yet
+      the report is a legitimate empty one — the header reads
+      `0 current-schema dataset(s), 0 legacy, 0 newer-schema (never pruned)` and the
+      table's only body row is `(none)`. Correct, not a broken deployment
 - [ ] `YaraConsolidateStatus` run — eligible scans reviewed
 - [ ] Mode decided: **Summary** (safe, non-destructive) or **Full** (destructive)
 - [ ] Understood: **`Apply` has no dry run and deletes on first use**

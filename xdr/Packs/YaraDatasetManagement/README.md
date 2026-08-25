@@ -149,6 +149,16 @@ plus the `schema_version` and `retention_hours` the run used. A failure here nev
 anything, so it is a flag to read rather than an incident to chase: host shards are untouched
 in every failure case and **re-running is always safe**.
 
+**On a tenant with no YARA datasets yet, every one of those counts comes back `0` and every
+list comes back empty — that is the correct result, not a broken deployment.** The first line
+reads `DRY RUN - nothing was created or written.  XQL calls: 0 (+1 dataset listing)`, with
+`EXECUTED.` in place of the dry-run head when `execute=true`, followed by
+`written: 0 | skipped: 0 | failed: 0 | file-level findings collapsed: 0`; `written`,
+`skipped` and `query_modes` come back empty, while `schema_version` and `retention_hours`
+still report what the run used. There is no host shard to read — nothing is misconfigured.
+Budget for the wait, though: `execute=true` with nothing to do still takes ~70s in-process
+(~100-110s as seen in the War Room), while the dry run returns in about a second.
+
 **Two consequences of summary mode, stated rather than defended against.** Summary targets
 are invisible to `YaraCleanup` by construction — the name matches neither the current-dataset
 regex nor the shard regex, which is what stops one `delete_legacy=true` pass taking every
@@ -191,6 +201,13 @@ Outputs land under `Yara.Report.*`: the rendered table as `report`, per-dataset 
 `datasets` (name / kind / host / month / age_months / state), plus `frozen`, `not_rotated`,
 `consolidated`, `legacy`, `newer` and a `*_count` for each. The War Room entry carries the
 same table inside a code fence so its fixed-width columns stay aligned.
+
+**A tenant with no YARA datasets yet reports zeros, and that is the correct answer.** The
+header line reads `0 current-schema dataset(s), 0 legacy, 0 newer-schema (never pruned)`,
+the table's only body row is `(none)`, `datasets` is empty and every `*_count` is `0`, while
+`now_yyyymm` and `schema_version` are still populated. Nothing is misconfigured: a listing
+that fails — a bad credential included — raises, and the automation returns an error rather
+than a table, so a report of zeros is a successful run and not a silent one.
 
 ## Retention pruning — `YaraCleanup`
 
@@ -471,6 +488,7 @@ the YaraCleanup section above before granting this key to anything.
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `YaraConsolidateStatus failed: ... HTTP 401: ...` or `YaraConsolidateApply failed: ... HTTP 401: ...` in the Job's task error / War Room | The embedded `DEFAULT_XDR_API_KEY`/`DEFAULT_XDR_API_ID` were rotated, revoked, or hit their `expiration` on the tenant. The identical generic 401 also covers a mistyped key/ID and a Standard/Advanced type mismatch — the response body alone cannot tell you which. | Regenerate an Advanced-type key for this pack's role (see Credentials above), edit the three `DEFAULT_XDR_*` constants in **all five** automations — each one carries its own credential block, because the tenant resolves no cross-script import and every automation is therefore self-contained — and re-deliver the pack (editing the repo file alone does nothing until it's re-imported/re-installed — see Deployment above). Confirm with `YaraConsolidateStatus` — it's read-only and safe to run any time. |
+| `YaraConsolidateStatus` reports `0 scan(s) eligible to consolidate` and every list in its outputs is empty | A fresh or freshly-wiped tenant holds no host matches or scans datasets at all, so the gate has no scan to evaluate. | Not a failure and not a misconfiguration. `eligible_count` and `blocked_count` are `0`, `any_in_progress` is `False`, `blocked_reasons` is `{}`, and `eligible_scan_ids` / `pending_scan_ids` / `blocked_scan_ids` are empty — that is the correct read-only answer on an empty tenant. Run a scan, wait out the 900-second quiet period (`DEFAULT_QUIET_SECS`), and re-run. |
 | Every scheduled Job run fails at task "Check consolidation status" (or "Apply consolidation") and task 8 ("Flag failures for attention") never lights up | `return_error` halts the whole playbook run at the failing task, before task 8's condition is ever evaluated — task 8 only reports data-level `failed_count` from a *completed* run, not a total execution error. | Watch the Job's own run history, not just the task-8 context flag — a dead key (or any other uncaught exception) is a hard failure, not a soft one. The `yara_scanner_consolidation_runs` dataset (see Monitoring below) also gets a `status="crashed"` row for a mid-run `YaraConsolidateApply` crash specifically (not for a `YaraConsolidateStatus` crash — that one never reaches `YaraConsolidateApply` at all). |
 | Job history shows "0 scan(s) consolidated" every run, nothing actually being merged | Consolidation lock held by another concurrent run (the CLI's `xdr_data_management.py --consolidate --yes`, or an overlapping Job execution) | Check `Yara.ConsolidateApply.lock_held_by_other_run` in context, or just read the readable output — it now says "Skipped this pass — consolidation lock is held by another concurrent run" instead of looking identical to a genuinely-empty pass. Confirm the Job's Queue Handling is set to "Don't trigger a new job instance" and that no one is running the CLI `--consolidate --yes` concurrently. |
 | The playbook run ends at **"Unrecognised consolidation_mode - nothing done"** and nothing was merged or written | `consolidation_mode` is neither exactly `full` nor exactly `summary` — a typo, a capitalised value, or an empty one. This is the designed fail-safe, not a bug: an unrecognised mode must never fall through to the branch that deletes per-host shards. | Set the input to exactly `full` or exactly `summary` and re-run. If it is already one of those, the `isEqualString` condition in task 11 is the thing to verify against the live tenant (see the playbook description's NOTE ON VERIFICATION) — it has no local precedent in this repo. |
