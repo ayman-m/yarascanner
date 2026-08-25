@@ -1,4 +1,4 @@
-<svg width="100%" viewBox="0 0 680 2335" role="img">
+<svg width="100%" viewBox="0 0 680 2519" role="img">
 <title>YaraCleanup - what the script does, step by step</title>
 <desc>Workflow of YaraCleanup (in the tenant (Cortex automation script)): Prune aged-out datasets; dry run by default. Each step names the function responsible; the reference blocks list every API endpoint it calls and every lookup dataset it touches.</desc>
 <defs>
@@ -163,5 +163,13 @@
 <text class="ts" x="74" y="2236" dominant-baseline="central">- Takes the consolidation lock before evaluating rails</text>
 <text class="ts" x="74" y="2257" dominant-baseline="central">- Rails 6-7 fail closed: a query error keeps the dataset</text>
 <text class="ts" x="74" y="2278" dominant-baseline="central">- min_quiet_hours floored at 1h; 0 would disable rail 6</text>
+</g>
+<rect class="band-bg" x="40" y="2329" width="600" height="32" rx="6" stroke-width="0.5"/>
+<text class="th band-txt" x="340" y="2345" text-anchor="middle" dominant-baseline="central">On a tenant with no YARA datasets yet</text>
+<g class="node c-green"><rect x="60" y="2377" width="560" height="102" rx="8" stroke-width="0.5"/>
+<text class="ts" x="74" y="2399" dominant-baseline="central">- Bare run refuses: no window given, so nothing is selected</text>
+<text class="ts" x="74" y="2420" dominant-baseline="central">- execute=true alone STILL deletes nothing without a window</text>
+<text class="ts" x="74" y="2441" dominant-baseline="central">- With a window: DRY RUN 0 would be deleted / EXECUTED 0 deleted</text>
+<text class="ts" x="74" y="2462" dominant-baseline="central">- execute=true takes ~90s of fixed lock cost even deleting nothing</text>
 </g>
 </svg>

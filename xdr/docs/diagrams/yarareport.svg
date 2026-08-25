@@ -1,4 +1,4 @@
-<svg width="680" height="2208" viewBox="0 0 680 2208" xmlns="http://www.w3.org/2000/svg" role="img">
+<svg width="680" height="2371" viewBox="0 0 680 2371" xmlns="http://www.w3.org/2000/svg" role="img">
 <title>YaraReport - what the script does, step by step</title>
 <desc>Workflow of YaraReport (in the tenant, as a Cortex automation): Read-only inventory of every YARA lookup dataset. Each step names the function responsible; the reference blocks list every API endpoint it calls and every lookup dataset it touches.</desc>
 <defs>
@@ -149,4 +149,10 @@
 <text class="ts" x="74" y="2109" dominant-baseline="central">- Rail 5: parse_dataset_name returns None for foreign names</text>
 <text class="ts" x="74" y="2130" dominant-baseline="central">- CoreApiClient refuses to run on placeholder credentials</text>
 <text class="ts" x="74" y="2151" dominant-baseline="central">- MONTH_RE accepts only 20YY and 01-12 as a month suffix</text>
+<rect x="40" y="2202" width="600" height="32" rx="6" fill="#333"/>
+<text class="bandtxt" x="340" y="2218" text-anchor="middle" dominant-baseline="central">On a tenant with no YARA datasets yet</text>
+<rect x="60" y="2250" width="560" height="81" rx="8" fill="#e8f5e9" stroke="#5aa96a" stroke-width="0.5"/>
+<text class="ts" x="74" y="2272" dominant-baseline="central">- Reports 0 current-schema, 0 legacy, 0 newer - the correct result</text>
+<text class="ts" x="74" y="2293" dominant-baseline="central">- The dataset table renders one (none) row</text>
+<text class="ts" x="74" y="2314" dominant-baseline="central">- Every count is 0. A zero report is not a failed run</text>
 </svg>

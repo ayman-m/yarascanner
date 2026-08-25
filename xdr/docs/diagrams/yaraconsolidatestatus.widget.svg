@@ -1,4 +1,4 @@
-<svg width="100%" viewBox="0 0 680 2159" role="img">
+<svg width="100%" viewBox="0 0 680 2322" role="img">
 <title>YaraConsolidateStatus - what the script does, step by step</title>
 <desc>Workflow of YaraConsolidateStatus (in the tenant, as an XDR automation): Read-only readiness check for the per-scan merge. Each step names the function responsible; the reference blocks list every API endpoint it calls and every lookup dataset it touches.</desc>
 <defs>
@@ -149,5 +149,12 @@
 <text class="ts" x="74" y="2060" dominant-baseline="central">- Over the 2,000,000-row ceiling: reported, never merged</text>
 <text class="ts" x="74" y="2081" dominant-baseline="central">- Endpoint clock skew corrected via _insert_time</text>
 <text class="ts" x="74" y="2102" dominant-baseline="central">- Context cleared first so stale scan_ids can't accumulate</text>
+</g>
+<rect class="band-bg" x="40" y="2153" width="600" height="32" rx="6" stroke-width="0.5"/>
+<text class="th band-txt" x="340" y="2169" text-anchor="middle" dominant-baseline="central">On a tenant with no YARA datasets yet</text>
+<g class="node c-green"><rect x="60" y="2201" width="560" height="81" rx="8" stroke-width="0.5"/>
+<text class="ts" x="74" y="2223" dominant-baseline="central">- Reports "0 scan(s) eligible to consolidate"</text>
+<text class="ts" x="74" y="2244" dominant-baseline="central">- any_in_progress=false; eligible/pending/blocked all empty</text>
+<text class="ts" x="74" y="2265" dominant-baseline="central">- Nothing to consolidate is a normal state, not a fault</text>
 </g>
 </svg>

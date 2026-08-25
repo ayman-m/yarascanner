@@ -1,4 +1,4 @@
-<svg width="680" height="2506" viewBox="0 0 680 2506" xmlns="http://www.w3.org/2000/svg" role="img">
+<svg width="680" height="2690" viewBox="0 0 680 2690" xmlns="http://www.w3.org/2000/svg" role="img">
 <title>YaraWipeAllDatasets - what the script does, step by step</title>
 <desc>Workflow of YaraWipeAllDatasets (in the tenant (Playground / War Room)): Wipe every yara_scanner_* dataset. Each step names the function responsible; the reference blocks list every API endpoint it calls and every lookup dataset it touches.</desc>
 <defs>
@@ -161,4 +161,11 @@
 <text class="ts" x="74" y="2407" dominant-baseline="central">- A capped pass states exactly how many candidates remain</text>
 <text class="ts" x="74" y="2428" dominant-baseline="central">- Aborts at startup if API URL is still replace_with...</text>
 <text class="ts" x="74" y="2449" dominant-baseline="central">- Every run, dry or executed, is logged to wipe_runs</text>
+<rect x="40" y="2500" width="600" height="32" rx="6" fill="#333"/>
+<text class="bandtxt" x="340" y="2516" text-anchor="middle" dominant-baseline="central">On a tenant with no YARA datasets yet</text>
+<rect x="60" y="2548" width="560" height="102" rx="8" fill="#e8f5e9" stroke="#5aa96a" stroke-width="0.5"/>
+<text class="ts" x="74" y="2570" dominant-baseline="central">- Only the pack's own run-logs remain, and they are preserved</text>
+<text class="ts" x="74" y="2591" dominant-baseline="central">- Dry run: 0 of N would be deleted, N preserved</text>
+<text class="ts" x="74" y="2612" dominant-baseline="central">- execute=true without the exact phrase is refused, deletes nothing</text>
+<text class="ts" x="74" y="2633" dominant-baseline="central">- Correct phrase: EXECUTED - 0 deleted, run-logs still preserved</text>
 </svg>

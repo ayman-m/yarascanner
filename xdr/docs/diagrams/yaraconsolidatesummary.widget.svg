@@ -1,4 +1,4 @@
-<svg width="100%" viewBox="0 0 680 2232" role="img">
+<svg width="100%" viewBox="0 0 680 2395" role="img">
 <title>YaraConsolidateSummary - what the script does, step by step</title>
 <desc>Workflow of YaraConsolidateSummary (in the tenant (Cortex automation)): Which rules fired on which host, per scan. Each step names the function responsible; the reference blocks list every API endpoint it calls and every lookup dataset it touches.</desc>
 <defs>
@@ -158,5 +158,12 @@
 <text class="ts" x="74" y="2133" dominant-baseline="central">- Equal row count means verified - not rewritten</text>
 <text class="ts" x="74" y="2154" dominant-baseline="central">- Unreadable lifecycle means unknown; those scans stay put</text>
 <text class="ts" x="74" y="2175" dominant-baseline="central">- Non-matches dataset refused before any XQL interpolation</text>
+</g>
+<rect class="band-bg" x="40" y="2226" width="600" height="32" rx="6" stroke-width="0.5"/>
+<text class="th band-txt" x="340" y="2242" text-anchor="middle" dominant-baseline="central">On a tenant with no YARA datasets yet</text>
+<g class="node c-green"><rect x="60" y="2274" width="560" height="81" rx="8" stroke-width="0.5"/>
+<text class="ts" x="74" y="2296" dominant-baseline="central">- Dry run: written 0 | skipped 0 | failed 0, XQL calls: 0</text>
+<text class="ts" x="74" y="2317" dominant-baseline="central">- execute=true reports EXECUTED with the same zeros</text>
+<text class="ts" x="74" y="2338" dominant-baseline="central">- execute=true still takes ~70s of fixed cost - not a hang</text>
 </g>
 </svg>

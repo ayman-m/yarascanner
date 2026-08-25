@@ -1,4 +1,4 @@
-<svg width="100%" viewBox="0 0 680 2692" role="img">
+<svg width="100%" viewBox="0 0 680 2855" role="img">
 <title>YaraConsolidateApply - what the script does, step by step</title>
 <desc>Workflow of YaraConsolidateApply (in the tenant, as an XDR automation): Merge per-host shards into one set per scan. Each step names the function responsible; the reference blocks list every API endpoint it calls and every lookup dataset it touches.</desc>
 <defs>
@@ -201,5 +201,12 @@
 <text class="ts" x="74" y="2593" dominant-baseline="central">- Existing target with an odd row count is left untouched</text>
 <text class="ts" x="74" y="2614" dominant-baseline="central">- Row cleanup touches matches shards only, never scans</text>
 <text class="ts" x="74" y="2635" dominant-baseline="central">- Pass bounded to 4 scans to fit the 900s task timeout</text>
+</g>
+<rect class="band-bg" x="40" y="2686" width="600" height="32" rx="6" stroke-width="0.5"/>
+<text class="th band-txt" x="340" y="2702" text-anchor="middle" dominant-baseline="central">On a tenant with no YARA datasets yet</text>
+<g class="node c-green"><rect x="60" y="2734" width="560" height="81" rx="8" stroke-width="0.5"/>
+<text class="ts" x="74" y="2756" dominant-baseline="central">- Reports "0 scan(s) consolidated"; nothing is deleted</text>
+<text class="ts" x="74" y="2777" dominant-baseline="central">- Still takes 2-3 min: fixed lock cost, not a hang. Do not cancel</text>
+<text class="ts" x="74" y="2798" dominant-baseline="central">- Cancelling mid-run strands the lock for 20 min</text>
 </g>
 </svg>
