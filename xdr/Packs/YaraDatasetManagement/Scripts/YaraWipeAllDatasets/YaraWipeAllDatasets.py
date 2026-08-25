@@ -80,7 +80,7 @@ _WIPE_RUNS_DATASET = "yara_scanner_wipe_runs"
 _WIPE_RUNS_SCHEMA = {
     "run_ts_ms": "number", "mode": "text", "total_found": "number",
     "to_delete_count": "number", "deleted_count": "number", "failed_count": "number",
-    "deleted": "text", "failed": "text", "preserved": "text",
+    "deleted": "text", "failed": "text", "preserved": "text", "stopped_early": "text",
 }
 
 # Never deleted, regardless of how they reach the candidate list: the three run-logs this
@@ -95,6 +95,18 @@ PRESERVED_DATASETS = frozenset({
 })
 
 DELETE_CONCURRENCY = 12   # parallel delete_dataset calls, same bound every sibling uses
+
+# A platform automation task cannot outlive its ~900s execution timeout (the same ceiling
+# YaraConsolidateApply's DEFAULT_MAX_SCANS_PER_PASS exists for - see xdr_consolidate.py:101,
+# "a run cannot outlive the 900s task timeout"). delete_dataset measures ~60s server-side, so
+# at DELETE_CONCURRENCY=12 an unbounded pass over a few hundred datasets - exactly this
+# tenant's accumulated count from a long test session - runs 15-20+ minutes and gets killed
+# mid-batch. That happened live: a full pass against ~240 datasets surfaced as a bare
+# "Internal Server Error" with no clean YaraWipeAllDatasets message, after silently deleting
+# most of its candidates first. 100 candidates x 60s / 12-wide = ~500s (56% of budget) -
+# comfortable margin, matching how conservative Apply's own bound is relative to its measured
+# ceiling. Re-run to drain the rest, exactly like Apply's own "owed a further pass" pattern.
+DEFAULT_MAX_DELETES_PER_PASS = 100
 
 
 def _read_lock(client):
@@ -333,6 +345,7 @@ def record_wipe_run(client, result, now_ms=None, log=print):
         "deleted": json.dumps(result.get("deleted", []))[:8000],
         "failed": json.dumps(result.get("failed", []))[:4000],
         "preserved": json.dumps(result.get("preserved", []))[:2000],
+        "stopped_early": str(bool(result.get("stopped_early"))),
     }
     try:
         client.create_lookup_dataset(_WIPE_RUNS_DATASET, _WIPE_RUNS_SCHEMA)
@@ -341,10 +354,14 @@ def record_wipe_run(client, result, now_ms=None, log=print):
         log("could not record wipe run outcome: %s" % e)
 
 
-def wipe_all(client, execute=False, log=print, now_ms=None):
+def wipe_all(client, execute=False, log=print, now_ms=None, max_deletes=DEFAULT_MAX_DELETES_PER_PASS):
     """Find every yara_scanner_* dataset, delete every one of them except
     PRESERVED_DATASETS. Read-only (a dry run) unless execute is True. Takes the
     consolidation lock for the duration of an executed pass; a dry run takes no lock.
+
+    max_deletes bounds a single EXECUTED pass so it finishes inside the platform's task
+    timeout (see DEFAULT_MAX_DELETES_PER_PASS) - a dry run is unaffected and always reports
+    the full candidate list, since a report has no execution-time budget to protect.
 
     Returns a result dict; see main() for the shape consumed there."""
     now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
@@ -359,6 +376,7 @@ def wipe_all(client, execute=False, log=print, now_ms=None):
         "to_delete": to_delete,
         "preserved": preserved_present,
         "lock_held_by_other_run": False,
+        "stopped_early": False,
         "deleted_count": 0, "failed_count": 0, "deleted": [], "failed": [],
     }
 
@@ -371,7 +389,13 @@ def wipe_all(client, execute=False, log=print, now_ms=None):
         result["lock_held_by_other_run"] = True
         return result
     try:
-        deleted, failed = _delete_all(client, to_delete, log)
+        this_pass = to_delete
+        if max_deletes and len(to_delete) > max_deletes:
+            result["stopped_early"] = True
+            this_pass = to_delete[:max_deletes]
+            log("pass bounded to %d of %d candidate(s) so it finishes inside its task "
+                "timeout; the rest are owed a further pass" % (max_deletes, len(to_delete)))
+        deleted, failed = _delete_all(client, this_pass, log)
         result["deleted"] = deleted
         result["deleted_count"] = len(deleted)
         result["failed"] = failed
@@ -388,6 +412,17 @@ def main():
     args = demisto.args()
     execute = bool(argToBoolean(args.get("execute"))) if args.get("execute") not in (None, "") else False
     confirm = str(args.get("confirm") or "")
+    max_deletes_arg = args.get("max_deletes")
+    try:
+        max_deletes = (int(max_deletes_arg) if max_deletes_arg not in (None, "")
+                      else DEFAULT_MAX_DELETES_PER_PASS)
+    except (TypeError, ValueError):
+        demisto.executeCommand("DeleteContext", {"key": "Yara.WipeAll"})
+        return_error("YaraWipeAllDatasets: max_deletes must be a whole number ({!r} given). "
+                     "Nothing was deleted.".format(max_deletes_arg))
+        return
+    if max_deletes <= 0:
+        max_deletes = None   # 0 or negative disables the cap - an explicit, logged choice
 
     if execute and confirm != CONFIRM_PHRASE:
         demisto.executeCommand("DeleteContext", {"key": "Yara.WipeAll"})
@@ -398,7 +433,8 @@ def main():
 
     log_lines = []
     try:
-        result = wipe_all(CoreApiClient(), execute=execute, log=lambda m: log_lines.append(m))
+        result = wipe_all(CoreApiClient(), execute=execute, max_deletes=max_deletes,
+                          log=lambda m: log_lines.append(m))
     except Exception as ex:
         demisto.executeCommand("DeleteContext", {"key": "Yara.WipeAll"})
         return_error("YaraWipeAllDatasets failed: {}".format(ex))
@@ -414,11 +450,23 @@ def main():
                  "Re-run with execute=true and confirm=\"{}\" to apply."
                  .format(result["to_delete_count"], result["total_found"],
                          len(result["preserved"]), CONFIRM_PHRASE)]
+        # Tell the operator BEFORE they ever set execute=true, not only after the first
+        # capped pass — a dry run is exactly when this needs to be known, not discovered.
+        if max_deletes and result["to_delete_count"] > max_deletes:
+            passes = -(-result["to_delete_count"] // max_deletes)  # ceil division
+            lines.append("This is more than one execute pass handles (max_deletes={}): "
+                        "expect {} execute run(s), invoking the exact same command each "
+                        "time, to fully drain it.".format(max_deletes, passes))
         if result["to_delete"]:
             lines += ["", "would delete:"] + ["  {}".format(n) for n in result["to_delete"]]
     else:
         lines = ["EXECUTED - {} dataset(s) deleted, {} failed.".format(
             result["deleted_count"], result["failed_count"])]
+        if result["stopped_early"]:
+            remaining = result["to_delete_count"] - result["deleted_count"]
+            lines.append("Pass was bounded to {} of {} candidate(s) - {} remain. Run this "
+                         "exact command again to continue draining the rest."
+                         .format(max_deletes, result["to_delete_count"], remaining))
         if result["failed"]:
             lines += ["", "failed:"] + ["  {}".format(n) for n in result["failed"]]
 

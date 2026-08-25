@@ -208,6 +208,49 @@ def test_dry_run_reports_the_correct_split_and_records_itself():
     assert client.wipe_run_rows[0]["mode"] == "dry_run"
 
 
+def test_dry_run_warns_up_front_that_more_than_one_execute_pass_will_be_needed():
+    """The gap a real run exposed: an operator following the documented "dry run first"
+    advice must learn about the cap BEFORE ever setting execute=true, not discover it only
+    after a capped pass. FULL_TENANT has 8 candidates; max_deletes=3 needs ceil(8/3)=3 runs."""
+    demisto.args_value = {"max_deletes": "3"}
+    client = FakeTenant(FULL_TENANT)
+    W.CoreApiClient = lambda: client
+    try:
+        W.main()
+    except SystemExit:
+        pass
+    assert client.deleted() == []   # still just a dry run
+    out = csp.results[-1].readable_output
+    assert "3 execute run(s)" in out
+    assert "max_deletes=3" in out
+
+
+def test_dry_run_says_nothing_about_passes_when_everything_fits_in_one():
+    demisto.args_value = {"max_deletes": "100"}
+    client = FakeTenant(FULL_TENANT)
+    W.CoreApiClient = lambda: client
+    try:
+        W.main()
+    except SystemExit:
+        pass
+    out = csp.results[-1].readable_output
+    assert "execute run(s)" not in out
+
+
+def test_executed_capped_pass_states_exactly_how_many_remain():
+    demisto.args_value = {"execute": "true", "confirm": "DELETE ALL YARA DATASETS",
+                          "max_deletes": "3"}
+    client = FakeTenant(FULL_TENANT)
+    W.CoreApiClient = lambda: client
+    try:
+        W.main()
+    except SystemExit:
+        pass
+    out = csp.results[-1].readable_output
+    assert "3 of 8 candidate(s) - 5 remain" in out
+    assert "Run this exact command again" in out
+
+
 def test_executed_pass_deletes_everything_except_preserved():
     client = FakeTenant(FULL_TENANT)
     result = W.wipe_all(client, execute=True, log=lambda *a: None)
@@ -241,6 +284,81 @@ def test_executed_pass_records_itself_with_deleted_and_failed_lists():
     row = client.wipe_run_rows[0]
     assert row["mode"] == "executed"
     assert row["deleted_count"] == result["deleted_count"]
+
+
+# --------------------------------------------------------------------- max_deletes cap
+# The bug this whole block exists to catch: a real pass against ~240 accumulated datasets
+# ran 12-wide with delete_dataset's measured ~60s server-side cost, exceeded the platform's
+# ~900s automation task timeout, and got killed mid-batch — surfacing to the operator as a
+# bare "Internal Server Error" after silently deleting most of its candidates first.
+
+def test_default_max_deletes_matches_the_documented_constant():
+    assert W.DEFAULT_MAX_DELETES_PER_PASS == 100
+
+
+def test_execute_bounds_a_pass_to_max_deletes():
+    client = FakeTenant(FULL_TENANT)   # 8 real candidates
+    result = W.wipe_all(client, execute=True, max_deletes=3, log=lambda *a: None)
+    assert result["stopped_early"] is True
+    assert result["deleted_count"] == 3
+    # the report still shows the TRUE total scope, not just what this pass touched
+    assert result["to_delete_count"] == 8
+
+
+def test_a_pass_within_the_cap_is_not_marked_stopped_early():
+    client = FakeTenant(FULL_TENANT)
+    result = W.wipe_all(client, execute=True, max_deletes=100, log=lambda *a: None)
+    assert result["stopped_early"] is False
+    assert result["deleted_count"] == result["to_delete_count"]
+
+
+def test_dry_run_ignores_max_deletes_and_reports_the_full_list():
+    client = FakeTenant(FULL_TENANT)
+    result = W.wipe_all(client, execute=False, max_deletes=1, log=lambda *a: None)
+    assert result["stopped_early"] is False
+    assert len(result["to_delete"]) == result["to_delete_count"] == 8
+
+
+def test_zero_max_deletes_disables_the_cap():
+    client = FakeTenant(FULL_TENANT)
+    result = W.wipe_all(client, execute=True, max_deletes=0, log=lambda *a: None)
+    assert result["stopped_early"] is False
+    assert result["deleted_count"] == 8
+
+
+def test_stopped_early_is_recorded_in_the_audit_row():
+    client = FakeTenant(FULL_TENANT)
+    W.wipe_all(client, execute=True, max_deletes=2, log=lambda *a: None)
+    assert client.wipe_run_rows[0]["stopped_early"] == "True"
+
+
+def test_main_rejects_a_non_numeric_max_deletes():
+    demisto.args_value = {"execute": "true", "confirm": "DELETE ALL YARA DATASETS",
+                          "max_deletes": "not-a-number"}
+    client = FakeTenant(FULL_TENANT)
+    W.CoreApiClient = lambda: client
+    try:
+        W.main()
+    except SystemExit:
+        pass
+    assert client.deleted() == []
+    assert csp.errors and "max_deletes" in csp.errors[-1]
+
+
+def test_main_wires_max_deletes_through_to_the_pass():
+    demisto.args_value = {"execute": "true", "confirm": "DELETE ALL YARA DATASETS",
+                          "max_deletes": "3"}
+    client = FakeTenant(FULL_TENANT)
+    W.CoreApiClient = lambda: client
+    try:
+        W.main()
+    except SystemExit:
+        pass
+    # client.deleted() also counts the lock's own acquire/release housekeeping (FULL_TENANT
+    # already has the lock dataset present, so taking it over deletes-then-recreates it) -
+    # the wipe-run audit row is what reports candidates actually wiped, cleanly.
+    assert csp.results and csp.results[-1].outputs["deleted_count"] == 3
+    assert csp.results[-1].outputs["stopped_early"] is True
 
 
 def test_executed_pass_takes_and_releases_the_lock():
@@ -341,10 +459,10 @@ def test_confirm_has_no_default_value():
     assert not arg.get("defaultValue")
 
 
-def test_the_yml_declares_exactly_the_two_arguments_the_py_reads():
+def test_the_yml_declares_exactly_the_arguments_the_py_reads():
     doc = _yml()
     names = {a["name"] for a in doc["args"]}
-    assert names == {"execute", "confirm"}
+    assert names == {"execute", "confirm", "max_deletes"}
 
 
 def test_py_compiles():

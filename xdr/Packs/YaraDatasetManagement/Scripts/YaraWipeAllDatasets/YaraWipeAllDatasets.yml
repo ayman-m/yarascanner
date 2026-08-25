@@ -23,6 +23,19 @@ args:
   isArray: false
   default: false
   secret: false
+- name: max_deletes
+  description: Caps a single EXECUTED pass so it finishes inside the platform's ~900s
+    automation task timeout. Defaults to 100 — measured against delete_dataset's ~60s
+    server-side cost at this automation's 12-way delete concurrency, roughly 500s
+    (56% of budget). A tenant with more than that many candidates is drained over
+    several re-runs, the same "bounded pass, re-run to continue" pattern
+    YaraConsolidateApply's max_scans uses. Does not affect a dry run, which always
+    reports the full candidate count regardless of this value. 0 or a negative number
+    disables the cap — an explicit, logged choice, not the default.
+  required: false
+  isArray: false
+  default: false
+  secret: false
 comment: >-
   Deletes EVERY yara_scanner_* lookup dataset on this tenant — host matches and scan
   lifecycle, old schema and new, per-scan consolidated targets and summary datasets
@@ -75,6 +88,10 @@ outputs:
 - contextPath: Yara.WipeAll.lock_held_by_other_run
   description: True if this run stood down because the consolidation lock was held by
     another concurrent run — nothing was deleted in that case.
+  type: Boolean
+- contextPath: Yara.WipeAll.stopped_early
+  description: True if there were more candidates than max_deletes allowed in this
+    pass — re-run to continue draining the rest.
   type: Boolean
 script: '-'
 system: false
