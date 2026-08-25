@@ -689,7 +689,7 @@ These constrain the five `YaraDatasetManagement` automations.
 | Abandoned-scan cutoff | **24 h** | > the 6 h Action Center script timeout |
 | Clock-skew tolerance | **5 min** | Measured honest gaps of 3.2–66.8 s |
 | Skew backstop | **7 days** | Bounds deferral if `remove_data` re-stamps `_insert_time` |
-| Consolidation lock staleness | **2 h** | Cost of a wrong takeover is a redundant merge |
+| Consolidation lock staleness | **20 min** | `DEFAULT_LOCK_STALE_SECS = 20 * 60`. Comfortably above the 900 s task timeout a run cannot outlive, so a marker older than this belongs to a killed pass; cost of a wrong takeover is a redundant merge |
 | Prune lock staleness | **6 h** | Above any consolidation runtime measured here; a wrong takeover is irreversible |
 | Default `min_quiet_hours` | **24 h** | Deliberately generous — proving no active writer at all, not just outlasting the drain window |
 | `add_data` timeout | **5 s connect / 120 s read** | Read is well above the largest merge a size-bounded dataset can reach |

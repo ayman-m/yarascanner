@@ -1112,8 +1112,9 @@ def test_an_unreadable_lock_row_is_treated_as_held_by_the_delete_path():
 
 
 def test_a_long_running_consolidation_lock_is_not_stolen_by_a_prune():
-    """Consolidation's own 2h staleness window would treat a 3h-old lock as abandoned. For a
-    prune the cost of being wrong is deleted datasets, so it judges on a much longer window."""
+    """Consolidation's own 20-minute staleness window would treat a 3h-old lock as abandoned.
+    For a prune the cost of being wrong is deleted datasets, so it judges on a much longer
+    window (PRUNE_LOCK_STALE_SECS, 6h)."""
     ds = "yara_scanner_matches_v2_hostx_ab1234_202601"
     t = FakeTenant([ds, K._LOCK_DATASET], scans={ds: {"S1": 5}},
                    counts={"yara_scanner_matches_v2_scan_s1": 5})

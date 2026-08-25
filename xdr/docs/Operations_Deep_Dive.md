@@ -393,13 +393,25 @@ data it couldn't prove it had copied.
 
 `max_scans` (default **4**) caps how many scans one invocation processes.
 
-**Measured per-scan cost: ~128 seconds.**
+**A pass costs fixed overhead plus per-scan work. `~128s` is not a per-scan rate.**
 
-| Pass size | Time | % of 900s timeout |
-|---|---|---|
-| 4 scans | 403s | 45% |
-| 5 scans | 638s | 71% |
-| 20 scans | ~2,552s (projected) | **283% — killed around scan 7** |
+Every pass pays roughly **105s of fixed bookkeeping before the first scan is merged**
+— measured on an idle pass: the consolidation lock costs ~75s (its release
+`delete_dataset` alone is ~60s, and that price is the same for a one-row lock table as
+for a large dataset), the run-log's two writes ~19s, and dataset enumeration ~11s. Only
+the remainder scales with the scans.
+
+| Pass size | Time | % of 900s timeout | implied marginal cost/scan |
+|---|---|---|---|
+| 4 scans | 403s | 45% | ~75s |
+| 5 scans | 638s | 71% | ~107s |
+| 20 scans | ~1,600–2,240s (projected) | **178–249% — killed between scan 7 and 11** |  |
+
+The two measured passes cannot be fit by one straight line, because per-scan cost depends
+on how many rows each scan holds — so read **~75–107s** as the marginal range, not `~128s`
+as a rate. Dividing a pass's total by its scan count folds the fixed ~105s into every scan
+and overstates the marginal cost by 20–70%; the old `~128s` figure was exactly that
+(638 ÷ 5). The conclusion is unchanged under either end of the range: 20 is fatal, 4 is safe.
 
 The default was originally 20. That was wrong and would have reliably reproduced a
 stuck-lock failure on a real backlog.
@@ -646,7 +658,10 @@ Every one of these was observed live during validation.
 - [ ] `YaraConsolidateStatus` run — eligible scans reviewed
 - [ ] Mode decided: **Summary** (safe, non-destructive) or **Full** (destructive)
 - [ ] Understood: **`Apply` has no dry run and deletes on first use**
-- [ ] `max_scans` left at 4 for the first pass; measure your own per-scan cost before raising
+- [ ] `max_scans` left at 4 for the first pass. Before raising it, measure your own
+      **marginal** per-scan cost — subtract the fixed ~105s per-pass overhead first, then
+      divide by the scan count. Dividing a pass total by its scan count counts that fixed
+      cost once per scan and will mislead you into raising the cap too far
 
 **Ongoing**
 

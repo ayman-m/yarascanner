@@ -135,8 +135,9 @@ def test_the_shipped_default_reflects_the_measured_per_scan_cost():
     cleanly. Pin to that, with real margin instead of none.
     """
     assert C.DEFAULT_MAX_SCANS_PER_PASS <= 4, (
-        "DEFAULT_MAX_SCANS_PER_PASS=%d has no margin against the measured ~128s/scan rate "
-        "and the 900s task timeout" % C.DEFAULT_MAX_SCANS_PER_PASS)
+        "DEFAULT_MAX_SCANS_PER_PASS=%d has no margin against the measured cost "
+        "(~105s fixed per-pass overhead + ~75-107s marginal per scan) and the 900s task "
+        "timeout" % C.DEFAULT_MAX_SCANS_PER_PASS)
 
 
 def test_the_playbook_apply_task_passes_max_scans():

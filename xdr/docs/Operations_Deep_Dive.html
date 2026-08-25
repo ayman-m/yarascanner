@@ -534,14 +534,16 @@ restore. Treat consolidation as one-way.</p></div>
 <p>It means the tool refused to delete data it couldn’t prove it had copied.</p></div>
 
 <h3>The bounded pass</h3>
-<p><code>max_scans</code> (default <strong>4</strong>) caps how many scans one invocation processes. <strong>Measured per-scan cost: ~128 seconds.</strong></p>
+<p><code>max_scans</code> (default <strong>4</strong>) caps how many scans one invocation processes. <strong>A pass costs fixed overhead plus per-scan work — <code>~128 s</code> is not a per-scan rate.</strong></p>
+<p>Every pass pays roughly <strong>105 s of fixed bookkeeping before the first scan is merged</strong> — measured on an idle pass: the consolidation lock costs ~75 s (its release <code>delete_dataset</code> alone is ~60 s, and that price is the same for a one-row lock table as for a large dataset), the run-log's two writes ~19 s, and dataset enumeration ~11 s. Only the remainder scales with the scans.</p>
 <div class="scroll"><table>
-<thead><tr><th>Pass size</th><th>Time</th><th>% of 900 s timeout</th></tr></thead>
+<thead><tr><th>Pass size</th><th>Time</th><th>% of 900 s timeout</th><th>implied marginal cost/scan</th></tr></thead>
 <tbody>
-<tr><td>4 scans</td><td>403 s</td><td>45%</td></tr>
-<tr><td>5 scans</td><td>638 s</td><td>71%</td></tr>
-<tr><td>20 scans</td><td>~2,552 s (projected)</td><td><strong>283% — killed around scan 7</strong></td></tr>
+<tr><td>4 scans</td><td>403 s</td><td>45%</td><td>~75 s</td></tr>
+<tr><td>5 scans</td><td>638 s</td><td>71%</td><td>~107 s</td></tr>
+<tr><td>20 scans</td><td>~1,600–2,240 s (projected)</td><td><strong>178–249% — killed between scan 7 and 11</strong></td><td></td></tr>
 </tbody></table></div>
+<p>The two measured passes cannot be fit by one straight line, because per-scan cost depends on how many rows each scan holds — so read <strong>~75–107 s</strong> as the marginal range, not <code>~128 s</code> as a rate. Dividing a pass's total by its scan count folds the fixed ~105 s into every scan and overstates the marginal cost by 20–70%; the old <code>~128 s</code> figure was exactly that (638 ÷ 5). The conclusion is unchanged under either end of the range: 20 is fatal, 4 is safe.</p>
 <p>The default was originally 20. That was wrong and would have reliably reproduced a stuck-lock failure on a real backlog.</p>
 <div class="call warn"><span class="lbl">A bounded pass does not resume itself</span>
 <p>It reports <code>stopped_early</code>; drain a large backlog by re-running, or raise the cap after
@@ -714,7 +716,7 @@ scan log.</p></div>
 <li><span><code>YaraConsolidateStatus</code> run — eligible scans reviewed</span></li>
 <li><span>Mode decided: <strong>Summary</strong> (safe, non-destructive) or <strong>Full</strong> (destructive)</span></li>
 <li><span>Understood: <strong><code>Apply</code> has no dry run and deletes on first use</strong></span></li>
-<li><span><code>max_scans</code> left at 4 for the first pass; measure your own per-scan cost before raising</span></li>
+<li><span><code>max_scans</code> left at 4 for the first pass. Before raising it, measure your own <strong>marginal</strong> per-scan cost — subtract the fixed ~105 s per-pass overhead first, then divide by the scan count. Dividing a pass total by its scan count counts that fixed cost once per scan and will mislead you into raising the cap too far</span></li>
 </ul>
 <h3>Ongoing</h3>
 <ul class="ck">
