@@ -1,0 +1,183 @@
+<svg width="680" height="2692" viewBox="0 0 680 2692" xmlns="http://www.w3.org/2000/svg" role="img">
+<title>YaraConsolidateApply - what the script does, step by step</title>
+<desc>Workflow of YaraConsolidateApply (in the tenant, as an XDR automation): Merge per-host shards into one set per scan. Each step names the function responsible; the reference blocks list every API endpoint it calls and every lookup dataset it touches.</desc>
+<defs>
+  <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M2 1L8 5L2 9" fill="none" stroke="#888" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </marker>
+</defs>
+<style>
+  text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #1a1a1a; }
+  .th { font-size: 14px; font-weight: 600; }
+  .ts { font-size: 12px; fill: #444; }
+  .fn { font-size: 11px; fill: #666; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .bandtxt { font-size: 13px; font-weight: 600; fill: #fff; }
+  .phase { font-size: 11px; fill: #555; font-weight: 600; }
+  .arr { stroke: #888; stroke-width: 1.5; fill: none; }
+</style>
+<rect x="40" y="20" width="600" height="32" rx="6" fill="#333"/>
+<text class="bandtxt" x="340" y="36" text-anchor="middle" dominant-baseline="central">YaraConsolidateApply  -  Merge per-host shards into one set per scan</text>
+<rect x="60" y="68" width="560" height="26" rx="4" fill="#e8e8e8" stroke="#bbb" stroke-width="0.5"/>
+<text class="phase" x="340" y="81" text-anchor="middle" dominant-baseline="central">runs in the tenant, as an XDR automation  -  DESTRUCTIVE</text>
+<rect x="60" y="110" width="560" height="58" rx="8" fill="#f2f2f2" stroke="#999999" stroke-width="0.5"/>
+<text class="fn" x="74" y="132" dominant-baseline="central">API base</text>
+<text class="ts" x="606" y="132" text-anchor="end" dominant-baseline="central">https://api-&lt;tenant&gt;.xdr.&lt;region&gt;.paloaltonetworks.com</text>
+<text class="fn" x="74" y="152" dominant-baseline="central">Delivered via</text>
+<text class="ts" x="606" y="152" text-anchor="end" dominant-baseline="central">POST /xsoar/automation/import (multipart file=unified yml)</text>
+<rect x="60" y="174" width="560" height="26" rx="4" fill="#e8e8e8" stroke="#bbb" stroke-width="0.5"/>
+<text class="phase" x="340" y="187" text-anchor="middle" dominant-baseline="central">Same tenant host, HMAC-signed with the same Advanced key as the calls above</text>
+<rect x="60" y="220" width="560" height="76" rx="8" fill="#eef4fb" stroke="#6b9bd1" stroke-width="0.5"/>
+<text class="th" x="340" y="238" text-anchor="middle" dominant-baseline="central">Run starts, args read</text>
+<text class="ts" x="340" y="257" text-anchor="middle" dominant-baseline="central">scan_ids, quiet, ceiling overrides</text>
+<text class="fn" x="340" y="278" text-anchor="middle" dominant-baseline="central">main</text>
+<line x1="340" y1="296" x2="340" y2="318" class="arr" marker-end="url(#arrow)"/>
+<rect x="60" y="318" width="560" height="76" rx="8" fill="#fdf3e0" stroke="#d9a441" stroke-width="0.5"/>
+<text class="th" x="340" y="336" text-anchor="middle" dominant-baseline="central">Take consolidation lock</text>
+<text class="ts" x="340" y="355" text-anchor="middle" dominant-baseline="central">one merge pass per tenant</text>
+<text class="fn" x="340" y="376" text-anchor="middle" dominant-baseline="central">acquire_consolidation_lock</text>
+<line x1="340" y1="394" x2="192" y2="424" class="arr" marker-end="url(#arrow)"/>
+<line x1="340" y1="394" x2="487" y2="424" class="arr" marker-end="url(#arrow)"/>
+<rect x="60" y="424" width="265" height="76" rx="8" fill="#fdecea" stroke="#d9534f" stroke-width="0.5"/>
+<text class="th" x="192" y="442" text-anchor="middle" dominant-baseline="central">Free or stale lock</text>
+<text class="ts" x="192" y="461" text-anchor="middle" dominant-baseline="central">take it and merge</text>
+<text class="fn" x="192" y="482" text-anchor="middle" dominant-baseline="central">consolidate_all</text>
+<rect x="355" y="424" width="265" height="76" rx="8" fill="#e8f5e9" stroke="#5aa96a" stroke-width="0.5"/>
+<text class="th" x="487" y="442" text-anchor="middle" dominant-baseline="central">Held by other run</text>
+<text class="ts" x="487" y="461" text-anchor="middle" dominant-baseline="central">stand down, 0 merged</text>
+<text class="fn" x="487" y="482" text-anchor="middle" dominant-baseline="central">_read_lock</text>
+<line x1="192" y1="500" x2="340" y2="530" class="arr" marker-end="url(#arrow)"/>
+<line x1="487" y1="500" x2="340" y2="530" class="arr" marker-end="url(#arrow)"/>
+<rect x="60" y="530" width="560" height="76" rx="8" fill="#e6f4f1" stroke="#4fa896" stroke-width="0.5"/>
+<text class="th" x="340" y="548" text-anchor="middle" dominant-baseline="central">Pick and bound the scans</text>
+<text class="ts" x="340" y="567" text-anchor="middle" dominant-baseline="central">dry-run pass, cap at 4 per run</text>
+<text class="fn" x="340" y="588" text-anchor="middle" dominant-baseline="central">check_consolidation_status</text>
+<line x1="340" y1="606" x2="340" y2="628" class="arr" marker-end="url(#arrow)"/>
+<rect x="60" y="628" width="560" height="76" rx="8" fill="#fdf3e0" stroke="#d9a441" stroke-width="0.5"/>
+<text class="th" x="340" y="646" text-anchor="middle" dominant-baseline="central">Find source shards</text>
+<text class="ts" x="340" y="665" text-anchor="middle" dominant-baseline="central">live v4 matches store excluded</text>
+<text class="fn" x="340" y="686" text-anchor="middle" dominant-baseline="central">parse_shard</text>
+<line x1="340" y1="704" x2="340" y2="726" class="arr" marker-end="url(#arrow)"/>
+<rect x="60" y="726" width="560" height="76" rx="8" fill="#fdf3e0" stroke="#d9a441" stroke-width="0.5"/>
+<text class="th" x="340" y="744" text-anchor="middle" dominant-baseline="central">Gate every candidate scan</text>
+<text class="ts" x="340" y="763" text-anchor="middle" dominant-baseline="central">terminal? quiet? under ceiling?</text>
+<text class="fn" x="340" y="784" text-anchor="middle" dominant-baseline="central">_gate_scan</text>
+<line x1="340" y1="802" x2="340" y2="824" class="arr" marker-end="url(#arrow)"/>
+<rect x="60" y="824" width="560" height="26" rx="4" fill="#e8e8e8" stroke="#bbb" stroke-width="0.5"/>
+<text class="phase" x="340" y="837" text-anchor="middle" dominant-baseline="central">one of these four outcomes</text>
+<rect x="60" y="864" width="265" height="76" rx="8" fill="#fdecea" stroke="#d9534f" stroke-width="0.5"/>
+<text class="th" x="192" y="882" text-anchor="middle" dominant-baseline="central">Ready</text>
+<text class="ts" x="192" y="901" text-anchor="middle" dominant-baseline="central">terminal and quiet</text>
+<text class="fn" x="192" y="922" text-anchor="middle" dominant-baseline="central">_count</text>
+<rect x="355" y="864" width="265" height="76" rx="8" fill="#e8f5e9" stroke="#5aa96a" stroke-width="0.5"/>
+<text class="th" x="487" y="882" text-anchor="middle" dominant-baseline="central">Not terminal</text>
+<text class="ts" x="487" y="901" text-anchor="middle" dominant-baseline="central">defer, retry later</text>
+<text class="fn" x="487" y="922" text-anchor="middle" dominant-baseline="central">shard_is_terminal</text>
+<rect x="60" y="954" width="265" height="76" rx="8" fill="#eef4fb" stroke="#6b9bd1" stroke-width="0.5"/>
+<text class="th" x="192" y="972" text-anchor="middle" dominant-baseline="central">In quiet period</text>
+<text class="ts" x="192" y="991" text-anchor="middle" dominant-baseline="central">defer, retry later</text>
+<text class="fn" x="192" y="1012" text-anchor="middle" dominant-baseline="central">newest_row_age_ok</text>
+<rect x="355" y="954" width="265" height="76" rx="8" fill="#f2edfa" stroke="#9b7fd4" stroke-width="0.5"/>
+<text class="th" x="487" y="972" text-anchor="middle" dominant-baseline="central">Over row ceiling</text>
+<text class="ts" x="487" y="991" text-anchor="middle" dominant-baseline="central">reported, not merged</text>
+<text class="fn" x="487" y="1012" text-anchor="middle" dominant-baseline="central">plan_consolidation</text>
+<line x1="192" y1="1030" x2="340" y2="1060" class="arr" marker-end="url(#arrow)"/>
+<line x1="487" y1="1030" x2="340" y2="1060" class="arr" marker-end="url(#arrow)"/>
+<rect x="60" y="1060" width="560" height="76" rx="8" fill="#fdf3e0" stroke="#d9a441" stroke-width="0.5"/>
+<text class="th" x="340" y="1078" text-anchor="middle" dominant-baseline="central">Check existing target rows</text>
+<text class="ts" x="340" y="1097" text-anchor="middle" dominant-baseline="central">count rows already in the target</text>
+<text class="fn" x="340" y="1118" text-anchor="middle" dominant-baseline="central">_count</text>
+<line x1="340" y1="1136" x2="340" y2="1158" class="arr" marker-end="url(#arrow)"/>
+<rect x="60" y="1158" width="560" height="26" rx="4" fill="#e8e8e8" stroke="#bbb" stroke-width="0.5"/>
+<text class="phase" x="340" y="1171" text-anchor="middle" dominant-baseline="central">one of these four outcomes</text>
+<rect x="60" y="1198" width="265" height="76" rx="8" fill="#fdecea" stroke="#d9534f" stroke-width="0.5"/>
+<text class="th" x="192" y="1216" text-anchor="middle" dominant-baseline="central">Already complete</text>
+<text class="ts" x="192" y="1235" text-anchor="middle" dominant-baseline="central">verified, no rewrite</text>
+<text class="fn" x="192" y="1256" text-anchor="middle" dominant-baseline="central">_count</text>
+<rect x="355" y="1198" width="265" height="76" rx="8" fill="#e8f5e9" stroke="#5aa96a" stroke-width="0.5"/>
+<text class="th" x="487" y="1216" text-anchor="middle" dominant-baseline="central">More than sources</text>
+<text class="ts" x="487" y="1235" text-anchor="middle" dominant-baseline="central">partial cleanup</text>
+<text class="fn" x="487" y="1256" text-anchor="middle" dominant-baseline="central">remove_lookup_data</text>
+<rect x="60" y="1288" width="265" height="76" rx="8" fill="#eef4fb" stroke="#6b9bd1" stroke-width="0.5"/>
+<text class="th" x="192" y="1306" text-anchor="middle" dominant-baseline="central">Row count off</text>
+<text class="ts" x="192" y="1325" text-anchor="middle" dominant-baseline="central">mismatch, untouched</text>
+<text class="fn" x="192" y="1346" text-anchor="middle" dominant-baseline="central">plan_consolidation</text>
+<rect x="355" y="1288" width="265" height="76" rx="8" fill="#f2edfa" stroke="#9b7fd4" stroke-width="0.5"/>
+<text class="th" x="487" y="1306" text-anchor="middle" dominant-baseline="central">Absent or empty</text>
+<text class="ts" x="487" y="1325" text-anchor="middle" dominant-baseline="central">write it now</text>
+<text class="fn" x="487" y="1346" text-anchor="middle" dominant-baseline="central">create_lookup_dataset</text>
+<line x1="192" y1="1364" x2="340" y2="1394" class="arr" marker-end="url(#arrow)"/>
+<line x1="487" y1="1364" x2="340" y2="1394" class="arr" marker-end="url(#arrow)"/>
+<rect x="60" y="1394" width="560" height="76" rx="8" fill="#e6f4f1" stroke="#4fa896" stroke-width="0.5"/>
+<text class="th" x="340" y="1412" text-anchor="middle" dominant-baseline="central">Write rows to per-scan target</text>
+<text class="ts" x="340" y="1431" text-anchor="middle" dominant-baseline="central">create, then add_data in 500s</text>
+<text class="fn" x="340" y="1452" text-anchor="middle" dominant-baseline="central">add_lookup_data</text>
+<line x1="340" y1="1470" x2="340" y2="1492" class="arr" marker-end="url(#arrow)"/>
+<rect x="60" y="1492" width="560" height="76" rx="8" fill="#e6f4f1" stroke="#4fa896" stroke-width="0.5"/>
+<text class="th" x="340" y="1510" text-anchor="middle" dominant-baseline="central">Re-count and verify</text>
+<text class="ts" x="340" y="1529" text-anchor="middle" dominant-baseline="central">counts equal = VERIFIED, else fail</text>
+<text class="fn" x="340" y="1550" text-anchor="middle" dominant-baseline="central">plan_consolidation</text>
+<line x1="340" y1="1568" x2="340" y2="1590" class="arr" marker-end="url(#arrow)"/>
+<rect x="60" y="1590" width="560" height="76" rx="8" fill="#fdecea" stroke="#d9534f" stroke-width="0.5"/>
+<text class="th" x="340" y="1608" text-anchor="middle" dominant-baseline="central">Strip merged rows from source</text>
+<text class="ts" x="340" y="1627" text-anchor="middle" dominant-baseline="central">matches shards only, sequential</text>
+<text class="fn" x="340" y="1648" text-anchor="middle" dominant-baseline="central">_cleanup_verified_scan_rows</text>
+<line x1="340" y1="1666" x2="340" y2="1688" class="arr" marker-end="url(#arrow)"/>
+<rect x="60" y="1688" width="560" height="76" rx="8" fill="#fdecea" stroke="#d9534f" stroke-width="0.5"/>
+<text class="th" x="340" y="1706" text-anchor="middle" dominant-baseline="central">Delete fully-merged shards</text>
+<text class="ts" x="340" y="1725" text-anchor="middle" dominant-baseline="central">only when EVERY scan verified</text>
+<text class="fn" x="340" y="1746" text-anchor="middle" dominant-baseline="central">_delete_many</text>
+<line x1="340" y1="1764" x2="340" y2="1786" class="arr" marker-end="url(#arrow)"/>
+<rect x="60" y="1786" width="560" height="76" rx="8" fill="#e8f5e9" stroke="#5aa96a" stroke-width="0.5"/>
+<text class="th" x="340" y="1804" text-anchor="middle" dominant-baseline="central">Record outcome and report</text>
+<text class="ts" x="340" y="1823" text-anchor="middle" dominant-baseline="central">success, partial_failure, crashed</text>
+<text class="fn" x="340" y="1844" text-anchor="middle" dominant-baseline="central">record_consolidation_run</text>
+<path d="M 60 1628 L 28 1628 L 28 764 L 58 764" class="arr" fill="none" marker-end="url(#arrow)"/>
+<path d="M 620 1726 L 652 1726 L 652 666 L 622 666" class="arr" fill="none" marker-end="url(#arrow)"/>
+<rect x="40" y="1896" width="600" height="32" rx="6" fill="#333"/>
+<text class="bandtxt" x="340" y="1912" text-anchor="middle" dominant-baseline="central">API endpoints called</text>
+<rect x="60" y="1944" width="560" height="178" rx="8" fill="#eef4fb" stroke="#6b9bd1" stroke-width="0.5"/>
+<text class="fn" x="74" y="1966" dominant-baseline="central">/public_api/v1/xql/get_datasets/</text>
+<text class="ts" x="606" y="1966" text-anchor="end" dominant-baseline="central">list tenant lookup datasets</text>
+<text class="fn" x="74" y="1986" dominant-baseline="central">/public_api/v1/xql/start_xql_query/</text>
+<text class="ts" x="606" y="1986" text-anchor="end" dominant-baseline="central">start an XQL query</text>
+<text class="fn" x="74" y="2006" dominant-baseline="central">/public_api/v1/xql/get_query_results/</text>
+<text class="ts" x="606" y="2006" text-anchor="end" dominant-baseline="central">poll for query results</text>
+<text class="fn" x="74" y="2026" dominant-baseline="central">/public_api/v1/xql/get_query_results_stream/</text>
+<text class="ts" x="606" y="2026" text-anchor="end" dominant-baseline="central">stream large result sets</text>
+<text class="fn" x="74" y="2046" dominant-baseline="central">/public_api/v1/xql/add_dataset/</text>
+<text class="ts" x="606" y="2046" text-anchor="end" dominant-baseline="central">create per-scan target dataset</text>
+<text class="fn" x="74" y="2066" dominant-baseline="central">/public_api/v1/xql/lookups/add_data/</text>
+<text class="ts" x="606" y="2066" text-anchor="end" dominant-baseline="central">write rows into the target</text>
+<text class="fn" x="74" y="2086" dominant-baseline="central">/public_api/v1/xql/lookups/remove_data/</text>
+<text class="ts" x="606" y="2086" text-anchor="end" dominant-baseline="central">strip merged rows from a source</text>
+<text class="fn" x="74" y="2106" dominant-baseline="central">/public_api/v2/xql/delete_dataset/</text>
+<text class="ts" x="606" y="2106" text-anchor="end" dominant-baseline="central">delete a fully-merged shard</text>
+<rect x="40" y="2156" width="600" height="32" rx="6" fill="#333"/>
+<text class="bandtxt" x="340" y="2172" text-anchor="middle" dominant-baseline="central">Datasets touched</text>
+<rect x="60" y="2204" width="560" height="138" rx="8" fill="#f2edfa" stroke="#9b7fd4" stroke-width="0.5"/>
+<text class="fn" x="74" y="2226" dominant-baseline="central">yara_scanner_matches_v&lt;N&gt;_&lt;host&gt;</text>
+<text class="ts" x="606" y="2226" text-anchor="end" dominant-baseline="central">read, strip rows, delete</text>
+<text class="fn" x="74" y="2246" dominant-baseline="central">yara_scanner_scans_v&lt;N&gt;_&lt;host&gt;_&lt;YYYYMM&gt;</text>
+<text class="ts" x="606" y="2246" text-anchor="end" dominant-baseline="central">read, delete when merged</text>
+<text class="fn" x="74" y="2266" dominant-baseline="central">yara_scanner_&lt;kind&gt;_v&lt;N&gt;_scan_&lt;id&gt;</text>
+<text class="ts" x="606" y="2266" text-anchor="end" dominant-baseline="central">create, write, verify</text>
+<text class="fn" x="74" y="2286" dominant-baseline="central">yara_scanner_matches_v4_&lt;host&gt;</text>
+<text class="ts" x="606" y="2286" text-anchor="end" dominant-baseline="central">excluded as a source</text>
+<text class="fn" x="74" y="2306" dominant-baseline="central">yara_scanner_consolidation_lock</text>
+<text class="ts" x="606" y="2306" text-anchor="end" dominant-baseline="central">create, read, delete</text>
+<text class="fn" x="74" y="2326" dominant-baseline="central">yara_scanner_consolidation_runs</text>
+<text class="ts" x="606" y="2326" text-anchor="end" dominant-baseline="central">create, append one row</text>
+<rect x="40" y="2376" width="600" height="32" rx="6" fill="#333"/>
+<text class="bandtxt" x="340" y="2392" text-anchor="middle" dominant-baseline="central">Safety rails</text>
+<rect x="60" y="2424" width="560" height="228" rx="8" fill="#fdf3e0" stroke="#d9a441" stroke-width="0.5"/>
+<text class="ts" x="74" y="2446" dominant-baseline="central">- Another run holds the lock -&gt; this pass merges nothing</text>
+<text class="ts" x="74" y="2467" dominant-baseline="central">- Unsuffixed v4 matches store is never a source or a delete</text>
+<text class="ts" x="74" y="2488" dominant-baseline="central">- _is_live_overwrite_dataset re-checks both delete calls</text>
+<text class="ts" x="74" y="2509" dominant-baseline="central">- Shard deleted only when EVERY scan in it verified</text>
+<text class="ts" x="74" y="2530" dominant-baseline="central">- Target must equal the source row sum before any delete</text>
+<text class="ts" x="74" y="2551" dominant-baseline="central">- Row ceiling 2,000,000: reported, never half-merged</text>
+<text class="ts" x="74" y="2572" dominant-baseline="central">- Non-terminal or still-writing scan is deferred</text>
+<text class="ts" x="74" y="2593" dominant-baseline="central">- Existing target with an odd row count is left untouched</text>
+<text class="ts" x="74" y="2614" dominant-baseline="central">- Row cleanup touches matches shards only, never scans</text>
+<text class="ts" x="74" y="2635" dominant-baseline="central">- Pass bounded to 4 scans to fit the 900s task timeout</text>
+</svg>

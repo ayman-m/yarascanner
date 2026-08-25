@@ -1,0 +1,152 @@
+<svg width="680" height="2208" viewBox="0 0 680 2208" xmlns="http://www.w3.org/2000/svg" role="img">
+<title>YaraReport - what the script does, step by step</title>
+<desc>Workflow of YaraReport (in the tenant, as a Cortex automation): Read-only inventory of every YARA lookup dataset. Each step names the function responsible; the reference blocks list every API endpoint it calls and every lookup dataset it touches.</desc>
+<defs>
+  <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M2 1L8 5L2 9" fill="none" stroke="#888" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </marker>
+</defs>
+<style>
+  text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #1a1a1a; }
+  .th { font-size: 14px; font-weight: 600; }
+  .ts { font-size: 12px; fill: #444; }
+  .fn { font-size: 11px; fill: #666; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .bandtxt { font-size: 13px; font-weight: 600; fill: #fff; }
+  .phase { font-size: 11px; fill: #555; font-weight: 600; }
+  .arr { stroke: #888; stroke-width: 1.5; fill: none; }
+</style>
+<rect x="40" y="20" width="600" height="32" rx="6" fill="#333"/>
+<text class="bandtxt" x="340" y="36" text-anchor="middle" dominant-baseline="central">YaraReport  -  Read-only inventory of every YARA lookup dataset</text>
+<rect x="60" y="68" width="560" height="26" rx="4" fill="#e8e8e8" stroke="#bbb" stroke-width="0.5"/>
+<text class="phase" x="340" y="81" text-anchor="middle" dominant-baseline="central">runs in the tenant, as a Cortex automation</text>
+<rect x="60" y="110" width="560" height="58" rx="8" fill="#f2f2f2" stroke="#999999" stroke-width="0.5"/>
+<text class="fn" x="74" y="132" dominant-baseline="central">API base</text>
+<text class="ts" x="606" y="132" text-anchor="end" dominant-baseline="central">https://api-&lt;tenant&gt;.xdr.&lt;region&gt;.paloaltonetworks.com</text>
+<text class="fn" x="74" y="152" dominant-baseline="central">Delivered via</text>
+<text class="ts" x="606" y="152" text-anchor="end" dominant-baseline="central">POST /xsoar/automation/import (multipart file=unified yml)</text>
+<rect x="60" y="174" width="560" height="26" rx="4" fill="#e8e8e8" stroke="#bbb" stroke-width="0.5"/>
+<text class="phase" x="340" y="187" text-anchor="middle" dominant-baseline="central">Same tenant host, HMAC-signed with the same Advanced key as the calls above</text>
+<rect x="60" y="220" width="560" height="76" rx="8" fill="#eef4fb" stroke="#6b9bd1" stroke-width="0.5"/>
+<text class="th" x="340" y="238" text-anchor="middle" dominant-baseline="central">Run YaraReport</text>
+<text class="ts" x="340" y="257" text-anchor="middle" dominant-baseline="central">reads the schema_version argument</text>
+<text class="fn" x="340" y="278" text-anchor="middle" dominant-baseline="central">main</text>
+<line x1="340" y1="296" x2="340" y2="318" class="arr" marker-end="url(#arrow)"/>
+<rect x="60" y="318" width="560" height="76" rx="8" fill="#fdf3e0" stroke="#d9a441" stroke-width="0.5"/>
+<text class="th" x="340" y="336" text-anchor="middle" dominant-baseline="central">Validate version</text>
+<text class="ts" x="340" y="355" text-anchor="middle" dominant-baseline="central">must be a whole number, else stop</text>
+<text class="fn" x="340" y="376" text-anchor="middle" dominant-baseline="central">set_schema_version</text>
+<line x1="340" y1="394" x2="340" y2="416" class="arr" marker-end="url(#arrow)"/>
+<rect x="60" y="416" width="560" height="76" rx="8" fill="#fdf3e0" stroke="#d9a441" stroke-width="0.5"/>
+<text class="th" x="340" y="434" text-anchor="middle" dominant-baseline="central">Build API client</text>
+<text class="ts" x="340" y="453" text-anchor="middle" dominant-baseline="central">aborts if credentials unset</text>
+<text class="fn" x="340" y="474" text-anchor="middle" dominant-baseline="central">CoreApiClient.__init__</text>
+<line x1="340" y1="492" x2="340" y2="514" class="arr" marker-end="url(#arrow)"/>
+<rect x="60" y="514" width="560" height="76" rx="8" fill="#eef4fb" stroke="#6b9bd1" stroke-width="0.5"/>
+<text class="th" x="340" y="532" text-anchor="middle" dominant-baseline="central">List lookup datasets</text>
+<text class="ts" x="340" y="551" text-anchor="middle" dominant-baseline="central">one API call, the only one</text>
+<text class="fn" x="340" y="572" text-anchor="middle" dominant-baseline="central">CoreApiClient.get_datasets</text>
+<line x1="340" y1="590" x2="340" y2="612" class="arr" marker-end="url(#arrow)"/>
+<rect x="60" y="612" width="560" height="76" rx="8" fill="#fdf3e0" stroke="#d9a441" stroke-width="0.5"/>
+<text class="th" x="340" y="630" text-anchor="middle" dominant-baseline="central">Split by schema version</text>
+<text class="ts" x="340" y="649" text-anchor="middle" dominant-baseline="central">current, legacy or newer bucket</text>
+<text class="fn" x="340" y="670" text-anchor="middle" dominant-baseline="central">classify_yara_datasets</text>
+<line x1="340" y1="688" x2="147" y2="718" class="arr" marker-end="url(#arrow)"/>
+<line x1="340" y1="688" x2="339" y2="718" class="arr" marker-end="url(#arrow)"/>
+<line x1="340" y1="688" x2="532" y2="718" class="arr" marker-end="url(#arrow)"/>
+<rect x="60" y="718" width="175" height="76" rx="8" fill="#fdecea" stroke="#d9534f" stroke-width="0.5"/>
+<text class="th" x="147" y="736" text-anchor="middle" dominant-baseline="central">Current</text>
+<text class="ts" x="147" y="755" text-anchor="middle" dominant-baseline="central">matches CURRENT_RE</text>
+<text class="fn" x="147" y="776" text-anchor="middle" dominant-baseline="central">CURRENT_RE.match</text>
+<rect x="252" y="718" width="175" height="76" rx="8" fill="#e8f5e9" stroke="#5aa96a" stroke-width="0.5"/>
+<text class="th" x="339" y="736" text-anchor="middle" dominant-baseline="central">Legacy</text>
+<text class="ts" x="339" y="755" text-anchor="middle" dominant-baseline="central">older or unversioned</text>
+<text class="fn" x="339" y="776" text-anchor="middle" dominant-baseline="central">ver_re.search</text>
+<rect x="445" y="718" width="175" height="76" rx="8" fill="#eef4fb" stroke="#6b9bd1" stroke-width="0.5"/>
+<text class="th" x="532" y="736" text-anchor="middle" dominant-baseline="central">Newer</text>
+<text class="ts" x="532" y="755" text-anchor="middle" dominant-baseline="central">higher _vN, kept</text>
+<text class="fn" x="532" y="776" text-anchor="middle" dominant-baseline="central">ver_re.search</text>
+<line x1="147" y1="794" x2="340" y2="824" class="arr" marker-end="url(#arrow)"/>
+<line x1="339" y1="794" x2="340" y2="824" class="arr" marker-end="url(#arrow)"/>
+<line x1="532" y1="794" x2="340" y2="824" class="arr" marker-end="url(#arrow)"/>
+<rect x="60" y="824" width="560" height="76" rx="8" fill="#fdf3e0" stroke="#d9a441" stroke-width="0.5"/>
+<text class="th" x="340" y="842" text-anchor="middle" dominant-baseline="central">Read each name's shape</text>
+<text class="ts" x="340" y="861" text-anchor="middle" dominant-baseline="central">kind, version, host, month</text>
+<text class="fn" x="340" y="882" text-anchor="middle" dominant-baseline="central">parse_dataset_name</text>
+<line x1="340" y1="900" x2="340" y2="922" class="arr" marker-end="url(#arrow)"/>
+<rect x="60" y="922" width="560" height="26" rx="4" fill="#e8e8e8" stroke="#bbb" stroke-width="0.5"/>
+<text class="phase" x="340" y="935" text-anchor="middle" dominant-baseline="central">one of these four outcomes</text>
+<rect x="60" y="962" width="265" height="76" rx="8" fill="#fdecea" stroke="#d9534f" stroke-width="0.5"/>
+<text class="th" x="192" y="980" text-anchor="middle" dominant-baseline="central">Per-scan target</text>
+<text class="ts" x="192" y="999" text-anchor="middle" dominant-baseline="central">state consolidated</text>
+<text class="fn" x="192" y="1020" text-anchor="middle" dominant-baseline="central">parse_dataset_name</text>
+<rect x="355" y="962" width="265" height="76" rx="8" fill="#e8f5e9" stroke="#5aa96a" stroke-width="0.5"/>
+<text class="th" x="487" y="980" text-anchor="middle" dominant-baseline="central">Overwrite (v4+)</text>
+<text class="ts" x="487" y="999" text-anchor="middle" dominant-baseline="central">state overwrite</text>
+<text class="fn" x="487" y="1020" text-anchor="middle" dominant-baseline="central">parse_dataset_name</text>
+<rect x="60" y="1052" width="265" height="76" rx="8" fill="#eef4fb" stroke="#6b9bd1" stroke-width="0.5"/>
+<text class="th" x="192" y="1070" text-anchor="middle" dominant-baseline="central">Dated YYYYMM</text>
+<text class="ts" x="192" y="1089" text-anchor="middle" dominant-baseline="central">state rotated</text>
+<text class="fn" x="192" y="1110" text-anchor="middle" dominant-baseline="central">MONTH_RE.match</text>
+<rect x="355" y="1052" width="265" height="76" rx="8" fill="#f2edfa" stroke="#9b7fd4" stroke-width="0.5"/>
+<text class="th" x="487" y="1070" text-anchor="middle" dominant-baseline="central">Unsuffixed</text>
+<text class="ts" x="487" y="1089" text-anchor="middle" dominant-baseline="central">frozen / not_rotated</text>
+<text class="fn" x="487" y="1110" text-anchor="middle" dominant-baseline="central">has_rotated_sibling</text>
+<line x1="192" y1="1128" x2="340" y2="1158" class="arr" marker-end="url(#arrow)"/>
+<line x1="487" y1="1128" x2="340" y2="1158" class="arr" marker-end="url(#arrow)"/>
+<rect x="60" y="1158" width="560" height="76" rx="8" fill="#fdf3e0" stroke="#d9a441" stroke-width="0.5"/>
+<text class="th" x="340" y="1176" text-anchor="middle" dominant-baseline="central">Unsuffixed: any siblings?</text>
+<text class="ts" x="340" y="1195" text-anchor="middle" dominant-baseline="central">dated siblings decide advice</text>
+<text class="fn" x="340" y="1216" text-anchor="middle" dominant-baseline="central">has_rotated_sibling</text>
+<line x1="340" y1="1234" x2="192" y2="1264" class="arr" marker-end="url(#arrow)"/>
+<line x1="340" y1="1234" x2="487" y2="1264" class="arr" marker-end="url(#arrow)"/>
+<rect x="60" y="1264" width="265" height="76" rx="8" fill="#fdecea" stroke="#d9534f" stroke-width="0.5"/>
+<text class="th" x="192" y="1282" text-anchor="middle" dominant-baseline="central">Siblings exist</text>
+<text class="ts" x="192" y="1301" text-anchor="middle" dominant-baseline="central">frozen, not growing</text>
+<text class="fn" x="192" y="1322" text-anchor="middle" dominant-baseline="central">has_rotated_sibling</text>
+<rect x="355" y="1264" width="265" height="76" rx="8" fill="#e8f5e9" stroke="#5aa96a" stroke-width="0.5"/>
+<text class="th" x="487" y="1282" text-anchor="middle" dominant-baseline="central">No siblings</text>
+<text class="ts" x="487" y="1301" text-anchor="middle" dominant-baseline="central">grows without bound</text>
+<text class="fn" x="487" y="1322" text-anchor="middle" dominant-baseline="central">has_rotated_sibling</text>
+<line x1="192" y1="1340" x2="340" y2="1370" class="arr" marker-end="url(#arrow)"/>
+<line x1="487" y1="1340" x2="340" y2="1370" class="arr" marker-end="url(#arrow)"/>
+<rect x="60" y="1370" width="560" height="76" rx="8" fill="#e6f4f1" stroke="#4fa896" stroke-width="0.5"/>
+<text class="th" x="340" y="1388" text-anchor="middle" dominant-baseline="central">Age the dated shards</text>
+<text class="ts" x="340" y="1407" text-anchor="middle" dominant-baseline="central">whole months from YYYYMM to now</text>
+<text class="fn" x="340" y="1428" text-anchor="middle" dominant-baseline="central">months_between</text>
+<line x1="340" y1="1446" x2="340" y2="1468" class="arr" marker-end="url(#arrow)"/>
+<rect x="60" y="1468" width="560" height="76" rx="8" fill="#e6f4f1" stroke="#4fa896" stroke-width="0.5"/>
+<text class="th" x="340" y="1486" text-anchor="middle" dominant-baseline="central">Render the table</text>
+<text class="ts" x="340" y="1505" text-anchor="middle" dominant-baseline="central">fixed-width rows plus warnings</text>
+<text class="fn" x="340" y="1526" text-anchor="middle" dominant-baseline="central">render_report</text>
+<line x1="340" y1="1544" x2="340" y2="1566" class="arr" marker-end="url(#arrow)"/>
+<rect x="60" y="1566" width="560" height="76" rx="8" fill="#e8f5e9" stroke="#5aa96a" stroke-width="0.5"/>
+<text class="th" x="340" y="1584" text-anchor="middle" dominant-baseline="central">Return the inventory</text>
+<text class="ts" x="340" y="1603" text-anchor="middle" dominant-baseline="central">clears then sets Yara.Report</text>
+<text class="fn" x="340" y="1624" text-anchor="middle" dominant-baseline="central">return_results</text>
+<path d="M 60 1408 L 28 1408 L 28 862 L 58 862" class="arr" fill="none" marker-end="url(#arrow)"/>
+<rect x="40" y="1676" width="600" height="32" rx="6" fill="#333"/>
+<text class="bandtxt" x="340" y="1692" text-anchor="middle" dominant-baseline="central">API endpoints called</text>
+<rect x="60" y="1724" width="560" height="38" rx="8" fill="#eef4fb" stroke="#6b9bd1" stroke-width="0.5"/>
+<text class="fn" x="74" y="1746" dominant-baseline="central">/public_api/v1/xql/get_datasets/</text>
+<text class="ts" x="606" y="1746" text-anchor="end" dominant-baseline="central">list every lookup dataset (one call)</text>
+<rect x="40" y="1796" width="600" height="32" rx="6" fill="#333"/>
+<text class="bandtxt" x="340" y="1812" text-anchor="middle" dominant-baseline="central">Datasets touched</text>
+<rect x="60" y="1844" width="560" height="98" rx="8" fill="#f2edfa" stroke="#9b7fd4" stroke-width="0.5"/>
+<text class="fn" x="74" y="1866" dominant-baseline="central">yara_scanner_matches_v&lt;N&gt;_&lt;host&gt;</text>
+<text class="ts" x="606" y="1866" text-anchor="end" dominant-baseline="central">list names, no row read</text>
+<text class="fn" x="74" y="1886" dominant-baseline="central">yara_scanner_scans_v&lt;N&gt;_&lt;host&gt;_YYYYMM</text>
+<text class="ts" x="606" y="1886" text-anchor="end" dominant-baseline="central">list names, no row read</text>
+<text class="fn" x="74" y="1906" dominant-baseline="central">yara_scanner_&lt;kind&gt;_v&lt;N&gt;_scan_&lt;slug&gt;</text>
+<text class="ts" x="606" y="1906" text-anchor="end" dominant-baseline="central">list names, no row read</text>
+<text class="fn" x="74" y="1926" dominant-baseline="central">yara_matches_* / yara_scans_* (legacy)</text>
+<text class="ts" x="606" y="1926" text-anchor="end" dominant-baseline="central">list names, no row read</text>
+<rect x="40" y="1976" width="600" height="32" rx="6" fill="#333"/>
+<text class="bandtxt" x="340" y="1992" text-anchor="middle" dominant-baseline="central">Safety rails</text>
+<rect x="60" y="2024" width="560" height="144" rx="8" fill="#fdf3e0" stroke="#d9a441" stroke-width="0.5"/>
+<text class="ts" x="74" y="2046" dominant-baseline="central">- Writes nothing, deletes nothing - one get_datasets call</text>
+<text class="ts" x="74" y="2067" dominant-baseline="central">- set_schema_version refuses a non-numeric schema_version</text>
+<text class="ts" x="74" y="2088" dominant-baseline="central">- Rail 4: newer-schema names are never handed to deletion</text>
+<text class="ts" x="74" y="2109" dominant-baseline="central">- Rail 5: parse_dataset_name returns None for foreign names</text>
+<text class="ts" x="74" y="2130" dominant-baseline="central">- CoreApiClient refuses to run on placeholder credentials</text>
+<text class="ts" x="74" y="2151" dominant-baseline="central">- MONTH_RE accepts only 20YY and 01-12 as a month suffix</text>
+</svg>
