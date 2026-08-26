@@ -1834,9 +1834,11 @@ def main():
             if items:
                 lines += ["", "%s:" % label] + ["  %s" % x for x in items]
 
-    if log_lines:
-        lines += ["", "lock events:"] + ["  %s" % m for m in log_lines
-                                         if "lock" in m.lower()]
+    # Filter FIRST: a dry run takes no lock, so the header would otherwise print with
+    # nothing under it and read as a section that failed to render.
+    lock_events = [m for m in log_lines if "lock" in m.lower()]
+    if lock_events:
+        lines += ["", "lock events:"] + ["  %s" % m for m in lock_events]
     return_results(CommandResults(readable_output="\n".join(lines),
                                   outputs_prefix="Yara.ConsolidateApply",
                                   outputs=result, raw_response=result))

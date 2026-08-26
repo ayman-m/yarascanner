@@ -320,6 +320,13 @@ Observed on a live tenant, 2026-08-26, three hosts scanned by one Action Center 
   rules 90149530ddc2: wrote 24 row(s) for 3 new scan(s), dropped 0 stale row(s)
                       -> yara_scanner_summary_v4_rules_90149530ddc2 (3 host(s) total, completed)
 
+!YaraConsolidateApply schema_version="4" retention_hours="24" row_ceiling="60000" execute="false"
+  DRY RUN - nothing was created or written.  FULL consolidation: every column of every matched-file row.
+  dataset(s): 1 | rows: 1012 | skipped: 0 | failed: 0
+  host matches datasets deleted: 0 (source data is never deleted ...)
+  rules 90149530ddc2: WOULD write 1012 full row(s) from 3 host(s) / 3 scan(s)
+                      -> yara_scanner_full_v4_rules_90149530ddc2
+
 !YaraConsolidateStatus
   3 scan(s) ready to consolidate, in 1 ruleset group(s)
   ready: xdr-agent_20260825_103650..., xdragent2_20260825_103653..., xdragent_20260825_103654...
@@ -342,6 +349,10 @@ To check whether the work has already been done, look for the output datasets:
 |---|---|
 | Has the compact rule/host record been written? | `yara_scanner_summary_v4_rules_<hash>` exists |
 | Has the full per-file detail been written? | `yara_scanner_full_v4_rules_<hash>` exists |
+
+**The same 1,134 detections, two fidelities:** `Summary` collapses them to **24** rows of
+`(host, rule)`; `Apply` keeps all **1,012** matched-file rows with every column. Both land in
+one dataset per ruleset, and neither touches the per-host sources.
 
 Both are visible in `!YaraReport`.
 

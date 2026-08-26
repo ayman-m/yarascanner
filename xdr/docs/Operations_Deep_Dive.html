@@ -489,28 +489,32 @@ rather than guessing.</p></div>
 merges and deletes on its first run. Use <code>YaraConsolidateStatus</code> to preview.</p></div>
 
 <h3>The two consolidation modes</h3>
-<p>They are not two routes to the same result. <strong>Under the v4 model they read and write different datasets</strong>, so the choice is about what each one records, not how much you are willing to lose.</p>
+<p>Both group the <strong>same</strong> data the <strong>same</strong> way. They differ only in fidelity — which is the whole choice being offered.</p>
 <div class="scroll"><table>
 <thead><tr><th></th><th>Full detail (<code>Apply</code>)</th><th>Summary only (<code>Summary</code>)</th></tr></thead>
 <tbody>
-<tr><td>Reads</td><td>Rotation shards — on a current tenant, only <code>yara_scanner_scans_v4_&lt;host&gt;_&lt;6hex&gt;_&lt;YYYYMM&gt;</code></td><td>The live <code>yara_scanner_matches_v4_&lt;host&gt;_&lt;6hex&gt;</code>, plus any month-suffixed v4 matches shard</td></tr>
-<tr><td>Target</td><td><code>yara_scanner_scans_v4_scan_&lt;id&gt;</code></td><td><code>yara_scanner_summary_v4_scan_&lt;id&gt;</code></td></tr>
-<tr><td>Row grain</td><td>Every source row, verbatim</td><td>One row per <strong>(host, rule)</strong></td></tr>
-<tr><td>Columns</td><td>Full source schema</td><td><code>scan_id</code>, <code>hostname</code>, <code>rule</code>, <code>event_timestamp_ms</code></td></tr>
-<tr><td>Per-rule counts</td><td>n/a</td><td><strong>Deliberately absent</strong></td></tr>
-<tr><td>Source afterwards</td><td><strong>Deleted</strong> once verified</td><td><strong>Untouched</strong></td></tr>
-<tr><td>Read cost</td><td>Reads the shard’s rows</td><td>One XQL per shard, aggregated in-engine</td></tr>
-<tr><td>Default</td><td>Writes and deletes</td><td><strong>Dry run</strong></td></tr>
+<tr><td>Reads</td><td>The live <code>yara_scanner_matches_v4_&lt;host&gt;_&lt;6hex&gt;</code>, plus any month-suffixed v4 matches shard</td><td>Identical</td></tr>
+<tr><td>Groups by</td><td>The ruleset hash trailing every <code>scan_id</code></td><td>Identical</td></tr>
+<tr><td>Target</td><td><code>yara_scanner_full_v4_rules_&lt;hash&gt;</code></td><td><code>yara_scanner_summary_v4_rules_&lt;hash&gt;</code></td></tr>
+<tr><td>Datasets produced</td><td><strong>One per ruleset</strong>, holding every host scanned with it</td><td>Identical</td></tr>
+<tr><td>Row grain</td><td>Every matched-file row, verbatim</td><td>One row per <strong>(host, rule)</strong></td></tr>
+<tr><td>Columns</td><td>Full v4 schema — filenames, offsets, matched strings, hashes</td><td><code>scan_id</code>, <code>hostname</code>, <code>rule</code>, <code>event_timestamp_ms</code></td></tr>
+<tr><td>Measured, 3 hosts / 1,134 detections</td><td><strong>1,012 rows</strong></td><td><strong>24 rows</strong></td></tr>
+<tr><td>Source afterwards</td><td><strong>Untouched</strong></td><td><strong>Untouched</strong></td></tr>
+<tr><td>Size rail</td><td><code>row_ceiling</code>, default <strong>60,000</strong> — refuses rather than half-filling</td><td>None needed</td></tr>
+<tr><td>Default</td><td><strong>Dry run</strong></td><td><strong>Dry run</strong></td></tr>
 </tbody></table></div>
-<p><strong>The live matches dataset is out of <code>Apply</code>’s reach by design.</strong> <code>parse_shard()</code> returns nothing for an unsuffixed <code>matches</code> name at schema v4 or newer — exactly the shape of the permanent per-host dataset — so it never enters a consolidation or a deletion list, and <code>_is_live_overwrite_dataset()</code> re-derives that answer from the same regex, independently, at both destructive call sites. <code>Apply</code> sweeps six <code>(schema, kind)</code> pairs on every run — v2, v3 and v4 × matches and scans — and <code>YaraConsolidateStatus</code> previews the same six. On a current tenant exactly one of them finds a shard at all: <strong>v4 / scans</strong>.</p>
-<div class="call warn"><span class="lbl">Apply’s matches path still exists</span>
-<p>It fires on any matches shard that is not the live v4 overwrite dataset — a schema v2 or v3
-matches dataset, or month-suffixed v4 debris predating the permanent model. A tenant built by
-scanner 3.4.0 has none.</p></div>
-<div class="call warn"><span class="lbl">Summary is the only durable record of what matched</span>
-<p><code>Apply</code> archives lifecycle rows, not findings, and the per-host matches dataset is
-overwritten by the next scan on that host (<a href="#s14">§14</a>). Run <code>Summary</code> per scan
-if the rule/host list has to outlive the scan.</p></div>
+<p><strong>Neither mode deletes anything.</strong> The per-host matches datasets are permanent, overwritten by the next scan on that host, and remain the deep-dive source both targets point back to. The only rows either automation removes are its own, in its own target, for a scan the source no longer holds — that is how a re-run reconciles instead of appending.</p>
+<p><strong>Re-running is a verified no-op.</strong> Both compare the <code>scan_id</code> set their target already holds against the set the sources offer now. A re-scanned host mints a new <code>scan_id</code>, so a changed host is detected without reading a single row back: its old rows are dropped, its new ones written, and untouched hosts are not rewritten at all.</p>
+<div class="call warn"><span class="lbl">Pick Summary for a fleet, Apply for an investigation</span>
+<p>Full detail is roughly 42× the rows on the same data. At fleet scale that is what the 50 MB
+lookup cap is for, and <code>row_ceiling</code> will refuse the write rather than half-fill a
+dataset. <code>Summary</code> answers &ldquo;which rules fired where&rdquo;; <code>Apply</code>
+answers &ldquo;which files, at which offsets, matching what&rdquo;.</p></div>
+<div class="call warn"><span class="lbl">Apply no longer consolidates the scans lifecycle</span>
+<p>It once merged <code>yara_scanner_scans_v4_&lt;host&gt;_&lt;6hex&gt;_&lt;YYYYMM&gt;</code> shards into
+per-scan targets and deleted the sources. That work is deferred to a future automation; the
+functions remain in place and drift-gated, but nothing calls them today.</p></div>
 <div class="call ok"><span class="lbl">Zeros on an empty tenant are correct</span>
 <p>On a tenant with no YARA datasets yet, summary mode is a clean no-op. Dry run and
 <code>execute=true</code> alike report <code>XQL calls: 0 (+1 dataset listing)</code>,

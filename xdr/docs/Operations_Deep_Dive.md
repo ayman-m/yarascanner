@@ -327,32 +327,41 @@ A worked example, reconciled exactly:
 
 ### The two consolidation modes
 
-They are not two routes to the same result. **Under the v4 model they read and write
-different datasets**, so the choice is about what each one records, not how much you are
-willing to lose.
+Both group the **same** data the **same** way. They differ only in fidelity — which is the
+whole choice being offered.
 
 |  | **Full detail** (`Apply`) | **Summary only** (`Summary`) |
 |---|---|---|
-| Reads | Rotation shards — on a current tenant, only `yara_scanner_scans_v4_<host>_<6hex>_<YYYYMM>` | The live `yara_scanner_matches_v4_<host>_<6hex>`, plus any month-suffixed v4 matches shard |
-| Target | `yara_scanner_scans_v4_scan_<id>` | `yara_scanner_summary_v4_scan_<id>` |
-| Row grain | Every source row, verbatim | One row per **(host, rule)** |
-| Columns | Full source schema | `scan_id`, `hostname`, `rule`, `event_timestamp_ms` |
-| Per-rule counts | n/a | **Deliberately absent** |
-| Source afterwards | **Deleted** once verified | **Untouched** |
-| Read cost | Reads the shard's rows | One XQL per shard, aggregated in-engine |
-| Default | Writes and deletes | **Dry run** |
+| Reads | The live `yara_scanner_matches_v4_<host>_<6hex>`, plus any month-suffixed v4 matches shard | Identical |
+| Groups by | The ruleset hash trailing every `scan_id` | Identical |
+| Target | `yara_scanner_full_v4_rules_<hash>` | `yara_scanner_summary_v4_rules_<hash>` |
+| Datasets produced | **One per ruleset**, holding every host scanned with it | Identical |
+| Row grain | Every matched-file row, verbatim | One row per **(host, rule)** |
+| Columns | Full v4 schema — filenames, offsets, matched strings, hashes | `scan_id`, `hostname`, `rule`, `event_timestamp_ms` |
+| Measured, 3 hosts / 1,134 detections | **1,012 rows** | **24 rows** |
+| Source afterwards | **Untouched** | **Untouched** |
+| Size rail | `row_ceiling`, default **60,000** — refuses rather than half-filling | None needed |
+| Default | **Dry run** | **Dry run** |
 
-**The live matches dataset is out of `Apply`'s reach by design.** `parse_shard()` returns
-nothing for an unsuffixed `matches` name at schema v4 or newer — exactly the shape of the
-permanent per-host dataset — so it never enters a consolidation or a deletion list, and
-`_is_live_overwrite_dataset()` re-derives that answer from the same regex, independently, at
-both destructive call sites. `Apply` sweeps six `(schema, kind)` pairs on every run — v2, v3
-and v4 × matches and scans — and `YaraConsolidateStatus` previews the same six. On a current
-tenant exactly one of them finds a shard at all: **v4 / scans**.
+**Neither mode deletes anything.** The per-host matches datasets are permanent, overwritten by
+the next scan on that host, and remain the deep-dive source both targets point back to. The
+only rows either automation removes are its own, in its own target, for a scan the source no
+longer holds — that is how a re-run reconciles instead of appending.
 
-> **`Apply`'s matches path still exists.** It fires on any matches shard that is not the live
-> v4 overwrite dataset — a schema v2 or v3 matches dataset, or month-suffixed v4 debris
-> predating the permanent model. A tenant built by scanner 3.4.0 has none.
+**Re-running is a verified no-op.** Both compare the `scan_id` set their target already holds
+against the set the sources offer now. A re-scanned host mints a new `scan_id`, so a changed
+host is detected without reading a single row back: its old rows are dropped, its new ones
+written, and untouched hosts are not rewritten at all.
+
+> **Pick `Summary` for a fleet, `Apply` for an investigation.** Full detail is roughly 42× the
+> rows on the same data. At fleet scale that is what the 50 MB lookup cap is for, and
+> `row_ceiling` will refuse the write rather than half-fill a dataset. `Summary` answers
+> "which rules fired where"; `Apply` answers "which files, at which offsets, matching what".
+
+> **`Apply` no longer consolidates the scans lifecycle.** It once merged
+> `yara_scanner_scans_v4_<host>_<6hex>_<YYYYMM>` shards into per-scan targets and deleted the
+> sources. That work is deferred to a future automation; the functions remain in place and
+> drift-gated, but nothing calls them today.
 
 > **`Summary` is the only durable record of what matched.** `Apply` archives lifecycle rows,
 > not findings, and the per-host matches dataset is overwritten by the next scan on that host
