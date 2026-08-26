@@ -23,26 +23,23 @@ commonfields:
 enabled: true
 name: YaraConsolidateStatus
 outputs:
-- contextPath: Yara.ConsolidateStatus.any_in_progress
-  description: True if at least one scan is still running or settling.
-  type: Boolean
 - contextPath: Yara.ConsolidateStatus.eligible_count
-  description: Number of scans ready to consolidate now.
+  description: How many scans passed the finished-or-aged gate and are ready for either consolidation mode.
   type: Number
 - contextPath: Yara.ConsolidateStatus.eligible_scan_ids
-  description: scan_id(s) ready to consolidate now.
+  description: Those scan_ids. Feed straight into YaraConsolidateSummary or YaraConsolidateApply.
   type: String
-- contextPath: Yara.ConsolidateStatus.pending_scan_ids
-  description: scan_id(s) still in progress (running, or settling).
-  type: String
-- contextPath: Yara.ConsolidateStatus.blocked_count
-  description: Number of scans blocked (row ceiling or count mismatch).
+- contextPath: Yara.ConsolidateStatus.pending_count
+  description: Scans still in progress - not yet eligible.
   type: Number
-- contextPath: Yara.ConsolidateStatus.blocked_scan_ids
-  description: scan_id(s) blocked and needing attention.
+- contextPath: Yara.ConsolidateStatus.pending_scan_ids
+  description: Those scan_ids.
   type: String
-- contextPath: Yara.ConsolidateStatus.blocked_reasons
-  description: Map of blocked scan_id to the specific reason it's blocked (e.g. row_ceiling_exceeded, count_mismatch).
+- contextPath: Yara.ConsolidateStatus.group_count
+  description: How many ruleset groups the ready scans fall into - i.e. how many consolidated datasets a run would produce.
+  type: Number
+- contextPath: Yara.ConsolidateStatus.groups
+  description: 'Per ruleset hash: how many scans and which hosts land in that group.'
   type: Unknown
 script: |
   """YaraConsolidateStatus - read-only readiness check for the YARA per-scan dataset merge.

@@ -321,23 +321,29 @@ Observed on a live tenant, 2026-08-26, three hosts scanned by one Action Center 
                       -> yara_scanner_summary_v4_rules_90149530ddc2 (3 host(s) total, completed)
 
 !YaraConsolidateStatus
-  3 scan(s) eligible to consolidate
-  eligible: xdr-agent_20260825_103650..., xdragent2_20260825_103653..., xdragent_20260825_103654...
+  3 scan(s) ready to consolidate, in 1 ruleset group(s)
+  ready: xdr-agent_20260825_103650..., xdragent2_20260825_103653..., xdragent_20260825_103654...
+  rules 90149530ddc2: 3 scan(s) across 3 host(s) -> one summary dataset and/or one full
+                      dataset (xdr-agent, xdragent, xdragent2)
 ```
 
-**`Status` still lists all three as eligible, and that is correct.** It reports readiness for
-`YaraConsolidateApply`, which had not run. `Summary` writing a rollup does not make a scan
-consolidated, because `Apply` merges the *scans* shards and `Summary` never touches them.
+**`Status` still lists all three as ready, and that is correct.** Readiness means the scan is
+*finished* — terminal lifecycle, or silent past `retention_hours` — not that it is
+unconsolidated. A finished scan stays ready however many times you group it, because both
+modes are idempotent: re-running reconciles rather than appends.
 
-Read it as two independent questions:
+So read `Status` as "what would a consolidation run group right now", not as a to-do list that
+empties. The grouping line is the useful part: **1 ruleset group, 3 scans, 3 hosts** tells you a
+run produces exactly one dataset covering all three.
+
+To check whether the work has already been done, look for the output datasets:
 
 | Question | Answered by |
 |---|---|
-| Has this scan's rule/host record been captured? | the `summary_v4_rules_<hash>` dataset exists |
-| Have this scan's lifecycle shards been merged and removed? | `YaraConsolidateStatus`, and the presence of `scans_v4_scan_<id>` targets |
+| Has the compact rule/host record been written? | `yara_scanner_summary_v4_rules_<hash>` exists |
+| Has the full per-file detail been written? | `yara_scanner_full_v4_rules_<hash>` exists |
 
-`!YaraReport` at the same moment showed all three source shards still present, no per-scan
-targets, and the summary dataset alongside them — the state both answers describe.
+Both are visible in `!YaraReport`.
 
 ## 4. Cleanup — `xdr_data_management.py`
 

@@ -396,7 +396,7 @@ macOS    /usr/local/yara_scanner/logs/scan_summary_&lt;run_id&gt;.json</code></p
   <div class="step"><div class="sh"><span class="n">E2</span><span class="t">Readiness</span></div><div class="sb">
     <div class="blk"><span class="lead do">Do</span><pre><code>!YaraConsolidateStatus</code></pre></div>
     <div class="blk"><span class="lead exp">Expect</span><p>Eligible scan count, plus any in progress or blocked, with reasons.</p>
-      <p><strong>On a fresh or freshly-wiped tenant:</strong> <code>0 scan(s) eligible to consolidate</code>,
+      <p><strong>On a fresh or freshly-wiped tenant:</strong> <code>0 scan(s) ready to consolidate, in 0 ruleset group(s)</code>,
       with every count <code>0</code> and every scan-ID list empty. The correct result, not a
       misconfiguration — a tenant with no host matches or scans datasets gives the gate
       nothing to evaluate.</p>

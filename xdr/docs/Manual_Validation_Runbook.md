@@ -340,7 +340,7 @@ pack. (For a v2/v3 dataset it is correct and expected.)
 
 **Expect:** a count of eligible scans, plus any still in progress or blocked, with reasons.
 
-**On a fresh or freshly-wiped tenant:** `0 scan(s) eligible to consolidate`, with every
+**On a fresh or freshly-wiped tenant:** `0 scan(s) ready to consolidate, in 0 ruleset group(s)`, with every
 count `0` and every scan-ID list empty. That is the correct result, not a misconfiguration —
 a tenant with no host matches or scans datasets gives the gate nothing to evaluate.
 
