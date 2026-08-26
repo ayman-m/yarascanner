@@ -27,19 +27,39 @@ description: 'Merges each finished YARA scan''s per-host lookup dataset shards i
   consolidation modes re-derive eligibility from tenant state on each call.
 
 
-  TWO CONSOLIDATION MODES, chosen by the consolidation_mode input. Both read the same
+  TWO CONSOLIDATION MODES, chosen by the consolidation_mode input. Both leave the scanner
 
-  per-host matches dataset and both leave the scanner untouched; they differ only in what
+  untouched. On the v4 overwrite model they do NOT read the same source: only summary mode
 
-  they copy out, and in whether the source survives.
+  reads the per-host matches dataset, and only summary mode records what matched.
 
-  * full (default, the pre-existing behaviour) -> YaraConsolidateApply. Copies EVERY
+  * full (default, the pre-existing behaviour) -> YaraConsolidateApply. Enumerates its
 
-  matched-file row into yara_scanner_matches_v<VER>_scan_<slug>, then DELETES the per-host
+  sources with parse_shard, which deliberately returns None for the v4 per-host matches
 
-  source shard once the target''s row count has verified. Use it when the per-scan target
+  dataset - unsuffixed, permanent, overwritten wholesale at the start of every scan - so on
 
-  has to answer file-level questions on its own.
+  a current-model tenant full mode finds no matches shards at all. What it consolidates
+
+  instead is the SCANS lifecycle shards, into yara_scanner_scans_v<VER>_scan_<slug>,
+
+  DELETING those shards once the target''s row count has verified. It never reaches the
+
+  per-host matches dataset and cannot delete it: parse_shard keeps the name out of every
+
+  shard and deletion list, and _is_live_overwrite_dataset re-checks both destructive call
+
+  sites as a second, independent guard. Its matched-file copy path is intact and still
+
+  fires on a MONTH-SUFFIXED matches shard - schema v2/v3, or dated v4 debris predating the
+
+  overwrite model - copying every matched-file row into
+
+  yara_scanner_matches_v<VER>_scan_<slug> and deleting that shard the same way. A
+
+  current-model tenant simply has none of those, so on v4 use full mode for the lifecycle
+
+  record; it is still the file-level mode on a v2/v3 fleet.
 
   * summary -> YaraConsolidateSummary. Writes ONE ROW PER (host, rule) into
 
@@ -51,11 +71,21 @@ description: 'Merges each finished YARA scan''s per-host lookup dataset shards i
 
   summary_execute is left at its default of true.
 
-  The two are not interchangeable after the fact: full mode removes the per-host shard that
+  The two are not interchangeable after the fact, but on v4 the reason is the opposite of
 
-  summary mode leaves as the only place per-file detail still lives (until the next scan on
+  what it once was: full mode does not remove the per-host matches dataset - it cannot
 
-  that host rewrites it). Pick per deployment, not per run.
+  reach it - it simply records nothing about what matched. A scan consolidated in full mode
+
+  gets a per-scan LIFECYCLE record and no per-scan record of which rules fired; summary
+
+  mode is the only automation that writes the latter. Under either mode the per-host
+
+  dataset stays the only place per-file detail still lives, until the next scan on that
+
+  host overwrites it, and nothing archives it before that happens. Pick per deployment, not
+
+  per run.
 
 
   NOTE ON VERIFICATION: the condition operators (isExists on the eligible/pending
@@ -427,7 +457,7 @@ tasks:
       id: 7d3e0c30-0000-0000-0000-00000000000b
       version: -1
       name: Which consolidation mode?
-      description: 'Branches on the consolidation_mode input. Both modes read the same per-host matches dataset; they differ in what is copied out and whether the source survives. full -> YaraConsolidateApply (every matched-file row, then DELETES the verified source shard). summary -> YaraConsolidateSummary (one row per host+rule, deletes nothing). Both labels are matched explicitly and anything else goes to task 15, which does nothing at all: an unrecognised mode must never fall through to the branch that deletes data.'
+      description: 'Branches on the consolidation_mode input. On v4 the two modes do not read the same source: only summary mode reads the per-host matches dataset, and only summary mode records what matched. full -> YaraConsolidateApply (parse_shard excludes the permanent per-host matches dataset, so on a current-model tenant this consolidates the SCANS lifecycle shards and DELETES those once verified; its matched-file copy path fires only on a month-suffixed matches shard). summary -> YaraConsolidateSummary (one row per host+rule, deletes nothing). Both labels are matched explicitly and anything else goes to task 15, which does nothing at all: an unrecognised mode must never fall through to the branch that deletes data.'
       type: condition
       iscommand: false
       brand: ''
@@ -590,7 +620,7 @@ inputs:
   value:
     simple: full
   required: false
-  description: 'Which consolidation step runs on the eligible scans: "full" (default) merges every matched-file row with YaraConsolidateApply and then DELETES the verified per-host source shard; "summary" writes one row per (host, rule) with YaraConsolidateSummary and deletes nothing, leaving the per-host dataset as the deep-dive source. Matched exactly - any other value, including an empty one, runs NEITHER and ends the pass at a dead-end task rather than defaulting to the branch that deletes data.'
+  description: 'Which consolidation step runs on the eligible scans: "full" (default) runs YaraConsolidateApply, which on v4 merges the SCANS lifecycle shards into a per-scan lifecycle dataset and DELETES those shards once verified - parse_shard excludes the permanent per-host matches dataset, so full mode never reads it, never deletes it, and records nothing about what matched; its matched-file copy path fires only on a month-suffixed matches shard (v2/v3, or dated v4 debris). "summary" writes one row per (host, rule) with YaraConsolidateSummary and deletes nothing, leaving the per-host dataset as the deep-dive source and writing the only per-scan record of which rules fired. Matched exactly - any other value, including an empty one, runs NEITHER and ends the pass at a dead-end task rather than defaulting to the branch that deletes data.'
   playbookInputQuery: null
 - key: summary_execute
   value:

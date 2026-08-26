@@ -319,23 +319,37 @@ A worked example, reconciled exactly:
 
 ### The two consolidation modes
 
+They are not two routes to the same result. **Under the v4 model they read and write
+different datasets**, so the choice is about what each one records, not how much you are
+willing to lose.
+
 |  | **Full detail** (`Apply`) | **Summary only** (`Summary`) |
 |---|---|---|
-| Target | `yara_scanner_matches_v4_scan_<id>` | `yara_scanner_summary_v4_scan_<id>` |
-| Row grain | Every matched-file row, verbatim | One row per **(host, rule)** |
-| Columns | Full v4 schema | `scan_id`, `hostname`, `rule`, `event_timestamp_ms` |
+| Reads | Rotation shards — on a current tenant, only `yara_scanner_scans_v4_<host>_<6hex>_<YYYYMM>` | The live `yara_scanner_matches_v4_<host>_<6hex>`, plus any month-suffixed v4 matches shard |
+| Target | `yara_scanner_scans_v4_scan_<id>` | `yara_scanner_summary_v4_scan_<id>` |
+| Row grain | Every source row, verbatim | One row per **(host, rule)** |
+| Columns | Full source schema | `scan_id`, `hostname`, `rule`, `event_timestamp_ms` |
 | Per-rule counts | n/a | **Deliberately absent** |
 | Source afterwards | **Deleted** once verified | **Untouched** |
 | Read cost | Reads the shard's rows | One XQL per shard, aggregated in-engine |
 | Default | Writes and deletes | **Dry run** |
 
-**Summary** is the safer default for fleet reporting — the per-host dataset stays in place,
-so any summary row can still be drilled into. **Full detail** is right when the per-scan
-dataset must answer file-level questions with no second lookup.
+**The live matches dataset is out of `Apply`'s reach by design.** `parse_shard()` returns
+nothing for an unsuffixed `matches` name at schema v4 or newer — exactly the shape of the
+permanent per-host dataset — so it never enters a consolidation or a deletion list, and
+`_is_live_overwrite_dataset()` re-derives that answer from the same regex, independently, at
+both destructive call sites. `Apply` sweeps six `(schema, kind)` pairs on every run — v2, v3
+and v4 × matches and scans — and `YaraConsolidateStatus` previews the same six. On a current
+tenant exactly one of them finds a shard at all: **v4 / scans**.
 
-> **They are not interchangeable after the fact.** Full mode deletes the per-host shard that
-> summary mode preserves. The next scan on that host recreates it, so the loss is bounded —
-> but until then that scan's per-file detail is gone.
+> **`Apply`'s matches path still exists.** It fires on any matches shard that is not the live
+> v4 overwrite dataset — a schema v2 or v3 matches dataset, or month-suffixed v4 debris
+> predating the permanent model. A tenant built by scanner 3.4.0 has none.
+
+> **`Summary` is the only durable record of what matched.** `Apply` archives lifecycle rows,
+> not findings, and the per-host matches dataset is overwritten by the next scan on that host
+> ([§14](#14-known-limitations-and-open-questions)). Run `Summary` per scan if the rule/host
+> list has to outlive the scan.
 
 > **On a tenant with no YARA datasets yet, summary mode is a clean no-op.** Dry run and
 > `execute=true` alike report `XQL calls: 0 (+1 dataset listing)`,
@@ -589,7 +603,7 @@ Every one of these was observed live during validation.
 | `count_mismatch` on a scan | Target ≠ sum of sources | **Safe** — nothing deleted. Often a prior partial run |
 | "Lock held by another run" | Genuine concurrency, **or** a stale lock from a killed pass | Check the runs tracker before clearing ([§9](#9-the-consolidation-lock)) |
 | Consolidation stalls indefinitely | Pass killed at the task timeout holding the lock | Fixed by `max_scans` bounding. Clear the lock if confirmed dead |
-| Summary mode writes 0 rows | Scan still in progress (correctly skipped), or genuinely no matches | Check the skip reasons in the output |
+| Summary mode writes 0 rows | Scan still in progress (correctly skipped), genuinely no matches, or the host was re-scanned and its matches dataset overwritten | Check the skip reasons. An overwritten scan produces no skip reason — it is simply absent |
 | 401 on every automation call | Standard key in an Advanced-key slot, or rotated key | Regenerate an **Advanced** key; edit all five |
 | Dataset grows despite overwrite | Query Center permission missing on the **scanner's** key | Grant `investigation_query_view` |
 | `add_data` rows silently skipped | Row carries a field outside the dataset's schema | Schema can't be altered in place — bump the version tag |
@@ -602,8 +616,11 @@ Every one of these was observed live during validation.
 
 - **Verification compares counts, not content.** A corrupted write on the right count passes.
 - **`delete_dataset` has no undo.** No versioning, no restore.
-- **Two concurrent scans on one host are unsupported** — the second's flush deletes the
-  first's rows.
+- **Any re-scan of a host destroys the previous scan's file-level matches** — concurrent or
+  sequential, at any interval. On v4 nothing archives them: full consolidation is blocked
+  from the live matches dataset by design, and summary mode keeps only rule/host/timestamp,
+  not filenames or offsets. Alerts already raised are unaffected. Consolidation cadence does
+  not change this.
 - **The CLI path (`xdr_data_management.py --consolidate`) has no `max_scans` bound.** It was
   not updated when the cap was added to the pack automations. Restrict scope with `--scan-id`.
 - **A bounded pass doesn't self-resume.** Re-run to drain a backlog.
@@ -665,7 +682,9 @@ Every one of these was observed live during validation.
       `0 current-schema dataset(s), 0 legacy, 0 newer-schema (never pruned)` and the
       table's only body row is `(none)`. Correct, not a broken deployment
 - [ ] `YaraConsolidateStatus` run — eligible scans reviewed
-- [ ] Mode decided: **Summary** (safe, non-destructive) or **Full** (destructive)
+- [ ] Both modes understood — they act on **different datasets**, not two ways of doing one
+      job: `Summary` records what matched and never deletes; `Apply` archives the scans
+      lifecycle shards and deletes them once verified
 - [ ] Understood: **`Apply` has no dry run and deletes on first use**
 - [ ] `max_scans` left at 4 for the first pass. Before raising it, measure your own
       **marginal** per-scan cost — subtract the fixed ~105s per-pass overhead first, then

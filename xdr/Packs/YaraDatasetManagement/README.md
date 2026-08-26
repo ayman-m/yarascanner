@@ -17,8 +17,8 @@ manual CLI invocation.
 |---|---|---|
 | `YARA Dataset Consolidation` | Playbook | Orchestrates one pass: check readiness → wait on in-progress scans → **consolidate in the mode `consolidation_mode` selects** → flag failures. Meant to run **twice daily** as a scheduled Job. |
 | `YaraConsolidateStatus` | Automation | Read-only readiness check. Never writes or deletes. Shared by both modes. |
-| `YaraConsolidateApply` | Automation | **Mode A, full detail.** Creates per-scan targets, copies every matched-file row, deletes fully-verified source shards. |
-| `YaraConsolidateSummary` | Automation | **Mode B, summary only.** One row per (host, rule) — which rules fired on which host — into `yara_scanner_summary_v<VER>_scan_<slug>`. Four columns, no filenames, no per-rule counts. **Deletes nothing at all.** Dry run unless `execute=true`. |
+| `YaraConsolidateApply` | Automation | **Mode A, full detail.** Creates per-scan targets and deletes fully-verified source shards. On the v4 overwrite model the only shards it can see are the **scans** lifecycle ones — `parse_shard` excludes the permanent per-host matches dataset by design — so its matched-file copy path fires only on a month-suffixed matches shard (v2/v3, or dated v4 debris). |
+| `YaraConsolidateSummary` | Automation | **Mode B, summary only.** One row per (host, rule) — which rules fired on which host — into `yara_scanner_summary_v<VER>_scan_<slug>`. Four columns, no filenames, no per-rule counts. **Deletes nothing at all.** Dry run unless `execute=true`. On v4 it is also the **only** automation that writes a durable per-scan record of what matched. |
 | `YaraReport` | Automation | Read-only inventory of every `yara_scanner_*` lookup dataset (kind, host, age, plus the legacy / newer-schema / consolidated buckets). One API call, no writes — safe any time. Writes to `Yara.Report.*`. |
 | `YaraCleanup` | Automation | Retention pruning — **deletes whole datasets**. Dry run by default; see below. |
 | `YaraWipeAllDatasets` | Automation | **Deletes every `yara_scanner_*` dataset on the tenant, unconditionally.** No scoping, no rules. **Not wired to the playbook or any other content item — run it by hand only.** See below. |
@@ -82,17 +82,21 @@ Three consequences worth knowing before you run anything:
 
 ## Two consolidation modes — full detail or summary only
 
-The host dataset and the scanner behave **identically** under both modes. Only what
-consolidation copies out differs — and whether the source survives it.
+The host dataset and the scanner behave **identically** under both modes, and on v4 the
+host dataset survives both — full mode cannot reach it. What differs is what each mode
+reads and what it copies out: only summary mode reads the per-host matches dataset, and
+only summary mode records what matched.
 
 | | **A. Full detail** | **B. Summary only** |
 |---|---|---|
 | Automation | `YaraConsolidateApply` | `YaraConsolidateSummary` |
-| Target | `yara_scanner_matches_v<VER>_scan_<slug>` | `yara_scanner_summary_v<VER>_scan_<slug>` |
-| Row grain | every matched-file row, copied verbatim | **one row per (host, rule)** |
-| Columns | the full v4 match schema | `scan_id`, `hostname`, `rule`, `event_timestamp_ms` — and nothing else |
+| Source enumeration | `parse_shard` — which returns `None` for the v4 per-host matches dataset, so on a current-model tenant it sees **no matches shards at all** | `_matches_shard_for_read` — a deliberately wider, read-only inclusion that **does** see the live per-host dataset, because reading it is safe when nothing is ever deleted |
+| Target | on v4, `yara_scanner_scans_v<VER>_scan_<slug>` — the lifecycle record. The matches target `yara_scanner_matches_v<VER>_scan_<slug>` is written only for a **month-suffixed** matches shard (v2/v3, or dated v4 debris) | `yara_scanner_summary_v<VER>_scan_<slug>` |
+| Row grain | on v4, the scan's lifecycle rows, copied verbatim; every matched-file row, copied verbatim, on a month-suffixed matches shard | **one row per (host, rule)** |
+| Columns | on v4, the scans lifecycle schema; the full v4 match schema on a month-suffixed matches shard | `scan_id`, `hostname`, `rule`, `event_timestamp_ms` — and nothing else |
+| Records what matched | **no**, not on v4 — with no matches shard in scope, it consolidates lifecycle rows only | **yes.** The only automation that writes a durable per-scan record of which rules fired |
 | Per-rule counts | n/a | **deliberately absent.** A count column turns every dashboard query over the summary into an aggregation over numbers instead of a distinct-set lookup. |
-| Source shard afterwards | **deleted**, once the target's row count verifies | **untouched.** No `delete_dataset`, no `remove_lookup_data`, no row removal anywhere in the file. `shards_deleted` is always `0` and is reported so a playbook can assert it. |
+| Source shard afterwards | **deleted**, once the target's row count verifies — on v4 that means the *scans* shards. The per-host matches dataset is never deleted: `parse_shard` keeps it out of the list, and `_is_live_overwrite_dataset` re-checks both destructive call sites | **untouched.** No `delete_dataset`, no `remove_lookup_data`, no row removal anywhere in the file. `shards_deleted` is always `0` and is reported so a playbook can assert it. |
 | Read cost | reads the shard's rows | **one XQL per host shard**, which expands the v4 `rules` JSON array and groups inside the engine, so the rows never leave the tenant |
 | Write verification | required — it must count rows into the target *before* deleting the source | not required — the source outlives the run, so a partial write is fixed by re-running |
 | Default | writes (and deletes) | **dry run** unless `execute=true` |
@@ -105,14 +109,20 @@ consolidation copies out differs — and whether the source survives it.
   drilled into for the files behind it. Its size limit is `50 MB` per lookup dataset, which
   at ~163 B per (host, rule) row is ~321,649 rows: **the fleet limit is rules-matched-per-host,
   not host count.**
-* **Full detail** is right when the per-scan dataset itself has to answer file-level
-  questions with no second lookup — an investigation workflow that queries only the per-scan
-  target, or a tenant where the per-scan target is exported elsewhere.
-* **They are not interchangeable after the fact.** Full mode deletes the per-host shard that
-  summary mode leaves alone. The next scan on that host recreates and refills it (the
-  scanner ensures the dataset exists at scan start), so the loss is bounded — but until then
-  the per-file detail for *that* scan is gone, and a summary row written afterwards has
-  nothing to drill into. Pick per deployment, not per run.
+* **Full detail** answers file-level questions from the per-scan dataset alone — an
+  investigation workflow that queries only the per-scan target, or a tenant where that
+  target is exported elsewhere — but **on v4 it has nothing to build one from.** The only v4
+  matches dataset a host has is the permanent per-host one, and `parse_shard` excludes that
+  by design, so a v4 full-mode pass consolidates the scans lifecycle shards and writes no
+  matches target. It remains the file-level mode on a **v2/v3** fleet, and it still picks up
+  a month-suffixed v4 matches dataset left over from before the overwrite model.
+* **They are not interchangeable after the fact — and on v4 the reason has inverted.** Full
+  mode does not delete the per-host dataset; it cannot reach it. What it does instead is
+  record nothing about what matched, so a scan consolidated in full mode leaves a per-scan
+  *lifecycle* row and no per-scan record of which rules fired. Summary mode is the only
+  thing that writes one. Either way the per-host dataset stays the only place per-file
+  detail lives, until the next scan on that host overwrites it — at which point that scan's
+  file-level detail is gone and nothing archived it. Pick per deployment, not per run.
 * **One pass is bounded, in both modes.** `YaraConsolidateApply` takes `max_scans` (default
   **4**) to cap how many scans one invocation processes, so it finishes comfortably inside
   the script timeout instead of being killed mid-merge while still holding the consolidation

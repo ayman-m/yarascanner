@@ -339,13 +339,37 @@ Wait it out rather than working around it.
 > Run this against **test scans you are willing to lose**. Deleted datasets cannot be
 > recovered — the platform has no undo.
 
+### F2 and F3 are not one job at two settings
+
+They read different datasets, write different targets, and only one of them deletes. On v4
+you run **both** — picking one is not the decision on offer.
+
+|  | `YaraConsolidateSummary` — F2 | `YaraConsolidateApply` — F3 |
+|---|---|---|
+| Reads | the per-host **matches** dataset (plus the scans shards, to see which scans have finished) | the monthly **scans** lifecycle shards |
+| Writes | `yara_scanner_summary_v4_scan_<id>` | `yara_scanner_scans_v4_scan_<id>` |
+| Deletes | nothing, ever | the scans shards it merged, once verified |
+
+The v4 per-host matches dataset carries **no month suffix**, so `Apply` never classifies it
+as a shard: it never enters a consolidation or deletion list, and no `Apply` run merges it or
+deletes it. The warning above is about your **scans** shards. (`Apply`'s matches path is
+still live code and would fire on a *month-suffixed* matches shard — schema v2/v3, or dated
+v4 debris. A current-model tenant has none.)
+
+That leaves `Summary` as the only automation that writes a durable per-scan record of what
+matched. A scan's file-level detail is never lost to consolidation — it is lost to the
+**next scan on that host**, which overwrites the matches dataset wholesale, and on v4
+nothing archives it first.
+
 ### F1 · Preview first (safe)
 
 **Do:** `!YaraConsolidateStatus`
 
-Note which `scan_id`s are eligible. These are exactly what F3 will consume.
+Note which `scan_id`s are eligible. Those are the scans F3 will merge. Summarise them in F2
+**first** — not because F3 would delete their matches, but because the next scan on that
+host will overwrite them and F2 is the only thing that keeps a record.
 
-### F2 · Try summary mode first (non-destructive)
+### F2 · Summary — record what matched (non-destructive)
 
 **Do:**
 
@@ -373,7 +397,7 @@ dataset = <MATCHES> | comp count() as rows by scan_id
 
 **Expect:** unchanged. This is the proof that summary mode is safe to schedule.
 
-### F3 · Full consolidation (destructive)
+### F3 · Apply — merge the scans lifecycle shards (destructive)
 
 **Do:**
 
@@ -387,13 +411,38 @@ bound visible in the War Room record.
 **Expect:** `N scan(s) consolidated`, and if more remain,
 *"Pass was bounded… Run again to continue."*
 
-**Verify the target exists and the source is gone:**
+**Verify the target holds the merged rows:**
 
 ```
-dataset = yara_scanner_matches_v4_scan_<slugified_scan_id> | comp count() as rows
+dataset = yara_scanner_scans_v4_scan_<slugified_scan_id> | comp count() as rows
 ```
 
-**Expect:** the row count matches what the source held.
+**Expect:** the count matches that scan's rows across the source scans shards.
+
+> **Do not** go looking for a `yara_scanner_matches_v4_scan_<slug>` dataset. Earlier
+> revisions of this runbook told you to. On v4 it is never created, and querying it returns
+> a dataset-not-found error that reads exactly like a failed consolidation.
+
+**Verify the sources went:**
+
+**Do:** `!YaraReport`
+
+**Expect:** the month-suffixed `yara_scanner_scans_v4_<host>_<hex>_<YYYYMM>` shards that held
+*only* this scan are gone, and the new `..._scan_<slug>` target is listed as a per-scan
+consolidated target.
+
+**Reading it:** a shard that also holds a scan you did **not** consolidate is deliberately
+**kept** — the run log says *"kept shard … N of M scan(s) still pending consolidation"*. A
+surviving shard is that, not a failure. It goes on the pass that finishes its last scan.
+
+**Verify what Apply left alone:**
+
+```
+dataset = <MATCHES> | comp count() as rows by scan_id
+```
+
+**Expect:** identical to F2 — same dataset, same single `scan_id`, same row count. The
+per-host matches dataset is never a consolidation source on v4 and is never deleted.
 
 ### F4 · Confirm the run was recorded
 
@@ -536,7 +585,7 @@ empty backlog. Recognising that is the point of this test.
 | E1 | Live matches dataset reported as permanent, not "not rotated" | ☐ |
 | E2 | Readiness reports quiet-period deferrals correctly | ☐ |
 | F2 | Summary mode wrote rows and deleted **nothing** | ☐ |
-| F3 | Apply merged and verified before deleting | ☐ |
+| F3 | Apply merged the **scans** shards, verified, then deleted — matches dataset untouched | ☐ |
 | F4 | `started` + terminal rows both recorded | ☐ |
 | G1 | Second concurrent Apply refused on the lock | ☐ |
 | G2 | Cleanup dry-run deleted nothing | ☐ |
@@ -547,7 +596,11 @@ empty backlog. Recognising that is the point of this test.
 ### Before you go to production
 
 - [ ] Action timeout sized from **your** D2 measurement, not the reference figure
-- [ ] Consolidation mode chosen — **Summary** (safe) or **Full** (destructive)
+- [ ] **Both** consolidation automations scheduled, and understood as different jobs —
+      `Summary` for the per-scan record of what matched, `Apply` for the scans lifecycle
+      shards. Not alternatives: `Apply` never writes or deletes the per-host matches dataset,
+      so scheduling it alone leaves you with no record of any scan's matches once the next
+      scan overwrites that host
 - [ ] Everyone who can run automations knows **`Apply` has no dry-run mode**
 - [ ] `YaraCleanup` scheduled — if at all — in its **own** window, never alongside the merge
 - [ ] Test rules removed; only real detection content ships

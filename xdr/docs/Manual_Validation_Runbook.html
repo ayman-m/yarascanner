@@ -400,12 +400,35 @@ macOS    /usr/local/yara_scanner/logs/scan_summary_&lt;run_id&gt;.json</code></p
     <p>Run against <strong>test scans you are willing to lose</strong>. Deleted datasets cannot be
     recovered — the platform has no undo.</p></div>
 
+  <div class="call ok"><span class="lbl">F2 and F3 are not one job at two settings</span>
+    <p>They read different datasets, write different targets, and only one of them deletes. On v4
+    you run <strong>both</strong> — picking one is not the decision on offer.</p>
+    <div class="scroll"><table>
+    <thead><tr><th></th><th><code>YaraConsolidateSummary</code> — F2</th><th><code>YaraConsolidateApply</code> — F3</th></tr></thead>
+    <tbody>
+    <tr><td>Reads</td><td>the per-host <strong>matches</strong> dataset (plus the scans shards, to see which scans have finished)</td><td>the monthly <strong>scans</strong> lifecycle shards</td></tr>
+    <tr><td>Writes</td><td><code>yara_scanner_summary_v4_scan_&lt;id&gt;</code></td><td><code>yara_scanner_scans_v4_scan_&lt;id&gt;</code></td></tr>
+    <tr><td>Deletes</td><td>nothing, ever</td><td>the scans shards it merged, once verified</td></tr>
+    </tbody></table></div>
+    <p>The v4 per-host matches dataset carries <strong>no month suffix</strong>, so <code>Apply</code>
+    never classifies it as a shard: it never enters a consolidation or deletion list, and no
+    <code>Apply</code> run merges it or deletes it. The warning above is about your
+    <strong>scans</strong> shards. (<code>Apply</code>'s matches path is still live code and would
+    fire on a <em>month-suffixed</em> matches shard — schema v2/v3, or dated v4 debris. A
+    current-model tenant has none.)</p>
+    <p>That leaves <code>Summary</code> as the only automation that writes a durable per-scan record
+    of what matched. A scan's file-level detail is never lost to consolidation — it is lost to the
+    <strong>next scan on that host</strong>, which overwrites the matches dataset wholesale, and on
+    v4 nothing archives it first.</p></div>
+
   <div class="step"><div class="sh"><span class="n">F1</span><span class="t">Preview first (safe)</span></div><div class="sb">
     <div class="blk"><span class="lead do">Do</span><pre><code>!YaraConsolidateStatus</code></pre>
-    <p>Note the eligible <code>scan_id</code>s — exactly what F3 will consume.</p></div>
+    <p>Note the eligible <code>scan_id</code>s — the scans F3 will merge. Summarise them in F2
+    <strong>first</strong>: not because F3 would delete their matches, but because the next scan on
+    that host will overwrite them and F2 is the only thing that keeps a record.</p></div>
   </div></div>
 
-  <div class="step"><div class="sh"><span class="n">F2</span><span class="t">Summary mode first (non-destructive)</span></div><div class="sb">
+  <div class="step"><div class="sh"><span class="n">F2</span><span class="t">Summary — record what matched (non-destructive)</span></div><div class="sb">
     <div class="blk"><span class="lead do">Do</span><pre><code>!YaraConsolidateSummary execute="false"</code></pre>
     <p>Then for real:</p><pre><code>!YaraConsolidateSummary execute="true"</code></pre></div>
     <div class="blk"><span class="lead exp">Expect</span><p>Dry run reports what it <em>would</em> write. The real run writes to <code>yara_scanner_summary_v4_scan_&lt;id&gt;</code> and reports <strong><code>host shards deleted: 0</code></strong> — summary mode never deletes.</p>
@@ -414,13 +437,26 @@ macOS    /usr/local/yara_scanner/logs/scan_summary_&lt;run_id&gt;.json</code></p
       <p>Unchanged. That's the proof summary mode is safe to schedule.</p></div>
   </div></div>
 
-  <div class="step"><div class="sh"><span class="n">F3</span><span class="t">Full consolidation (destructive)</span></div><div class="sb">
+  <div class="step"><div class="sh"><span class="n">F3</span><span class="t">Apply — merge the scans lifecycle shards (destructive)</span></div><div class="sb">
     <div class="blk"><span class="lead do">Do</span><pre><code>!YaraConsolidateApply max_scans="4"</code></pre>
     <p>Pass <code>max_scans</code> explicitly the first time even though 4 is the default — it makes the bound visible in the War Room record.</p></div>
     <div class="blk"><span class="lead exp">Expect</span><p><code>N scan(s) consolidated</code>, and if more remain, <em>"Pass was bounded… Run again to continue."</em></p>
-      <p><strong>Verify:</strong></p>
-      <pre><code>dataset = yara_scanner_matches_v4_scan_&lt;slug&gt; | comp count() as rows</code></pre>
-      <p>The count should match what the source held.</p></div>
+      <p><strong>Verify the target holds the merged rows:</strong></p>
+      <pre><code>dataset = yara_scanner_scans_v4_scan_&lt;slug&gt; | comp count() as rows</code></pre>
+      <p>The count should match that scan's rows across the source scans shards. <strong>Do not</strong>
+      go looking for a <code>yara_scanner_matches_v4_scan_&lt;slug&gt;</code> dataset — earlier revisions
+      of this runbook told you to; on v4 it is never created, and querying it returns a
+      dataset-not-found error that reads exactly like a failed consolidation.</p>
+      <p><strong>Verify the sources went:</strong> run <code>!YaraReport</code>. The month-suffixed
+      <code>yara_scanner_scans_v4_&lt;host&gt;_&lt;hex&gt;_&lt;YYYYMM&gt;</code> shards that held <em>only</em> this
+      scan are gone; the new <code>..._scan_&lt;slug&gt;</code> target is listed as a per-scan consolidated
+      target. A shard that also holds a scan you did <strong>not</strong> consolidate is deliberately
+      <strong>kept</strong> — the log says <em>"kept shard … N of M scan(s) still pending
+      consolidation"</em>. That is correct, not a failure.</p>
+      <p><strong>Verify what Apply left alone:</strong></p>
+      <pre><code>dataset = &lt;MATCHES&gt; | comp count() as rows by scan_id</code></pre>
+      <p>Identical to F2 — same dataset, same single <code>scan_id</code>, same row count. The per-host
+      matches dataset is never a consolidation source on v4 and is never deleted.</p></div>
   </div></div>
 
   <div class="step"><div class="sh"><span class="n">F4</span><span class="t">Confirm the run was recorded</span></div><div class="sb">
@@ -515,7 +551,7 @@ REPLACES it wholesale ...</code></pre></div>
     <li><span><span class="rid">E1</span>Live matches dataset reported as permanent</span></li>
     <li><span><span class="rid">E2</span>Quiet-period deferrals reported correctly</span></li>
     <li><span><span class="rid">F2</span>Summary wrote rows and deleted <strong>nothing</strong></span></li>
-    <li><span><span class="rid">F3</span>Apply merged and verified before deleting</span></li>
+    <li><span><span class="rid">F3</span>Apply merged the <strong>scans</strong> shards, verified, then deleted — matches dataset untouched</span></li>
     <li><span><span class="rid">F4</span><code>started</code> + terminal rows both recorded</span></li>
     <li><span><span class="rid">G1</span>Second concurrent Apply refused on the lock</span></li>
     <li><span><span class="rid">G2</span>Cleanup dry-run deleted nothing</span></li>
@@ -527,7 +563,7 @@ REPLACES it wholesale ...</code></pre></div>
   <div class="call warn"><span class="lbl">Before production</span>
   <ul style="margin-bottom:0">
     <li>Timeout sized from <strong>your</strong> D2 measurement, not the reference figure</li>
-    <li>Consolidation mode chosen — <strong>Summary</strong> (safe) or <strong>Full</strong> (destructive)</li>
+    <li><strong>Both</strong> consolidation automations scheduled, and understood as different jobs — <code>Summary</code> for the per-scan record of what matched, <code>Apply</code> for the scans lifecycle shards. Not alternatives: <code>Apply</code> never writes or deletes the per-host matches dataset, so scheduling it alone leaves no record of any scan's matches once the next scan overwrites that host</li>
     <li>Everyone who can run automations knows <strong><code>Apply</code> has no dry-run mode</strong></li>
     <li><code>YaraCleanup</code> scheduled — if at all — in its <strong>own</strong> window, never alongside the merge</li>
     <li>Test rules removed; only real detection content ships</li>

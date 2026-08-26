@@ -379,6 +379,15 @@ yara_scanner_scans_v4_&lt;host&gt;_&lt;6hex&gt;_&lt;YYYYMM&gt;  APPEND-ONLY — 
 <p><strong>Two concurrent scans on one host</strong> are not supported under the overwrite model.
 The second scan’s flush would delete the first’s rows — from the dataset’s point of view they
 <em>are</em> a previous scan.</p></div>
+<div class="call warn"><span class="lbl">Sequential re-scans destroy the previous scan’s file detail too — and consolidation does not prevent it</span>
+<p>The flush does not check whether the previous scan was archived, because on v4 nothing archives
+it: <code>YaraConsolidateApply</code> is deliberately blocked from consuming the live v4 matches
+dataset (doing so would recreate the unbounded per-scan growth the overwrite model removed), and
+<code>YaraConsolidateSummary</code> reads it but keeps only <code>scan_id</code>, <code>hostname</code>,
+<code>rule</code>, <code>event_timestamp_ms</code> — no filenames, no offsets. So a host’s file-level
+findings live in exactly one place and the next scan on that host replaces them, at any interval,
+whatever your consolidation cadence. Alerts already raised are unaffected. Treat each scan’s file
+detail as valid until that host is scanned again.</p></div>
 
 <h3>Schema v4 — one row per file</h3>
 <p>v2 wrote one row per matched <strong>string</strong>. v3 wrote one per <strong>(rule, file)</strong> finding. v4 writes one per <strong>file</strong>, folding every rule that hit it into a <code>rules</code> JSON array.</p>
@@ -476,21 +485,28 @@ rather than guessing.</p></div>
 merges and deletes on its first run. Use <code>YaraConsolidateStatus</code> to preview.</p></div>
 
 <h3>The two consolidation modes</h3>
+<p>They are not two routes to the same result. <strong>Under the v4 model they read and write different datasets</strong>, so the choice is about what each one records, not how much you are willing to lose.</p>
 <div class="scroll"><table>
 <thead><tr><th></th><th>Full detail (<code>Apply</code>)</th><th>Summary only (<code>Summary</code>)</th></tr></thead>
 <tbody>
-<tr><td>Target</td><td><code>yara_scanner_matches_v4_scan_&lt;id&gt;</code></td><td><code>yara_scanner_summary_v4_scan_&lt;id&gt;</code></td></tr>
-<tr><td>Row grain</td><td>Every matched-file row, verbatim</td><td>One row per <strong>(host, rule)</strong></td></tr>
-<tr><td>Columns</td><td>Full v4 schema</td><td><code>scan_id</code>, <code>hostname</code>, <code>rule</code>, <code>event_timestamp_ms</code></td></tr>
+<tr><td>Reads</td><td>Rotation shards — on a current tenant, only <code>yara_scanner_scans_v4_&lt;host&gt;_&lt;6hex&gt;_&lt;YYYYMM&gt;</code></td><td>The live <code>yara_scanner_matches_v4_&lt;host&gt;_&lt;6hex&gt;</code>, plus any month-suffixed v4 matches shard</td></tr>
+<tr><td>Target</td><td><code>yara_scanner_scans_v4_scan_&lt;id&gt;</code></td><td><code>yara_scanner_summary_v4_scan_&lt;id&gt;</code></td></tr>
+<tr><td>Row grain</td><td>Every source row, verbatim</td><td>One row per <strong>(host, rule)</strong></td></tr>
+<tr><td>Columns</td><td>Full source schema</td><td><code>scan_id</code>, <code>hostname</code>, <code>rule</code>, <code>event_timestamp_ms</code></td></tr>
 <tr><td>Per-rule counts</td><td>n/a</td><td><strong>Deliberately absent</strong></td></tr>
 <tr><td>Source afterwards</td><td><strong>Deleted</strong> once verified</td><td><strong>Untouched</strong></td></tr>
 <tr><td>Read cost</td><td>Reads the shard’s rows</td><td>One XQL per shard, aggregated in-engine</td></tr>
 <tr><td>Default</td><td>Writes and deletes</td><td><strong>Dry run</strong></td></tr>
 </tbody></table></div>
-<p><strong>Summary</strong> is the safer default for fleet reporting — the per-host dataset stays in place, so any summary row can still be drilled into. <strong>Full detail</strong> is right when the per-scan dataset must answer file-level questions with no second lookup.</p>
-<div class="call warn"><span class="lbl">Not interchangeable after the fact</span>
-<p>Full mode deletes the per-host shard that summary mode preserves. The next scan on that host
-recreates it, so the loss is bounded — but until then that scan’s per-file detail is gone.</p></div>
+<p><strong>The live matches dataset is out of <code>Apply</code>’s reach by design.</strong> <code>parse_shard()</code> returns nothing for an unsuffixed <code>matches</code> name at schema v4 or newer — exactly the shape of the permanent per-host dataset — so it never enters a consolidation or a deletion list, and <code>_is_live_overwrite_dataset()</code> re-derives that answer from the same regex, independently, at both destructive call sites. <code>Apply</code> sweeps six <code>(schema, kind)</code> pairs on every run — v2, v3 and v4 × matches and scans — and <code>YaraConsolidateStatus</code> previews the same six. On a current tenant exactly one of them finds a shard at all: <strong>v4 / scans</strong>.</p>
+<div class="call warn"><span class="lbl">Apply’s matches path still exists</span>
+<p>It fires on any matches shard that is not the live v4 overwrite dataset — a schema v2 or v3
+matches dataset, or month-suffixed v4 debris predating the permanent model. A tenant built by
+scanner 3.4.0 has none.</p></div>
+<div class="call warn"><span class="lbl">Summary is the only durable record of what matched</span>
+<p><code>Apply</code> archives lifecycle rows, not findings, and the per-host matches dataset is
+overwritten by the next scan on that host (<a href="#s14">§14</a>). Run <code>Summary</code> per scan
+if the rule/host list has to outlive the scan.</p></div>
 <div class="call ok"><span class="lbl">Zeros on an empty tenant are correct</span>
 <p>On a tenant with no YARA datasets yet, summary mode is a clean no-op. Dry run and
 <code>execute=true</code> alike report <code>XQL calls: 0 (+1 dataset listing)</code>,
@@ -663,7 +679,7 @@ scan log.</p></div>
 <tr><td><code>count_mismatch</code> on a scan</td><td>Target ≠ sum of sources</td><td><strong>Safe</strong> — nothing deleted. Often a prior partial run</td></tr>
 <tr><td>“Lock held by another run”</td><td>Genuine concurrency, <strong>or</strong> a stale lock from a killed pass</td><td>Check the runs tracker before clearing (<a href="#s9">§9</a>)</td></tr>
 <tr><td>Consolidation stalls indefinitely</td><td>Pass killed at the task timeout holding the lock</td><td>Fixed by <code>max_scans</code> bounding. Clear the lock if confirmed dead</td></tr>
-<tr><td>Summary mode writes 0 rows</td><td>Scan still in progress (correctly skipped), or genuinely no matches</td><td>Check the skip reasons in the output</td></tr>
+<tr><td>Summary mode writes 0 rows</td><td>Scan still in progress (correctly skipped), genuinely no matches, or the host was re-scanned and its matches dataset overwritten</td><td>Check the skip reasons. An overwritten scan produces no skip reason — it is simply absent</td></tr>
 <tr><td>401 on every automation call</td><td>Standard key in an Advanced-key slot, or rotated key</td><td>Regenerate an <strong>Advanced</strong> key; edit all five</td></tr>
 <tr><td>Dataset grows despite overwrite</td><td>Query Center permission missing on the <strong>scanner’s</strong> key</td><td>Grant <code>investigation_query_view</code></td></tr>
 <tr><td><code>add_data</code> rows silently skipped</td><td>Row carries a field outside the dataset’s schema</td><td>Schema can’t be altered in place — bump the version tag</td></tr>
@@ -720,7 +736,7 @@ scan log.</p></div>
 <li><span><strong>Advanced (HMAC)</strong> key in all five automations</span></li>
 <li><span><code>YaraReport</code> run — inventory understood. On a tenant with no YARA datasets yet the report is a legitimate empty one — the header reads <code>0 current-schema dataset(s), 0 legacy, 0 newer-schema (never pruned)</code> and the table's only body row is <code>(none)</code>. Correct, not a broken deployment</span></li>
 <li><span><code>YaraConsolidateStatus</code> run — eligible scans reviewed</span></li>
-<li><span>Mode decided: <strong>Summary</strong> (safe, non-destructive) or <strong>Full</strong> (destructive)</span></li>
+<li><span>Both modes understood — they act on <strong>different datasets</strong>, not two ways of doing one job: <code>Summary</code> records what matched and never deletes; <code>Apply</code> archives the scans lifecycle shards and deletes them once verified</span></li>
 <li><span>Understood: <strong><code>Apply</code> has no dry run and deletes on first use</strong></span></li>
 <li><span><code>max_scans</code> left at 4 for the first pass. Before raising it, measure your own <strong>marginal</strong> per-scan cost — subtract the fixed ~105 s per-pass overhead first, then divide by the scan count. Dividing a pass total by its scan count counts that fixed cost once per scan and will mislead you into raising the cap too far</span></li>
 </ul>
