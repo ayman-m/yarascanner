@@ -256,6 +256,59 @@ Two honest caveats:
 > `YaraConsolidateSummary` to keep at least the rule/host/timestamp record. Scheduling
 > consolidation more frequently does **not** help here.
 
+## 3b. The run-log datasets — why three `*_runs` datasets exist
+
+Alongside the scan data you will see three small datasets that no scan ever writes:
+
+| Dataset | Written by | One row records |
+|---|---|---|
+| `yara_scanner_consolidation_runs` | `YaraConsolidateApply` | `status`, `consolidated_count`, `failed_count`, failed scan IDs and their reasons |
+| `yara_scanner_cleanup_runs` | `YaraCleanup` | `mode`, `schema_version`, `deleted_count`, and the retention scope the pass ran with |
+| `yara_scanner_wipe_runs` | `YaraWipeAllDatasets` | `mode`, `total_found`, `deleted_count`, `failed_count`, `stopped_early` |
+
+They are an **audit trail: one row per run**. Every automation that mutates or deletes
+writes one; the read-only ones (`YaraReport`, `YaraConsolidateStatus`) write nothing.
+
+### Why keep them
+
+**A War Room entry scrolls away; a dataset does not.** These answer "did last night's pass
+actually run, and what did it do?" days later, from XQL, without hunting through job history.
+
+**They make a killed run detectable.** `YaraConsolidateApply` writes a `started` row *before*
+the merge and a terminal row after. The platform kills a task that overruns its ~900 s
+timeout, and a kill runs no Python — so the terminal row is unreachable in exactly the case
+worth diagnosing. **A `started` row with no matching terminal row is the timeout-kill
+signature**, and it is only visible because the first row was written in advance.
+
+**They settle "what actually happened" after an ambiguous failure.** A wipe once surfaced as a
+bare `Internal Server Error`. Its `wipe_runs` row showed `total_found=245`,
+`deleted_count=195`, `failed_count=48` — and because `195 + 48 = 243` matched the candidate
+count, the pass had demonstrably *completed* rather than being killed mid-batch. That
+distinction came from the row, not the error message.
+
+**They are the record of a destructive act.** `YaraWipeAllDatasets` logs both dry runs and
+executed ones, so "who checked what a full wipe would remove, and when" survives even when
+nothing was deleted.
+
+### Why the wipe never deletes them
+
+All three are in `PRESERVED_DATASETS`, so `YaraWipeAllDatasets` skips them even though they
+match `yara_scanner_*`. Deleting the record of a wipe defeats the reason it exists.
+
+### Two things that surprise people
+
+**They do not appear in `!YaraReport`.** The inventory classifies `matches`, `scans` and
+`summary` datasets; the run logs sit outside that naming contract deliberately, so they are
+never mistaken for scan data or considered for retention. Query them directly by name.
+
+**Nothing prunes them.** They grow by a row or two per run, forever. At a few hundred bytes a
+row this is immaterial for years, but it is unbounded by design rather than by a rail — worth
+knowing before a very high-frequency schedule.
+
+> **`YaraConsolidateSummary` does not write a run log.** It is the one mutating automation
+> with no audit row, so a scheduled summarisation cannot be confirmed from the tenant the way
+> a consolidation or a cleanup can. Check its War Room output instead.
+
 ## 4. Cleanup — `xdr_data_management.py`
 
 A small standalone script that deletes whole old datasets.
