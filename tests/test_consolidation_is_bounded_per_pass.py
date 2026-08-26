@@ -140,11 +140,16 @@ def test_the_shipped_default_reflects_the_measured_per_scan_cost():
         "timeout" % C.DEFAULT_MAX_SCANS_PER_PASS)
 
 
-def test_the_playbook_apply_task_passes_max_scans():
-    """The default above is meaningless if the playbook never sends it. Task 6 (Apply
-    consolidation) omitted max_scans entirely, so every playbook-driven pass used whatever
-    DEFAULT_MAX_SCANS_PER_PASS happened to be - the exact gap that would have reproduced
-    this morning's incident on the very first customer playbook run."""
+def test_the_playbook_apply_task_passes_execute_and_a_row_ceiling():
+    """The playbook must send the arguments that make a full-consolidation pass do work AND
+    stay bounded.
+
+    Supersedes the old max_scans assertion. YaraConsolidateApply no longer walks scans in a
+    bounded loop - it writes one dataset per ruleset group - so the per-pass bound is
+    row_ceiling, not max_scans. And it is now DRY RUN BY DEFAULT, which is the sharper trap:
+    a task that omits execute reports what it would write and writes nothing, silently, on
+    every scheduled run for ever. That regression was introduced and caught by this file.
+    """
     import yaml
     path = os.path.join(_REPO, "xdr", "Packs", "YaraDatasetManagement", "Playbooks",
                         "playbook-YARA_Dataset_Consolidation.yml")
@@ -152,8 +157,27 @@ def test_the_playbook_apply_task_passes_max_scans():
     apply_task = next(t for t in pb["tasks"].values()
                       if (t.get("task") or {}).get("script") == "YaraConsolidateApply")
     args = apply_task.get("scriptarguments") or {}
-    assert "max_scans" in args, "the playbook's Apply task does not pass max_scans"
-    assert args["max_scans"] == {"simple": "${inputs.max_scans}"}, args["max_scans"]
+    assert "execute" in args, (
+        "the playbook's Apply task does not pass execute - the full branch would dry-run "
+        "for ever and never write")
+    assert args["execute"] == {"simple": "${inputs.full_execute}"}, args["execute"]
+    assert "row_ceiling" in args, "the playbook's Apply task does not pass row_ceiling"
+    assert "max_scans" not in args, (
+        "max_scans is not an argument of the full-consolidation Apply any more; passing it "
+        "would be silently ignored and imply a bound that is not applied")
+
+
+def test_the_playbook_declares_a_full_execute_input():
+    """The counterpart of summary_execute. Without it the operator cannot preview a full
+    pass, and task 6's ${inputs.full_execute} would resolve to nothing."""
+    import yaml
+    path = os.path.join(_REPO, "xdr", "Packs", "YaraDatasetManagement", "Playbooks",
+                        "playbook-YARA_Dataset_Consolidation.yml")
+    pb = yaml.safe_load(open(path))
+    inputs = {i.get("key"): i for i in (pb.get("inputs") or [])}
+    assert "full_execute" in inputs, "playbook has no full_execute input"
+    assert (inputs["full_execute"].get("value") or {}).get("simple") == "true", (
+        "full_execute must default to true, or every scheduled full pass is a no-op")
 
 
 def test_the_playbook_declares_a_max_scans_input():

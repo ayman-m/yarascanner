@@ -159,9 +159,7 @@ tasks:
     scriptarguments:
       scan_id:
         simple: ${inputs.scan_id}
-      row_ceiling:
-        simple: ${inputs.row_ceiling}
-      abandoned_after_hours:
+      retention_hours:
         simple: ${inputs.abandoned_after_hours}
     nexttasks:
       '#none#':
@@ -269,9 +267,7 @@ tasks:
     scriptarguments:
       scan_id:
         simple: ${inputs.scan_id}
-      row_ceiling:
-        simple: ${inputs.row_ceiling}
-      abandoned_after_hours:
+      retention_hours:
         simple: ${inputs.abandoned_after_hours}
     nexttasks:
       '#none#':
@@ -333,12 +329,12 @@ tasks:
       scan_id:
         complex:
           root: Yara.ConsolidateStatus.eligible_scan_ids
-      max_scans:
-        simple: ${inputs.max_scans}
+      retention_hours:
+        simple: ${inputs.abandoned_after_hours}
       row_ceiling:
         simple: ${inputs.row_ceiling}
-      abandoned_after_hours:
-        simple: ${inputs.abandoned_after_hours}
+      execute:
+        simple: ${inputs.full_execute}
     nexttasks:
       '#none#':
       - '7'
@@ -626,7 +622,13 @@ inputs:
   value:
     simple: 'true'
   required: false
-  description: 'Only read in summary mode. YaraConsolidateSummary is a dry run unless execute=true, so this is "true" by default - left at "false" the summary branch would report what it would write and write nothing, every scheduled run, for ever. Set it to "false" deliberately to preview a pass. The full-detail branch has no equivalent: YaraConsolidateApply always writes, and deletes.'
+  description: 'Only read in summary mode. YaraConsolidateSummary is a dry run unless execute=true, so this is "true" by default - left at "false" the summary branch would report what it would write and write nothing, every scheduled run, for ever. Set it to "false" deliberately to preview a pass.'
+  playbookInputQuery: null
+- key: full_execute
+  value:
+    simple: 'true'
+  required: false
+  description: 'Only read in full mode, and the exact counterpart of summary_execute. YaraConsolidateApply is now a dry run unless execute=true, so this is "true" by default - left at "false" the full branch would report what it would write and write nothing, every scheduled run, for ever. Both modes are non-destructive: neither reads nor removes the per-host matches datasets, which stay the deep-dive source.'
   playbookInputQuery: null
 - key: scan_id
   value:

@@ -1,41 +1,22 @@
 args:
 - name: scan_id
-  description: Restrict the check to these scan_id(s) (comma-separated). Omit for
-    all finished scans.
+  description: Restrict the preview to these scan_id(s), comma-separated.
   required: false
   isArray: true
-  default: false
   secret: false
-- name: quiet_secs
-  description: Override the default settle window (900s) a completed scan's newest
-    row must be older than before it's considered safe.
+- name: schema_version
+  description: Lookup schema version to act on. Defaults to 4.
   required: false
   isArray: false
-  default: false
+  defaultValue: '4'
   secret: false
-- name: row_ceiling
-  description: Override the default per-scan row ceiling (2,000,000) above which a
-    scan is refused rather than half-built.
+- name: retention_hours
+  description: A scan with no terminal lifecycle row is treated as finished past this age. Defaults to 24. Must match what the consolidation run will use, or this preview and that run disagree.
   required: false
   isArray: false
-  default: false
+  defaultValue: '24'
   secret: false
-- name: abandoned_after_hours
-  description: Override the default hours (from CONFIG_CONSOLIDATE_OBSOLETE_AFTER,
-    24h default in code) a non-terminal scan must be silent before it's treated as
-    abandoned and consolidated anyway to preserve its partial findings.
-  required: false
-  isArray: false
-  default: false
-  secret: false
-comment: >-
-  Read-only readiness check for the YARA per-scan dataset merge. Never writes or
-  deletes anything — safe to call repeatedly from inside a wait/retry poll loop.
-  Reports which scans are eligible to consolidate now, which are still in progress
-  (a real scan running, or a just-finished scan still inside its settle window), and
-  which are blocked (row ceiling exceeded, or an existing target with a mismatched
-  row count needing manual attention). A scan only counts as eligible if BOTH the
-  scans-lifecycle and matches shards agree it's ready.
+comment: 'Read-only readiness check. Never writes or deletes. Previews exactly what YaraConsolidateSummary (compact) and YaraConsolidateApply (full detail) would group: which scans pass the finished-or-aged gate, and how they bucket by ruleset hash into consolidated datasets. It does NOT preview a scans-lifecycle merge - nothing performs one today.'
 commonfields:
   id: YaraConsolidateStatus
   version: -1
@@ -61,8 +42,7 @@ outputs:
   description: scan_id(s) blocked and needing attention.
   type: String
 - contextPath: Yara.ConsolidateStatus.blocked_reasons
-  description: Map of blocked scan_id to the specific reason it's blocked (e.g.
-    row_ceiling_exceeded, count_mismatch).
+  description: Map of blocked scan_id to the specific reason it's blocked (e.g. row_ceiling_exceeded, count_mismatch).
   type: Unknown
 script: '-'
 system: false

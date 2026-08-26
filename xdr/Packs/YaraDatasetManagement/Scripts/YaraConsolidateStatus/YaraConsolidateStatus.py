@@ -685,6 +685,99 @@ def run_consolidation(client, kind, ver="2", quiet_secs=DEFAULT_QUIET_SECS,
     return plans
 
 
+def _matches_shard_for_read(name, ver):
+    """{kind, ver, host, month} for a dataset safe to READ as a matches source of schema
+    `ver`, or None. Unlike parse_shard, this INCLUDES the live overwrite dataset (matches
+    v4+, unsuffixed) - parse_shard excludes it so Apply/Fast can never select it for
+    deletion, but Summary never deletes anything, and the live dataset is the ONLY place a
+    v4-scanned host's current findings live once matches stopped rotating. Excluding it here
+    left Summary silently producing zero rows for every host on the shipped default: `main`
+    built match_ds from parse_shard's list alone, and the live host dataset was the only
+    thing in it for a host running the current scanner. Read-for-summary and
+    safe-to-delete are different questions; this answers the first one, independent of
+    parse_shard's answer to the second."""
+    p = parse_shard(name)
+    if p:
+        return p if p["kind"] == "matches" and str(p["ver"]) == str(ver) else None
+    m = _SHARD_RE.match(name or "")
+    if not (m and m.group("kind") == "matches" and str(m.group("ver")) == str(ver)):
+        return None
+    host = m.group("host")
+    if host.startswith("scan_") or host == "scan":
+        return None
+    return {"kind": "matches", "ver": m.group("ver"), "host": host, "month": m.group("month")}
+
+
+_RULE_HASH_RE = re.compile(r"_yara_([0-9a-f]{6,})$")
+
+
+def rule_hash_of(scan_id):
+    """The ruleset hash trailing a scan_id, or None.
+
+    The scanner builds scan_id as "{hostname}_{run_id}_yara_{sha256(rules)[:12]}" and keeps
+    that suffix deliberately "so the ruleset stays identifiable from the scan_id alone".
+    hostname and run_id are per-host; the hash is the ONLY component every host in one
+    Action Center scan shares, which makes it the grouping key. No API call, no scanner
+    change, and it works on data already on the tenant."""
+    m = _RULE_HASH_RE.search(str(scan_id or ""))
+    return m.group(1) if m else None
+
+
+def check_readiness(client, ver="4", retention_hours=24.0, now_ms=None, log=lambda *a: None):
+    """Which scans are ready for YaraConsolidateSummary / YaraConsolidateApply to group.
+
+    Mirrors the gate BOTH consolidation modes apply, so this previews the work they would
+    actually do. It reads the live per-host matches datasets and asks per scan: is its
+    lifecycle terminal, or has it been silent past retention_hours? Then it buckets the
+    ready ones by ruleset hash, which is the key both modes group on - so the preview also
+    answers "how many datasets will this produce, and which hosts land in each".
+
+    NOT the same question as check_consolidation_status, which previews the scans-lifecycle
+    merge. Nothing consumes that today; it is retained for a future lifecycle automation.
+    """
+    now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+    cutoff_ms = float(retention_hours) * 3600 * 1000
+    names = _list_yara_datasets(client)
+    match_ds = [n for n in names if _matches_shard_for_read(n, ver)]
+    scans_ds = [n for n in names
+                if (parse_shard(n) or {}).get("kind") == "scans"
+                and str((parse_shard(n) or {}).get("ver")) == str(ver)]
+    tmap = build_terminal_map({d: _rows_of(d, client) for d in scans_ds}, None)
+
+    hosts, newest = {}, {}
+    for ds in match_ds:
+        try:
+            rows = _rows_of(ds, client)
+        except Exception as e:
+            log("%s: unreadable (%s)" % (ds, str(e)[:100]))
+            continue
+        for r in rows:
+            sid = r.get("scan_id")
+            if not sid:
+                continue
+            hosts.setdefault(sid, set()).add(r.get("hostname"))
+            newest[sid] = max(newest.get(sid, 0), int(r.get("event_timestamp_ms") or 0))
+
+    ready, pending, groups = [], [], {}
+    for sid in sorted(hosts):
+        terminal = bool(tmap.get(sid))
+        aged = bool(newest.get(sid)) and (now_ms - newest[sid]) >= cutoff_ms
+        if not (terminal or aged):
+            pending.append(sid)
+            continue
+        ready.append(sid)
+        rh = rule_hash_of(sid) or "unknown"
+        g = groups.setdefault(rh, {"scans": [], "hosts": set()})
+        g["scans"].append(sid)
+        g["hosts"].update(hosts[sid])
+    return {"eligible_count": len(ready), "eligible_scan_ids": ready,
+            "pending_count": len(pending), "pending_scan_ids": pending,
+            "group_count": len(groups),
+            "groups": [{"rule_hash": k, "scans": len(v["scans"]),
+                        "hosts": sorted(x for x in v["hosts"] if x)}
+                       for k, v in sorted(groups.items())]}
+
+
 def check_consolidation_status(client, kinds=("matches", "scans"), vers=KNOWN_MATCHES_SCHEMA_VERSIONS,
                                quiet_secs=DEFAULT_QUIET_SECS, row_ceiling=DEFAULT_ROW_CEILING,
                                abandoned_after_secs=DEFAULT_ABANDONED_SECS,
@@ -1572,48 +1665,42 @@ class CoreApiClient:
 def main():
     args = demisto.args()
     scan_ids = argToList(args.get("scan_id")) or None
-    quiet_secs = args.get("quiet_secs")
-    row_ceiling = args.get("row_ceiling")
-    abandoned_after_hours = args.get("abandoned_after_hours")
-
-    kwargs = {"only_scan_ids": scan_ids}
-    if quiet_secs:
-        kwargs["quiet_secs"] = int(quiet_secs)
-    if row_ceiling:
-        kwargs["row_ceiling"] = int(row_ceiling)
-    if abandoned_after_hours:
-        kwargs["abandoned_after_secs"] = int(float(abandoned_after_hours) * 3600)
+    ver = str(args.get("schema_version") or DEFAULT_LOOKUP_SCHEMA_VERSION).strip()
+    retention_hours = float(args.get("retention_hours") or 24.0)
 
     try:
-        status = check_consolidation_status(CoreApiClient(), log=lambda *a: None, **kwargs)
+        client = CoreApiClient()
+        st = check_readiness(client, ver=ver, retention_hours=retention_hours)
     except Exception as ex:
         return_error("YaraConsolidateStatus failed: {}".format(ex))
         return
 
-    lines = ["{} scan(s) eligible to consolidate".format(status["eligible_count"])]
-    if status["eligible_count"]:
-        lines.append("  eligible: {}".format(", ".join(status["eligible_scan_ids"][:10])))
-    if status["any_in_progress"]:
-        lines.append("{} scan(s) still in progress: {}".format(
-            len(status["pending_scan_ids"]), ", ".join(status["pending_scan_ids"][:10])))
-    if status["blocked_count"]:
-        reasons = status.get("blocked_reasons", {})
-        detail = ", ".join("{} ({})".format(sid, reasons.get(sid, "unknown"))
-                           for sid in status["blocked_scan_ids"][:10])
-        lines.append("{} scan(s) blocked: {}".format(status["blocked_count"], detail))
+    if scan_ids:
+        want = set(scan_ids)
+        st["eligible_scan_ids"] = [s for s in st["eligible_scan_ids"] if s in want]
+        st["pending_scan_ids"] = [s for s in st["pending_scan_ids"] if s in want]
+        st["eligible_count"] = len(st["eligible_scan_ids"])
+        st["pending_count"] = len(st["pending_scan_ids"])
 
-    # List-valued context is APPENDED to across repeated calls in one investigation rather
-    # than replaced, so eligible_scan_ids would accumulate a stale union even though each
-    # call's own return value is correct. Clear it first: the playbook's condition task and
-    # Apply's scan_id argument both read this path.
-    demisto.executeCommand("DeleteContext", {"key": "Yara.ConsolidateStatus"})
+    lines = ["%d scan(s) ready to consolidate, in %d ruleset group(s)"
+             % (st["eligible_count"], st["group_count"])]
+    if st["eligible_scan_ids"]:
+        lines.append("  ready: %s" % ", ".join(st["eligible_scan_ids"][:10]))
+    for g in st["groups"]:
+        lines.append("  rules %s: %d scan(s) across %d host(s) -> one summary dataset and/or "
+                     "one full dataset (%s)"
+                     % (g["rule_hash"], g["scans"], len(g["hosts"]), ", ".join(g["hosts"][:6])))
+    if st["pending_count"]:
+        lines.append("%d scan(s) still in progress - not yet eligible: %s"
+                     % (st["pending_count"], ", ".join(st["pending_scan_ids"][:10])))
+    lines.append("")
+    lines.append("Read-only. This previews what YaraConsolidateSummary (compact) and "
+                 "YaraConsolidateApply (full detail) would group; it does not preview the "
+                 "scans-lifecycle merge.")
 
-    return_results(CommandResults(
-        readable_output="\n".join(lines),
-        outputs_prefix="Yara.ConsolidateStatus",
-        outputs=status,
-        raw_response=status,
-    ))
+    return_results(CommandResults(readable_output="\n".join(lines),
+                                  outputs_prefix="Yara.ConsolidateStatus",
+                                  outputs=st, raw_response=st))
 
 
 if __name__ in ("__main__", "__builtin__", "builtins"):
