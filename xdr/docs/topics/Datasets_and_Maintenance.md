@@ -309,6 +309,36 @@ knowing before a very high-frequency schedule.
 > with no audit row, so a scheduled summarisation cannot be confirmed from the tenant the way
 > a consolidation or a cleanup can. Check its War Room output instead.
 
+### Worked example — the two modes are independent
+
+Observed on a live tenant, 2026-08-26, three hosts scanned by one Action Center launch:
+
+```
+!YaraConsolidateSummary schema_version="4" retention_hours="24" execute="true"
+  EXECUTED.  XQL calls: 6 (+1 dataset listing)  [single-query]
+  written: 1 | skipped: 0 | failed: 0 | file-level findings collapsed: 1134
+  rules 90149530ddc2: wrote 24 row(s) for 3 new scan(s), dropped 0 stale row(s)
+                      -> yara_scanner_summary_v4_rules_90149530ddc2 (3 host(s) total, completed)
+
+!YaraConsolidateStatus
+  3 scan(s) eligible to consolidate
+  eligible: xdr-agent_20260825_103650..., xdragent2_20260825_103653..., xdragent_20260825_103654...
+```
+
+**`Status` still lists all three as eligible, and that is correct.** It reports readiness for
+`YaraConsolidateApply`, which had not run. `Summary` writing a rollup does not make a scan
+consolidated, because `Apply` merges the *scans* shards and `Summary` never touches them.
+
+Read it as two independent questions:
+
+| Question | Answered by |
+|---|---|
+| Has this scan's rule/host record been captured? | the `summary_v4_rules_<hash>` dataset exists |
+| Have this scan's lifecycle shards been merged and removed? | `YaraConsolidateStatus`, and the presence of `scans_v4_scan_<id>` targets |
+
+`!YaraReport` at the same moment showed all three source shards still present, no per-scan
+targets, and the summary dataset alongside them — the state both answers describe.
+
 ## 4. Cleanup — `xdr_data_management.py`
 
 A small standalone script that deletes whole old datasets.
