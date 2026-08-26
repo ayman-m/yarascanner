@@ -346,8 +346,12 @@ complete (verified 8/8).</p></div>
 <tr><td>Windows Server 2022</td><td>full <code>C:\</code></td><td>636,743</td><td>2,643</td><td>1,622 s (~27 min)</td><td>393 f/s</td></tr>
 <tr><td>Linux (GCP e2)</td><td><code>/usr</code></td><td>93,137</td><td>19,447</td><td>169 s</td><td>551 f/s</td></tr>
 <tr><td>Linux (GCP e2)</td><td><code>/etc</code></td><td>1,449</td><td>164</td><td>2.5 s</td><td>580 f/s</td></tr>
+<tr><td>Linux (<code>xdr_agent_cd7e9b</code>)</td><td>full (default)</td><td>209,804</td><td>225</td><td>236 s</td><td>888 f/s</td></tr>
+<tr><td>Windows (<code>xdragent_68494d</code>)</td><td>full (default)</td><td>636,780</td><td>452</td><td>1,437 s (~24 min)</td><td>443 f/s</td></tr>
+<tr><td>Windows (<code>xdragent2_2fd370</code>)</td><td>full (default)</td><td>935,868</td><td>457</td><td>1,728 s (~29 min)</td><td>541 f/s</td></tr>
 </tbody></table></div>
-<p>Rates cluster around <strong>400–580 files/s</strong> with the default 2 workers and headroom governor.</p>
+<p>The last three rows are the <strong>2026-08-25</strong> round — scanner 3.4.0, 10 rules, three hosts scanned concurrently; the rows above them are earlier rounds.</p>
+<p>Rates span <strong>393–888 files/s</strong> with the default 2 workers and headroom governor. The Linux 888 is high because the rate counts only the files actually scanned and skipping is cheap — that host skipped <strong>269,716</strong> files against the <strong>209,804</strong> it scanned.</p>
 </section>
 
 <section id="s4">
@@ -675,7 +679,7 @@ scan log.</p></div>
 <tr><td>Scan “completed” but rows missing</td><td>Run timeout expired mid-drain</td><td>Check <code>delivery_shortfall</code>. Raise the timeout (<a href="#s5">§5</a>)</td></tr>
 <tr><td>Scan shows <code>running</code> forever</td><td>Console Cancel, or terminal row lost</td><td>24 h cutoff rescues it. Use the <code>cancel</code> entry point instead</td></tr>
 <tr><td>No <code>scan_summary_*.json</code></td><td>Run killed before completing</td><td>Confirms a mid-drain kill</td></tr>
-<tr><td>Consolidation reports 0 candidates, exits clean</td><td><code>schema_version</code> mismatch — datasets classify as “newer” and are correctly left alone</td><td>Ensure <code>schema_version</code> matches the scanner (<strong>4</strong>)</td></tr>
+<tr><td>Consolidation reports 0 candidates, exits clean</td><td><strong>v4 <code>matches</code> — by design, not a fault.</strong> The permanent per-host matches dataset carries no month suffix, so <code>parse_shard</code> never classifies it as a shard: <code>no matches shards found</code> is the correct result even while matches datasets exist. <strong><code>scans</code></strong> — nothing eligible yet: a quiet period, or already consolidated. <strong>A genuine <code>schema_version</code> mismatch</strong> — datasets classify as “newer” and are correctly left alone</td><td>Read <em>which</em> <code>(schema, kind)</code> pair reported zero. v4/<code>matches</code> needs no action (<a href="#s7">§7</a>); for <code>scans</code>, <code>YaraConsolidateStatus</code> shows whether any scan is eligible. Suspect <code>schema_version</code> (<strong>4</strong>) only after both check out</td></tr>
 <tr><td><code>count_mismatch</code> on a scan</td><td>Target ≠ sum of sources</td><td><strong>Safe</strong> — nothing deleted. Often a prior partial run</td></tr>
 <tr><td>“Lock held by another run”</td><td>Genuine concurrency, <strong>or</strong> a stale lock from a killed pass</td><td>Check the runs tracker before clearing (<a href="#s9">§9</a>)</td></tr>
 <tr><td>Consolidation stalls indefinitely</td><td>Pass killed at the task timeout holding the lock</td><td>Fixed by <code>max_scans</code> bounding. Clear the lock if confirmed dead</td></tr>

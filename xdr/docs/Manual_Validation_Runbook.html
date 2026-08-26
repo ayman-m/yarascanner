@@ -275,6 +275,25 @@ Below, <code>MATCHES</code> and <code>SCANS</code> mean those two names.</p></di
       <code>string_hits</code> is every individual string match.
       <code>rows ≤ rule_file_pairs ≤ string_hits</code> is the v4 grain working — <strong>not</strong> loss.</p></div>
     <div class="blk"><span class="lead fail">Fails if</span><p>More than one <code>scan_id</code> (only one scan has run), or <code>rows</code> is 0 while the scan reported matches.</p></div>
+    <div class="call ok" style="margin-top:.6rem"><span class="lbl">A large match count is the test rules working</span>
+    <p>The repo's <code>test_rules.yar</code> — 10 rules, <code>alert_severity</code> <code>low</code>,
+    <code>scan_folder</code> left at its default (full scan) — produced <strong>1,134 detections across
+    1,012 matched files</strong> over three hosts. That is normal, and every part of it is explicable:</p>
+    <ul style="margin-bottom:.5rem">
+      <li><strong><code>MatchNotepad</code> and <code>MatchCalc</code> are far broader than
+      <code>notepad.exe</code> and <code>calc.exe</code>.</strong> The strings <code>"Notepad"</code> and
+      <code>"calc.exe"</code> appear in many Windows resource binaries — <code>forfiles.exe.mui</code>,
+      WinSxS resource DLLs, .NET GAC assemblies. <code>MatchNotepad</code> alone fired <strong>594</strong> times.</li>
+      <li><strong>The realistic-looking signature rules fire benignly too.</strong>
+      <code>Mimikatz_Indicator</code> matched
+      <code>C:\ProgramData\Microsoft\Windows Defender\Scans\mpcache-*</code> because Defender's own
+      signature cache literally contains the string <code>gentilkiwi</code>.</li>
+      <li><strong>A rules file matches itself.</strong> A <code>.yar</code> file contains the very strings
+      its rules search for, so <code>test_rules.yar</code> shows up in its own results — as do any decoy
+      files you planted, by construction.</li>
+    </ul>
+    <p>Judge a validation run by <code>0 rules failed compilation</code> (B1) and by rows landing here —
+    <strong>not</strong> by a low match count. These rules exist to prove the pipeline, not to detect anything.</p></div>
   </div></div>
 
   <div class="step"><div class="sh"><span class="n">B4</span><span class="t">Delivery accounting on the endpoint</span></div><div class="sb">

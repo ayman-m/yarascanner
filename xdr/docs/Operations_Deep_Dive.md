@@ -120,8 +120,16 @@ of one of them.
 | Windows Server 2022 | full `C:\` | 636,743 | 2,643 | 1,622s (~27 min) | 393 files/s |
 | Linux (GCP e2) | `/usr` | 93,137 | 19,447 | 169s | 551 files/s |
 | Linux (GCP e2) | `/etc` | 1,449 | 164 | 2.5s | 580 files/s |
+| Linux (`xdr_agent_cd7e9b`) | full (default) | 209,804 | 225 | 236s | 888 files/s |
+| Windows (`xdragent_68494d`) | full (default) | 636,780 | 452 | 1,437s (~24 min) | 443 files/s |
+| Windows (`xdragent2_2fd370`) | full (default) | 935,868 | 457 | 1,728s (~29 min) | 541 files/s |
 
-Rates cluster around **400–580 files/s** with the default 2 workers and headroom governor.
+The last three rows are the **2026-08-25** round — scanner 3.4.0, 10 rules, three hosts scanned
+concurrently; the rows above them are earlier rounds.
+
+Rates span **393–888 files/s** with the default 2 workers and headroom governor. The Linux 888 is
+high because the rate counts only the files actually scanned and skipping is cheap — that host
+skipped **269,716** files against the **209,804** it scanned.
 
 ---
 
@@ -599,7 +607,7 @@ Every one of these was observed live during validation.
 | Scan "completed" but rows missing | Run timeout expired mid-drain | Check `delivery_shortfall`. Raise the timeout ([§5](#5-sizing-the-run-timeout--the-drain-problem)) |
 | Scan shows `running` forever | Console Cancel, or terminal row lost | 24h cutoff rescues it. Use the `cancel` entry point instead |
 | No `scan_summary_*.json` | Run killed before completing | Confirms a mid-drain kill |
-| Consolidation reports 0 candidates, exits clean | `schema_version` mismatch — datasets classify as "newer" and are correctly left alone | Ensure `schema_version` matches the scanner (**4**) |
+| Consolidation reports 0 candidates, exits clean | **v4 `matches` — by design, not a fault.** The permanent per-host matches dataset carries no month suffix, so `parse_shard` never classifies it as a shard: `no matches shards found` is the correct result even while matches datasets exist. **`scans`** — nothing eligible yet: a quiet period, or already consolidated. **A genuine `schema_version` mismatch** — datasets classify as "newer" and are correctly left alone | Read *which* `(schema, kind)` pair reported zero. v4/`matches` needs no action ([§7](#7-dataset-management-the-five-automations)); for `scans`, `YaraConsolidateStatus` shows whether any scan is eligible. Suspect `schema_version` (**4**) only after both check out |
 | `count_mismatch` on a scan | Target ≠ sum of sources | **Safe** — nothing deleted. Often a prior partial run |
 | "Lock held by another run" | Genuine concurrency, **or** a stale lock from a killed pass | Check the runs tracker before clearing ([§9](#9-the-consolidation-lock)) |
 | Consolidation stalls indefinitely | Pass killed at the task timeout holding the lock | Fixed by `max_scans` bounding. Clear the lock if confirmed dead |

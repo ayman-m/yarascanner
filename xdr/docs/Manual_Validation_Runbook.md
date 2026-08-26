@@ -174,6 +174,26 @@ working, **not** data loss.
 **Fails if:** more than one `scan_id` appears at this point (only one scan has run), or
 `rows` is 0 while the scan reported matches.
 
+> **A large match count is the test rules working, not a finding.** The repo's
+> `test_rules.yar` — 10 rules, `alert_severity` `low`, `scan_folder` left at its default
+> (full scan) — produced **1,134 detections across 1,012 matched files** over three hosts.
+> That is normal, and every part of it is explicable:
+>
+> - **`MatchNotepad` and `MatchCalc` are far broader than `notepad.exe` and `calc.exe`.**
+>   The strings `"Notepad"` and `"calc.exe"` appear in many Windows resource binaries —
+>   `forfiles.exe.mui`, WinSxS resource DLLs, .NET GAC assemblies. `MatchNotepad` alone
+>   fired **594** times.
+> - **The realistic-looking signature rules fire benignly too.** `Mimikatz_Indicator`
+>   matched `C:\ProgramData\Microsoft\Windows Defender\Scans\mpcache-*` because Defender's
+>   own signature cache literally contains the string `gentilkiwi`.
+> - **A rules file matches itself.** A `.yar` file contains the very strings its rules
+>   search for, so `test_rules.yar` shows up in its own results — as do any decoy files you
+>   planted, by construction.
+>
+> Judge a validation run by `0 rules failed compilation` (B1) and by rows landing here —
+> **not** by a low match count. These rules exist to prove the pipeline, not to detect
+> anything.
+
 ### B4 · Delivery accounting on the endpoint
 
 The authoritative record. **Do:** read the summary file on the endpoint:

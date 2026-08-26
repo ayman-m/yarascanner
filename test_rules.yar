@@ -6,8 +6,12 @@
     validated end-to-end without staging real malware.
 
     The remaining eight rules are realistic-looking detection signatures
-    (Mimikatz, Cobalt Strike, common ransomware indicators, etc.) that
-    should not match on a clean system.
+    (Mimikatz, Cobalt Strike, common ransomware indicators, etc.). They do
+    match on a clean system, benignly - Defender's signature cache contains
+    malware strings, and a rules file contains the very strings its own
+    rules search for. All ten rules exist to prove the pipeline, not to
+    detect anything; read B3 in xdr/docs/Manual_Validation_Runbook.md
+    before reading anything into a match count.
 */
 
 rule MatchCalc
