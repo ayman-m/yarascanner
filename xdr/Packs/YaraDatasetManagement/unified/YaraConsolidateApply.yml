@@ -1881,8 +1881,17 @@ script: |
           return
 
       if execute:
+          # A pass that stood down on the lock did NO work, and recording that as "success"
+          # made it indistinguishable from a genuine no-op in the run log - the exact question
+          # the log exists to answer. It gets its own status.
+          if result.get("lock_held_by_other_run"):
+              status = "skipped_locked"
+          elif result["failed"]:
+              status = "partial_failure"
+          else:
+              status = "success"
           record_consolidation_run(
-              client, "partial_failure" if result["failed"] else "success",
+              client, status,
               result={"consolidated_count": len(result["written"]),
                       "failed_count": len(result["failed"]),
                       "failed_scan_ids": [], "failed_reasons": {}},

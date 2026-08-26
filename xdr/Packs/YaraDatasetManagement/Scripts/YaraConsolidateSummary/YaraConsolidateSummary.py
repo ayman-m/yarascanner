@@ -1865,6 +1865,13 @@ def main():
     # it, because it mutates nothing.
     if execute and not acquire_consolidation_lock(client, log=log,
                                                   holder="YaraConsolidateSummary"):
+        # Recorded HERE, not at the end: this path returns before `result` is built, so a
+        # standdown would otherwise leave no row at all - indistinguishable in the run log
+        # from a pass that never started.
+        record_consolidation_run(client, "skipped_locked",
+                                 result={"consolidated_count": 0, "failed_count": 0,
+                                         "failed_scan_ids": [], "failed_reasons": {}},
+                                 log=lambda *a: None)
         return_results(CommandResults(
             readable_output="Another consolidation run holds the lock - nothing was touched.",
             outputs_prefix="Yara.ConsolidateSummary",
@@ -2067,6 +2074,19 @@ def main():
               "skipped": skipped, "failed": failed, "schema_version": ver,
               "retention_hours": retention_hours, "shards_deleted": 0,
               "findings_collapsed": findings[0], "query_modes": sorted(modes)}
+    # Summary was the one mutating automation with no audit row, so a scheduled
+    # summarisation could not be confirmed from the tenant the way a consolidation can.
+    # Dry runs are not recorded: they change nothing, and a row per preview would bury the
+    # writes this log exists to evidence.
+    if execute:
+        # No lock branch here on purpose: a standdown returns above, before this point.
+        _status = "partial_failure" if failed else "success"
+        record_consolidation_run(
+            client, _status,
+            result={"consolidated_count": len(written), "failed_count": len(failed),
+                    "failed_scan_ids": [], "failed_reasons": {}},
+            log=lambda *a: None)
+
     return_results(CommandResults(readable_output="\n".join(out),
                                   outputs_prefix="Yara.ConsolidateSummary", outputs=result,
                                   raw_response=result))
