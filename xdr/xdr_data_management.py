@@ -60,6 +60,21 @@ MONTH_RE = re.compile(r"^(?:(?P<host>.*?)_)?(?P<month>20\d{2}(?:0[1-9]|1[0-2]))$
 DEFAULT_MIN_QUIET_HOURS = 24.0
 
 
+_SUMMARY_DS_RE = re.compile(r"^yara_scanner_summary_v\d+_.+$")
+
+
+def is_summary_dataset(name):
+    """True for this pack's OWN summary output, yara_scanner_summary_v<N>_rules_<hash>.
+
+    LABELLING ONLY. It never grants deletion candidacy and is never consulted by any
+    selection rail. NAME_RE deliberately refuses to parse a summary dataset - that refusal
+    IS safety rail 5, and loosening it would make the pack's own consolidated output an
+    ordinary retention candidate. This exists so the inventory stops describing a dataset
+    this pack created as "unrecognised", which read as debris of unknown origin.
+    """
+    return bool(_SUMMARY_DS_RE.match(name or ""))
+
+
 def parse_dataset_name(name):
     """Parse a dataset name into its parts, or None if it is not YARA-owned.
 
@@ -137,7 +152,10 @@ def select_rotated_for_deletion(current_names, older_than_months, now_yyyymm):
     for name in current_names or []:
         info = parse_dataset_name(name)
         if info is None:
-            skipped.append("%s: not a YARA dataset name" % name)
+            skipped.append("%s: %s" % (name,
+                "summary consolidation OUTPUT - this pack's own cross-host rollup, not a "
+                "rotation shard and never a retention candidate"
+                if is_summary_dataset(name) else "not a YARA dataset name"))
             continue
         if info["scan_target"]:
             skipped.append("%s: per-scan consolidated target - consolidation OUTPUT, not a "
@@ -340,7 +358,9 @@ def render_report(current, legacy, newer, now_yyyymm):
     for name in current:
         info = parse_dataset_name(name)
         if info is None:
-            lines.append("%-52s %s" % (name[:52], "(unrecognised - never a candidate)"))
+            label = ("(summary - this pack's own rollup, never a candidate)"
+                     if is_summary_dataset(name) else "(unrecognised - never a candidate)")
+            lines.append("%-52s %s" % (name[:52], label))
             continue
         if info["scan_target"]:
             age = "scan"

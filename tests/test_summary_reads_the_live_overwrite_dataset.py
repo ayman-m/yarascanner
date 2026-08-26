@@ -102,3 +102,77 @@ def test_main_selects_the_live_dataset_for_summarisation(monkeypatch):
     t = FakeTenant(names=[LIVE, SCANS])
     _run_automation(S, {"schema_version": "4", "execute": "false"}, t)
     assert LIVE in seen, "the live overwrite dataset was never handed to summarise_shard"
+
+
+# ---------------------------------------------------------------- grouping by ruleset
+# Round: testing showed the script named "consolidate" produced one summary dataset per
+# HOST - the same count it started with. scan_id is "{hostname}_{run_id}_yara_{hash}", so
+# keying a target on it can only ever be per-host. The ruleset hash is the shared component.
+
+H1 = "yara_scanner_matches_v4_hosta_aa0001"
+H2 = "yara_scanner_matches_v4_hostb_bb0002"
+S1 = "hosta_20260825_100000_000001_yara_deadbeef1234"
+S2 = "hostb_20260825_100002_000002_yara_deadbeef1234"   # SAME ruleset hash
+TGT = "yara_scanner_summary_v4_rules_deadbeef1234"
+
+
+def test_the_ruleset_hash_is_extracted_from_a_scan_id():
+    assert S.rule_hash_of(S1) == "deadbeef1234"
+    assert S.rule_hash_of(S2) == S.rule_hash_of(S1), "both hosts must land in one group"
+    assert S.rule_hash_of("no-hash-here") is None
+    assert S.rule_hash_of(None) is None
+
+
+def test_the_target_is_named_per_ruleset_not_per_scan():
+    t = S.summary_target_for_rules("4", "deadbeef1234")
+    assert t == TGT
+    assert "_scan_" not in t, "a per-scan name is a per-host name - that was the bug"
+
+
+def test_two_hosts_on_one_ruleset_write_to_a_single_dataset():
+    """The whole point: N hosts -> 1 dataset, not N."""
+    t = FakeTenant(names=[H1, H2])
+    t.rows = {}
+    created = []
+    real_create = t.create_lookup_dataset
+
+    def spy(name, schema):
+        if name.startswith("yara_scanner_summary_"):
+            created.append(name)
+        return real_create(name, schema)
+    t.create_lookup_dataset = spy
+    assert S.summary_target_for_rules("4", S.rule_hash_of(S1)) == \
+           S.summary_target_for_rules("4", S.rule_hash_of(S2)), \
+        "two hosts scanned with one ruleset must resolve to ONE target name"
+
+
+# ------------------------------------------------- summary datasets must be visible + safe
+# Testing found the pack's OWN summary output invisible to YaraReport and described by
+# YaraCleanup as "not a YARA dataset name". YARA_OWNED_RE only listed matches|scans, so a
+# dataset the pack creates was neither reported nor managed - unbounded growth nobody could
+# see. Visibility must NOT come at the cost of deletion candidacy.
+
+SUMMARY_DS = "yara_scanner_summary_v4_rules_90149530ddc2"
+
+
+def test_a_summary_dataset_is_recognised_as_pack_owned():
+    from test_pack_data_management import YaraReport as R
+    assert R.YARA_OWNED_RE.match(SUMMARY_DS), "invisible to the inventory"
+
+
+def test_a_current_version_summary_is_not_classified_as_legacy():
+    """Without this, delete_legacy=true points at the pack's own consolidated output."""
+    from test_pack_data_management import YaraCleanup as K
+    K.set_schema_version("4")          # main() always calls this - it REASSIGNS CURRENT_RE
+    assert K.CURRENT_RE.match(SUMMARY_DS), "would land in the legacy bucket"
+    assert not K.CURRENT_RE.match("yara_scanner_summary_v3_rules_abc123"), \
+        "an older-schema summary should still read as legacy"
+
+
+def test_a_summary_dataset_is_never_a_deletion_candidate():
+    """Safety rail 5: NAME_RE must keep refusing to parse it, so no retention rule can
+    select it. Labelling recognises it; the selector still cannot touch it."""
+    from test_pack_data_management import YaraCleanup as K
+    assert K.parse_dataset_name(SUMMARY_DS) is None
+    assert K.is_summary_dataset(SUMMARY_DS)
+    assert not K.is_summary_dataset("yara_scanner_matches_v4_hosta_aa0001")

@@ -294,6 +294,25 @@ class FakeTenant:
             self.lock_rows.extend(rows)
         return {"records_added": len(rows)}
 
+    def remove_lookup_data(self, dataset_name, filters):
+        """Drop rows whose scan_id matches any filter block. Mirrors the real endpoint's
+        EXACT-value, OR-across-blocks semantics closely enough to reconcile a summary
+        target: the fake models a dataset as {scan_id: row_count}, so removing a scan_id
+        removes its rows."""
+        self.calls.append("remove_lookup_data:%s" % dataset_name)
+        wanted = set()
+        for block in (filters or []):
+            for cond in (block if isinstance(block, list) else [block]):
+                if isinstance(cond, dict) and cond.get("field") == "scan_id":
+                    v = cond.get("value")
+                    wanted.update(v if isinstance(v, list) else [v])
+        held = self.scans.get(dataset_name, {})
+        removed = sum(n for sid, n in held.items() if sid in wanted)
+        self.scans[dataset_name] = {s: n for s, n in held.items() if s not in wanted}
+        if dataset_name in self.counts:
+            self.counts[dataset_name] = max(0, self.counts[dataset_name] - removed)
+        return {"deleted": removed}
+
     def delete_dataset(self, dataset_name, force=False):
         self.calls.append("delete_dataset:%s" % dataset_name)
         self.force_flags = getattr(self, "force_flags", [])

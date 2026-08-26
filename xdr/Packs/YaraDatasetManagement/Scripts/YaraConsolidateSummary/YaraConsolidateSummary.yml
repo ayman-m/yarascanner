@@ -65,7 +65,40 @@ outputs:
 script: |
   """YaraConsolidateSummary - summary-only consolidation: which rules fired on which host.
 
-  Writes ONE ROW PER (host, rule) into yara_scanner_summary_v<VER>_scan_<slug>, with four
+  Writes ONE ROW PER (host, rule) into yara_scanner_summary_v<VER>_rules_<hash> - ONE dataset
+  per RULESET, holding every host scanned with it. Grouping is by the ruleset hash the scanner
+  leaves at the end of every scan_id, which is the only component all hosts in one Action
+  Center scan share; scan_id itself is "{hostname}_{run_id}_yara_{hash}", so keying targets on
+  it produced one dataset per host and consolidated nothing.
+
+  Re-running reconciles rather than appends: it compares the scan_ids the target already holds
+  against the ones the sources hold now. Unchanged hosts are left alone, a re-scanned host's
+  old rows are dropped and its new ones written. Running twice with nothing changed is a
+  verified no-op. Rows keep their own scan_id and hostname, so provenance survives grouping.
+
+  CAVEATS, stated rather than engineered around:
+    - Two separate launches using an IDENTICAL ruleset share a hash. This is MEASURED, not
+      hypothetical: the tenant's own audit log shows launches at 2026-08-20 06:29:52 and
+      2026-08-21 04:24:41, both ruleset b451b4336910, both over the same three endpoints, 22h
+      apart. When every host is re-scanned this is harmless - each host's matches dataset is
+      overwritten, so the target reconciles wholesale to the newer launch. It only matters on
+      a PARTIAL re-scan (below). Tell launches apart by scan_id or event_timestamp_ms.
+    - A host NOT re-scanned stays in the group with its older scan_id. The dataset is the
+      current state of every host on that ruleset, which is not always the same thing as one
+      Action Center action.
+    - A host that matched NOTHING contributes no rows and is invisible here. Absence from this
+      dataset means "no findings", never "not scanned" - the scans lifecycle shard is where
+      you confirm a host actually ran.
+    - A host scanned with a DIFFERENT ruleset moves to that ruleset's dataset and its old rows
+      are dropped from this one.
+
+  WHY NOT the Action Center group_action_id, which would be exact? It cannot be discovered.
+  Probed live: /actions/get_actions/, /actions/get_all_actions/, /actions/get_actions_status/
+  and /audits/actions/ all return HTTP 500, and get_action_status without an id returns 500
+  "group_action_id param is missing". The id would have to be typed in by hand from the console
+  for every run. The ruleset hash needs no input and works on data already on the tenant.
+
+  The four columns are
   columns - scan_id, hostname, rule, event_timestamp_ms. No filenames, no offsets, no per-rule
   counts: the per-host matches dataset stays the deep-dive source for those. The rule list
   comes from one XQL per host shard, expanded and grouped inside the engine, so the read cost
@@ -882,8 +915,8 @@ script: |
   YARA_SCHEMA_VERSION = (os.environ.get("YARA_LOOKUP_SCHEMA_VER",
                                         DEFAULT_LOOKUP_SCHEMA_VERSION).strip()
                          or DEFAULT_LOOKUP_SCHEMA_VERSION)
-  YARA_OWNED_RE = re.compile(r"^(yara_scanner_(matches|scans)(_.*)?|yara_(matches|scans)_.*)$")
-  CURRENT_RE = re.compile(r"^yara_scanner_(matches|scans)_v%s(_.*)?$" % re.escape(YARA_SCHEMA_VERSION))
+  YARA_OWNED_RE = re.compile(r"^(yara_scanner_(matches|scans|summary)(_.*)?|yara_(matches|scans)_.*)$")
+  CURRENT_RE = re.compile(r"^yara_scanner_(matches|scans|summary)_v%s(_.*)?$" % re.escape(YARA_SCHEMA_VERSION))
 
   # The value at import, before any set_schema_version() call. The script container is
   # long-lived and serves many executions from one process, so main() resets to this rather
@@ -912,7 +945,7 @@ script: |
               'e.g. "2" or "3" — but got %r. Refusing to continue: a non-numeric version '
               "silently reclassifies every live dataset on the tenant as legacy." % (ver,))
       YARA_SCHEMA_VERSION = clean
-      CURRENT_RE = re.compile(r"^yara_scanner_(matches|scans)_v%s(_.*)?$"
+      CURRENT_RE = re.compile(r"^yara_scanner_(matches|scans|summary)_v%s(_.*)?$"
                               % re.escape(YARA_SCHEMA_VERSION))
       os.environ["YARA_LOOKUP_SCHEMA_VER"] = YARA_SCHEMA_VERSION
 
@@ -946,6 +979,21 @@ script: |
           else:
               legacy.append(name)
       return sorted(current), sorted(legacy), sorted(newer)
+
+
+  _SUMMARY_DS_RE = re.compile(r"^yara_scanner_summary_v\d+_.+$")
+
+
+  def is_summary_dataset(name):
+      """True for this pack's OWN summary output, yara_scanner_summary_v<N>_rules_<hash>.
+
+      LABELLING ONLY. It never grants deletion candidacy and is never consulted by any
+      selection rail. NAME_RE deliberately refuses to parse a summary dataset - that refusal
+      IS safety rail 5, and loosening it would make the pack's own consolidated output an
+      ordinary retention candidate. This exists so the inventory stops describing a dataset
+      this pack created as "unrecognised", which read as debris of unknown origin.
+      """
+      return bool(_SUMMARY_DS_RE.match(name or ""))
 
 
   def parse_dataset_name(name):
@@ -1016,7 +1064,10 @@ script: |
       for name in current_names or []:
           info = parse_dataset_name(name)
           if info is None:
-              skipped.append("%s: not a YARA dataset name" % name)
+              skipped.append("%s: %s" % (name,
+                  "summary consolidation OUTPUT - this pack's own cross-host rollup, not a "
+                  "rotation shard and never a retention candidate"
+                  if is_summary_dataset(name) else "not a YARA dataset name"))
               continue
           if info["scan_target"]:
               skipped.append("%s: per-scan consolidated target - consolidation OUTPUT, not a "
@@ -1187,7 +1238,9 @@ script: |
       for name in current:
           info = parse_dataset_name(name)
           if info is None:
-              lines.append("%-52s %s" % (name[:52], "(unrecognised - never a candidate)"))
+              label = ("(summary - this pack's own rollup, never a candidate)"
+                       if is_summary_dataset(name) else "(unrecognised - never a candidate)")
+              lines.append("%-52s %s" % (name[:52], label))
               continue
           if info["scan_target"]:
               age = "scan"
@@ -1657,8 +1710,35 @@ script: |
 
   def summary_target_name(ver, scan_id):
       """yara_scanner_summary_v<VER>_scan_<slug>. Same slugifier as every other per-scan
-      target, so the summary and full-detail targets for one scan share a slug."""
+      target, so the summary and full-detail targets for one scan share a slug.
+
+      RETAINED FOR THE OLD PER-SCAN LAYOUT ONLY. Summarising now groups by ruleset - see
+      summary_target_for_rules - because a per-scan target is a per-HOST target: scan_id is
+      "{hostname}_{run_id}_yara_{rule_hash}" by construction, so keying on it produced exactly
+      as many summary datasets as there were hosts, which is not a consolidation at all."""
       return target_name(_SUMMARY_KIND, ver, scan_id)
+
+
+  _RULE_HASH_RE = re.compile(r"_yara_([0-9a-f]{6,})$")
+
+
+  def rule_hash_of(scan_id):
+      """The ruleset hash trailing a scan_id, or None.
+
+      The scanner builds scan_id as "{hostname}_{run_id}_yara_{sha256(rules)[:12]}" and keeps
+      that suffix deliberately "so the ruleset stays identifiable from the scan_id alone".
+      hostname and run_id are per-host; the hash is the ONLY component every host in one
+      Action Center scan shares, which makes it the grouping key. No API call, no scanner
+      change, and it works on data already on the tenant."""
+      m = _RULE_HASH_RE.search(str(scan_id or ""))
+      return m.group(1) if m else None
+
+
+  def summary_target_for_rules(ver, rule_hash):
+      """yara_scanner_summary_v<VER>_rules_<hash>. ONE dataset per ruleset, holding every host
+      scanned with it - the consolidation the name always promised."""
+      slug = re.sub(r"[^a-z0-9]+", "_", str(rule_hash or "unknown").lower()).strip("_") or "unknown"
+      return "%s_%s_v%s_rules_%s" % (_PREFIX, _SUMMARY_KIND, ver, slug)
 
 
   def summary_query(dataset, ver):
@@ -1897,17 +1977,20 @@ script: |
           log("collected %d scan(s) across %d matches shard(s); %d file-level finding(s) "
               "collapsed" % (len(by_scan), len(match_ds), findings[0]))
 
-          # ---- 3. gate, then write ONE ROW PER (host, rule) -------------------------------
+          # ---- 3a. gate each scan, then bucket the survivors BY RULESET -----------------
+          # Grouping key is the ruleset hash, not the scan_id. scan_id is
+          # "{hostname}_{run_id}_yara_{rule_hash}" by construction, so keying a target on it
+          # produced one summary dataset PER HOST - the same dataset count we started with,
+          # which is not a consolidation. The hash is the only component every host in one
+          # Action Center scan shares. Gating stays per-scan: a host still mid-scan is kept
+          # out of the group rather than dragging the whole dataset into a half-written state.
+          groups = {}
           for sid in sorted(by_scan):
               if only and sid not in only:
                   continue
               pairs = by_scan[sid]
               st = state.get(sid) or {}
               terminal = bool(st.get("terminal"))
-              # Recency comes from the lifecycle stamp, or - when the scan has no lifecycle row
-              # at all, because its scans shard was pruned or rotated away - from the newest
-              # matches stamp this run already read. Without that second source such a scan
-              # could never be summarised.
               newest = int(st.get("newest_ms") or 0)
               for ts in pairs.values():
                   newest = max(newest, int(ts or 0))
@@ -1915,72 +1998,101 @@ script: |
               if not terminal and not aged:
                   skipped.append("%s: scan still in progress - left alone" % sid[:34])
                   continue
-              why = "completed" if terminal else "no lifecycle activity for %gh" % retention_hours
+              rh = rule_hash_of(sid)
+              if not rh:
+                  skipped.append("%s: no ruleset hash in scan_id - cannot be grouped" % sid[:34])
+                  continue
+              g = groups.setdefault(rh, {"rows": [], "sids": set(), "hosts": set(), "why": set()})
+              for (host, rule), ts in sorted(pairs.items()):
+                  g["rows"].append({"scan_id": sid, "hostname": host, "rule": rule,
+                                    "event_timestamp_ms": int(ts) if ts else (newest or now_ms)})
+                  g["hosts"].add(host)
+              g["sids"].add(sid)
+              g["why"].add("completed" if terminal
+                           else "no lifecycle activity for %gh" % retention_hours)
 
-              rows = [{"scan_id": sid, "hostname": host, "rule": rule,
-                       "event_timestamp_ms": int(ts) if ts else (newest or now_ms)}
-                      for (host, rule), ts in sorted(pairs.items())]
-              rows = [_coerce_row(r, SUMMARY_SCHEMA) for r in rows]
-              hosts = len({h for h, _ in pairs})
-              target = summary_target_name(ver, sid)
+          # ---- 3b. one dataset per ruleset, reconciled against what is already there -------
+          for rh in sorted(groups):
+              g = groups[rh]
+              target = summary_target_for_rules(ver, rh)
+              rows = [_coerce_row(r, SUMMARY_SCHEMA) for r in g["rows"]]
+              desired = set(g["sids"])
+              why = ", ".join(sorted(g["why"]))
+              label = "rules %s" % rh
 
               if dry:
-                  written.append("%s: WOULD write %d (host, rule) row(s) from %d host(s) -> %s "
-                                 "(%s, ~%.1f KB)"
-                                 % (sid[:34], len(rows), hosts, target, why,
-                                    len(rows) * _SUMMARY_ROW_BYTES / 1024.0))
+                  written.append("%s: WOULD write %d (host, rule) row(s) from %d host(s) / "
+                                 "%d scan(s) -> %s (%s, ~%.1f KB)"
+                                 % (label, len(rows), len(g["hosts"]), len(desired), target,
+                                    why, len(rows) * _SUMMARY_ROW_BYTES / 1024.0))
                   continue
 
-              # Idempotency. target_name() slugifies the scan_id down to [a-z0-9_], so
-              # interpolating the target name into XQL here is safe.
-              pre = 0
+              # Which scans does the target already hold? A re-scan mints a NEW scan_id (new
+              # run_id), so comparing scan_id sets tells us what changed without reading a
+              # single row back.
+              held = set()
               if target in existing:
                   try:
                       qcount[0] += 1
-                      pre = _count(client, target)
+                      for r in (client.xql("dataset = %s | comp count() as n by scan_id" % target,
+                                           limit=10000) or []):
+                          if r.get("scan_id"):
+                              held.add(str(r.get("scan_id")))
                   except Exception as e:
-                      failed.append("%s: could not count existing target %s (%s) - NOT written"
-                                    % (sid[:34], target, str(e)[:100]))
+                      failed.append("%s: could not read existing target %s (%s) - NOT written"
+                                    % (label, target, str(e)[:100]))
                       continue
-              if pre and pre == len(rows):
-                  skipped.append("%s: target already holds %d row(s) - verified, not rewritten"
-                                 % (sid[:34], pre))
-                  continue
-              if pre:
-                  # Appending would duplicate (host, rule) pairs and this automation has no
-                  # delete path to undo that. The host dataset still holds everything, so
-                  # nothing is lost by declining.
-                  failed.append("%s: target %s holds %d row(s), this run computed %d - NOT "
-                                "written (appending would duplicate (host, rule) pairs)"
-                                % (sid[:34], target, pre, len(rows)))
+
+              stale = sorted(held - desired)      # a host was re-scanned, or dropped this ruleset
+              fresh = sorted(desired - held)      # new to this target
+              if held and not stale and not fresh:
+                  skipped.append("%s: target already current for %d scan(s) across %d host(s) "
+                                 "- verified, not rewritten" % (label, len(desired), len(g["hosts"])))
                   continue
 
               try:
                   client.create_lookup_dataset(target, SUMMARY_SCHEMA)
+                  removed = 0
+                  if stale:
+                      # The ONLY deletion this automation performs, and it is against its own
+                      # output: rows for a scan the source no longer holds. Source shards are
+                      # never touched. Serialised by the consolidation lock, which an executed
+                      # pass already holds - remove_data is not concurrency-safe.
+                      reply = client.remove_lookup_data(
+                          target, [[{"field": "scan_id", "operator": "eq", "value": s}]
+                                   for s in stale])
+                      removed = int((reply or {}).get("deleted") or 0)
+                  add_rows = [r for r in rows if str(r.get("scan_id")) in set(fresh)]
                   added, ok = 0, True
-                  for i in range(0, len(rows), _WRITE_BATCH):
-                      reply = client.add_lookup_data(target, rows[i:i + _WRITE_BATCH])
+                  for i in range(0, len(add_rows), _WRITE_BATCH):
+                      reply = client.add_lookup_data(target, add_rows[i:i + _WRITE_BATCH])
                       got = _added(reply)
                       if got <= 0:
-                          # A batch that added nothing is a failed write. Nothing is ever
-                          # deleted here, so it is reported rather than guarded against -
-                          # re-running simply retries.
                           ok = False
                           break
                       added += got
                   if ok:
-                      written.append("%s: wrote %d (host, rule) row(s) from %d host(s) -> %s (%s)"
-                                     % (sid[:34], added, hosts, target, why))
+                      written.append("%s: wrote %d row(s) for %d new scan(s), dropped %d stale "
+                                     "row(s) -> %s (%d host(s) total, %s)"
+                                     % (label, added, len(fresh), removed, target,
+                                        len(g["hosts"]), why))
                   else:
                       failed.append("%s: write to %s returned 0 rows added after %d - re-run to "
-                                    "retry (host shards are untouched)" % (sid[:34], target, added))
+                                    "retry (host shards untouched)" % (label, target, added))
               except Exception as e:
-                  failed.append("%s: %s - host shards untouched" % (sid[:34], str(e)[:140]))
+                  failed.append("%s: %s - host shards untouched" % (label, str(e)[:140]))
 
-          # ---- 4. there is no step 4. NOTHING IS DELETED ---------------------------------
-          # No delete_dataset, no remove_lookup_data, no _delete_many anywhere in this file.
-          # The host matches dataset is permanent and is overwritten by the NEXT scan on that
-          # host; the scans shard is the lifecycle record every future pass gates on.
+          # ---- 4. NO SOURCE DATA IS EVER DELETED -----------------------------------------
+          # No delete_dataset and no _delete_many anywhere in this file, and nothing at all is
+          # removed from a host matches shard or a scans shard. The host matches dataset is
+          # permanent and is overwritten by the NEXT scan on that host; the scans shard is the
+          # lifecycle record every future pass gates on.
+          #
+          # The one exception, deliberate and narrow: remove_lookup_data above, against this
+          # automation's OWN summary target, for rows belonging to a scan the source no longer
+          # holds. That is maintenance of its own output, not deletion of anyone's data - and
+          # without it a re-run after a re-scan could only append, duplicating (host, rule)
+          # pairs it has no way to undo.
 
       finally:
           if execute:
@@ -1995,8 +2107,8 @@ script: |
                 ("  [%s]" % ", ".join(sorted(modes))) if modes else ""),
              "written: %d | skipped: %d | failed: %d | file-level findings collapsed: %d"
              % (len(written), len(skipped), len(failed), findings[0]),
-             "host shards deleted: 0 (this automation never deletes - the host dataset is the "
-             "deep-dive source)"]
+             "host shards deleted: 0 (source data is never deleted - the host dataset is the "
+             "deep-dive source; only this automation's own summary rows are reconciled)"]
       for label, items in (("WRITTEN", written), ("SKIPPED", skipped), ("FAILED", failed)):
           if items:
               out.append("")
