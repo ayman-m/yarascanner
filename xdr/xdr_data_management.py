@@ -60,11 +60,12 @@ MONTH_RE = re.compile(r"^(?:(?P<host>.*?)_)?(?P<month>20\d{2}(?:0[1-9]|1[0-2]))$
 DEFAULT_MIN_QUIET_HOURS = 24.0
 
 
-_SUMMARY_DS_RE = re.compile(r"^yara_scanner_summary_v\d+_.+$")
+_PACK_OUTPUT_DS_RE = re.compile(r"^yara_scanner_(?:summary|full)_v\d+_.+$")
 
 
-def is_summary_dataset(name):
-    """True for this pack's OWN summary output, yara_scanner_summary_v<N>_rules_<hash>.
+def is_pack_output_dataset(name):
+    """True for this pack's OWN consolidated output - summary_v<N>_rules_<hash> (compact) or
+    full_v<N>_rules_<hash> (every column).
 
     LABELLING ONLY. It never grants deletion candidacy and is never consulted by any
     selection rail. NAME_RE deliberately refuses to parse a summary dataset - that refusal
@@ -72,7 +73,7 @@ def is_summary_dataset(name):
     ordinary retention candidate. This exists so the inventory stops describing a dataset
     this pack created as "unrecognised", which read as debris of unknown origin.
     """
-    return bool(_SUMMARY_DS_RE.match(name or ""))
+    return bool(_PACK_OUTPUT_DS_RE.match(name or ""))
 
 
 def parse_dataset_name(name):
@@ -153,9 +154,10 @@ def select_rotated_for_deletion(current_names, older_than_months, now_yyyymm):
         info = parse_dataset_name(name)
         if info is None:
             skipped.append("%s: %s" % (name,
-                "summary consolidation OUTPUT - this pack's own cross-host rollup, not a "
+                "%s consolidation OUTPUT - this pack's own cross-host rollup, not a "
                 "rotation shard and never a retention candidate"
-                if is_summary_dataset(name) else "not a YARA dataset name"))
+                % ("full" if "_full_v" in name else "summary")
+                if is_pack_output_dataset(name) else "not a YARA dataset name"))
             continue
         if info["scan_target"]:
             skipped.append("%s: per-scan consolidated target - consolidation OUTPUT, not a "
@@ -358,8 +360,9 @@ def render_report(current, legacy, newer, now_yyyymm):
     for name in current:
         info = parse_dataset_name(name)
         if info is None:
-            label = ("(summary - this pack's own rollup, never a candidate)"
-                     if is_summary_dataset(name) else "(unrecognised - never a candidate)")
+            label = (("(%s - this pack's own consolidated output, never a candidate)"
+                      % ("full" if "_full_v" in name else "summary"))
+                     if is_pack_output_dataset(name) else "(unrecognised - never a candidate)")
             lines.append("%-52s %s" % (name[:52], label))
             continue
         if info["scan_target"]:

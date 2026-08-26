@@ -174,5 +174,43 @@ def test_a_summary_dataset_is_never_a_deletion_candidate():
     select it. Labelling recognises it; the selector still cannot touch it."""
     from test_pack_data_management import YaraCleanup as K
     assert K.parse_dataset_name(SUMMARY_DS) is None
-    assert K.is_summary_dataset(SUMMARY_DS)
-    assert not K.is_summary_dataset("yara_scanner_matches_v4_hosta_aa0001")
+    assert K.is_pack_output_dataset(SUMMARY_DS)
+    assert not K.is_pack_output_dataset("yara_scanner_matches_v4_hosta_aa0001")
+
+
+# ------------------------------------------------- the FULL consolidated output, same rules
+# Adding a new dataset kind reintroduced the exact gap that had just been closed for
+# `summary`: yara_scanner_full_v4_rules_<hash> was invisible to YaraReport and unmanaged by
+# YaraCleanup, because YARA_OWNED_RE listed matches|scans|summary and nothing added `full`.
+# Any future kind must be added in all four places or it repeats.
+
+FULL_DS = "yara_scanner_full_v4_rules_90149530ddc2"
+
+
+def test_a_full_dataset_is_recognised_as_pack_owned():
+    from test_pack_data_management import YaraReport as R
+    assert R.YARA_OWNED_RE.match(FULL_DS), "invisible to the inventory"
+
+
+def test_a_current_version_full_dataset_is_not_classified_as_legacy():
+    from test_pack_data_management import YaraCleanup as K
+    K.set_schema_version("4")          # main() always calls this - it REASSIGNS CURRENT_RE
+    assert K.CURRENT_RE.match(FULL_DS), "would land in the legacy bucket, which delete_legacy targets"
+    assert not K.CURRENT_RE.match("yara_scanner_full_v3_rules_abc123"), \
+        "an older-schema full dataset should still read as legacy"
+
+
+def test_a_full_dataset_is_never_a_deletion_candidate():
+    from test_pack_data_management import YaraCleanup as K
+    assert K.parse_dataset_name(FULL_DS) is None, "safety rail 5 must still refuse to parse it"
+    assert K.is_pack_output_dataset(FULL_DS)
+
+
+def test_both_consolidated_kinds_are_covered_by_one_helper():
+    """summary and full are the same class of thing - this pack's own output - and must not
+    drift apart into two half-maintained special cases."""
+    from test_pack_data_management import YaraCleanup as K
+    assert K.is_pack_output_dataset("yara_scanner_summary_v4_rules_deadbeef")
+    assert K.is_pack_output_dataset("yara_scanner_full_v4_rules_deadbeef")
+    assert not K.is_pack_output_dataset("yara_scanner_matches_v4_hosta_aa0001")
+    assert not K.is_pack_output_dataset("yara_scanner_scans_v4_hosta_aa0001_202608")

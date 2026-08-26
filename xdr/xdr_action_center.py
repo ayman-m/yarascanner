@@ -44,8 +44,8 @@ import requests
 # DEFAULT_LOOKUP_SCHEMA_VERSION; a stale value here reclassifies every live dataset
 # as "newer" and the tooling then correctly refuses to touch any of them.
 YARA_SCHEMA_VERSION = (os.environ.get("YARA_LOOKUP_SCHEMA_VER", "4").strip() or "4")
-YARA_OWNED_RE = re.compile(r"^(yara_scanner_(matches|scans|summary)(_.*)?|yara_(matches|scans)_.*)$")
-CURRENT_RE = re.compile(r"^yara_scanner_(matches|scans|summary)_v%s(_.*)?$" % re.escape(YARA_SCHEMA_VERSION))
+YARA_OWNED_RE = re.compile(r"^(yara_scanner_(matches|scans|summary|full)(_.*)?|yara_(matches|scans)_.*)$")
+CURRENT_RE = re.compile(r"^yara_scanner_(matches|scans|summary|full)_v%s(_.*)?$" % re.escape(YARA_SCHEMA_VERSION))
 
 # ---------------------------------------------------------------------------
 # Config / auth
