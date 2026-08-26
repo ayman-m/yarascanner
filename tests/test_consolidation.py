@@ -803,6 +803,39 @@ def test_consolidate_all_dry_run_reports_nothing_consolidated():
     assert "yara_scanner_matches_v2_scan_s1" not in fc.ds   # nothing written
 
 
+def test_consolidate_all_dry_run_does_not_report_its_plans_as_failures():
+    """A dry-run plan carries ok=None and reason="dry_run". Falling through to the else branch
+    counted every previewed scan as FAILED: a healthy preview of three scans reported
+    failed_count=3 with all three in failed_scan_ids, against docs that say to alarm only on
+    failed_count. Observed live before the fix. They belong in their own bucket."""
+    fc = FakeClient()
+    _seed(fc, "yara_scanner_matches_v2_hosta_aa0001", _m("S1", "hosta", 5))
+    _seed(fc, "yara_scanner_scans_v2_hosta_aa0001", _s("S1", "hosta", "completed"))
+    result = C.consolidate_all(fc, kinds=("matches",), dry_run=True, quiet_secs=1,
+                               now_ms=NOW, log=lambda *a: None)
+    assert result["failed_count"] == 0
+    assert result["failed_scan_ids"] == []
+    assert result["failed_reasons"] == {}
+    assert result["would_count"] == 1               # previewed, not failed
+    assert result["would_scan_ids"] == ["S1"]
+
+
+def test_the_lock_held_result_carries_every_key_the_normal_result_does():
+    """consolidate_all has two return sites. A key added to one and not the other is a
+    KeyError waiting for whichever caller reads it on the stand-down path."""
+    fc = FakeClient()
+    C.acquire_consolidation_lock(fc, now_ms=NOW, holder="someone-else", log=lambda *a: None)
+    held = C.consolidate_all(fc, kinds=("matches",), dry_run=False, quiet_secs=1,
+                             now_ms=NOW + 1000, log=lambda *a: None)
+    assert held["lock_held_by_other_run"] is True
+    fc2 = FakeClient()
+    normal = C.consolidate_all(fc2, kinds=("matches",), dry_run=False, quiet_secs=1,
+                               now_ms=NOW, log=lambda *a: None)
+    assert sorted(held) == sorted(normal), (
+        "return sites disagree: only in lock-held=%s, only in normal=%s"
+        % (sorted(set(held) - set(normal)), sorted(set(normal) - set(held))))
+
+
 def test_consolidate_all_reports_deferred_and_failed_separately():
     fc = FakeClient()
     _seed(fc, "yara_scanner_matches_v2_hosta_aa0001", _m("S1", "hosta", 5))
@@ -975,6 +1008,10 @@ def test_consolidate_all_skips_when_locked_by_another_run():
                       "stopped_early": False,
                        "deferred_count": 0, "deferred_scan_ids": [],
                        "failed_count": 0, "failed_scan_ids": [], "failed_reasons": {},
+                       # Same rule for the dry-run preview counters: a stand-down previewed
+                       # nothing, but the keys are present so a caller never has to branch on
+                       # which return site it got.
+                       "would_count": 0, "would_scan_ids": [],
                        "lock_held_by_other_run": True}
     assert "yara_scanner_matches_v2_scan_s1" not in fc.ds   # nothing touched
 

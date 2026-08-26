@@ -892,11 +892,15 @@ def consolidate_all(client, kinds=("matches", "scans"), vers=KNOWN_MATCHES_SCHEM
     Write passes (dry_run=False) take a best-effort overlap guard first (see
     acquire_consolidation_lock) — if another run appears to already hold it, this returns
     immediately with lock_held_by_other_run=True and nothing touched. Dry runs never write or
-    delete, so they skip the lock entirely and can run concurrently with anything."""
+    delete, so they skip the lock entirely and can run concurrently with anything.
+
+    A dry run reports its plans in would_count/would_scan_ids, never in failed_*: a preview is
+    not an outcome, and failed_count is the field callers alarm on."""
     if not dry_run and not acquire_consolidation_lock(client, log=log, now_ms=now_ms):
         return {"consolidated_count": 0, "consolidated_scan_ids": [],
                 "deferred_count": 0, "deferred_scan_ids": [],
                 "failed_count": 0, "failed_scan_ids": [], "failed_reasons": {},
+                "would_count": 0, "would_scan_ids": [],
                 "stopped_early": False,
                 "lock_held_by_other_run": True}
     try:
@@ -916,7 +920,7 @@ def consolidate_all(client, kinds=("matches", "scans"), vers=KNOWN_MATCHES_SCHEM
                 log("pass bounded to %d of %d eligible scan(s) so it finishes inside its "
                     "task timeout; the rest are owed a further pass"
                     % (max_scans, len(_candidates)))
-        consolidated, deferred, failed = set(), set(), set()
+        consolidated, deferred, failed, would = set(), set(), set(), set()
         failed_reasons = {}
         for ver in vers:
             for kind in kinds:
@@ -928,6 +932,13 @@ def consolidate_all(client, kinds=("matches", "scans"), vers=KNOWN_MATCHES_SCHEM
                     sid = p["scan_id"]
                     if p.get("ok"):
                         consolidated.add(sid)
+                    elif p.get("reason") == "dry_run":
+                        # A PREVIEW, NOT AN OUTCOME. A dry-run plan carries ok=None because
+                        # nothing ran. Without this branch it fell through to `failed`, so a
+                        # healthy dry run reported every previewed scan as a failure - and the
+                        # operator docs say to alarm only on failed_count. Measured live: a
+                        # three-scan preview reported failed_count=3.
+                        would.add(sid)
                     elif p.get("reason") in ("host_not_terminal", "within_quiet_period"):
                         deferred.add(sid)
                     else:
@@ -941,7 +952,8 @@ def consolidate_all(client, kinds=("matches", "scans"), vers=KNOWN_MATCHES_SCHEM
             "lock_held_by_other_run": False,
             "stopped_early": stopped_early,
             "failed_count": len(failed), "failed_scan_ids": sorted(failed),
-            "failed_reasons": failed_reasons}
+            "failed_reasons": failed_reasons,
+            "would_count": len(would), "would_scan_ids": sorted(would)}
 
 
 def _delete_many(client, names, log, concurrency=None):
