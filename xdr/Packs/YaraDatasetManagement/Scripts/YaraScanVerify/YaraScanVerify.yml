@@ -1,0 +1,68 @@
+args:
+- name: hostnames
+  description: The hostnames the wave was dispatched to, comma-separated. Matched case-insensitively against the lifecycle rows, because core-get-endpoints and the scanner do not always agree on case.
+  required: true
+  isArray: true
+  secret: false
+- name: dispatch_ms
+  description: Epoch milliseconds at which the scan was dispatched. REQUIRED and load-bearing - every query is bounded on it, and without it a host scanned yesterday would count as this wave starting.
+  required: true
+  isArray: false
+  secret: false
+- name: schema_version
+  description: Lookup schema version to read. Defaults to 4.
+  required: false
+  isArray: false
+  defaultValue: '4'
+  secret: false
+comment: >-
+  Bounded confirmation that a dispatched wave actually STARTED. It does not wait for
+  completion - a full scan runs 24-29 minutes plus upload drain, and this answers a much
+  cheaper question in a few minutes. Measured on the tenant, the initiated lifecycle row lands
+  +17 to +20 seconds after dispatch, so that is the signal. The 600-second running heartbeat
+  cannot be: its first row arrives at ~10.3 minutes, roughly double a five-minute gate, so
+  waiting for it either false-alarms on every wave or stops the gate being short. Match rows
+  are positive evidence only - their presence proves the whole path works, their absence
+  proves nothing, because a clean host legitimately has none, so a host is never failed for
+  having none. Verdicts - ok - every dispatched host started. partial - some started.
+  wave_dead - none did, which usually means a bad ruleset, a wrong script UID or a failed
+  delivery, and is the case this gate exists to catch in minutes rather than never. unknown -
+  the query itself failed, which is NOT evidence a scan failed and must not page anyone.
+commonfields:
+  id: YaraScanVerify
+  version: -1
+enabled: true
+name: YaraScanVerify
+outputs:
+- contextPath: Yara.ScanVerify.verdict
+  description: ok | partial | wave_dead | unknown. Branch on this.
+  type: String
+- contextPath: Yara.ScanVerify.dispatched
+  description: Hostnames the wave was dispatched to.
+  type: String
+- contextPath: Yara.ScanVerify.started
+  description: Hostnames with a lifecycle row written since dispatch.
+  type: String
+- contextPath: Yara.ScanVerify.not_started
+  description: Hostnames with no lifecycle row yet. Not necessarily failed - a host offline at dispatch simply stays due for the next wave.
+  type: String
+- contextPath: Yara.ScanVerify.states
+  description: Per host, which lifecycle states have been seen since dispatch.
+  type: Unknown
+- contextPath: Yara.ScanVerify.match_rows
+  description: Per host, how many match rows have landed since dispatch. Evidence only - never used to decide the verdict.
+  type: Unknown
+- contextPath: Yara.ScanVerify.error
+  description: Why the verdict is unknown. Empty otherwise.
+  type: String
+script: '-'
+system: false
+tags: []
+timeout: 300
+type: python
+subtype: python3
+dockerimage: demisto/python3:3.11.10.116949
+fromversion: 6.5.0
+marketplaces:
+- xsoar
+- marketplacev2
