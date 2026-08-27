@@ -1,0 +1,447 @@
+args:
+- name: b64
+  description: The base64 payload to decode - the same value the scanner takes as its yarafile input. Whitespace and missing padding are repaired automatically, so a blob pasted out of context or a report still works.
+  required: false
+  isArray: false
+  secret: false
+- name: entry_id
+  description: War Room entry ID of a file containing the base64, used when b64 is not passed directly. Handy when the payload is too large to pass as an argument.
+  required: false
+  isArray: false
+  secret: false
+- name: expected_hash
+  description: A ruleset hash to check the decoded text against - for example the one in a dataset name, yara_scanner_full_v4_rules_<hash>. When given, the output states plainly whether the payload really is the ruleset that dataset was named for. A mismatch is reported as its own finding and does not by itself mark the decode as failed.
+  required: false
+  isArray: false
+  secret: false
+- name: validate
+  description: Hold the decoded text to the same structural standard YaraRulesFromFile applies before dispatch. Defaults to true. Set false to read a payload the gate would refuse - the text is still returned, which is exactly when reading it matters most.
+  required: false
+  isArray: false
+  defaultValue: 'true'
+  auto: PREDEFINED
+  predefined:
+  - 'true'
+  - 'false'
+  secret: false
+- name: as_file
+  description: Also attach the decoded rules as a downloadable .yar file. Defaults to false, which keeps the output inline in the War Room.
+  required: false
+  isArray: false
+  defaultValue: 'false'
+  auto: PREDEFINED
+  predefined:
+  - 'true'
+  - 'false'
+  secret: false
+- name: max_bytes
+  description: Size ceiling applied to the decoded text when validate is true. Defaults to 2097152 (2 MB), matching YaraRulesFromFile.
+  required: false
+  isArray: false
+  defaultValue: '2097152'
+  secret: false
+comment: 'Decodes the scanner''s yarafile base64 back into readable YARA rules - the inverse of YaraRulesFromFile, and built for verification rather than convenience. A consolidated dataset is named after a ruleset hash (yara_scanner_full_v4_rules_<hash>), and a hash is one-way, so it cannot on its own answer "which rules produced these matches?". Passing the dispatched base64 here recomputes that hash from the text, so a match against expected_hash is proof the text is what the dataset was named for. Strict about the base64 alphabet on purpose: Python''s decoder silently discards stray characters, which would turn a corrupted payload into plausible garbage instead of an error, and this automation is meant to be trusted as evidence. Whitespace and missing padding are repaired, being artifacts of copy-paste rather than corruption. Note the round trip is normalising, not byte-exact - a UTF-8 BOM is stripped at encode time, so the decoded text, the hash and the dispatched bytes all agree with each other and all differ from a BOM-carrying original by that BOM. Needs no tenant credentials.'
+commonfields:
+  id: YaraRulesDecode
+  version: -1
+enabled: true
+name: YaraRulesDecode
+outputs:
+- contextPath: Yara.RulesDecoded.ok
+  description: True if the payload decoded and (when validate is true) passed the structural checks. Branch on this.
+  type: Boolean
+- contextPath: Yara.RulesDecoded.rules
+  description: The decoded YARA rules text. Truncated to 4000 characters when the payload failed validation, so a bad payload can still be inspected.
+  type: String
+- contextPath: Yara.RulesDecoded.rule_hash
+  description: First 12 hex of sha256 over the decoded text, computed exactly as the scanner and YaraRulesFromFile compute it.
+  type: String
+- contextPath: Yara.RulesDecoded.expected_hash
+  description: The hash that was supplied for comparison, if any.
+  type: String
+- contextPath: Yara.RulesDecoded.hash_matches
+  description: True when rule_hash equals expected_hash, false when it does not, and unset when no expected_hash was given. Never conflated with ok.
+  type: Boolean
+- contextPath: Yara.RulesDecoded.errors
+  description: Why the payload could not be used, each naming what to fix. Empty on success.
+  type: String
+- contextPath: Yara.RulesDecoded.rule_names
+  description: The decoded rule names, in file order.
+  type: String
+- contextPath: Yara.RulesDecoded.rule_count
+  description: How many rule declarations the decoded text contains.
+  type: Number
+- contextPath: Yara.RulesDecoded.size_bytes
+  description: Size of the decoded rules text in bytes.
+  type: Number
+script: |
+  """YaraRulesDecode - turn the scanner's yarafile base64 back into readable YARA rules.
+
+  The inverse of YaraRulesFromFile, and the reason it exists is verification, not convenience.
+  A consolidated dataset is named after a ruleset hash - yara_scanner_full_v4_rules_<hash> - so
+  when an analyst asks "which rules produced these matches?", the hash alone cannot answer it:
+  it is one-way. What this does is close the loop from the other end. Give it the base64 that
+  was dispatched and it returns the rules text AND recomputes the hash, so a match against
+  `expected_hash` is proof that this text is what that dataset was named for.
+
+  THREE THINGS IT IS FOR
+    1. Verification. Confirm the encode step produced exactly what was intended before dispatch.
+    2. Forensics. Recover the readable ruleset behind an existing dataset or scan record.
+    3. Hand-off. An operator handed a base64 blob can read it without a local toolchain.
+
+  STRICT ABOUT THE ALPHABET, TOLERANT ABOUT LAYOUT. Whitespace and missing padding are artifacts
+  of moving a blob through context and copy-paste, so both are repaired. Characters outside the
+  base64 alphabet are NOT: Python's decoder discards them by default, which turns a corrupted
+  payload into plausible garbage rather than an error. Corruption has to be loud here, because
+  the whole point of this automation is to be trusted as evidence.
+
+  THE ROUND TRIP IS NORMALISING, NOT BYTE-EXACT. YaraRulesFromFile strips a UTF-8 BOM before
+  hashing, so decoding what it produced returns the text WITHOUT the BOM even if the uploaded
+  file had one. That is the intended contract: the hash, the dispatched bytes and this output
+  all agree with each other, and all of them differ from a BOM-carrying original by that BOM.
+
+  NO CREDENTIALS. Like YaraRulesFromFile, this touches no tenant API - it decodes text.
+
+  The validation helpers below are lifted VERBATIM from YaraRulesFromFile and pinned there by
+  a drift test. If the two disagreed about what a valid ruleset is, this automation could
+  declare a dispatched pack invalid, or bless one the gate would have refused.
+  """
+  import base64
+  import hashlib
+  import re
+
+  # A rules file bigger than this is a mistake, not a ruleset. The scanner's own ceiling is
+  # 50 MB of BASE64, which is far past anything a human uploads to an issue; refusing early
+  # keeps a stray disk image out of the War Room round trip.
+  DEFAULT_MAX_BYTES = 2 * 1024 * 1024
+
+  _RULE_RE = re.compile(r"(?m)^[ \t]*(?:private[ \t]+|global[ \t]+)*rule[ \t]+([A-Za-z_]\w*)")
+
+
+  _CONDITION_RE = re.compile(r"(?m)^[ \t]*condition[ \t]*:")
+
+
+  # Printable ASCII plus tab/newline/CR, and the common Latin-1 range a comment might carry.
+  _TEXTY = set(range(0x20, 0x7F)) | {0x09, 0x0A, 0x0D} | set(range(0xA0, 0x100))
+
+
+  # A YARA regex literal - $x = /pattern/modifiers - can contain braces that are not
+  # structural: a quantifier like {2,3}, or an escaped \{. They never span lines, so removing
+  # them before counting is exact rather than heuristic.
+  _REGEX_LITERAL_RE = re.compile(r"=\s*/(?:\\.|[^/\\\n])*/[a-z]*")
+
+
+  def _decode_bytes(raw):
+      """Bytes -> text, or None if this is not a text file at all."""
+      if isinstance(raw, str):
+          return raw
+      for enc in ("utf-8", "utf-8-sig", "latin-1"):
+          try:
+              return raw.decode(enc)
+          except (UnicodeDecodeError, AttributeError):
+              continue
+      return None
+
+
+  def _looks_binary(text):
+      """True if the content is not plausibly a text rules file.
+
+      NUL is decisive - no text editor emits it. Beyond that, a small fraction of exotic bytes
+      is normal (a UTF-8 comment), so only a heavy concentration counts.
+      """
+      if "\x00" in text:
+          return True
+      sample = text[:4096]
+      if not sample:
+          return False
+      odd = sum(1 for ch in sample if ord(ch) not in _TEXTY)
+      return (odd / float(len(sample))) > 0.10
+
+
+  def _brace_balance(text):
+      """Net brace depth, ignoring braces inside strings and // or /* */ comments.
+
+      A hex string like { 4D 5A } counts as a normal brace pair and balances itself, so it needs
+      no special case. Quoted strings do: a rule containing "}" would otherwise read as a close.
+      """
+      text = _REGEX_LITERAL_RE.sub("= REGEX", text)
+      depth, i, n = 0, 0, len(text)
+      in_str = in_line_comment = in_block_comment = False
+      while i < n:
+          ch = text[i]
+          nxt = text[i + 1] if i + 1 < n else ""
+          if in_line_comment:
+              if ch == "\n":
+                  in_line_comment = False
+          elif in_block_comment:
+              if ch == "*" and nxt == "/":
+                  in_block_comment = False
+                  i += 1
+          elif in_str:
+              if ch == "\\":
+                  i += 1
+              elif ch == '"':
+                  in_str = False
+          elif ch == "/" and nxt == "/":
+              in_line_comment = True
+              i += 1
+          elif ch == "/" and nxt == "*":
+              in_block_comment = True
+              i += 1
+          elif ch == '"':
+              in_str = True
+          elif ch == "{":
+              depth += 1
+          elif ch == "}":
+              depth -= 1
+              if depth < 0:
+                  return depth
+          i += 1
+      return depth
+
+
+  def validate_rules(raw, max_bytes=DEFAULT_MAX_BYTES):
+      """Validate a rules file and return everything the playbook needs.
+
+      Always returns a dict - never raises - so a playbook can branch on `valid` and show
+      `errors` to the analyst who uploaded the file. Every error names what to fix.
+      """
+      out = {"valid": False, "errors": [], "rule_names": [], "rule_count": 0,
+             "b64": "", "rule_hash": "", "size_bytes": 0}
+
+      text = _decode_bytes(raw)
+      if text is not None:
+          # A UTF-8 BOM is what Notepad and most Windows editors write by default. It sits
+          # immediately before the first `rule`, so the declaration scan misses it and a
+          # perfectly good file is rejected as "no rules". libyara would not accept it either,
+          # so stripping it is a fix, not a workaround.
+          text = text.lstrip("\ufeff")
+      if text is None:
+          out["errors"].append("File is not text: it could not be decoded as UTF-8 or Latin-1. "
+                               "Upload the rules as a plain .yar/.yara/.txt file.")
+          return out
+
+      out["size_bytes"] = len(text.encode("utf-8", "replace"))
+      if not text.strip():
+          out["errors"].append("File is empty - it contains no rules.")
+          return out
+      if max_bytes and out["size_bytes"] > max_bytes:
+          out["errors"].append("File is too large: %d bytes against a %d byte limit."
+                               % (out["size_bytes"], max_bytes))
+          return out
+
+      # Named before the generic binary check so the operator gets the useful message. A PDF is
+      # the likeliest wrong upload when the ask is "attach your rules".
+      if text.lstrip()[:5] == "%PDF-":
+          out["errors"].append("File is a PDF. Only plain-text YARA rules are supported - "
+                               "export or copy the rules into a .yar/.txt file and re-upload.")
+          return out
+      if _looks_binary(text):
+          out["errors"].append("File looks binary, not text. Only plain-text YARA rules are "
+                               "supported.")
+          return out
+
+      names = _RULE_RE.findall(text)
+      if not names:
+          out["errors"].append("No YARA rule declarations found. A rules file needs at least "
+                               "one `rule <Name> { ... }` block.")
+          return out
+      out["rule_names"] = names
+      out["rule_count"] = len(names)
+
+      depth = _brace_balance(text)
+      if depth != 0:
+          out["errors"].append(
+              "Unbalanced braces (%s). Every `rule { ... }` block must be closed."
+              % ("%d unclosed" % depth if depth > 0 else "%d unexpected closing" % -depth))
+          return out
+
+      # YARA requires a condition per rule. Counting is enough and avoids parsing rule bodies:
+      # fewer conditions than rules means at least one rule cannot compile.
+      conditions = len(_CONDITION_RE.findall(text))
+      if conditions < len(names):
+          out["errors"].append(
+              "%d rule(s) but only %d `condition:` section(s). Every YARA rule requires a "
+              "condition." % (len(names), conditions))
+          return out
+
+      # sha256 of the DECODED text, matching the scanner exactly (xdr_yara_scanner.py:2849), so
+      # the hash reported here is the one the consolidated datasets get named after.
+      out["rule_hash"] = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+      out["b64"] = base64.b64encode(text.encode("utf-8")).decode("ascii")
+      out["valid"] = True
+      return out
+
+
+
+  # Padding is derivable and whitespace is an artifact of moving a blob through context, so both
+  # are repaired. The alphabet is not repairable: b64decode DISCARDS stray characters unless
+  # validate=True, which is how corruption becomes plausible garbage instead of an error.
+  _B64_ALPHABET_RE = re.compile(r"^[A-Za-z0-9+/]*={0,2}$")
+  _URLSAFE_RE = re.compile(r"[-_]")
+
+
+  def decode_b64(text):
+      """base64 -> (bytes, error_message). Never raises."""
+      s = re.sub(r"\s+", "", str(text or ""))
+      if not s:
+          return None, "No base64 input given - pass b64, or entry_id of a file containing it."
+      if _URLSAFE_RE.search(s):
+          return None, ("Input looks like URL-safe base64 (it contains - or _). The scanner's "
+                        "yarafile input is standard base64; re-encode with the standard "
+                        "alphabet.")
+      if len(s) % 4:
+          s += "=" * (4 - len(s) % 4)
+      if not _B64_ALPHABET_RE.match(s):
+          return None, ("Input is not base64: it contains characters outside the base64 "
+                        "alphabet. If this was pasted from a document, it may have picked up "
+                        "quotes or line markers.")
+      try:
+          return base64.b64decode(s, validate=True), ""
+      except Exception as ex:
+          return None, "Input is not valid base64: %s" % str(ex)[:120]
+
+
+  def decode_rules(b64_text, expected_hash="", validate=True, max_bytes=DEFAULT_MAX_BYTES):
+      """Decode and, unless told otherwise, hold the result to the encoder's own standard."""
+      out = {"ok": False, "errors": [], "rules": "", "rule_hash": "", "rule_names": [],
+             "rule_count": 0, "size_bytes": 0, "expected_hash": str(expected_hash or "").strip(),
+             "hash_matches": None}
+
+      raw, err = decode_b64(b64_text)
+      if err:
+          out["errors"].append(err)
+          return out
+
+      if not validate:
+          # Still decode to text so an operator can SEE a payload the gate would refuse - that
+          # is exactly the case where reading it matters most.
+          text = _decode_bytes(raw)
+          if text is None:
+              out["errors"].append("Decoded bytes are not text in any supported encoding.")
+              return out
+          text = text.lstrip("\ufeff")
+          out["rules"] = text
+          out["size_bytes"] = len(text.encode("utf-8", "replace"))
+          out["rule_hash"] = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+          out["ok"] = True
+      else:
+          res = validate_rules(raw, max_bytes=max_bytes)
+          out["errors"] = list(res["errors"])
+          out["rule_names"] = res["rule_names"]
+          out["rule_count"] = res["rule_count"]
+          out["size_bytes"] = res["size_bytes"]
+          out["rule_hash"] = res["rule_hash"]
+          out["ok"] = res["valid"]
+          if res["valid"]:
+              text = _decode_bytes(raw)
+              out["rules"] = (text or "").lstrip("\ufeff")
+          else:
+              # Show what was decoded even on failure - "it decoded to a PDF" is the answer.
+              text = _decode_bytes(raw)
+              out["rules"] = (text or "")[:4000].lstrip("\ufeff")
+
+      # Compared AFTER decoding, and it never gates `ok`: a mismatch is a real finding worth
+      # reporting on its own, and conflating it with "this is not valid YARA" hides which of
+      # the two actually went wrong.
+      if out["expected_hash"] and out["rule_hash"]:
+          out["hash_matches"] = (out["rule_hash"].lower() == out["expected_hash"].lower())
+      return out
+
+
+  def main():
+      args = demisto.args()
+      b64_text = args.get("b64") or ""
+      entry_id = (args.get("entry_id") or "").strip()
+      expected = (args.get("expected_hash") or "").strip()
+
+      if not b64_text and entry_id:
+          try:
+              res = demisto.getFilePath(entry_id)
+              if not res or not res.get("path"):
+                  return_error("YaraRulesDecode: entry %s is not a file entry." % entry_id)
+                  return
+              with open(res["path"], "rb") as fh:
+                  b64_text = fh.read().decode("utf-8", "replace")
+          except Exception as ex:
+              return_error("YaraRulesDecode: could not read entry %s - %s" % (entry_id, ex))
+              return
+      if not b64_text:
+          return_error("YaraRulesDecode: nothing to decode. Pass b64 with the base64 payload, "
+                       "or entry_id of a file that contains it.")
+          return
+
+      try:
+          validate = argToBoolean(args.get("validate", "true"))
+      except (ValueError, TypeError):
+          return_error("YaraRulesDecode: validate must be true or false (%r given)."
+                       % args.get("validate"))
+          return
+      try:
+          as_file = argToBoolean(args.get("as_file", "false"))
+      except (ValueError, TypeError):
+          return_error("YaraRulesDecode: as_file must be true or false (%r given)."
+                       % args.get("as_file"))
+          return
+      mb = args.get("max_bytes")
+      try:
+          max_bytes = int(mb) if mb not in (None, "") else DEFAULT_MAX_BYTES
+      except (TypeError, ValueError):
+          return_error("YaraRulesDecode: max_bytes must be a whole number (%r given)." % mb)
+          return
+
+      result = decode_rules(b64_text, expected_hash=expected, validate=validate,
+                            max_bytes=max_bytes)
+
+      if result["ok"]:
+          lines = ["Decoded %d bytes of YARA rules." % result["size_bytes"]]
+          if result["rule_count"]:
+              lines.append("%d rule(s): %s" % (result["rule_count"],
+                                               ", ".join(result["rule_names"][:12])
+                                               + (" ..." if result["rule_count"] > 12 else "")))
+          lines.append("ruleset hash: `%s`" % result["rule_hash"])
+      else:
+          lines = ["Could NOT decode this payload into usable YARA rules.", ""]
+          lines += ["  - %s" % e for e in result["errors"]]
+
+      if result["hash_matches"] is True:
+          lines.append("Hash MATCHES `%s` - this text is what that scan dispatched."
+                       % result["expected_hash"])
+      elif result["hash_matches"] is False:
+          lines.append("Hash MISMATCH: this text hashes to `%s`, not the expected `%s`. The "
+                       "payload is not the ruleset it was said to be."
+                       % (result["rule_hash"], result["expected_hash"]))
+
+      if result["rules"]:
+          body = result["rules"]
+          shown = body if len(body) <= 3000 else body[:3000] + "\n... (truncated)"
+          lines += ["", "```", shown, "```"]
+
+      results = [CommandResults(readable_output="\n".join(lines),
+                                outputs_prefix="Yara.RulesDecoded",
+                                outputs=result, raw_response=result)]
+      if as_file and result["rules"]:
+          try:
+              results.append(fileResult("decoded_rules_%s.yar" % (result["rule_hash"] or "x"),
+                                        result["rules"]))
+          except Exception as ex:
+              demisto.debug("YaraRulesDecode: file output unavailable - %s" % ex)
+
+      # List-valued context is APPENDED to across calls in one investigation, so a second
+      # decode would otherwise merge both payloads' rule names.
+      demisto.executeCommand("DeleteContext", {"key": "Yara.RulesDecoded"})
+      return_results(results)
+
+
+  if __name__ in ("__main__", "__builtin__", "builtins"):
+      main()
+system: false
+tags: []
+timeout: 300
+type: python
+subtype: python3
+dockerimage: demisto/python3:3.11.10.116949
+fromversion: 6.5.0
+marketplaces:
+- xsoar
+- marketplacev2

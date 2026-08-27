@@ -63,12 +63,19 @@ def _looks_binary(text):
     return (odd / float(len(sample))) > 0.10
 
 
+# A YARA regex literal - $x = /pattern/modifiers - can contain braces that are not
+# structural: a quantifier like {2,3}, or an escaped \{. They never span lines, so removing
+# them before counting is exact rather than heuristic.
+_REGEX_LITERAL_RE = re.compile(r"=\s*/(?:\\.|[^/\\\n])*/[a-z]*")
+
+
 def _brace_balance(text):
     """Net brace depth, ignoring braces inside strings and // or /* */ comments.
 
     A hex string like { 4D 5A } counts as a normal brace pair and balances itself, so it needs
     no special case. Quoted strings do: a rule containing "}" would otherwise read as a close.
     """
+    text = _REGEX_LITERAL_RE.sub("= REGEX", text)
     depth, i, n = 0, 0, len(text)
     in_str = in_line_comment = in_block_comment = False
     while i < n:
@@ -114,6 +121,12 @@ def validate_rules(raw, max_bytes=DEFAULT_MAX_BYTES):
            "b64": "", "rule_hash": "", "size_bytes": 0}
 
     text = _decode_bytes(raw)
+    if text is not None:
+        # A UTF-8 BOM is what Notepad and most Windows editors write by default. It sits
+        # immediately before the first `rule`, so the declaration scan misses it and a
+        # perfectly good file is rejected as "no rules". libyara would not accept it either,
+        # so stripping it is a fix, not a workaround.
+        text = text.lstrip("\ufeff")
     if text is None:
         out["errors"].append("File is not text: it could not be decoded as UTF-8 or Latin-1. "
                              "Upload the rules as a plain .yar/.yara/.txt file.")

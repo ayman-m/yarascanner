@@ -1,0 +1,99 @@
+args:
+- name: b64
+  description: The base64 payload to decode - the same value the scanner takes as its yarafile input. Whitespace and missing padding are repaired automatically, so a blob pasted out of context or a report still works.
+  required: false
+  isArray: false
+  secret: false
+- name: entry_id
+  description: War Room entry ID of a file containing the base64, used when b64 is not passed directly. Handy when the payload is too large to pass as an argument.
+  required: false
+  isArray: false
+  secret: false
+- name: expected_hash
+  description: A ruleset hash to check the decoded text against - for example the one in a dataset name, yara_scanner_full_v4_rules_<hash>. When given, the output states plainly whether the payload really is the ruleset that dataset was named for. A mismatch is reported as its own finding and does not by itself mark the decode as failed.
+  required: false
+  isArray: false
+  secret: false
+- name: validate
+  description: Hold the decoded text to the same structural standard YaraRulesFromFile applies before dispatch. Defaults to true. Set false to read a payload the gate would refuse - the text is still returned, which is exactly when reading it matters most.
+  required: false
+  isArray: false
+  defaultValue: 'true'
+  auto: PREDEFINED
+  predefined:
+  - 'true'
+  - 'false'
+  secret: false
+- name: as_file
+  description: Also attach the decoded rules as a downloadable .yar file. Defaults to false, which keeps the output inline in the War Room.
+  required: false
+  isArray: false
+  defaultValue: 'false'
+  auto: PREDEFINED
+  predefined:
+  - 'true'
+  - 'false'
+  secret: false
+- name: max_bytes
+  description: Size ceiling applied to the decoded text when validate is true. Defaults to 2097152 (2 MB), matching YaraRulesFromFile.
+  required: false
+  isArray: false
+  defaultValue: '2097152'
+  secret: false
+comment: >-
+  Decodes the scanner's yarafile base64 back into readable YARA rules - the inverse of
+  YaraRulesFromFile, and built for verification rather than convenience. A consolidated dataset
+  is named after a ruleset hash (yara_scanner_full_v4_rules_<hash>), and a hash is one-way, so
+  it cannot on its own answer "which rules produced these matches?". Passing the dispatched
+  base64 here recomputes that hash from the text, so a match against expected_hash is proof the
+  text is what the dataset was named for. Strict about the base64 alphabet on purpose: Python's
+  decoder silently discards stray characters, which would turn a corrupted payload into
+  plausible garbage instead of an error, and this automation is meant to be trusted as
+  evidence. Whitespace and missing padding are repaired, being artifacts of copy-paste rather
+  than corruption. Note the round trip is normalising, not byte-exact - a UTF-8 BOM is stripped
+  at encode time, so the decoded text, the hash and the dispatched bytes all agree with each
+  other and all differ from a BOM-carrying original by that BOM. Needs no tenant credentials.
+commonfields:
+  id: YaraRulesDecode
+  version: -1
+enabled: true
+name: YaraRulesDecode
+outputs:
+- contextPath: Yara.RulesDecoded.ok
+  description: True if the payload decoded and (when validate is true) passed the structural checks. Branch on this.
+  type: Boolean
+- contextPath: Yara.RulesDecoded.rules
+  description: The decoded YARA rules text. Truncated to 4000 characters when the payload failed validation, so a bad payload can still be inspected.
+  type: String
+- contextPath: Yara.RulesDecoded.rule_hash
+  description: First 12 hex of sha256 over the decoded text, computed exactly as the scanner and YaraRulesFromFile compute it.
+  type: String
+- contextPath: Yara.RulesDecoded.expected_hash
+  description: The hash that was supplied for comparison, if any.
+  type: String
+- contextPath: Yara.RulesDecoded.hash_matches
+  description: True when rule_hash equals expected_hash, false when it does not, and unset when no expected_hash was given. Never conflated with ok.
+  type: Boolean
+- contextPath: Yara.RulesDecoded.errors
+  description: Why the payload could not be used, each naming what to fix. Empty on success.
+  type: String
+- contextPath: Yara.RulesDecoded.rule_names
+  description: The decoded rule names, in file order.
+  type: String
+- contextPath: Yara.RulesDecoded.rule_count
+  description: How many rule declarations the decoded text contains.
+  type: Number
+- contextPath: Yara.RulesDecoded.size_bytes
+  description: Size of the decoded rules text in bytes.
+  type: Number
+script: '-'
+system: false
+tags: []
+timeout: 300
+type: python
+subtype: python3
+dockerimage: demisto/python3:3.11.10.116949
+fromversion: 6.5.0
+marketplaces:
+- xsoar
+- marketplacev2

@@ -140,6 +140,10 @@ def _install_xsoar_stubs():
         csp.errors.append(message)
         raise SystemExit(message)
 
+    def fileResult(filename, data, file_type=None):
+        return {"Type": 3, "File": filename, "FileID": "stub", "Contents": data}
+
+    csp.fileResult = fileResult
     csp.argToList = argToList
     csp.argToBoolean = argToBoolean
     csp.return_results = return_results
@@ -173,6 +177,7 @@ def _install_xsoar_stubs():
     builtins.argToBoolean = argToBoolean
     builtins.return_results = return_results
     builtins.return_error = return_error
+    builtins.fileResult = fileResult
 
     return dm, csp
 
@@ -470,7 +475,8 @@ _DELETED_LIBRARY = "YaraConsolidateCommon"
 _DELETED_AUTOMATIONS = ("YaraConsolidateCommon",)
 OTHER_AUTOMATIONS = {"YaraWipeAllDatasets": "test_wipe_all_datasets.py",
                      "YaraRulesFromFile": "test_rules_from_file.py",
-                     "YaraScanVerify": "test_scan_verify.py"}
+                     "YaraScanVerify": "test_scan_verify.py",
+                     "YaraRulesDecode": "test_rules_decode.py"}
 
 
 def test_no_automation_escapes_the_gate():
