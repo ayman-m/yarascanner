@@ -160,9 +160,10 @@ def select_rotated_for_deletion(current_names, older_than_months, now_yyyymm):
                 if is_pack_output_dataset(name) else "not a YARA dataset name"))
             continue
         if info["scan_target"]:
-            skipped.append("%s: per-scan consolidated target - consolidation OUTPUT, not a "
-                           "rotation shard, and after the source shards were deleted it is "
-                           "the only copy of that scan" % name)
+            skipped.append("%s: per-scan consolidated target from the retired per-scan "
+                           "merge - consolidation OUTPUT, not a rotation shard, and on a "
+                           "tenant that ran that merge it can be the only copy of that "
+                           "scan" % name)
             continue
         if info["overwrite"]:
             skipped.append("%s: permanent per-host matches dataset - the scanner REPLACES it "
@@ -390,10 +391,12 @@ def render_report(current, legacy, newer, now_yyyymm):
     if consolidated:
         lines += [
             "",
-            "%d dataset(s) are per-scan CONSOLIDATED TARGETS (…_scan_<id>). They are"
+            "%d dataset(s) are per-scan CONSOLIDATED TARGETS (…_scan_<id>) from the"
             % len(consolidated),
-            "      consolidation OUTPUT: unrotated by design, finished, not growing, and",
-            "      often a scan's only surviving copy. Never a cleanup candidate.",
+            "      retired per-scan merge: consolidation OUTPUT, unrotated by design,",
+            "      finished, not growing, and no longer produced by anything - on a tenant",
+            "      that ran that merge, often a scan's only surviving copy. Never a",
+            "      cleanup candidate.",
         ]
     if overwritten:
         lines += [

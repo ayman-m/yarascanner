@@ -1,6 +1,6 @@
 # YARA Scanner for Cortex XDR — Operations Deep Dive
 
-*Scanner **3.4.0** · pack automations v16/v24/v24/v12/v14 · playbook v4*
+*Scanner **3.4.0** · 9 pack automations · playbook v4*
 
 Everything an operator needs to know that isn't obvious from the config file: what the
 platform does that you can't change, what the scanner does about it, what it costs, and
@@ -19,7 +19,7 @@ something is unverified or unresolved it says so explicitly.
 4. [The dataset model](#4-the-dataset-model)
 5. [Sizing the run timeout — the drain problem](#5-sizing-the-run-timeout--the-drain-problem)
 6. [Delivery accounting — did my data land?](#6-delivery-accounting--did-my-data-land)
-7. [Dataset management: the five automations](#7-dataset-management-the-five-automations)
+7. [Dataset management: the nine automations](#7-dataset-management-the-nine-automations)
 8. [Consolidation mechanics and safety rails](#8-consolidation-mechanics-and-safety-rails)
 9. [The consolidation lock](#9-the-consolidation-lock)
 10. [Cancellation](#10-cancellation)
@@ -40,14 +40,16 @@ when the last file is checked, but queued match rows keep uploading afterwards �
 at **169s of scanning followed by 6m41s of draining**. Size the Action Center timeout for
 both or you lose queued rows. → [§5](#5-sizing-the-run-timeout--the-drain-problem)
 
-**2. `YaraConsolidateApply` has no dry-run mode and deletes on its first run.** There is no
-`execute` argument. A bare invocation with no arguments merges and deletes source shards
-immediately. `YaraConsolidateStatus` is the read-only equivalent — check with it first.
-→ [§7](#7-dataset-management-the-five-automations)
+**2. `YaraConsolidateApply` is dry run by default, and never deletes a source.** Its `execute`
+argument defaults to `false`, so a bare invocation reports what it would write and writes
+nothing. Even with `execute=true` it only writes its own consolidated dataset — the per-host
+matches datasets are never deleted. `YaraConsolidateStatus` previews the same grouping
+read-only. → [§7](#7-dataset-management-the-nine-automations)
 
-**3. One consolidation pass is bounded and does not self-drain.** Default `max_scans` is
-**4**. A larger backlog needs the automation re-run, or the cap raised. The playbook does
-not loop. → [§8](#8-consolidation-mechanics-and-safety-rails)
+**3. One consolidation pass is bounded by rows, not by scan count.** There is no `max_scans`
+argument. `row_ceiling` (default **60,000**) refuses a ruleset group larger than that rather
+than half-filling its target; nothing else caps a pass, so a large backlog is a 900s-timeout
+risk. Narrow it with `scan_id`. → [§8](#8-consolidation-mechanics-and-safety-rails)
 
 **4. The matches dataset is permanent and overwritten, not rotated.** One per host, no month
 suffix, replaced wholesale at the start of every scan. It is the deep-dive source. Anything
@@ -175,15 +177,16 @@ too *few* rows are removed.
 > second scan's flush would delete the first's rows — from the dataset's point of view they
 > *are* a previous scan.
 >
-> **Sequential re-scans destroy the previous scan's file detail too — and consolidation does
-> not prevent it.** The flush does not check whether the previous scan was archived, because on
-> v4 nothing archives it: `YaraConsolidateApply` is deliberately blocked from consuming the
-> live v4 matches dataset (doing so would recreate the unbounded per-scan growth the overwrite
-> model removed), and `YaraConsolidateSummary` reads it but keeps only `scan_id`, `hostname`,
-> `rule`, `event_timestamp_ms` — no filenames, no offsets. So a host's file-level findings live
-> in exactly one place and the next scan on that host replaces them, at any interval, whatever
-> your consolidation cadence. Alerts already raised are unaffected. Treat each scan's file
-> detail as valid until that host is scanned again.
+> **Sequential re-scans destroy the previous scan's file detail unless you consolidated it
+> first.** The flush does not check whether the previous scan was archived — it has no way to.
+> Archiving it is entirely on you: `YaraConsolidateApply` with `execute=true` copies every
+> column of every matched-file row into `yara_scanner_full_v4_rules_<hash>`, so a scan's file
+> detail survives a later re-scan *if* Apply ran against it in between. `YaraConsolidateSummary`
+> reads the same source but keeps only `scan_id`, `hostname`, `rule`, `event_timestamp_ms` — no
+> filenames, no offsets. Nothing schedules either, and the scanner does not wait for them. So
+> without a consolidation between scans a host's file-level findings live in exactly one place
+> and the next scan on that host replaces them, at any interval. Alerts already raised are
+> unaffected. Treat each scan's file detail as valid until that host is scanned again.
 
 ### Schema v4 — one row per file
 
@@ -310,20 +313,41 @@ A worked example, reconciled exactly:
 
 ---
 
-## 7. Dataset management: the five automations
+## 7. Dataset management: the nine automations
 
 | Automation | Writes? | Deletes? | Dry run? |
 |---|---|---|---|
 | `YaraReport` | No | No | n/a — read-only |
 | `YaraConsolidateStatus` | No | No | n/a — read-only |
-| **`YaraConsolidateApply`** | **Yes** | **Yes** | **NO — none exists** |
+| **`YaraConsolidateApply`** | **Yes** | **Never** | Yes, unless `execute=true` |
 | `YaraConsolidateSummary` | Yes | **Never** | Yes, unless `execute=true` |
 | `YaraCleanup` | No | **Yes** | Yes, unless `execute=true` |
+| **`YaraWipeAllDatasets`** | No | **Yes — every `yara_scanner_*` dataset** | Yes, unless `execute=true` **and** an exact `confirm` phrase |
+| `YaraScanVerify` | No | No | n/a — read-only |
+| `YaraRulesFromFile` | No | No | n/a — read-only, makes no tenant call |
+| `YaraRulesDecode` | No | No | n/a — read-only, makes no tenant call |
 
-> ### ⚠ `YaraConsolidateApply` is the exception
-> It has **no `execute` argument and no dry-run mode**. `main()` runs with `dry_run=False`
-> unconditionally. A bare `!YaraConsolidateApply` with zero arguments merges and deletes on
-> its first run. Use `YaraConsolidateStatus` to preview.
+The last four are newer than the consolidation set and are the ones most often missed:
+
+- **`YaraWipeAllDatasets`** deletes every `yara_scanner_*` dataset on the tenant. Destructive,
+  and confirm-gated — `execute=true` on its own does nothing without the exact `confirm` phrase.
+- **`YaraScanVerify`** is a bounded post-dispatch check that a dispatched scan wave actually
+  started on its hosts. Read-only, but it queries the tenant, so it needs a key.
+- **`YaraRulesFromFile`** validates an operator-uploaded YARA rules file and returns the base64
+  the Action Center scanner takes as its `yarafile` input.
+- **`YaraRulesDecode`** is the inverse: it decodes that base64 back to readable rules and
+  recomputes the ruleset hash, for verification and forensics.
+
+`YaraRulesFromFile` and `YaraRulesDecode` make no tenant API call at all, which is why they are
+the two that carry no credentials — see [§12](#12-credentials-and-permissions).
+
+> ### `YaraConsolidateApply` is not the exception — it behaves like the rest
+> `YaraConsolidateApply.yml` declares an `execute` argument with `defaultValue: 'false'`, and
+> the script defaults it `False` too. A bare `!YaraConsolidateApply` with zero arguments
+> reports what it would write and **writes nothing** — it does not even take the consolidation
+> lock, which only `execute=true` acquires. And it deletes nothing in either mode: the per-host
+> matches datasets are permanent, and the only rows it ever removes are its own, inside its own
+> target. Use `YaraConsolidateStatus` for a preview that reads even less.
 
 ### The two consolidation modes
 
@@ -358,28 +382,36 @@ written, and untouched hosts are not rewritten at all.
 > `row_ceiling` will refuse the write rather than half-fill a dataset. `Summary` answers
 > "which rules fired where"; `Apply` answers "which files, at which offsets, matching what".
 
-> **`Apply` no longer consolidates the scans lifecycle.** It once merged
-> `yara_scanner_scans_v4_<host>_<6hex>_<YYYYMM>` shards into per-scan targets and deleted the
-> sources. That work is deferred to a future automation; the functions remain in place and
-> drift-gated, but nothing calls them today.
+> **`Apply` neither consolidates nor deletes the scans lifecycle shards.** It reads
+> `yara_scanner_scans_v4_<host>_<6hex>_<YYYYMM>` for one purpose only — building the terminal
+> map that decides which scans are eligible — and writes nothing back to them. It once merged
+> those shards into per-scan targets and deleted the sources; that work is deferred to a future
+> automation, the functions remain in place and drift-gated, and nothing calls them today.
+> **`YaraCleanup` is the only thing in the pack that deletes an aged month-suffixed scans
+> shard, and nothing schedules it** — that is a run you have to make yourself.
 
-> **`Summary` is the only durable record of what matched.** `Apply` archives lifecycle rows,
-> not findings, and the per-host matches dataset is overwritten by the next scan on that host
-> ([§14](#14-known-limitations-and-open-questions)). Run `Summary` per scan if the rule/host
-> list has to outlive the scan.
+> **Both modes produce a record that outlives the source scan — but only if you run one.**
+> `Apply` archives the findings themselves, every column of every matched-file row; `Summary`
+> archives one row per (host, rule). Neither is scheduled, and the per-host matches dataset is
+> overwritten by the next scan on that host
+> ([§14](#14-known-limitations-and-open-questions)). Run one of them per scan if the findings
+> have to outlive the scan — `Summary` if the rule/host list is enough, `Apply` if the file
+> detail has to survive.
 
 > **On a tenant with no YARA datasets yet, summary mode is a clean no-op.** Dry run and
 > `execute=true` alike report `XQL calls: 0 (+1 dataset listing)`,
 > `written: 0 | skipped: 0 | failed: 0 | file-level findings collapsed: 0` and
-> `host shards deleted: 0`, with `written`, `skipped` and `query_modes` empty. Zero here is
-> the correct result, not a misconfiguration.
+> `host shards deleted: 0 (source data is never deleted — the host dataset is the deep-dive
+> source; only this automation's own summary rows are reconciled)`, with `written`, `skipped`
+> and `query_modes` empty. That deletion counter is a constant zero, not a tally — zero here
+> is the correct result, not a misconfiguration.
 
 ### YaraCleanup's safety rails
 
-Nothing is deleted if it is: not a YARA dataset name · a per-scan consolidated target · a
-**permanent per-host matches dataset** · an abandoned pre-rotation dataset · genuinely
-unrotated · the current month · dated in the future · inside the retention window · written
-to more recently than `min_quiet_hours` · still holding an unconsolidated scan.
+Nothing is deleted if it is: not a YARA dataset name · a consolidated target (consolidation
+*output*, not a source) · a **permanent per-host matches dataset** · an abandoned pre-rotation
+dataset · genuinely unrotated · the current month · dated in the future · inside the retention
+window · written to more recently than `min_quiet_hours` · still holding an unconsolidated scan.
 
 Plus **dry run unless `execute=true`**, and `older_than_months` has no default.
 
@@ -390,45 +422,77 @@ Plus **dry run unless `execute=true`**, and `older_than_months` has no default.
 ### The pipeline
 
 ```
-Status (read-only)  →  eligible scan IDs
+Status (read-only)  →  eligible scan IDs, grouped by ruleset hash
                        ↓
-Apply               →  create per-scan target
-                       copy this scan's rows from each source shard
-                       count target rows
+Apply               →  read every per-host matches dataset
+                       gate each scan: terminal lifecycle row AND newest row
+                       older than the 900s quiet period, OR aged past
+                       retention_hours (24h)
+                       bucket the survivors by the ruleset hash in the scan_id
                        ↓
-                    verify: target_count == sum(source_counts)?
-                       ↓ yes                        ↓ no
-                    strip this scan's rows       count_mismatch —
-                    from sources; delete a       nothing deleted,
-                    shard once EVERY scan        reported for review
-                    in it is verified
+                    per ruleset group, against ONE target
+                    yara_scanner_full_v4_rules_<hash>:
+                       ↓
+                    rows > row_ceiling?  →  REFUSED, nothing written
+                       ↓ no
+                    read the scan_ids the target already holds
+                    drop the held ones no source still holds   ← its OWN rows
+                    write the ones the target does not have
+                       ↓
+                    sources untouched, in every branch
 ```
 
-### Verify-before-delete
+### Reconciliation, not verify-before-delete
 
-A source shard is deleted **only** when the target's row count equals the sum of its sources
-*and* every scan sharing that shard is verified. Any shortfall keeps every source.
+An earlier build wrote a per-scan target, compared row counts, and deleted the source shard
+once every scan in it verified. **That pipeline is gone.** Full consolidation deletes no source
+at all, so there is no delete to gate — what replaced the count check is `scan_id`
+reconciliation. Each pass compares the set of `scan_id`s the target already holds against the
+set the sources still hold: the ones missing from every source are dropped from the target,
+the ones the target lacks are written, and an unchanged group is left alone entirely.
 
-> **What verification does not check.** It compares row *counts*, not row *content*. A
-> corrupted write landing on the same count would pass. And `delete_dataset` has no undo —
-> the platform offers no versioning or restore. Treat consolidation as one-way.
+Stale is measured as *held minus observed-in-sources*, never *held minus what this pass was
+asked to process* — a scan_id still sitting in a source is valid whether or not `scan_id`
+narrowed this pass to it. And if **any** source dataset could not be read, stale-row removal is
+skipped for the whole pass: a scan missing from an unreadable source is not evidence it was
+superseded.
 
-### Gate outcomes
+> **What reconciliation does and does not check.** It compares `scan_id` *sets*, not row
+> *content* — a corrupted row carrying a scan_id the target already holds is left alone.
+> Consolidation's only `delete_dataset` call is releasing its own lock. The genuinely
+> destructive tools are elsewhere: **`YaraCleanup` and `YaraWipeAllDatasets` do call
+> `delete_dataset` on real data, and `delete_dataset` has no undo** — the platform offers no
+> versioning or restore. Treat *those* as one-way.
+
+### Pass outcomes
 
 | Outcome | Meaning | Action |
 |---|---|---|
-| `verified` | Counts match; sources deletable | None — success |
-| `host_not_terminal` | Scan has no terminal lifecycle row yet | Deferred; retried next pass |
-| `within_quiet_period` | Newest row is younger than `quiet_secs` (900s) | Deferred — the uploader may still be draining |
-| `count_mismatch` | Target ≠ sum of sources | **Nothing deleted.** Investigate |
-| `row_ceiling_exceeded` | Scan exceeds 2,000,000 rows | Refused before writing, not half-built |
+| `WOULD write …` | Dry run — the default — reporting the write it would perform | Re-run with `execute=true` |
+| `target already current … verified, not rewritten` | Held scan_ids already match the sources | None — success |
+| `scan still in progress - left alone` | No terminal lifecycle row and not yet past `retention_hours` | Deferred; picked up next pass |
+| `finished, but its newest row is inside the 900s quiet period (rows may still be draining) - left alone` | Terminal, but its newest match row is younger than `quiet_secs` (**900s**) | Deferred; picked up once the scan has been quiet that long |
+| `no ruleset hash in scan_id - cannot be grouped` | scan_id predates the ruleset-hash suffix | Nothing to group it by; rescan |
+| `<dataset>: unreadable` | A source matches dataset could not be read | Its rows are absent this pass, **and stale-row removal is skipped for every group** |
+| `exceeds the full-consolidation ceiling` | Group larger than `row_ceiling` (60,000) | **Refused before writing**, not half-built. Use `Summary`, or raise `row_ceiling` deliberately |
+| `could not read existing target` | Target exists but its scan_id set could not be read | Nothing written for that group — re-run |
 
-**`count_mismatch` is a safety feature, not an error.** It means the tool refused to delete
-data it couldn't prove it had copied.
+**Refusal is a safety feature, not an error.** In every one of these branches the source
+datasets are untouched and the target is either correct or unwritten — never half-filled.
 
-### The bounded pass
+> **A cleanly completed scan does not wait out `retention_hours`.** The terminal-lifecycle gate
+> is real: a scan with a terminal row for every host is eligible as soon as its newest match row
+> has been quiet for **900s** (`DEFAULT_QUIET_SECS`). That quiet period is the drain guard, not
+> ceremony — the scanner writes the terminal row *ahead* of the upload queue
+> ([§3](#3-what-a-scan-actually-does)), so consolidating inside that window would copy a partial
+> row set, and the damage would be permanent: the `scan_id` would land in the target and never
+> be written again. `retention_hours` (24h) is the *fallback* for a scan that never wrote a
+> terminal row, not the wait everything serves.
 
-`max_scans` (default **4**) caps how many scans one invocation processes.
+### What a pass costs
+
+There is no scan-count cap. One invocation attempts every eligible scan, so the cost model
+below is what decides whether a pass fits inside the 900s task timeout.
 
 **A pass costs fixed overhead plus per-scan work. `~128s` is not a per-scan rate.**
 
@@ -448,20 +512,29 @@ The two measured passes cannot be fit by one straight line, because per-scan cos
 on how many rows each scan holds — so read **~75–107s** as the marginal range, not `~128s`
 as a rate. Dividing a pass's total by its scan count folds the fixed ~105s into every scan
 and overstates the marginal cost by 20–70%; the old `~128s` figure was exactly that
-(638 ÷ 5). The conclusion is unchanged under either end of the range: 20 is fatal, 4 is safe.
+(638 ÷ 5). The conclusion is unchanged under either end of the range: 20 scans in one pass is
+fatal, 4 is safe.
 
-The default was originally 20. That was wrong and would have reliably reproduced a
-stuck-lock failure on a real backlog.
+An earlier build enforced that with a scan-count cap — `max_scans`, shipped at 20, then
+corrected to 4. **That argument no longer exists.** Nothing now stops a pass attempting the
+whole backlog, so the bound has become yours to apply.
 
-> **A bounded pass does not resume itself.** It reports `stopped_early`; drain a large
-> backlog by re-running, or raise the cap after measuring your own per-scan cost. The
-> playbook runs Apply exactly once per execution — it does not loop back.
+> **A pass is not self-limiting — scope it yourself.** There is no cap and no `stopped_early`
+> report to tell you one held back. Name the scans with `scan_id`
+> (`YaraConsolidateStatus`'s `eligible_scan_ids` is the list to draw from — it is the
+> conservative end of what a pass will take, never more) and work a large backlog
+> in batches sized against the numbers above. Re-running is a verified no-op, so an overlapping
+> batch costs a read, not a rewrite. The playbook runs Apply exactly once per execution — it
+> does not loop back.
 
 ### Run history
 
 `yara_scanner_consolidation_runs` gets a **`started`** row before the merge and a terminal
-row (`success` / `partial_failure` / `crashed`) after. A `started` row with **no** matching
-terminal row means a pass was killed — or is still running.
+row (`success` / `partial_failure` / `crashed` / `skipped_locked`) after. A `started` row with
+**no** matching terminal row means a pass was killed — or is still running.
+
+**Only an `execute=true` pass is recorded at all.** A dry run writes no row here, so an absent
+row means either "nothing ran" or "only dry runs ran" — it is not evidence of a failure.
 
 ---
 
@@ -478,9 +551,11 @@ never happens.
 
 ### Why it exists
 
-Consolidation merges then **deletes**. Two concurrent runs on the same scan could both delete
-sources after only one wrote a target. Plus `add_data` isn't concurrency-safe. Passes are
-serialised tenant-wide.
+Consolidation writes tenant-wide, and `add_data` **isn't concurrency-safe**: two passes writing
+the same `yara_scanner_full_v4_rules_<hash>` target would silently drop each other's rows
+([§2](#2-platform-constraints-you-cannot-change)), and each would reconcile against a scan_id
+set the other was mid-way through changing. Passes are serialised tenant-wide. **A dry run
+takes no lock** — only `execute=true` acquires one.
 
 ### Stale takeover
 
@@ -584,10 +659,25 @@ match tens of thousands fleet-wide.
 | Component | Key type | Where |
 |---|---|---|
 | Scanner (`xdr_yara_scanner.py`) | **Standard** | `DEFAULT_XDR_API_KEY` / `_ID` / `_URL`, top of CUSTOMER CONFIG |
-| Pack automations (×5) | **Advanced (HMAC)** | Same three constants, top of each automation |
+| Pack automations (×7) | **Advanced (HMAC)** | Same three constants, under the `CONFIGURATION - the only values in this file you need to edit` banner in each of the seven |
 
-**This is five separate edits for the automations.** Every automation is self-contained —
-the tenant resolves no cross-script imports, so there is no shared library to edit once.
+**This is seven separate edits for the automations, not five.** Every automation is
+self-contained — the tenant resolves no cross-script imports, so there is no shared library to
+edit once. The seven carrying the credential block are `YaraCleanup`, `YaraConsolidateApply`,
+`YaraConsolidateStatus`, `YaraConsolidateSummary`, `YaraReport`, **`YaraScanVerify`** and
+**`YaraWipeAllDatasets`**. The last two are the ones operators skip, because older guidance said
+"five" — leave either on its placeholder values and it fails at client construction the first
+time it is run.
+
+**`YaraRulesFromFile` and `YaraRulesDecode` need no credentials.** Neither makes a tenant API
+call — one reads an uploaded file, the other decodes a base64 string — so neither carries the
+configuration block, and there is nothing in them to edit.
+
+Don't go looking for a line number; find the banner, which appears verbatim in all seven:
+
+```
+CONFIGURATION - the only values in this file you need to edit
+```
 
 ### Scanner key permissions
 
@@ -616,12 +706,12 @@ Every one of these was observed live during validation.
 | Scan "completed" but rows missing | Run timeout expired mid-drain | Check `delivery_shortfall`. Raise the timeout ([§5](#5-sizing-the-run-timeout--the-drain-problem)) |
 | Scan shows `running` forever | Console Cancel, or terminal row lost | 24h cutoff rescues it. Use the `cancel` entry point instead |
 | No `scan_summary_*.json` | Run killed before completing | Confirms a mid-drain kill |
-| Consolidation reports 0 candidates, exits clean | **v4 `matches` — by design, not a fault.** The permanent per-host matches dataset carries no month suffix, so `parse_shard` never classifies it as a shard: `no matches shards found` is the correct result even while matches datasets exist. **`scans`** — nothing eligible yet: a quiet period, or already consolidated. **A genuine `schema_version` mismatch** — datasets classify as "newer" and are correctly left alone | Read *which* `(schema, kind)` pair reported zero. v4/`matches` needs no action ([§7](#7-dataset-management-the-five-automations)); for `scans`, `YaraConsolidateStatus` shows whether any scan is eligible. Suspect `schema_version` (**4**) only after both check out |
-| `count_mismatch` on a scan | Target ≠ sum of sources | **Safe** — nothing deleted. Often a prior partial run |
+| Consolidation reports 0 candidates, exits clean | **The scans were gated, not invisible.** Both modes read the permanent per-host matches dataset deliberately, through a wider read-only inclusion than `parse_shard`'s — so zero here means every scan was skipped: still running, inside the 900s quiet period, no ruleset hash in its `scan_id`, or already reconciled. **A genuine `schema_version` mismatch** also reads as zero — those datasets classify as "newer" and are correctly left alone. (`no matches shards found` belongs to the retired per-scan merge; no live entry point emits it) | Read the `SKIPPED:` lines — they name the gate per scan. `YaraConsolidateStatus` shows whether any scan is eligible at all. Suspect `schema_version` (**4**) only after those check out |
+| A ruleset group reported `REFUSED` | The group exceeds `row_ceiling` (60,000 rows) | **Safe** — nothing written for that group, sources untouched. Use `Summary` at that scale, or raise `row_ceiling` deliberately |
 | "Lock held by another run" | Genuine concurrency, **or** a stale lock from a killed pass | Check the runs tracker before clearing ([§9](#9-the-consolidation-lock)) |
-| Consolidation stalls indefinitely | Pass killed at the task timeout holding the lock | Fixed by `max_scans` bounding. Clear the lock if confirmed dead |
+| Consolidation stalls indefinitely | Pass killed at the task timeout holding the lock | Scope the next pass with `scan_id` ([§8](#8-consolidation-mechanics-and-safety-rails)). The 20-minute stale window releases the lock; clear it only if confirmed dead |
 | Summary mode writes 0 rows | Scan still in progress (correctly skipped), genuinely no matches, or the host was re-scanned and its matches dataset overwritten | Check the skip reasons. An overwritten scan produces no skip reason — it is simply absent |
-| 401 on every automation call | Standard key in an Advanced-key slot, or rotated key | Regenerate an **Advanced** key; edit all five |
+| 401 on every automation call | Standard key in an Advanced-key slot, or rotated key | Regenerate an **Advanced** key; edit all **seven** that carry the CONFIGURATION banner — `YaraScanVerify` and `YaraWipeAllDatasets` included |
 | Dataset grows despite overwrite | Query Center permission missing on the **scanner's** key | Grant `investigation_query_view` |
 | `add_data` rows silently skipped | Row carries a field outside the dataset's schema | Schema can't be altered in place — bump the version tag |
 
@@ -631,16 +721,19 @@ Every one of these was observed live during validation.
 
 ### Accepted limitations
 
-- **Verification compares counts, not content.** A corrupted write on the right count passes.
-- **`delete_dataset` has no undo.** No versioning, no restore.
-- **Any re-scan of a host destroys the previous scan's file-level matches** — concurrent or
-  sequential, at any interval. On v4 nothing archives them: full consolidation is blocked
-  from the live matches dataset by design, and summary mode keeps only rule/host/timestamp,
-  not filenames or offsets. Alerts already raised are unaffected. Consolidation cadence does
-  not change this.
-- **The CLI path (`xdr_data_management.py --consolidate`) has no `max_scans` bound.** It was
-  not updated when the cap was added to the pack automations. Restrict scope with `--scan-id`.
-- **A bounded pass doesn't self-resume.** Re-run to drain a backlog.
+- **Reconciliation compares `scan_id` sets, not content.** A corrupted row under a scan_id the
+  target already holds is left alone.
+- **`delete_dataset` has no undo.** No versioning, no restore — which is why `YaraCleanup` and
+  `YaraWipeAllDatasets` are the two automations to be careful with. Consolidation calls it only
+  on its own lock dataset, never on a source.
+- **Any re-scan of a host destroys the previous scan's file-level matches unless it was
+  consolidated first** — concurrent or sequential, at any interval. `Apply` with `execute=true`
+  archives that detail into `yara_scanner_full_v4_rules_<hash>`, and summary mode keeps only
+  rule/host/timestamp, not filenames or offsets; but nothing runs either automatically and the
+  scanner does not wait for one. Alerts already raised are unaffected.
+- **Neither the pack automation nor the CLI (`xdr_data_management.py --consolidate`) bounds a
+  pass by scan count.** Restrict scope with `scan_id` / `--scan-id`.
+- **A pass has no scan-count bound and no `stopped_early` report.** Batch it yourself.
 - **XQL truncates silently at 1,000,000 rows.**
 
 ### Open questions — genuinely unresolved
@@ -693,23 +786,31 @@ Every one of these was observed live during validation.
 
 **Before the first consolidation**
 
-- [ ] **Advanced (HMAC)** key in all five automations
+- [ ] **Advanced (HMAC)** key in all **seven** automations carrying the
+      `CONFIGURATION - the only values in this file you need to edit` banner — including
+      **`YaraScanVerify`** and **`YaraWipeAllDatasets`**, the two usually left on placeholders.
+      `YaraRulesFromFile` and `YaraRulesDecode` make no API call and need no key
 - [ ] `YaraReport` run — inventory understood. On a tenant with no YARA datasets yet
       the report is a legitimate empty one — the header reads
       `0 current-schema dataset(s), 0 legacy, 0 newer-schema (never pruned)` and the
       table's only body row is `(none)`. Correct, not a broken deployment
 - [ ] `YaraConsolidateStatus` run — eligible scans reviewed
-- [ ] Both modes understood — they act on **different datasets**, not two ways of doing one
-      job: `Summary` records what matched and never deletes; `Apply` archives the scans
-      lifecycle shards and deletes them once verified
-- [ ] Understood: **`Apply` has no dry run and deletes on first use**
-- [ ] `max_scans` left at 4 for the first pass. Before raising it, measure your own
-      **marginal** per-scan cost — subtract the fixed ~105s per-pass overhead first, then
-      divide by the scan count. Dividing a pass total by its scan count counts that fixed
-      cost once per scan and will mislead you into raising the cap too far
+- [ ] Both modes understood — they read the **same** sources and differ only in fidelity:
+      `Summary` keeps one row per (host, rule), `Apply` keeps every column of every
+      matched-file row. **Neither deletes a source**
+- [ ] Understood: **`Apply` is dry run by default** — nothing is written until `execute=true`,
+      and no per-host matches dataset is ever deleted
+- [ ] First pass scoped with `scan_id` rather than run open-ended — there is no scan-count cap.
+      Size the batch against your own **marginal** per-scan cost: subtract the fixed ~105s
+      per-pass overhead first, then divide by the scan count. Dividing a pass total by its scan
+      count counts that fixed cost once per scan and will mislead you into batching too far
+- [ ] `row_ceiling` left at 60,000. A group above it is refused, not half-written — at that
+      scale reach for `Summary` instead of raising it
 
 **Ongoing**
 
 - [ ] Watch `yara_scanner_consolidation_runs` for `started` rows without terminal rows
-- [ ] Re-run consolidation until it stops reporting `stopped_early`
-- [ ] Schedule `YaraCleanup` separately from consolidation — never the same window
+- [ ] Consolidate after each wave, before those hosts are scanned again — it reconciles on
+      `scan_id`, so a pass with nothing changed is a verified no-op
+- [ ] Run `YaraCleanup` yourself — nothing in the pack schedules it, and it is the only thing
+      that removes an aged scans shard. Never in the same window as consolidation

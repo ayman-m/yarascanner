@@ -164,7 +164,7 @@ footer{border-top:1px solid var(--rule); padding:1.4rem 0 3rem; color:var(--ink-
     <span class="chip">≈ 2½ hours</span>
     <span class="chip">8 parts · 23 checks</span>
     <span class="chip">No scripts required</span>
-    <span class="chip hot">Part F deletes data</span>
+    <span class="chip">Consolidation is dry-run by default</span>
   </div>
 </div></header>
 
@@ -178,7 +178,7 @@ footer{border-top:1px solid var(--rule); padding:1.4rem 0 3rem; color:var(--ink-
 <tr><td><a href="#pc">C</a></td><td>The dataset is overwritten, not appended</td><td>10 min</td><td>No</td></tr>
 <tr><td><a href="#pd">D</a></td><td>Delivery at volume; your own drain ratio</td><td>45 min</td><td>No</td></tr>
 <tr><td><a href="#pe">E</a></td><td>Inventory and readiness reporting</td><td>10 min</td><td>No</td></tr>
-<tr><td><a href="#pf">F</a></td><td>The merge verifies before deleting</td><td>30 min</td><td><strong>Yes</strong></td></tr>
+<tr><td><a href="#pf">F</a></td><td>Both consolidation modes group correctly, and delete nothing</td><td>30 min</td><td>No</td></tr>
 <tr><td><a href="#pg">G</a></td><td>The guards actually stop things</td><td>20 min</td><td>Partly</td></tr>
 <tr><td><a href="#ph">H</a></td><td>Sign-off sheet</td><td>—</td><td>—</td></tr>
 </tbody></table></div>
@@ -187,7 +187,16 @@ footer{border-top:1px solid var(--rule); padding:1.4rem 0 3rem; color:var(--ink-
 <ul style="margin-bottom:.5rem">
 <li>A <strong>test endpoint</strong> you may scan freely. Not production.</li>
 <li>Console access to <strong>Action Center</strong> and <strong>XQL Search</strong>.</li>
-<li>Scanner uploaded with a <strong>Standard</strong> key; 5 automations with an <strong>Advanced (HMAC)</strong> key.</li>
+<li>Scanner uploaded with a <strong>Standard</strong> key. All <strong>9</strong> automations
+uploaded, of which <strong>seven</strong> need an <strong>Advanced (HMAC)</strong> key:
+<code>YaraReport</code>, <code>YaraConsolidateStatus</code>, <code>YaraConsolidateApply</code>,
+<code>YaraConsolidateSummary</code>, <code>YaraCleanup</code>, <code>YaraScanVerify</code>,
+<code>YaraWipeAllDatasets</code>. In each, the values to edit sit under the banner
+<code>CONFIGURATION - the only values in this file you need to edit</code>.
+<code>YaraScanVerify</code> and <code>YaraWipeAllDatasets</code> are the two most often left on
+placeholders, and both then fail at client construction the first time they are run.
+<code>YaraRulesFromFile</code> and <code>YaraRulesDecode</code> need <strong>no</strong>
+credentials: they make no tenant API call.</li>
 <li>A base64 YARA rule file you <strong>know</strong> will match something.</li>
 </ul>
 <p><strong>A rule that matches nothing makes most of this untestable.</strong> For a throwaway
@@ -215,16 +224,32 @@ Below, <code>MATCHES</code> and <code>SCANS</code> mean those two names.</p></di
     <div class="blk"><span class="lead fail">Fails if</span><p>Anything lower. Later parts assume v4 behaviour older builds don't have.</p></div>
   </div></div>
 
-  <div class="step"><div class="sh"><span class="n">A2</span><span class="t">Five automations, and no stragglers</span></div><div class="sb">
+  <div class="step"><div class="sh"><span class="n">A2</span><span class="t">Nine automations, and no stragglers</span></div><div class="sb">
     <div class="blk"><span class="lead do">Do</span><p>Settings → Automations, search <code>Yara</code>.</p></div>
-    <div class="blk"><span class="lead exp">Expect</span><p>Exactly five: <code>YaraReport</code>, <code>YaraConsolidateStatus</code>, <code>YaraConsolidateApply</code>, <code>YaraConsolidateSummary</code>, <code>YaraCleanup</code>.</p></div>
+    <div class="blk"><span class="lead exp">Expect</span><p>Exactly nine: <code>YaraReport</code>, <code>YaraConsolidateStatus</code>, <code>YaraConsolidateApply</code>, <code>YaraConsolidateSummary</code>, <code>YaraCleanup</code>, <code>YaraWipeAllDatasets</code>, <code>YaraRulesFromFile</code>, <code>YaraRulesDecode</code>, <code>YaraScanVerify</code>.</p>
+      <p><strong>What the four newer ones do</strong>, if you have not met them yet:</p>
+      <div class="scroll"><table>
+      <thead><tr><th>Automation</th><th>What it does</th></tr></thead>
+      <tbody>
+      <tr><td><code>YaraWipeAllDatasets</code></td><td>Deletes every <code>yara_scanner_*</code> dataset. Destructive, confirm-gated.</td></tr>
+      <tr><td><code>YaraRulesFromFile</code></td><td>Validates an operator-uploaded YARA rules file and returns the base64 the Action Center scanner takes as its <code>yarafile</code> input.</td></tr>
+      <tr><td><code>YaraRulesDecode</code></td><td>The inverse: decodes that base64 back to readable rules and recomputes the ruleset hash, for verification and forensics.</td></tr>
+      <tr><td><code>YaraScanVerify</code></td><td>Bounded post-dispatch check that a dispatched scan wave actually started on its hosts.</td></tr>
+      </tbody></table></div></div>
     <div class="blk"><span class="lead fail">Fails if</span><p>You see <code>YaraConsolidateFast</code> — removed; you're on an old pack.</p></div>
   </div></div>
 
   <div class="step"><div class="sh"><span class="n">A3</span><span class="t">Credentials — fastest test that finds a wrong key</span></div><div class="sb">
     <div class="blk"><span class="lead do">Do</span><pre><code>!YaraReport</code></pre></div>
     <div class="blk"><span class="lead exp">Expect</span><p>A dataset inventory table. On a fresh tenant it may legitimately say <em>0 current-schema datasets</em> — still a <strong>pass</strong>, because it proves the key authenticated.</p></div>
-    <div class="blk"><span class="lead fail">Fails if</span><p><code>HTTP 401</code>. A Standard key in an Advanced slot, a typo, or a rotated key — the message can't distinguish them. Regenerate an <strong>Advanced</strong> key and re-edit <strong>all five</strong>.</p></div>
+    <div class="blk"><span class="lead fail">Fails if</span><p><code>HTTP 401</code>. A Standard key in an Advanced slot, a typo, or a rotated key — the message can't distinguish them. Regenerate an <strong>Advanced</strong> key and re-edit <strong>all seven</strong> automations that carry credentials: <code>YaraReport</code>, <code>YaraConsolidateStatus</code>, <code>YaraConsolidateApply</code>, <code>YaraConsolidateSummary</code>, <code>YaraCleanup</code>, <code>YaraScanVerify</code>, <code>YaraWipeAllDatasets</code>. In each of the seven, the values to edit sit under the banner <code>CONFIGURATION - the only values in this file you need to edit</code>.</p></div>
+    <div class="call warn" style="margin-top:.6rem"><span class="lbl">A passing <code>!YaraReport</code> proves one key, not seven</span>
+      <p>It exercises <code>YaraReport</code> alone. <code>YaraScanVerify</code> and
+      <code>YaraWipeAllDatasets</code> are the two most often left on placeholders, and neither is
+      touched anywhere else in this runbook — both fail at client construction the first time they
+      are run. Open all seven and confirm each carries your real values.
+      <code>YaraRulesFromFile</code> and <code>YaraRulesDecode</code> have no
+      <code>CONFIGURATION</code> block and need no key: they make no tenant API call.</p></div>
   </div></div>
 
   <div class="step"><div class="sh"><span class="n">A4</span><span class="t">Scanner key has Query Center</span></div><div class="sb">
@@ -400,9 +425,19 @@ macOS    /usr/local/yara_scanner/logs/scan_summary_&lt;run_id&gt;.json</code></p
       with every count <code>0</code> and every scan-ID list empty. The correct result, not a
       misconfiguration — a tenant with no host matches or scans datasets gives the gate
       nothing to evaluate.</p>
-      <p><strong>Reading it:</strong> a scan you <em>just</em> ran often shows as <strong>not</strong>
-      eligible. Correct — a 900-second quiet period stops consolidation racing a still-draining
-      uploader. Wait it out rather than working around it.</p></div>
+      <p><strong>Reading it:</strong> eligibility is not a countdown from when the scan ran. A scan
+      is ready once its lifecycle row is <strong>terminal</strong>; a scan with no terminal row at
+      all is treated as finished only after <code>retention_hours</code> (24 by default). A scan
+      still listed as <em>in progress</em> here is one whose terminal row has not arrived yet.</p></div>
+    <div class="call warn" style="margin-top:.6rem"><span class="lbl">The looser of the two gates — about 15 minutes of difference</span>
+      <p><code>YaraConsolidateStatus</code> asks only <em>terminal, or silent past
+      <code>retention_hours</code></em>. F2 and F3 apply one further condition before they will group
+      a terminal scan: its newest match row must be at least <strong>900 s</strong> old. The scanner
+      sends the terminal row <em>ahead</em> of the upload drain (B2), so grouping inside that window
+      would copy a partial row set — permanently, because the <code>scan_id</code> then counts as
+      already consolidated and its missing rows are never written. So a scan can be listed as ready
+      here and still be left alone by F2 or F3, with the reason <em>"finished, but its newest row is
+      inside the 900s quiet period (rows may still be draining)"</em>.</p></div>
   </div></div>
 </section>
 
@@ -410,85 +445,124 @@ macOS    /usr/local/yara_scanner/logs/scan_summary_&lt;run_id&gt;.json</code></p
 <section class="part" id="pf">
   <div class="part-head"><span class="id">PART F</span>
     <h2>Consolidation</h2>
-    <div class="badges"><span class="badge time">30 min</span><span class="badge danger">Deletes data</span></div>
+    <div class="badges"><span class="badge time">30 min</span><span class="badge safe">Non-destructive</span></div>
   </div>
 
-  <div class="call crit"><span class="lbl">This part deletes data</span>
-    <p><code>YaraConsolidateApply</code> <strong>has no dry-run mode</strong>. There is no
-    <code>execute</code> argument. A bare invocation merges and deletes source shards immediately.</p>
-    <p>Run against <strong>test scans you are willing to lose</strong>. Deleted datasets cannot be
-    recovered — the platform has no undo.</p></div>
+  <div class="call ok"><span class="lbl">This part does not delete data</span>
+    <p>Both consolidation automations are <strong>dry run by default</strong>.
+    <code>YaraConsolidateApply</code> takes an <code>execute</code> argument that defaults to
+    <code>false</code>, exactly as <code>YaraConsolidateSummary</code> does — a bare
+    <code>!YaraConsolidateApply</code> writes nothing and deletes nothing.</p>
+    <p>Neither mode ever deletes a per-host matches dataset, and neither deletes a scans shard.
+    The real runs below do <strong>create and write</strong> new datasets on your tenant, so run
+    them on a tenant where that is welcome.</p></div>
 
   <div class="call ok"><span class="lbl">F2 and F3 are not one job at two settings</span>
-    <p>They read different datasets, write different targets, and only one of them deletes. On v4
-    you run <strong>both</strong> — picking one is not the decision on offer.</p>
+    <p>They read the <strong>same</strong> sources and group them the same way — by the ruleset hash
+    the scanner leaves at the end of every <code>scan_id</code> — but they write different targets at
+    different grain, and neither deletes. On v4 you run <strong>both</strong> if you want both grains;
+    the choice is grain, not safety.</p>
     <div class="scroll"><table>
     <thead><tr><th></th><th><code>YaraConsolidateSummary</code> — F2</th><th><code>YaraConsolidateApply</code> — F3</th></tr></thead>
     <tbody>
-    <tr><td>Reads</td><td>the per-host <strong>matches</strong> dataset (plus the scans shards, to see which scans have finished)</td><td>the monthly <strong>scans</strong> lifecycle shards</td></tr>
-    <tr><td>Writes</td><td><code>yara_scanner_summary_v4_scan_&lt;id&gt;</code></td><td><code>yara_scanner_scans_v4_scan_&lt;id&gt;</code></td></tr>
-    <tr><td>Deletes</td><td>nothing, ever</td><td>the scans shards it merged, once verified</td></tr>
+    <tr><td>Reads</td><td>the per-host <strong>matches</strong> datasets (plus the scans shards, to see which scans have finished)</td><td>the same</td></tr>
+    <tr><td>Writes</td><td><code>yara_scanner_summary_v4_rules_&lt;rulehash&gt;</code> — one row per (host, rule)</td><td><code>yara_scanner_full_v4_rules_&lt;rulehash&gt;</code> — every column of every matched-file row</td></tr>
+    <tr><td>Deletes</td><td>nothing, ever</td><td>nothing, ever</td></tr>
+    <tr><td>Default</td><td>dry run (<code>execute</code> defaults <code>false</code>)</td><td>dry run (<code>execute</code> defaults <code>false</code>)</td></tr>
     </tbody></table></div>
-    <p>The v4 per-host matches dataset carries <strong>no month suffix</strong>, so <code>Apply</code>
-    never classifies it as a shard: it never enters a consolidation or deletion list, and no
-    <code>Apply</code> run merges it or deletes it. The warning above is about your
-    <strong>scans</strong> shards. (<code>Apply</code>'s matches path is still live code and would
-    fire on a <em>month-suffixed</em> matches shard — schema v2/v3, or dated v4 debris. A
-    current-model tenant has none.)</p>
-    <p>That leaves <code>Summary</code> as the only automation that writes a durable per-scan record
-    of what matched. A scan's file-level detail is never lost to consolidation — it is lost to the
-    <strong>next scan on that host</strong>, which overwrites the matches dataset wholesale, and on
-    v4 nothing archives it first.</p></div>
+    <p>One dataset per <strong>ruleset</strong>, not per scan — every host scanned in one Action
+    Center launch shares the ruleset hash, and that is the only component they do share.</p>
+    <p><strong>Why nothing is deleted, and why that is not an oversight.</strong> The v4 per-host
+    matches dataset carries <strong>no month suffix</strong>: it is <strong>permanent</strong>, and the
+    scanner <strong>overwrites it wholesale</strong> at the start of the next scan on that host. There
+    is no accumulating pile of shards to reclaim, so there is nothing for consolidation to free — and
+    the dataset stays put as the deep-dive source that a consolidated row points back to. Two
+    independent guards keep it that way: it is excluded when datasets are enumerated, and the same
+    answer is re-derived at every destructive call site. The single <code>remove_lookup_data</code>
+    call inside the full consolidation targets <strong>its own output dataset</strong>, dropping
+    <code>scan_id</code>s the sources no longer hold so a re-run after a re-scan reconciles instead of
+    duplicating.</p>
+    <p>A scan's file-level detail is therefore never lost to consolidation — it is lost to the
+    <strong>next scan on that host</strong>, which is precisely why you want a consolidated target
+    written before then.</p>
+    <p><strong>The scans lifecycle shards are a separate concern, and nothing in Part F touches
+    them.</strong> Full mode reads them only to build the terminal map that decides which scans have
+    finished. The only thing that deletes an aged month-suffixed scans shard is
+    <code>YaraCleanup</code>, and nothing in the pack schedules it — see G2.</p></div>
 
   <div class="step"><div class="sh"><span class="n">F1</span><span class="t">Preview first (safe)</span></div><div class="sb">
     <div class="blk"><span class="lead do">Do</span><pre><code>!YaraConsolidateStatus</code></pre>
-    <p>Note the eligible <code>scan_id</code>s — the scans F3 will merge. Summarise them in F2
-    <strong>first</strong>: not because F3 would delete their matches, but because the next scan on
-    that host will overwrite them and F2 is the only thing that keeps a record.</p></div>
+    <p>Note the eligible <code>scan_id</code>s, and which ruleset groups they fall into — those are
+    the scans F2 and F3 will group once each has also cleared the <strong>900-second settle
+    window</strong> (E2), so run F2 or F3 within about 15 minutes of a scan and expect some of them
+    to be left alone for now. Run them before the next scan on those hosts: not because
+    consolidation would delete their matches, but because that next scan will overwrite the per-host
+    dataset and a consolidated target is what keeps a record.</p></div>
   </div></div>
 
   <div class="step"><div class="sh"><span class="n">F2</span><span class="t">Summary — record what matched (non-destructive)</span></div><div class="sb">
     <div class="blk"><span class="lead do">Do</span><pre><code>!YaraConsolidateSummary execute="false"</code></pre>
     <p>Then for real:</p><pre><code>!YaraConsolidateSummary execute="true"</code></pre></div>
-    <div class="blk"><span class="lead exp">Expect</span><p>Dry run reports what it <em>would</em> write. The real run writes to <code>yara_scanner_summary_v4_scan_&lt;id&gt;</code> and reports <strong><code>host shards deleted: 0</code></strong> — summary mode never deletes.</p>
+    <div class="blk"><span class="lead exp">Expect</span><p><code>DRY RUN - nothing was created or written.</code> and a list of what it <em>would</em> write. The real run reports <code>EXECUTED.</code>, writes to <code>yara_scanner_summary_v4_rules_&lt;rulehash&gt;</code> and reports <strong><code>host shards deleted: 0</code></strong> — summary mode never deletes.</p>
       <p><strong>Verify the source survived:</strong></p>
       <pre><code>dataset = &lt;MATCHES&gt; | comp count() as rows by scan_id</code></pre>
       <p>Unchanged. That's the proof summary mode is safe to schedule.</p></div>
   </div></div>
 
-  <div class="step"><div class="sh"><span class="n">F3</span><span class="t">Apply — merge the scans lifecycle shards (destructive)</span></div><div class="sb">
-    <div class="blk"><span class="lead do">Do</span><pre><code>!YaraConsolidateApply max_scans="4"</code></pre>
-    <p>Pass <code>max_scans</code> explicitly the first time even though 4 is the default — it makes the bound visible in the War Room record.</p></div>
-    <div class="blk"><span class="lead exp">Expect</span><p><code>N scan(s) consolidated</code>, and if more remain, <em>"Pass was bounded… Run again to continue."</em></p>
-      <p><strong>Verify the target holds the merged rows:</strong></p>
-      <pre><code>dataset = yara_scanner_scans_v4_scan_&lt;slug&gt; | comp count() as rows</code></pre>
-      <p>The count should match that scan's rows across the source scans shards. <strong>Do not</strong>
-      go looking for a <code>yara_scanner_matches_v4_scan_&lt;slug&gt;</code> dataset — earlier revisions
-      of this runbook told you to; on v4 it is never created, and querying it returns a
-      dataset-not-found error that reads exactly like a failed consolidation.</p>
-      <p><strong>Verify the sources went:</strong> run <code>!YaraReport</code>. The month-suffixed
-      <code>yara_scanner_scans_v4_&lt;host&gt;_&lt;hex&gt;_&lt;YYYYMM&gt;</code> shards that held <em>only</em> this
-      scan are gone; the new <code>..._scan_&lt;slug&gt;</code> target is listed as a per-scan consolidated
-      target. A shard that also holds a scan you did <strong>not</strong> consolidate is deliberately
-      <strong>kept</strong> — the log says <em>"kept shard … N of M scan(s) still pending
-      consolidation"</em>. That is correct, not a failure.</p>
+  <div class="step"><div class="sh"><span class="n">F3</span><span class="t">Apply — the full-detail consolidation (non-destructive)</span></div><div class="sb">
+    <div class="blk"><span class="lead do">Do</span><p>The dry run first, which is what a bare invocation already gives you:</p>
+    <pre><code>!YaraConsolidateApply</code></pre>
+    <p>Then for real:</p><pre><code>!YaraConsolidateApply execute="true"</code></pre></div>
+    <div class="blk"><span class="lead exp">Expect</span><p><code>DRY RUN - nothing was created or
+      written.  FULL consolidation: every column of every matched-file row.</code>, followed by a
+      <code>WOULD write N full row(s) from H host(s) / S scan(s) -&gt;
+      yara_scanner_full_v4_rules_&lt;rulehash&gt;</code> line per ruleset group. The real run reports
+      <code>EXECUTED.</code>, a <code>wrote N full row(s)…</code> line per group, and
+      <strong><code>host matches datasets deleted: 0</code></strong>.</p>
+      <p><strong>Verify the target holds the grouped rows:</strong></p>
+      <pre><code>dataset = yara_scanner_full_v4_rules_&lt;rulehash&gt;
+| comp count() as rows by scan_id</code></pre>
+      <p>One row per consolidated <code>scan_id</code>, with counts matching what those hosts' matches
+      datasets hold. <strong>Do not</strong> go looking for a
+      <code>yara_scanner_matches_v4_scan_&lt;slug&gt;</code> or
+      <code>yara_scanner_scans_v4_scan_&lt;slug&gt;</code> dataset — earlier revisions of this runbook told
+      you to. Those per-scan target names are obsolete: the full consolidation never creates them, and
+      querying one returns a dataset-not-found error that reads exactly like a failed consolidation.</p>
       <p><strong>Verify what Apply left alone:</strong></p>
       <pre><code>dataset = &lt;MATCHES&gt; | comp count() as rows by scan_id</code></pre>
       <p>Identical to F2 — same dataset, same single <code>scan_id</code>, same row count. The per-host
-      matches dataset is never a consolidation source on v4 and is never deleted.</p></div>
+      matches dataset is never deleted by either mode. Run <code>!YaraReport</code> and every per-host
+      matches and scans dataset is still present, with the new
+      <code>yara_scanner_full_v4_rules_&lt;rulehash&gt;</code> target listed as <em>this pack's own
+      consolidated output, never a candidate</em>.</p>
+      <p><strong>Reading it:</strong> re-run <code>!YaraConsolidateApply execute="true"</code> with
+      nothing changed and it should report the group as <em>"target already current … verified, not
+      rewritten"</em>. That verified no-op is the reconciliation working, not a skipped pass.</p></div>
   </div></div>
 
   <div class="step"><div class="sh"><span class="n">F4</span><span class="t">Confirm the run was recorded</span></div><div class="sb">
     <div class="blk"><span class="lead do">Do</span><pre><code>dataset = yara_scanner_consolidation_runs
 | fields _insert_time, status, consolidated_count, failed_count
 | sort desc _insert_time | limit 5</code></pre></div>
-    <div class="blk"><span class="lead exp">Expect</span><p>A <strong><code>started</code></strong> row <em>and</em> a terminal row (<code>success</code> / <code>partial_failure</code>).</p>
-      <p><strong>Reading it:</strong> a <code>started</code> row with <strong>no</strong> terminal row means a pass was killed — or is still running. That pairing is the diagnostic you'll rely on in production.</p></div>
+    <div class="blk"><span class="lead exp">Expect</span><p>A <strong><code>started</code></strong> row <em>and</em> a terminal row (<code>success</code> / <code>partial_failure</code>) for your <code>execute="true"</code> run.</p>
+      <p><strong>Reading it:</strong> a <code>started</code> row with <strong>no</strong> terminal row means a pass was killed — or is still running. That pairing is the diagnostic you'll rely on in production.</p>
+      <p><strong>Look for nothing from the dry runs.</strong> Only an <code>execute="true"</code> pass
+      writes to this dataset; a preview changes nothing and is deliberately not logged. A pass that
+      stood down on the lock records its own status, <code>skipped_locked</code>, rather than
+      <code>success</code>.</p></div>
   </div></div>
 
-  <div class="step"><div class="sh"><span class="n">F5</span><span class="t">Drain the backlog</span></div><div class="sb">
-    <div class="blk"><span class="lead do">Do</span><p>If F3 said more remained, run it again until it stops saying so.</p></div>
-    <div class="blk"><span class="lead exp">Expect</span><p>Each pass consolidates up to <code>max_scans</code> and reports what's left. <strong>It does not resume itself</strong> — by design, not a bug.</p></div>
+  <div class="step"><div class="sh"><span class="n">F5</span><span class="t">A group too large to write</span></div><div class="sb">
+    <div class="blk"><span class="lead do">Do</span><p>There is no bounded pass to drain and no
+    <code>max_scans</code> argument. The per-pass bound is <code>row_ceiling</code> (shipped default
+    <code>60000</code>), and it is a <strong>refusal</strong>, not a partial write.</p></div>
+    <div class="blk"><span class="lead exp">Expect</span><p>A ruleset group over the ceiling appears
+      under <code>FAILED</code> as <em>"N row(s) exceeds the full-consolidation ceiling of 60000 —
+      REFUSED rather than half-filling …"</em>. Re-running will not help — it will refuse
+      identically.</p>
+      <p><strong>If you hit it:</strong> use <code>YaraConsolidateSummary</code> for a fleet that size
+      (full detail runs roughly 40× the rows of a summary), or raise <code>row_ceiling</code>
+      deliberately, knowing lookup writes were measured going dead around 70,000 rows.</p></div>
   </div></div>
 </section>
 
@@ -501,14 +575,22 @@ macOS    /usr/local/yara_scanner/logs/scan_summary_&lt;run_id&gt;.json</code></p
   </div>
 
   <div class="step"><div class="sh"><span class="n">G1</span><span class="t">The consolidation lock</span></div><div class="sb">
-    <div class="blk"><span class="lead do">Do</span><p>Start <code>!YaraConsolidateApply</code> and, while it runs, start a <strong>second</strong> one from another War Room tab.</p></div>
-    <div class="blk"><span class="lead exp">Expect</span><p><em>"Skipped this pass — the consolidation lock is held by another concurrent run."</em> and nothing touched.</p>
-      <p><strong>Why it matters:</strong> without this, two runs could both delete sources after only one wrote a target.</p></div>
+    <div class="blk"><span class="lead do">Do</span><p>Start <code>!YaraConsolidateApply execute="true"</code> and, while it runs, start a <strong>second</strong> one from another War Room tab.</p>
+      <p><strong><code>execute="true"</code> is required for this test.</strong> A dry run takes no
+      lock — it has nothing to serialise — so two concurrent previews will both simply run.</p></div>
+    <div class="blk"><span class="lead exp">Expect</span><p><em>"Skipped this pass — the consolidation lock is held by another concurrent run."</em> and nothing touched. <code>!YaraConsolidateSummary execute="true"</code> takes the same lock, so a Summary pass and an Apply pass will not overlap either.</p>
+      <p><strong>Why it matters:</strong> the lock serialises <strong>writers</strong>, not deleters.
+      Concurrent writers to one lookup dataset lose rows — measured at 87% loss with eight of them —
+      and two passes reconciling the same consolidated target would each compute <em>stale</em> from a
+      target the other was mid-way through changing.</p></div>
   </div></div>
 
   <div class="step"><div class="sh"><span class="n">G2</span><span class="t">Cleanup refuses to delete without opt-in</span></div><div class="sb">
     <div class="blk"><span class="lead do">Do</span><pre><code>!YaraCleanup older_than_months="0"</code></pre></div>
-    <div class="blk"><span class="lead exp">Expect</span><p>A report of what it <em>would</em> delete, and <strong>nothing deleted</strong> — <code>execute</code> defaults false. Verify the named datasets still exist.</p></div>
+    <div class="blk"><span class="lead exp">Expect</span><p>A report of what it <em>would</em> delete, and <strong>nothing deleted</strong> — <code>execute</code> defaults false. Verify the named datasets still exist.</p>
+      <p><strong>Reading it:</strong> this is the <strong>only</strong> thing in the pack that deletes
+      an aged month-suffixed scans shard, and nothing schedules it. Those shards accumulate until you
+      run this deliberately — consolidation never removes them for you.</p></div>
   </div></div>
 
   <div class="step"><div class="sh"><span class="n">G3</span><span class="t">Cleanup will not touch your live matches dataset</span></div><div class="sb">
@@ -541,8 +623,9 @@ REPLACES it wholesale ...</code></pre></div>
       deletion via <code>YaraCleanup</code>'s delete-legacy path.</p>
       <p><strong>Rails still stand between that and loss:</strong> blanket legacy deletion is refused
       outright if any newer-schema dataset exists; unsuffixed datasets (yours is one) are never
-      candidates; per-scan targets, the current month and future months are never candidates;
-      <code>execute</code> still defaults false. Verify by <em>reading the skip reasons</em>, not by
+      candidates; this pack's own consolidated output — the <code>_rules_&lt;hash&gt;</code> summary and
+      full datasets — is never a candidate, and neither is the current month or a future-dated
+      month; <code>execute</code> still defaults false. Verify by <em>reading the skip reasons</em>, not by
       running a real delete.</p></div>
   </div></div>
 </section>
@@ -555,8 +638,8 @@ REPLACES it wholesale ...</code></pre></div>
   </div>
   <ul class="ck">
     <li><span><span class="rid">A1</span>Scanner reports <code>3.4.0</code></span></li>
-    <li><span><span class="rid">A2</span>Exactly five automations, no <code>Fast</code></span></li>
-    <li><span><span class="rid">A3</span><code>!YaraReport</code> authenticates</span></li>
+    <li><span><span class="rid">A2</span>Exactly nine automations, no <code>Fast</code></span></li>
+    <li><span><span class="rid">A3</span><code>!YaraReport</code> authenticates, and all <strong>seven</strong> credentialled automations edited — <code>YaraScanVerify</code> and <code>YaraWipeAllDatasets</code> included</span></li>
     <li><span><span class="rid">A4</span>Scanner key has Query Center</span></li>
     <li><span><span class="rid">B1</span>Scan completes, 0 rules failed compilation</span></li>
     <li><span><span class="rid">B2</span><code>initiated</code> + terminal rows present</span></li>
@@ -568,10 +651,10 @@ REPLACES it wholesale ...</code></pre></div>
     <li><span><span class="rid">D3</span>No shortfall at volume</span></li>
     <li><span><span class="rid">D4</span>Production timeout sized from your own measurement</span></li>
     <li><span><span class="rid">E1</span>Live matches dataset reported as permanent</span></li>
-    <li><span><span class="rid">E2</span>Quiet-period deferrals reported correctly</span></li>
+    <li><span><span class="rid">E2</span>In-progress scans reported as not yet eligible</span></li>
     <li><span><span class="rid">F2</span>Summary wrote rows and deleted <strong>nothing</strong></span></li>
-    <li><span><span class="rid">F3</span>Apply merged the <strong>scans</strong> shards, verified, then deleted — matches dataset untouched</span></li>
-    <li><span><span class="rid">F4</span><code>started</code> + terminal rows both recorded</span></li>
+    <li><span><span class="rid">F3</span>Bare Apply was a <strong>dry run</strong>; <code>execute="true"</code> wrote the full ruleset target and deleted <strong>nothing</strong></span></li>
+    <li><span><span class="rid">F4</span><code>started</code> + terminal rows both recorded for the <code>execute="true"</code> run</span></li>
     <li><span><span class="rid">G1</span>Second concurrent Apply refused on the lock</span></li>
     <li><span><span class="rid">G2</span>Cleanup dry-run deleted nothing</span></li>
     <li><span><span class="rid">G3</span>Cleanup skipped the live matches dataset</span></li>
@@ -582,11 +665,11 @@ REPLACES it wholesale ...</code></pre></div>
   <div class="call warn"><span class="lbl">Before production</span>
   <ul style="margin-bottom:0">
     <li>Timeout sized from <strong>your</strong> D2 measurement, not the reference figure</li>
-    <li><strong>Both</strong> consolidation automations scheduled, and understood as different jobs — <code>Summary</code> for the per-scan record of what matched, <code>Apply</code> for the scans lifecycle shards. Not alternatives: <code>Apply</code> never writes or deletes the per-host matches dataset, so scheduling it alone leaves no record of any scan's matches once the next scan overwrites that host</li>
-    <li>Everyone who can run automations knows <strong><code>Apply</code> has no dry-run mode</strong></li>
-    <li><code>YaraCleanup</code> scheduled — if at all — in its <strong>own</strong> window, never alongside the merge</li>
+    <li>Consolidation scheduled at the grain you actually want — <code>Summary</code> for one row per (host, rule), <code>Apply</code> for every column of every matched-file row, or both. They differ in grain, not in safety: neither deletes anything, and either one scheduled alone still keeps a record of a scan's matches once the next scan overwrites that host</li>
+    <li>Whatever you schedule is scheduled with <strong><code>execute="true"</code></strong> — everyone who can run these knows that a bare invocation is a <strong>dry run that writes nothing</strong></li>
+    <li><code>YaraCleanup</code> scheduled — if at all — in its <strong>own</strong> window, never alongside the consolidation. It is the only thing that deletes, and nothing schedules it for you</li>
     <li>Test rules removed; only real detection content ships</li>
-    <li>A plan for draining a backlog larger than one bounded pass</li>
+    <li><code>row_ceiling</code> sized for your fleet, or <code>Summary</code> chosen instead — a group over the ceiling is refused outright, and re-running will not get it in</li>
   </ul></div>
 </section>
 
@@ -599,7 +682,7 @@ REPLACES it wholesale ...</code></pre></div>
   <tbody>
   <tr><td>Rows missing, <code>delivery_shortfall</code> non-empty</td><td>Action timeout too short — expired mid-drain (Part D)</td></tr>
   <tr><td>Matches dataset accumulating scans</td><td>Scanner key missing <strong>Query Center</strong> (A4)</td></tr>
-  <tr><td>Consolidation reports 0 candidates, exits clean</td><td><code>schema_version</code> mismatch, or the 900 s quiet period (E2)</td></tr>
+  <tr><td>Consolidation reports 0 candidates, exits clean</td><td><code>schema_version</code> mismatch; or every scan is still lacking a terminal lifecycle row, or is still inside the 900 s settle window (E2)</td></tr>
   </tbody></table></div>
 </section>
 

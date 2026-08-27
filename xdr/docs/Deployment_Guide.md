@@ -32,7 +32,7 @@ data is safe to consolidate across tenants.
 ## Topic guides
 
 This guide covers deployment and the capabilities of **3.4.0** as shipped. What changed
-between versions, and why, is in the [release notes](../../CHANGELOG.md). Four companion documents go
+between versions, and why, is in the [release notes](../../CHANGELOG.md). Seven companion documents go
 deeper where operators usually need it:
 
 | Guide | Answers |
@@ -66,7 +66,7 @@ A producer/consumer pipeline of single-responsibility classes:
 | `ScanConfig` | Rules, paths, thresholds, runtime options, tenant identity |
 | `YaraScanner` | Orchestrator — work queue, workers, scan loop, throttle + cancellation |
 | `ResultsUploader` | Insert Parsed Alerts channel (one alert per file×rule finding; storm cap + per-rule rollups; honest undelivered accounting) |
-| `LookupDatasetUploader` | Batched writes to the per-endpoint `yara_scanner_matches_v2_*` / `yara_scanner_scans_v2_*` shards |
+| `LookupDatasetUploader` | Batched writes to the per-endpoint `yara_scanner_matches_v4_*` / `yara_scanner_scans_v4_*` shards |
 | `EvidenceCollector` | Evidence ZIP (metadata always; matched-file copies optional) |
 | `CleanupManager` | Post-scan cleanup via Task Scheduler / systemd / launchd |
 
@@ -155,7 +155,7 @@ The `test_rules.yar` in this repo is a good starting point — its `MatchCalc` /
 # 7. Step 3 — Upload the Script to the Library
 
 **This specific claim is scoped to Action Center's endpoint-script library, not to
-platform automations in general** — the `YaraDatasetManagement` pack's six automations
+platform automations in general** — the `YaraDatasetManagement` pack's nine automations
 *do* have a working upload API (`POST /xsoar/automation/import`); see the pack's own
 [README](../Packs/YaraDatasetManagement/README.md#deployment--pack-install-or-console-import-not-a-bare-item-push).
 Only the scanner itself, as an Action-Center-dispatched endpoint script, has no such path:
@@ -233,10 +233,12 @@ never touched — it is shared across runs, not this run's data.
 **Per-run overrides.** A per-run `options` string (`key=value,key=value`) beats the constant
 for the ten runtime keys: `create_alerts`, `write_dataset`, `collect_files`, `cpu_guarantee`,
 `cpu_headroom_pct`, `cpu_budget_pct`, `cpu_floor_pct`, `workers`, `tenant_id`, `lookup_shard`.
-The two marked **constant only** have no options equivalent and are rejected as unknown keys —
-both are deployment-wide by nature (rotation decides dataset naming; the alert cap protects a
-per-API-key ceiling shared across every concurrent scan). Unknown keys always fail loudly with
-the valid list, rather than being silently ignored.
+The five marked **constant only** have no options equivalent and are rejected as unknown keys —
+all are deployment-wide by nature (rotation decides dataset naming; the alert cap protects a
+per-API-key ceiling shared across every concurrent scan; the offset render cap bounds the
+on-host `alert/` files; and host cleanup and its keep policy are deployment posture, not a
+per-run choice). Unknown keys always fail loudly with the valid list, rather than being
+silently ignored.
 
 > Advanced / automation only: the internal `run(...)` API and the CLI accept that `options`
 > string, but the Action Center `main` entry point deliberately does **not** expose it, so
@@ -380,11 +382,12 @@ time scaling with dataset size — the matches dataset never needs rotation to s
 because the overwrite already keeps it small.
 
 The cost is dataset count: a fleet produces roughly one matches dataset and one scans
-dataset per host, plus a new scans dataset per host every month. Control the fleet-wide
-count by bucketing rather than per-host — `CONFIG_LOOKUP_SHARD` accepts a literal label
-(`wave1`, `emea`) so hosts group into a fixed number of shards — and by deleting old scans
-months and consolidating matches with the pack automations (below) or
-`xdr_data_management.py`.
+dataset per host, plus a new scans dataset per host every month. Two levers reduce it —
+bucketing rather than per-host (`CONFIG_LOOKUP_SHARD` accepts a literal label, `wave1`,
+`emea`, so hosts group into a fixed number of shards), and deleting old scans months with
+`xdr_data_management.py`. **Consolidation is not one of those levers**: the pack automations
+below copy findings into an additional dataset and delete nothing, so they reduce the number
+of objects you have to *read*, not the number that exist.
 
 **Querying is unaffected either way.** Dashboards match `yara_scanner_matches*` wildcards,
 so shards fan back in automatically and filtering by `scan_id` or `scan_date` behaves
@@ -425,11 +428,11 @@ counts rows that were queued for upload but never sent when the run ended — se
 ## Keeping datasets bounded
 
 The **scans** dataset still needs rotation-based cleanup — old months accumulate and nothing
-deletes them automatically. The **matches** dataset needs a different kind of housekeeping:
-it never grows unbounded (the overwrite already prevents that), but a fleet still accumulates
-one matches dataset per host, and every finished scan is worth folding into a single
-searchable record rather than leaving scattered across per-host datasets. Two tools, two
-different jobs:
+deletes them automatically. The **matches** dataset needs no bounding at all: the overwrite
+already holds each host's dataset to one scan's worth of rows, permanently. What a fleet does
+want is a single searchable record of a launch, gathered *alongside* the per-host datasets
+rather than instead of them — each per-host dataset stays exactly where it is and remains the
+deep-dive source. Two tools, two different jobs:
 
 ```bash
 python3 xdr_data_management.py --report                      # inventory (default)
@@ -442,12 +445,26 @@ unsuffixed (permanent) dataset, a newer schema version, or anything outside the
 scans-lifecycle datasets grow but every scan still succeeds, and the matches dataset is
 unaffected either way (it is never a deletion candidate for this tool).
 
-For folding finished scans out of the per-host matches datasets, use the
-`YaraDatasetManagement` XSOAR pack (`YaraConsolidateStatus` / `YaraConsolidateApply` /
-`YaraConsolidateSummary`, driven by the `YARA Dataset Consolidation` playbook) — see the
-[pack README](../Packs/YaraDatasetManagement/README.md) for setup, the two consolidation
-modes, and **`YaraConsolidateApply`'s destructive-by-default behavior** (it has no dry-run
-mode; check with `YaraConsolidateStatus` first).
+For a fleet-wide view of finished scans, use the `YaraDatasetManagement` XSOAR pack
+(`YaraConsolidateStatus` / `YaraConsolidateApply` / `YaraConsolidateSummary`, driven by the
+`YARA Dataset Consolidation` playbook). It **copies** each finished scan's findings into one
+dataset per ruleset — `yara_scanner_full_v4_rules_<hash>` (every column of every matched-file
+row) or `yara_scanner_summary_v4_rules_<hash>` (one row per `(host, rule)`) — so one Action
+Center launch across a fleet reads back as one object instead of one per host.
+
+Two things to know before you run it:
+
+- **Neither mode deletes a per-host matches dataset.** They read the sources and leave them in
+  place; the per-host dataset is permanent, is overwritten by that host's next scan, and stays
+  the deep-dive source a consolidated row points back to. There is nothing to reclaim.
+- **Both are a dry run unless you pass `execute="true"`.** A bare `!YaraConsolidateApply`
+  writes nothing and deletes nothing — it reports the dataset it would build and the rows it
+  would carry. `YaraConsolidateStatus` is read-only in every mode.
+
+See the [pack README](../Packs/YaraDatasetManagement/README.md) for setup, the two modes, and
+their arguments. The genuinely destructive automations are elsewhere in the pack:
+**`YaraCleanup`** (deletes aged month-suffixed scans shards — and nothing schedules it, so it
+only runs when you run it) and **`YaraWipeAllDatasets`** (deletes everything, hand-run only).
 
 **Detail:** [Datasets and Maintenance](topics/Datasets_and_Maintenance.md) — the overwrite
 model, why sharding and rotation both exist, the report's dataset states, all safety rails,

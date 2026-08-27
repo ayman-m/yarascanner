@@ -957,9 +957,11 @@ script: |
       """Parse a dataset name into its parts, or None if it is not YARA-owned.
 
       Returning None is safety rail 5: anything outside the naming contract can never be a
-      deletion candidate. `scan_target` marks a CONSOLIDATED per-scan target
-      (yara_scanner_<kind>_v<N>_scan_<slug>) - no month by design, immutable once verified, and
-      once consolidation deleted the sources it is the ONLY copy of that scan.
+      deletion candidate. `scan_target` marks a per-scan target
+      (yara_scanner_<kind>_v<N>_scan_<slug>) left behind by the RETIRED per-scan merge - no
+      month by design, immutable once verified, and no longer produced by anything: full and
+      summary consolidation write one dataset per RULESET instead. Never a candidate all the
+      same, because on a tenant that ran the old merge it can be that scan's only copy.
       """
       m = NAME_RE.match(name or "")
       if not m:
@@ -1028,9 +1030,10 @@ script: |
                   if is_pack_output_dataset(name) else "not a YARA dataset name"))
               continue
           if info["scan_target"]:
-              skipped.append("%s: per-scan consolidated target - consolidation OUTPUT, not a "
-                             "rotation shard, and after the source shards were deleted it is "
-                             "the only copy of that scan" % name)
+              skipped.append("%s: per-scan consolidated target from the retired per-scan "
+                             "merge - consolidation OUTPUT, not a rotation shard, and on a "
+                             "tenant that ran that merge it can be the only copy of that "
+                             "scan" % name)
               continue
           if info["overwrite"]:
               skipped.append("%s: permanent per-host matches dataset - the scanner REPLACES it "
@@ -1088,13 +1091,14 @@ script: |
 
 
   def filter_unconsolidated(client, candidates, log=print):
-      """Safety rail 7. Drop any candidate still holding a scan_id that consolidation has not
-      verified into a per-scan target. Returns (survivors, skip_reasons).
+      """Safety rail 7. Drop any candidate still holding a scan_id that the retired per-scan
+      merge never verified into a per-scan target. Returns (survivors, skip_reasons).
 
-      A permanently stuck scan (row ceiling exceeded, or a merge never run) blocks
-      consolidation's own deletion pass forever. This prune is a separate path and would
-      otherwise delete that shard on month age alone - the scan's only copy. A query error
-      SKIPS (keeps) the dataset."""
+      Consolidation has no deletion pass of its own any more, so this rail is the only thing
+      standing between an aged month-suffixed shard and YaraCleanup, which really does delete.
+      A permanently stuck scan (row ceiling exceeded, or the merge never run) would otherwise
+      be dropped on month age alone - the scan's only copy. A query error SKIPS (keeps) the
+      dataset."""
       survivors, skipped = [], []
       for name in candidates:
           info = parse_dataset_name(name)
@@ -1226,10 +1230,12 @@ script: |
       if consolidated:
           lines += [
               "",
-              "%d dataset(s) are per-scan CONSOLIDATED TARGETS (…_scan_<id>). They are"
+              "%d dataset(s) are per-scan CONSOLIDATED TARGETS (…_scan_<id>) from the"
               % len(consolidated),
-              "      consolidation OUTPUT: unrotated by design, finished, not growing, and",
-              "      often a scan's only surviving copy. Never a cleanup candidate.",
+              "      retired per-scan merge: consolidation OUTPUT, unrotated by design,",
+              "      finished, not growing, and no longer produced by anything - on a tenant",
+              "      that ran that merge, often a scan's only surviving copy. Never a",
+              "      cleanup candidate.",
           ]
       if overwritten:
           lines += [

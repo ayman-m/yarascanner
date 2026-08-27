@@ -33,6 +33,12 @@ args:
   predefined:
   - 'true'
   - 'false'
+- name: quiet_secs
+  description: How long (seconds) a finished scan's newest match row must have been quiet before its rows are trusted to be complete. Defaults to 900. The scanner writes its terminal lifecycle row BEFORE draining the upload queue, so a scan can report completed while rows are still landing; consolidating inside that window copies a partial row set and the loss is permanent, because the scan_id is then already present in the target and no later pass rewrites it. Lower it only when you know a wave has fully drained.
+  required: false
+  isArray: false
+  defaultValue: '900'
+  secret: false
 comment: 'FULL consolidation: groups every column of every matched-file row, across every host scanned with one ruleset, into a single yara_scanner_full_v<N>_rules_<hash> dataset. The compact counterpart is YaraConsolidateSummary, which keeps one row per (host, rule) instead. Both read the permanent per-host matches datasets and NEITHER deletes them - they are overwritten by the next scan on that host and remain the deep-dive source. Grouping is by the ruleset hash the scanner leaves at the end of every scan_id, the only component every host in one Action Center launch shares. Re-running reconciles on scan_id sets: unchanged hosts are left alone, a re-scanned host''s rows are replaced, and a run with nothing changed is a verified no-op. DRY RUN BY DEFAULT - set execute=true to write. Consolidating the scans LIFECYCLE shards is a separate concern and is not performed here.'
 commonfields:
   id: YaraConsolidateApply

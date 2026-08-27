@@ -936,9 +936,11 @@ def parse_dataset_name(name):
     """Parse a dataset name into its parts, or None if it is not YARA-owned.
 
     Returning None is safety rail 5: anything outside the naming contract can never be a
-    deletion candidate. `scan_target` marks a CONSOLIDATED per-scan target
-    (yara_scanner_<kind>_v<N>_scan_<slug>) - no month by design, immutable once verified, and
-    once consolidation deleted the sources it is the ONLY copy of that scan.
+    deletion candidate. `scan_target` marks a per-scan target
+    (yara_scanner_<kind>_v<N>_scan_<slug>) left behind by the RETIRED per-scan merge - no
+    month by design, immutable once verified, and no longer produced by anything: full and
+    summary consolidation write one dataset per RULESET instead. Never a candidate all the
+    same, because on a tenant that ran the old merge it can be that scan's only copy.
     """
     m = NAME_RE.match(name or "")
     if not m:
@@ -1007,9 +1009,10 @@ def select_rotated_for_deletion(current_names, older_than_months, now_yyyymm):
                 if is_pack_output_dataset(name) else "not a YARA dataset name"))
             continue
         if info["scan_target"]:
-            skipped.append("%s: per-scan consolidated target - consolidation OUTPUT, not a "
-                           "rotation shard, and after the source shards were deleted it is "
-                           "the only copy of that scan" % name)
+            skipped.append("%s: per-scan consolidated target from the retired per-scan "
+                           "merge - consolidation OUTPUT, not a rotation shard, and on a "
+                           "tenant that ran that merge it can be the only copy of that "
+                           "scan" % name)
             continue
         if info["overwrite"]:
             skipped.append("%s: permanent per-host matches dataset - the scanner REPLACES it "
@@ -1067,13 +1070,14 @@ def filter_recently_written(client, candidates, min_quiet_secs, now_ms, log=prin
 
 
 def filter_unconsolidated(client, candidates, log=print):
-    """Safety rail 7. Drop any candidate still holding a scan_id that consolidation has not
-    verified into a per-scan target. Returns (survivors, skip_reasons).
+    """Safety rail 7. Drop any candidate still holding a scan_id that the retired per-scan
+    merge never verified into a per-scan target. Returns (survivors, skip_reasons).
 
-    A permanently stuck scan (row ceiling exceeded, or a merge never run) blocks
-    consolidation's own deletion pass forever. This prune is a separate path and would
-    otherwise delete that shard on month age alone - the scan's only copy. A query error
-    SKIPS (keeps) the dataset."""
+    Consolidation has no deletion pass of its own any more, so this rail is the only thing
+    standing between an aged month-suffixed shard and YaraCleanup, which really does delete.
+    A permanently stuck scan (row ceiling exceeded, or the merge never run) would otherwise
+    be dropped on month age alone - the scan's only copy. A query error SKIPS (keeps) the
+    dataset."""
     survivors, skipped = [], []
     for name in candidates:
         info = parse_dataset_name(name)
@@ -1205,10 +1209,12 @@ def render_report(current, legacy, newer, now_yyyymm):
     if consolidated:
         lines += [
             "",
-            "%d dataset(s) are per-scan CONSOLIDATED TARGETS (…_scan_<id>). They are"
+            "%d dataset(s) are per-scan CONSOLIDATED TARGETS (…_scan_<id>) from the"
             % len(consolidated),
-            "      consolidation OUTPUT: unrotated by design, finished, not growing, and",
-            "      often a scan's only surviving copy. Never a cleanup candidate.",
+            "      retired per-scan merge: consolidation OUTPUT, unrotated by design,",
+            "      finished, not growing, and no longer produced by anything - on a tenant",
+            "      that ran that merge, often a scan's only surviving copy. Never a",
+            "      cleanup candidate.",
         ]
     if overwritten:
         lines += [
@@ -1852,6 +1858,10 @@ def main():
 
     ver = str(YARA_SCHEMA_VERSION)
     cutoff_ms = retention_hours * 3600 * 1000
+    # How long a finished scan's newest row must have been quiet before its rows are trusted
+    # to be complete - see the quiet-period note at the gate below. Overridable per run for
+    # an operator who knows a wave has fully drained.
+    quiet_secs = float(args.get("quiet_secs") or DEFAULT_QUIET_SECS)
     now_ms = int(time.time() * 1000)
     qcount = [0]          # XQL queries ISSUED, succeeded or not; the dataset listing is not
                           # an XQL and is reported separately rather than folded in here
@@ -1904,12 +1914,17 @@ def main():
         # Every shard is read BEFORE any scan is written: a scan can span hosts, and its
         # summary must carry every host's rules, not the first shard's.
         by_scan = {}
+        sources_complete = True
         for ds in sorted(match_ds):
             try:
                 tuples, mode = summarise_shard(client, ds, ver, qcount, log, findings)
                 modes.add(mode)
             except Exception as e:
                 skipped.append("%s: unreadable (%s)" % (ds, str(e)[:120]))
+                # A scan missing because its source could not be READ looks identical to a
+                # scan missing because it was superseded, and only the second may cause a
+                # deletion - so an incomplete read disables stale removal entirely.
+                sources_complete = False
                 continue
             for sid, host, rule, ts in tuples:
                 # Dedupe on the full key: a host with a leftover month-suffixed matches
@@ -1921,6 +1936,18 @@ def main():
 
         log("collected %d scan(s) across %d matches shard(s); %d file-level finding(s) "
             "collapsed" % (len(by_scan), len(match_ds), findings[0]))
+
+        # Every scan_id the sources still hold, keyed by ruleset and taken BEFORE any gating
+        # or only_scan_ids filtering. This - not the gated, filtered `desired` - is what makes
+        # a row in the target stale: the scanner OVERWRITES a host's matches dataset on its
+        # next scan, so a scan_id that has vanished from every source is superseded. A scan_id
+        # still sitting in a source is present and valid; the fact that this pass chose not to
+        # process it says nothing about whether its rows belong in the target.
+        observed = {}
+        for sid_obs in by_scan:
+            rh_obs = rule_hash_of(sid_obs)
+            if rh_obs:
+                observed.setdefault(rh_obs, set()).add(sid_obs)
 
         # ---- 3a. gate each scan, then bucket the survivors BY RULESET -----------------
         # Grouping key is the ruleset hash, not the scan_id. scan_id is
@@ -1939,9 +1966,21 @@ def main():
             newest = int(st.get("newest_ms") or 0)
             for ts in pairs.values():
                 newest = max(newest, int(ts or 0))
+            # A terminal lifecycle row does NOT mean the match rows have landed. The scanner
+            # emits it with sync=True BEFORE draining the uploaders (xdr_yara_scanner.py:7270)
+            # - deliberately, because queued behind the drain it was the tail of the queue and
+            # got stranded. Summarising inside that window loses whole (host, rule) pairs, and
+            # permanently: the scan_id then sits in `held`, so no later pass rewrites it. This
+            # race was LIVE here rather than latent - Summary's terminal lookup always worked.
+            quiet = bool(newest) and (now_ms - newest) >= quiet_secs * 1000
             aged = bool(newest) and (now_ms - newest) >= cutoff_ms
-            if not terminal and not aged:
-                skipped.append("%s: scan still in progress - left alone" % sid[:34])
+            if not (terminal and quiet) and not aged:
+                skipped.append(
+                    "%s: %s - left alone"
+                    % (sid[:34],
+                       "finished, but its newest row is inside the %ds quiet period (rows "
+                       "may still be draining)" % quiet_secs if terminal
+                       else "scan still in progress"))
                 continue
             rh = rule_hash_of(sid)
             if not rh:
@@ -1988,7 +2027,16 @@ def main():
                                   % (label, target, str(e)[:100]))
                     continue
 
-            stale = sorted(held - desired)      # a host was re-scanned, or dropped this ruleset
+            # held - OBSERVED, never held - desired: see the `observed` note above. With any
+            # source unread, nothing is provably superseded, so nothing is removed.
+            if sources_complete:
+                stale = sorted(held - observed.get(rh, set()))
+            else:
+                stale = []
+                if held - observed.get(rh, set()):
+                    skipped.append("%s: stale-row removal SKIPPED - a source dataset could "
+                                   "not be read this pass, so a scan missing from it is not "
+                                   "evidence it was superseded" % label)
             fresh = sorted(desired - held)      # new to this target
             if held and not stale and not fresh:
                 skipped.append("%s: target already current for %d scan(s) across %d host(s) "

@@ -23,13 +23,19 @@ question resolves faster once you know which one you are looking at.
 | Runs | Component | What it is |
 |---|---|---|
 | **On the endpoint** | `xdr_yara_scanner.py` | The scan itself. Uploaded once to Action Center → Scripts, then dispatched per action (or by `playbooks/YARA_Scanner_Runner.yml`). Everything about *writing* data happens here. |
-| **In the tenant** | The six `YaraDatasetManagement` automations | `YaraReport`, `YaraConsolidateStatus`, `YaraConsolidateApply`, `YaraConsolidateSummary`, `YaraCleanup` — run from the War Room (`!YaraReport`) or by `playbook-YARA_Dataset_Consolidation.yml`. Plus `YaraWipeAllDatasets`, which is **not** wired to that playbook or any other content item — War Room / Playground only, by design (see below). Everything about *reshaping and pruning* data happens here. |
+| **In the tenant** | The nine `YaraDatasetManagement` automations | The five that touch datasets: `YaraReport`, `YaraConsolidateStatus`, `YaraConsolidateApply`, `YaraConsolidateSummary`, `YaraCleanup` — run from the War Room (`!YaraReport`) or by `playbook-YARA_Dataset_Consolidation.yml`. Plus `YaraWipeAllDatasets`, which is **not** wired to that playbook or any other content item — War Room / Playground only, by design (see below). The remaining three (`YaraRulesFromFile`, `YaraRulesDecode`, `YaraScanVerify`) handle rules and dispatch, not datasets, and are out of scope for this page. Everything about *reshaping and pruning* data happens here. |
 | **On an operator's machine** | `xdr_data_management.py`, `xdr_consolidate.py`, `xdr_action_center.py` | CLI equivalents, never uploaded to the tenant. `xdr_consolidate.py` is the readable source of the consolidation logic. |
 
 > **The automations inline their library rather than importing it.** A tenant cannot resolve
 > cross-script imports, so each of the five carries its own copy of the consolidation core.
-> Read the logic in **`xdr/xdr_consolidate.py`** — the line numbers below refer to it — then
-> regenerate the uploaded YAMLs with `tools/build_pack_unified.py` after any edit.
+> Read the shared logic in **`xdr/xdr_consolidate.py`** — unqualified line numbers below refer
+> to it — then regenerate the uploaded YAMLs with `tools/build_pack_unified.py` after any edit.
+>
+> **Two things live only in the pack scripts and are not in `xdr_consolidate.py`:**
+> `YaraConsolidateApply`'s `consolidate_full`, and `YaraConsolidateSummary`'s per-ruleset
+> rollup. `xdr_consolidate.py` still carries the *older* per-scan `run_consolidation`, which
+> the operator CLI (§5) drives — it is **not** what `YaraConsolidateApply` runs, and reading it
+> to work out what Apply does will mislead you.
 
 ### Action → component → function
 
@@ -42,16 +48,17 @@ question resolves faster once you know which one you are looking at.
 | ↳ list the scan_ids already present | scanner | `_matches_scan_ids` — `:4370` |
 | ↳ delete one scan_id's rows | scanner | `_remove_scan_id` — `:4454` |
 | Upload this scan's rows | scanner | `_upload_worker` — `:3258` |
-| **Refuse to consolidate the live matches dataset** | consolidation core | `parse_shard` — `xdr_consolidate.py:190`; `_is_live_overwrite_dataset` — `:512` |
+| **Refuse to merge-and-delete the live matches dataset** (reading it is fine — that is where full-detail rows come from) | consolidation core | `parse_shard` — `xdr_consolidate.py:190`; `_is_live_overwrite_dataset` — `:512` |
 | Report readiness (read-only) | `YaraConsolidateStatus` | `check_consolidation_status` — `xdr_consolidate.py:829` |
-| Decide if one scan may consolidate yet | consolidation core | `_gate_scan` — `:978` |
-| **Consolidate for real** (destructive) | `YaraConsolidateApply` | `consolidate_all` → `run_consolidation` — `:876`, `:643` |
-| Name the per-scan target | consolidation core | `target_name` — `:184` |
-| Summary-only consolidation | `YaraConsolidateSummary` | `_matches_shard_for_read` — `:1629`; `summary_target_name` — `:1584` |
-| Inventory every dataset | `YaraReport` | `report_datasets` — `:1217` |
-| **Prune old datasets** (destructive) | `YaraCleanup` | `prune_datasets` — `:1300` |
-| ↳ pick rotated candidates + rails | cleanup core | `select_rotated_for_deletion` — `xdr_data_management.py:124` |
-| ↳ pick legacy candidates + rails | cleanup core | `select_legacy_for_deletion` — `:251` |
+| Decide if one scan may consolidate yet (the retired per-scan path) | consolidation core | `_gate_scan` — `:990`. Full mode gates inline instead — `consolidate_full`, at the `terminal and quiet` check |
+| **Consolidate for real** (dry run unless `execute=true`; deletes no source) | `YaraConsolidateApply` | `consolidate_full` — `Scripts/YaraConsolidateApply/YaraConsolidateApply.py:1681` |
+| Name the per-ruleset full target | `YaraConsolidateApply` | `full_target_for_rules` — `YaraConsolidateApply.py:798`; the hash comes from `rule_hash_of` — `:786` |
+| Summary-only consolidation | `YaraConsolidateSummary` | `summarise_shard` — `Scripts/YaraConsolidateSummary/YaraConsolidateSummary.py:1744`; reads via `_matches_shard_for_read` — `:1721`; names via `summary_target_for_rules` — `:1675` |
+| Older **per-scan** merge, deletes verified sources (CLI only) | `xdr_data_management.py --consolidate` | `run_consolidation` — `xdr_consolidate.py:643`; `target_name` — `:184` |
+| Inventory every dataset | `YaraReport` | `report_datasets` — `Scripts/YaraReport/YaraReport.py:1249` (no copy in `xdr_consolidate.py`) |
+| **Prune old datasets** (destructive) | `YaraCleanup` | `prune_datasets` — `Scripts/YaraCleanup/YaraCleanup.py:1332` (no copy in `xdr_consolidate.py`) |
+| ↳ pick rotated candidates + rails | cleanup core | `select_rotated_for_deletion` — `xdr_data_management.py:140` |
+| ↳ pick legacy candidates + rails | cleanup core | `select_legacy_for_deletion` — `:271` |
 | **Delete every dataset, no exceptions** (destructive, hand-run only) | `YaraWipeAllDatasets` | `wipe_all` → `list_all_yara_datasets` — `Scripts/YaraWipeAllDatasets/YaraWipeAllDatasets.py` (self-contained; no canonical CLI copy — see the pack README) |
 
 Line numbers move as the code changes; the **function names are the stable handle** — grep for
@@ -133,9 +140,11 @@ verified at **8/8**.
 
 ### The cost we accept in exchange
 
-**Dataset count.** Per-host sharding combined with monthly rotation means a 500-endpoint
-fleet creates on the order of **1,000 datasets a month**. That is a real operational cost
-and the honest reason it is tolerated is that the alternative loses customer data.
+**Dataset count.** Per-host sharding means a 500-endpoint fleet carries **500 permanent
+matches datasets** (created once, then overwritten in place — they do not multiply with
+time) and adds **500 scans datasets every month**, because only the scans side still
+rotates (§3). That recurring 500-a-month is a real operational cost, and the honest reason
+it is tolerated is that the alternative loses customer data.
 
 Two levers control it:
 
@@ -204,10 +213,13 @@ the next scan in November writes to `_202611` and the gap is absent rather than 
 The host's **matches** dataset is likewise untouched by the passage of time. It holds its last
 scan's findings indefinitely, with no expiry — a host scanned once and never again keeps that
 one scan's results available until someone deletes it deliberately. That permanence is
-explicit, not incidental: `YaraCleanup` excludes unsuffixed datasets by safety rail, and
-`YaraConsolidateApply` is blocked from consuming the live v4 dataset by two independent guards
-(`parse_shard` returns `None` for it; `_is_live_overwrite_dataset` blocks both destructive call
-sites), each pinned by tests.
+explicit, not incidental: `YaraCleanup` excludes unsuffixed datasets by safety rail, and no
+consolidation path can delete the live v4 dataset — `YaraConsolidateApply` *reads* it (that is
+where full-detail rows come from) but has no deletion path over it, and the older per-scan
+merge is blocked from treating it as a mergeable-and-deletable source by two independent
+guards: `parse_shard` returns `None` for it at enumeration time, and
+`_is_live_overwrite_dataset` re-derives the same answer at each destructive call site. Both
+are pinned by tests.
 
 ### Why matches is overwritten rather than rotated — the 50 MB cap
 
@@ -239,22 +251,28 @@ Two honest caveats:
 > start. It does not check whether those rows were archived anywhere first, because on v4
 > **nothing archives them.**
 >
-> This is the part that surprises people: **consolidation does not protect the live matches
-> dataset, and no consolidation cadence changes that.** `YaraConsolidateApply` is deliberately
-> blocked from consuming the live v4 dataset (consolidating it would recreate exactly the
-> unbounded per-scan growth the overwrite model removed). `YaraConsolidateSummary` *does* read
-> it, but writes only four columns — `scan_id`, `hostname`, `rule`, `event_timestamp_ms`. No
-> filenames, no offsets, no per-rule counts.
+> This is the part that surprises people: **consolidation is not an archive, and no
+> consolidation cadence makes it one.** Both pack modes *read* the live matches dataset and
+> neither deletes it — `YaraConsolidateApply` copies **every column of every matched-file row**
+> into `yara_scanner_full_v4_rules_<hash>`, and `YaraConsolidateSummary` keeps four columns
+> (`scan_id`, `hostname`, `rule`, `event_timestamp_ms`) in
+> `yara_scanner_summary_v4_rules_<hash>`. But both **reconcile rather than accumulate**: when a
+> host is re-scanned, its previous `scan_id` disappears from the source, and the next pass
+> classifies those rows as superseded and drops them from the consolidated dataset too.
 >
-> So on v4, a host's file-level detail lives in exactly one place — its live matches dataset —
-> and the next scan on that host replaces it. Alerts already raised are unaffected (a separate
-> delivery channel, untouched by the flush), and summary rows survive if summary mode ran. The
-> filenames and offsets do not.
+> So on v4, a host's file-level detail tracks its newest scan wherever it lives, and the next
+> scan on that host replaces it. Alerts already raised are unaffected (a separate delivery
+> channel, untouched by the flush). A consolidated dataset is a fleet-wide *view of the current
+> state*, not a history of it.
+>
+> The one gap that looks like an archive is a scheduling artefact: until a pass runs *after* a
+> re-scan, the consolidated dataset still holds the older rows. That is a window, not a
+> retention guarantee — do not build a process on it.
 >
 > **Practical rule:** treat each scan's file-level findings as valid until that host is scanned
-> again. If you need them to outlive the next scan, export or act on them first — or run
-> `YaraConsolidateSummary` to keep at least the rule/host/timestamp record. Scheduling
-> consolidation more frequently does **not** help here.
+> again. If you need them to outlive the next scan, export them out of the tenant or act on
+> them first. Scheduling consolidation more frequently does **not** help here — reconciliation
+> is the point of it.
 
 ## 3b. The run-log datasets — why three `*_runs` datasets exist
 
@@ -262,12 +280,15 @@ Alongside the scan data you will see three small datasets that no scan ever writ
 
 | Dataset | Written by | One row records |
 |---|---|---|
-| `yara_scanner_consolidation_runs` | `YaraConsolidateApply` | `status`, `consolidated_count`, `failed_count`, failed scan IDs and their reasons |
+| `yara_scanner_consolidation_runs` | `YaraConsolidateApply` **and** `YaraConsolidateSummary` | `status`, `consolidated_count`, `failed_count`, failed scan IDs and their reasons |
 | `yara_scanner_cleanup_runs` | `YaraCleanup` | `mode`, `schema_version`, `deleted_count`, and the retention scope the pass ran with |
 | `yara_scanner_wipe_runs` | `YaraWipeAllDatasets` | `mode`, `total_found`, `deleted_count`, `failed_count`, `stopped_early` |
 
-They are an **audit trail: one row per run**. Every automation that mutates or deletes
-writes one; the read-only ones (`YaraReport`, `YaraConsolidateStatus`) write nothing.
+They are an **audit trail: one row per run that actually did something**. The read-only
+automations (`YaraReport`, `YaraConsolidateStatus`) write nothing — and neither does a **dry
+run**, deliberately: a preview changes nothing, and a row per preview would bury the writes
+the log exists to evidence. So a bare `!YaraConsolidateApply` leaves no trace here. Only an
+`execute="true"` pass is recorded.
 
 ### Why keep them
 
@@ -305,9 +326,13 @@ never mistaken for scan data or considered for retention. Query them directly by
 row this is immaterial for years, but it is unbounded by design rather than by a rail — worth
 knowing before a very high-frequency schedule.
 
-> **`YaraConsolidateSummary` does not write a run log.** It is the one mutating automation
-> with no audit row, so a scheduled summarisation cannot be confirmed from the tenant the way
-> a consolidation or a cleanup can. Check its War Room output instead.
+> **`YaraConsolidateSummary` records less than `YaraConsolidateApply` does.** It *does* write
+> to `yara_scanner_consolidation_runs` — a terminal `success` / `partial_failure` row on an
+> executing pass, and a `skipped_locked` row when it stands down on the lock — so a scheduled
+> summarisation can be confirmed from the tenant. What it does **not** write is a `started`
+> row, and it has no crash-recording path. The timeout-kill signature described above
+> therefore only works for `Apply`: a `Summary` pass killed mid-write, or one that crashed,
+> leaves no row at all. Fall back to its War Room output for those two cases.
 
 ### Worked example — the two modes are independent
 
@@ -397,9 +422,10 @@ Nothing is deleted if it is:
    XQL) — a rotation suffix reflects when a dataset was *created*, not when it was last
    written; a long-running scan against a host whose shard rotated months ago is still
    writing to that "old-looking" name
-7. **still holding a scan_id `--consolidate` (§5) hasn't fully verified into a per-scan
-   target** — most often a scan that tripped the row ceiling, or was never consolidated at
-   all; deleting it would be the only copy of that scan's findings gone for good
+7. **still holding a scan_id the CLI `--consolidate` (§5) hasn't fully verified into a
+   per-scan target** — most often a scan that tripped the row ceiling, or was never
+   consolidated at all; deleting it would be the only copy of that scan's findings gone for
+   good
 
 Plus: **dry run unless `--yes`**, and `--older-than-months` has no default, so a bare `--yes`
 deletes nothing. Rails 6 and 7 each cost one extra XQL query per candidate dataset and, like
@@ -413,26 +439,34 @@ every other rail here, skip (keep) the dataset rather than delete it if that que
 A failed delete is reported and the run continues to the next dataset, so one dataset with
 dependencies cannot strand the whole cleanup. Exit code is non-zero if any deletion failed.
 
-## 5. Consolidation — one dataset per scan
+## 5. Consolidation — one dataset per ruleset
 
 Deleting old months (§4) bounds *age*. It does not bound *count*: a fleet still produces one
-scans dataset per host every month, and — since a single scan can legitimately span many
-scan_ids over time — the *matches* side still benefits from being folded down to one dataset
-per scan even though it no longer rotates. Consolidation addresses the count directly — it
-folds each scan's per-host shards into a **single dataset per scan**, and, in the mode that
-does so, deletes the shards.
+scans dataset per host every month, and every host keeps its own permanent matches dataset.
+Consolidation does not bound the count either — **it adds a dataset rather than removing
+any.** What it bounds is the number of objects you have to *read*: it gathers every host's
+findings for one **ruleset** into a single dataset, so one Action Center launch across a
+fleet reads back as one object instead of one per host.
 
-**Two delivery mechanisms exist for the same underlying logic** (`xdr_consolidate.py`):
+> **Consolidation reclaims nothing, and is not meant to.** Neither pack mode deletes a
+> per-host matches dataset. That dataset is permanent and is overwritten by the next scan on
+> that host, so it never accumulates and there is no space to free — and it stays the
+> deep-dive source the consolidated rows point back to. Consolidation **adds** a queryable
+> rollup; it does not move data out of anywhere.
+
+**Two mechanisms exist, and they no longer share their logic** — this is the single most
+common source of stale expectations about what a consolidation run does:
 
 - **The pack automations** (`xdr/Packs/YaraDatasetManagement/`) — `YaraConsolidateStatus`
-  (read-only check), `YaraConsolidateApply` (writes and **deletes** verified source shards),
-  `YaraConsolidateSummary` (writes a lightweight rollup, **deletes nothing**), driven by the
-  `YARA Dataset Consolidation` playbook or invoked directly from the console. This is the
-  supported day-to-day path — see the
+  (read-only check), `YaraConsolidateApply` (full detail: every column of every matched-file
+  row; **dry run unless `execute="true"`**, and **deletes no source dataset**),
+  `YaraConsolidateSummary` (a lightweight rollup, one row per `(host, rule)`; likewise **dry
+  run by default and deletes nothing**), driven by the `YARA Dataset Consolidation` playbook
+  or invoked directly from the console. This is the supported day-to-day path — see the
   [pack README](../../Packs/YaraDatasetManagement/README.md) for the full comparison of the
   two modes, arguments, and outputs.
-- **The CLI** (`xdr_data_management.py --consolidate`) — the same logic, for scripted/ad-hoc
-  use outside XSOAR:
+- **The CLI** (`xdr_data_management.py --consolidate`) — the **older per-scan merge**, kept
+  for scripted/ad-hoc use outside XSOAR:
 
   ```bash
   python3 xdr_data_management.py --consolidate                 # dry run — plan only
@@ -440,39 +474,71 @@ does so, deletes the shards.
   python3 xdr_data_management.py --consolidate --scan-id <id>  # one scan (repeatable)
   ```
 
-  > **The CLI path has no per-pass bound.** `--consolidate --yes` calls the same underlying
-  > merge logic as the pack's `YaraConsolidateApply`, but without the cap described below —
-  > `_run_consolidate` in `xdr_data_management.py` was not updated when that cap was added.
-  > A CLI-driven consolidation against a large backlog can run for as long as there is work
-  > to do; there is currently no equivalent of `--max-scans` to bound one invocation. Restrict
-  > scope with `--scan-id` (repeatable) if you need to control how much one run touches.
+  > **The CLI is not what the pack runs, and it *does* delete.** `--consolidate --yes` drives
+  > `run_consolidation` in `xdr_consolidate.py`, which folds shards into `..._scan_<scan_id>`
+  > targets and removes verified sources. `YaraConsolidateApply` no longer does any of that —
+  > it runs `consolidate_full`, groups by ruleset, and deletes nothing. Treat the CLI as the
+  > destructive path and the pack as the additive one.
+  >
+  > The CLI also has no per-pass scan cap: a run against a large backlog continues for as long
+  > as there is work to do. Restrict scope with `--scan-id` (repeatable) if you need to control
+  > how much one invocation touches.
 
-The result is `yara_scanner_matches_v4_scan_<scan_id>` / `..._scans_v4_scan_<scan_id>`: all
-hosts for one scan, in one place, filterable by the same fields as before.
+**The two paths produce different targets.** The pack groups by *ruleset*; the CLI groups by
+*scan*:
 
-> **On v4, the matches side of this only applies to *dated* leftovers.** `YaraConsolidateApply`
-> is blocked from consuming a host's **live** unsuffixed matches dataset, so it can only produce
-> a `matches_v4_scan_*` target from pre-overwrite dated shards (`…_202608`) still on the tenant.
-> The scans side is unaffected — scans still rotates monthly at v4 and consolidates normally.
-> See §3's overwrite callout for what this means for retaining file-level detail.
+| Path | Target it writes | What happens to the sources |
+|---|---|---|
+| `YaraConsolidateApply` | `yara_scanner_full_v4_rules_<rulehash>` — every column of every matched-file row | read only, **never deleted** |
+| `YaraConsolidateSummary` | `yara_scanner_summary_v4_rules_<rulehash>` — one row per `(host, rule)` | read only, **never deleted** |
+| `xdr_data_management.py --consolidate --yes` | `yara_scanner_matches_v4_scan_<scan_id>` / `..._scans_v4_scan_<scan_id>` | verified sources deleted |
+
+`<rulehash>` is the ruleset hash the scanner leaves at the end of every `scan_id` — the one
+component every host in a single Action Center launch shares. Grouping on it is what makes a
+fleet-wide launch come back as one dataset.
+
+> **The CLI's matches side only applies to *dated* leftovers.** A host's **live** unsuffixed
+> matches dataset is off-limits to every destructive path, enforced twice over: `parse_shard`
+> refuses to classify it as a consolidation source at enumeration time, and
+> `_is_live_overwrite_dataset` re-derives the same answer at each destructive call site. So
+> `--consolidate` can only produce a `matches_v4_scan_*` target from pre-overwrite dated shards
+> (`…_202608`) still on the tenant. The scans side is unaffected — scans still rotates monthly
+> at v4 and consolidates normally. See §3's overwrite callout for what this means for retaining
+> file-level detail.
 
 **This is a housekeeping step, not a requirement, and not a reporting fix.** Reporting never
 needed it — dashboards query `yara_scanner_*` wildcards, so a query spans per-host and
-per-scan datasets identically. Consolidation only reduces how many datasets exist.
+consolidated datasets identically. Consolidation gives you one object per ruleset to query
+instead of one per host.
 
-> **`YaraConsolidateApply` is destructive with no dry-run mode; `YaraConsolidateStatus` is
-> read-only.** Check status first if you want to see what a pass *would* do before it does
-> it. There is no equivalent "would delete" flag on Apply itself.
+> **`YaraConsolidateApply` is a dry run by default.** Its `execute` argument defaults to
+> `false`, so a bare `!YaraConsolidateApply` **writes nothing and deletes nothing** — it
+> reports the dataset it *would* build and the rows it would carry. Set `execute="true"` to
+> write. `YaraConsolidateSummary` behaves the same way. `YaraConsolidateStatus` is read-only in
+> every mode and is still the fastest way to see which scans a pass would group.
 
-### One pass is bounded — it is not "run once and the backlog is gone"
+### One pass is bounded — but by rows, not by scans
 
-Both the CLI and the pack `YaraConsolidateApply` cap how many scans **one invocation**
-processes (`--max-scans` / the `max_scans` argument, default **4**), so a pass finishes
-comfortably inside the script/task timeout instead of being killed mid-merge while still
-holding the consolidation lock — measured live: a 5-scan pass used 71% of a 900-second
-timeout, and 20 would have been killed around scan 7. A bounded pass reports how many scans
-it left for next time; a backlog larger than one pass's cap needs to be **re-run**, or the
-cap raised, to fully drain — it does not resume itself automatically.
+**`YaraConsolidateApply` has no `max_scans` argument.** Its per-pass bound is `row_ceiling`,
+shipped at **60,000**, and it behaves as a *refusal* rather than a cap: a ruleset group larger
+than the ceiling is reported as failed and **not written at all**, rather than half-filled or
+split across passes. That default sits below the point at which lookup writes were measured
+going write-dead (~77k rows — §3), so a group that trips it is a group the platform would not
+have swallowed anyway.
+
+It matters because full detail is roughly **40x** the rows of a summary for the same findings.
+When a fleet is large enough to trip the ceiling, the intended answer is
+`YaraConsolidateSummary`, not a raised ceiling — raise `row_ceiling` only deliberately, knowing
+you are pushing a single lookup write toward the size at which it dies.
+
+The bound exists for the reason a scan cap would: a pass has to finish inside the ~900 s task
+timeout instead of being killed mid-write while still holding the consolidation lock —
+measured live, a 5-scan per-scan merge used 71% of that timeout. Re-running is cheap and
+idempotent: unchanged hosts are left alone, a re-scanned host's rows are replaced, and a run
+with nothing to do reports a verified no-op rather than rewriting.
+
+> The CLI's `--row-ceiling` is a **different knob on the older per-scan path**, and defaults to
+> **2,000,000**. Do not carry one default across to the other.
 
 ### The consolidation lock
 
@@ -491,43 +557,100 @@ safe to intervene manually.
 
 ### Why it is safe to run against live data
 
-It deletes datasets, so it is deliberately conservative:
+**The pack path is safe primarily because it deletes nothing.** `YaraConsolidateApply` reads
+the per-host matches datasets and writes one new dataset; it has no code path that deletes a
+source. Two independent guards make that structural rather than a matter of argument hygiene —
+`parse_shard` will not classify a live matches dataset as a *mergeable-and-deletable* source,
+and `_is_live_overwrite_dataset` re-derives the same answer at each destructive call site.
+(Reading is a separate question with a separate answer: full mode enumerates its sources with
+`_matches_shard_for_read`, which deliberately **includes** the live dataset, because on v4 that
+is the only place a host's current findings live.) Both guards are pinned by tests. Beyond
+that:
 
+- **Dry run by default** — `execute` defaults to `false`, so the first thing you run is always
+  a report.
 - **One sequential writer** per target — never exposed to the concurrent-write collision
   that per-host sharding exists to avoid (§2).
+- **Eligibility, not age alone.** A scan is grouped once it is *finished*: a terminal
+  lifecycle row, **or** silent past `retention_hours` (default 24). The terminal check is the
+  primary gate, so a cleanly completed scan is eligible **immediately** rather than after the
+  retention window. In earlier builds that gate was dead code — a bare-string lookup against a
+  map keyed by `(scan_id, host)` tuples, which could never match — so eligibility rested
+  entirely on the age check. If a completed scan of yours used to sit unconsolidated for a
+  day, that was why.
+  - The one wait that remains is short and deliberate: a terminal scan's newest row must also
+    be **900 s** old before it is grouped. The scanner sends its terminal row *ahead* of the
+    upload queue, so "finished" arrives before the rows do, and consolidating inside that
+    window would copy a partial row set permanently — the scan_id would land in the target and
+    never be topped up. A pass run within ~15 minutes of a scan reports
+    `finished, but its newest row is inside the 900s quiet period` and leaves it for the next
+    pass.
+- **Reconciled, not appended.** Re-running compares scan_id sets: unchanged hosts are left
+  alone, a re-scanned host's old rows are replaced by its new ones, and a run with nothing
+  changed reports a verified no-op.
+- **Row ceiling** (`row_ceiling`, default 60,000) refuses a group too large to write rather
+  than half-filling a target.
+
+> **The one `remove_lookup_data` call in `consolidate_full` targets its own output dataset**,
+> never a source. It drops `scan_id`s the sources no longer hold — the scanner overwrote that
+> host's matches dataset on its next scan, so those rows are superseded. Two properties of that
+> are worth knowing:
+>
+> - Staleness is measured as *held minus observed-in-sources*, **not** *held minus what this
+>   pass was asked to process*. Restricting a run with `scan_id` therefore no longer removes
+>   rows belonging to scans it was not asked to touch.
+> - If **any** source dataset cannot be read during a pass, stale-row removal is skipped
+>   entirely for that pass and the run says so. A scan missing from an unread source is not
+>   evidence that it was superseded.
+
+**The CLI path (`--consolidate --yes`) does delete**, so it carries the older, heavier rails:
+
 - **Verify before delete** — a shard is deleted only after the target's row count equals the
   sum of its sources. A mismatch keeps every source and reports it.
 - **A shard is deleted only when every scan in it is consolidated.** A host re-scanned in
   the same month shares one dataset; deleting after a single scan would destroy the others.
   Re-running is idempotent — an already-consolidated scan is detected and not rewritten.
 - **Abandoned-scan cutoff.** A scan stopped by the console Cancel leaves its lifecycle stuck
-  at `running`/`initiated` forever (§5, and the Scan Cancellation guide), which would block
-  its shard from ever being cleaned. A non-terminal scan whose newest row is older than
+  at `running`/`initiated` forever (see the Scan Cancellation guide), which would block its
+  shard from ever being cleaned. A non-terminal scan whose newest row is older than
   **24 hours** (`--abandoned-after-hours`, past the 6 h action timeout so a live scan is
   never mistaken for one) is treated as abandoned: it stops blocking cleanup, and its partial
   matches are still consolidated rather than dropped.
 - **Row ceiling** (`--row-ceiling`, default 2,000,000) refuses a consolidation too large to
   finish rather than half-building a target.
 
-> **What "verify before delete" does *not* check.** The row-count comparison confirms the
-> target has as many rows as its sources combined — it does not compare row *content*. A
-> corrupted or duplicated write that happens to land on the same count would still pass and
-> the source would still be deleted. And once `delete_dataset` runs, the platform has no
-> undelete or dataset versioning to fall back on — a mismatch or bug caught after the fact
-> cannot be recovered, only avoided by verifying before you run with `--yes`. Treat
-> consolidation, like the pruning in §4, as one-way.
+> **What "verify before delete" does *not* check** — and this concerns the CLI path only, since
+> the pack path deletes no source at all. The row-count comparison confirms the target has as
+> many rows as its sources combined; it does not compare row *content*. A corrupted or
+> duplicated write that happens to land on the same count would still pass and the source would
+> still be deleted. And once `delete_dataset` runs, the platform has no undelete or dataset
+> versioning to fall back on — a mismatch or bug caught after the fact cannot be recovered,
+> only avoided by verifying before you run with `--yes`. Treat the CLI consolidation, like the
+> pruning in §4, as one-way.
 
-### What it will and will not clean
+### What it will and will not touch
 
-A scan is consolidated once it is **finished** — a terminal lifecycle row, or abandoned past
-the cutoff. Scans still genuinely in progress are deferred to a later run. A per-host shard
-is removed only once *all* of its scans are handled, so on a busy host you may see per-scan
-targets appear while the shard persists until its last scan clears.
+A scan is consolidated once it is **finished** — a terminal lifecycle row, or silent past the
+retention cutoff. Scans still genuinely in progress are deferred to a later run.
 
-> Deleting a whole dataset takes ~60 seconds server-side on the tenants measured. Deletes of
-> different datasets do not conflict, so consolidation runs them concurrently (12 at a time);
-> even so, cleaning a large fleet is an hours-scale background job, not instant. Run it off-
-> peak.
+**No mode of the pack removes a per-host matches dataset.**
+`yara_scanner_matches_v4_<host>_<hex>` survives every Apply and every Summary, in dry run and
+under `execute="true"` alike. It is permanent by design and overwritten by that host's next
+scan, so nothing accumulates in it to reclaim — and it remains the deep-dive source a
+consolidated row points back to. Destroying it would make the consolidated output less useful,
+not the tenant tidier.
+
+**Full mode does not delete a *scans* shard either.** It reads the lifecycle shards, but only
+to build the terminal map that decides which scans are finished. Aged month-suffixed scans
+shards are deleted by **`YaraCleanup`** and by nothing else — and **nothing in the pack
+schedules `YaraCleanup`**. If you never run it, they accumulate (§4).
+
+> The CLI path, which does delete, removes a per-host shard only once *all* of its scans are
+> handled, so on a busy host you may see per-scan targets appear while the shard persists until
+> its last scan clears. Deleting a whole dataset takes ~60 seconds server-side on the tenants
+> measured. Deletes of different datasets do not conflict, so it runs them concurrently (12 at
+> a time); even so, cleaning a large fleet is an hours-scale background job, not instant. Run
+> it off-peak.
 
 ## 6. Row shapes
 
