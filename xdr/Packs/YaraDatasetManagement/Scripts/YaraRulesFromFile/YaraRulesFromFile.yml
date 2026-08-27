@@ -1,0 +1,68 @@
+args:
+- name: entry_id
+  description: War Room entry ID of the uploaded rules file. Omit it and the newest file attached to this issue is used, so an analyst can attach rules at issue creation without hunting for an entry ID. Newest wins, so re-uploading a corrected file supersedes a broken one without deleting it.
+  required: false
+  isArray: false
+  secret: false
+- name: max_bytes
+  description: Refuse a file larger than this many bytes. Defaults to 2097152 (2 MB) - a rules file bigger than that is a mistake, not a ruleset. The scanner's own ceiling is 50 MB of base64, far past anything a human attaches to an issue.
+  required: false
+  isArray: false
+  defaultValue: '2097152'
+  secret: false
+comment: >-
+  Reads an operator-uploaded YARA rules file from the War Room, VALIDATES it, and returns the
+  base64 the Action Center scanner takes as its yarafile input - plus the ruleset hash the
+  scan's results will be consolidated under. Validates harder than the scanner does on purpose:
+  decode_yara_rules on the endpoint only checks that the input base64-decodes and contains the
+  word "rule", which is right for a per-host check but means a malformed pack compile-fails on
+  every host in a wave. This runs once, before dispatch, and refuses an empty file, a PDF or
+  other binary, an oversized file, text with no rule declarations, unbalanced braces, and any
+  rule missing its condition section. It CANNOT prove a pack compiles - libyara is not in this
+  image, and rules valid on one agent can still fail on another (base64/base64wide modifiers,
+  pe.* fields are Windows-only). failed_rules on the scan's lifecycle row stays the authority
+  on what actually compiled. Needs no tenant credentials - it reads a file and returns text.
+commonfields:
+  id: YaraRulesFromFile
+  version: -1
+enabled: true
+name: YaraRulesFromFile
+outputs:
+- contextPath: Yara.Rules.valid
+  description: True if the file passed every pre-dispatch check. Branch on this.
+  type: Boolean
+- contextPath: Yara.Rules.errors
+  description: Why it was rejected, each naming what to fix. Empty when valid.
+  type: String
+- contextPath: Yara.Rules.b64
+  description: Base64 of the rules text - pass straight to the scanner's yarafile input. Empty when invalid.
+  type: String
+- contextPath: Yara.Rules.rule_hash
+  description: First 12 hex of sha256 over the rules text, computed exactly as the scanner does, so it is the hash the consolidated datasets are named after (yara_scanner_summary_v4_rules_<hash>, yara_scanner_full_v4_rules_<hash>).
+  type: String
+- contextPath: Yara.Rules.rule_count
+  description: How many rule declarations were found.
+  type: Number
+- contextPath: Yara.Rules.rule_names
+  description: The rule names, in file order.
+  type: String
+- contextPath: Yara.Rules.size_bytes
+  description: Size of the decoded rules text in bytes.
+  type: Number
+- contextPath: Yara.Rules.filename
+  description: Name of the file that was read.
+  type: String
+- contextPath: Yara.Rules.entry_id
+  description: War Room entry ID actually used, whether supplied or auto-discovered.
+  type: String
+script: '-'
+system: false
+tags: []
+timeout: 300
+type: python
+subtype: python3
+dockerimage: demisto/python3:3.11.10.116949
+fromversion: 6.5.0
+marketplaces:
+- xsoar
+- marketplacev2

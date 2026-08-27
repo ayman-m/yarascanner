@@ -468,7 +468,8 @@ def _pack_script_dirs():
 # test_every_other_automation_has_dedicated_coverage.
 _DELETED_LIBRARY = "YaraConsolidateCommon"
 _DELETED_AUTOMATIONS = ("YaraConsolidateCommon",)
-OTHER_AUTOMATIONS = {"YaraWipeAllDatasets": "test_wipe_all_datasets.py"}
+OTHER_AUTOMATIONS = {"YaraWipeAllDatasets": "test_wipe_all_datasets.py",
+                     "YaraRulesFromFile": "test_rules_from_file.py"}
 
 
 def test_no_automation_escapes_the_gate():
