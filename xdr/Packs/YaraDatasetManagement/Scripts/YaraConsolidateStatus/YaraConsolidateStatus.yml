@@ -16,6 +16,12 @@ args:
   isArray: false
   defaultValue: '24'
   secret: false
+- name: quiet_secs
+  description: How long (seconds) a finished scan's newest match row must have been quiet before it counts as ready. Defaults to 900, and must match what YaraConsolidateApply and YaraConsolidateSummary use - this automation is their preview, and the playbook feeds its eligible_scan_ids straight into them. The scanner writes its terminal lifecycle row BEFORE draining the upload queue, so a scan can report completed while rows are still landing.
+  required: false
+  isArray: false
+  defaultValue: '900'
+  secret: false
 comment: 'Read-only readiness check. Never writes or deletes. Previews exactly what YaraConsolidateSummary (compact) and YaraConsolidateApply (full detail) would group: which scans pass the finished-or-aged gate, and how they bucket by ruleset hash into consolidated datasets. It does NOT preview a scans-lifecycle merge - nothing performs one today.'
 commonfields:
   id: YaraConsolidateStatus

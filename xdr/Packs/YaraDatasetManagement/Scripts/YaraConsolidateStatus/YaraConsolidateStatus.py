@@ -723,12 +723,17 @@ def rule_hash_of(scan_id):
     return m.group(1) if m else None
 
 
-def check_readiness(client, ver="4", retention_hours=24.0, now_ms=None, log=lambda *a: None):
+def check_readiness(client, ver="4", retention_hours=24.0, now_ms=None,
+                    quiet_secs=DEFAULT_QUIET_SECS, log=lambda *a: None):
     """Which scans are ready for YaraConsolidateSummary / YaraConsolidateApply to group.
 
     Mirrors the gate BOTH consolidation modes apply, so this previews the work they would
     actually do. It reads the live per-host matches datasets and asks per scan: is its
-    lifecycle terminal, or has it been silent past retention_hours? Then it buckets the
+    lifecycle terminal AND quiet for quiet_secs, or has it been silent past retention_hours?
+    The gate must stay identical to consolidate_full's: the playbook feeds this function's
+    eligible_scan_ids straight into YaraConsolidateApply, so a preview that is more
+    generous reports scans as ready that Apply then declines, and one that is stricter
+    makes an operator wait out retention_hours for work that is ready now. Then it buckets the
     ready ones by ruleset hash, which is the key both modes group on - so the preview also
     answers "how many datasets will this produce, and which hosts land in each".
 
@@ -758,11 +763,23 @@ def check_readiness(client, ver="4", retention_hours=24.0, now_ms=None, log=lamb
             hosts.setdefault(sid, set()).add(r.get("hostname"))
             newest[sid] = max(newest.get(sid, 0), int(r.get("event_timestamp_ms") or 0))
 
+    # build_terminal_map keys on the 2-tuple (scan_id, host) - the host being the shard SLUG,
+    # which this path does not carry. A bare tmap.get(sid) can never match, so this gate was
+    # dead and readiness rested entirely on the age check; dropping the ["terminal"] deref
+    # instead would make any scan with a lifecycle row ready, running ones included.
+    term_by_sid = {}
+    for (t_sid, _t_host), t_entry in tmap.items():
+        term_by_sid.setdefault(t_sid, []).append(t_entry)
+
     ready, pending, groups = [], [], {}
     for sid in sorted(hosts):
-        terminal = bool(tmap.get(sid))
+        t_entries = term_by_sid.get(sid) or []
+        terminal = bool(t_entries) and all(bool(e.get("terminal")) for e in t_entries)
+        # The scanner writes its terminal row BEFORE draining the uploaders, so `completed`
+        # does not mean the rows have landed - see consolidate_full's quiet-period note.
+        quiet = bool(newest.get(sid)) and (now_ms - newest[sid]) >= quiet_secs * 1000
         aged = bool(newest.get(sid)) and (now_ms - newest[sid]) >= cutoff_ms
-        if not (terminal or aged):
+        if not ((terminal and quiet) or aged):
             pending.append(sid)
             continue
         ready.append(sid)
@@ -1679,7 +1696,8 @@ def main():
 
     try:
         client = CoreApiClient()
-        st = check_readiness(client, ver=ver, retention_hours=retention_hours)
+        st = check_readiness(client, ver=ver, retention_hours=retention_hours,
+                             quiet_secs=float(args.get("quiet_secs") or DEFAULT_QUIET_SECS))
     except Exception as ex:
         return_error("YaraConsolidateStatus failed: {}".format(ex))
         return

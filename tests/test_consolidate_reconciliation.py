@@ -85,14 +85,31 @@ class Client:
         return {"status": "deleted"}
 
     def remove_lookup_data(self, n, filters):
+        """The REAL endpoint's contract, probed live against the tenant:
+
+            [{"scan_id": "S1"}, {"scan_id": "S2"}]   -> HTTP 200 {"deleted": N}
+            [[{"field": "scan_id", "operator": "eq", "value": "S1"}]]
+                -> HTTP 500  "'list' object has no attribute 'items'"
+            [{"field": "scan_id", "operator": "eq", "value": "S1"}]
+                -> HTTP 400  "Filter's key field field not found"
+
+        A list of COLUMN -> VALUE dicts, OR'd across the list. The earlier fake accepted the
+        field/operator/value shape because it was written to match the code rather than the
+        API, so consolidate_full's reconciliation passed every test while 500ing on every
+        real call. Rejecting the wrong shapes here is the whole point of this method."""
+        for f in (filters or []):
+            if isinstance(f, list):
+                raise RuntimeError("HTTP 500: 'list' object has no attribute 'items'")
+            if not isinstance(f, dict):
+                raise RuntimeError("HTTP 400: filter must be an object")
+            for key in f:
+                if key in ("field", "operator", "value"):
+                    raise RuntimeError("HTTP 400: Filter's key field %s not found" % key)
         if n not in self.ds:
             return {"deleted": 0}
 
-        def one(row, f):
-            return row.get(f["field"]) == f["value"] if f.get("operator", "eq") == "eq" else False
-
         def m(row):
-            return any(all(one(row, f) for f in grp) for grp in filters)
+            return any(all(row.get(k) == v for k, v in f.items()) for f in filters)
 
         before = len(self.ds[n])
         self.ds[n] = [r for r in self.ds[n] if not m(r)]
@@ -337,3 +354,49 @@ def test_the_declared_default_matches_the_code(A):
     arg = next(a for a in d["args"] if a["name"] == "quiet_secs")
     assert int(arg["defaultValue"]) == int(A.DEFAULT_QUIET_SECS), (
         "yml says %s, code says %s" % (arg["defaultValue"], A.DEFAULT_QUIET_SECS))
+
+
+# --- Status is Apply's PREVIEW: if their gates differ, the preview lies -------------------
+
+@pytest.fixture(scope="module")
+def ST():
+    return _load("YaraConsolidateStatus")
+
+
+def test_status_and_apply_agree_that_a_fresh_completed_scan_is_not_yet_eligible(ST, A):
+    """YaraConsolidateStatus exists to tell an operator what Apply WILL do, and the playbook
+    feeds its eligible_scan_ids straight into Apply. So the two gates have to be the same
+    gate. Status carried the same dead terminal lookup Apply did - fixed there and missed
+    here - and once Apply gained the quiet period the two answers diverged: Status would
+    call a scan ready that Apply then declines to touch.
+    """
+    c = seed(status="completed")
+    r = ST.check_readiness(c, ver="4", retention_hours=24.0, now_ms=DRAINING,
+                           log=lambda *a: None)
+    assert r["eligible_count"] == 0, (
+        "Status called %d scan(s) ready inside the quiet period; Apply consolidates none"
+        % r["eligible_count"])
+
+    A.consolidate_full(c, ver="4", execute=True, now_ms=DRAINING, log=lambda *a: None)
+    assert not c.ds.get(TARGET), "Apply wrote inside the quiet period"
+
+
+def test_status_and_apply_agree_once_the_quiet_period_has_passed(ST, A):
+    """The other half: Status must not under-report either, or an operator waits 24h for
+    something that is ready now."""
+    c = seed(status="completed")
+    r = ST.check_readiness(c, ver="4", retention_hours=24.0, now_ms=FRESH,
+                           log=lambda *a: None)
+    assert r["eligible_count"] == 3, (
+        "Status called only %d of 3 completed scans ready past the quiet period"
+        % r["eligible_count"])
+
+    A.consolidate_full(c, ver="4", execute=True, now_ms=FRESH, log=lambda *a: None)
+    assert len(c.ds.get(TARGET, [])) == 1012, "Apply did not consolidate what Status promised"
+
+
+def test_status_does_not_call_a_running_scan_ready(ST):
+    c = seed(status="running")
+    r = ST.check_readiness(c, ver="4", retention_hours=24.0, now_ms=FRESH,
+                           log=lambda *a: None)
+    assert r["eligible_count"] == 0, "a running scan was reported ready"

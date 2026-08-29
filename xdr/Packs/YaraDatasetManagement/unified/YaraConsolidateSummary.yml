@@ -2122,9 +2122,12 @@ script: |
                       # output: rows for a scan the source no longer holds. Source shards are
                       # never touched. Serialised by the consolidation lock, which an executed
                       # pass already holds - remove_data is not concurrency-safe.
+                      # Filter shape is COLUMN -> VALUE, OR'd across the list. The
+                      # field/operator/value form this used to send is rejected by the
+                      # endpoint with HTTP 500 ("'list' object has no attribute 'items'"),
+                      # so reconciliation never removed a row. Probed live against the tenant.
                       reply = client.remove_lookup_data(
-                          target, [[{"field": "scan_id", "operator": "eq", "value": s}]
-                                   for s in stale])
+                          target, [{"scan_id": s} for s in stale])
                       removed = int((reply or {}).get("deleted") or 0)
                   add_rows = [r for r in rows if str(r.get("scan_id")) in set(fresh)]
                   added, ok = 0, True
