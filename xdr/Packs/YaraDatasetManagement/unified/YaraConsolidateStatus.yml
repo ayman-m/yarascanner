@@ -62,9 +62,17 @@ script: |
   ARGUMENTS
     scan_id                Restrict the check to these scan_id(s), comma-separated. Omit to
                            check every finished scan.
+    schema_version         The scanner's YARA_LOOKUP_SCHEMA_VER. Selects which shards are in
+                           scope; defaults to DEFAULT_LOOKUP_SCHEMA_VERSION.
+    retention_hours        A scan silent this long is treated as finished even without a
+                           terminal lifecycle row. Default 24.
     quiet_secs             Override DEFAULT_QUIET_SECS for this run.
-    row_ceiling            Override DEFAULT_ROW_CEILING for this run.
-    abandoned_after_hours  Override DEFAULT_ABANDONED_SECS for this run, given in hours.
+
+  These four are the whole argument surface: they are what main() parses and what the .yml
+  declares. row_ceiling and abandoned_after_hours were listed here once and were never either
+  - they belong to check_consolidation_status, part of the RETIRED per-scan library inlined
+  below, which main() does not call. Passing them did nothing, silently. If you want the row
+  ceiling previewed, see the note on check_readiness: it does not model one today.
   """
 
   # ############################################################################
@@ -78,9 +86,10 @@ script: |
   # Tenant API base URL, https://api-<tenant>.xdr.<region>.paloaltonetworks.com
   DEFAULT_XDR_API_URL = "replace_with_xdr_api_url"
 
-  # Merge gates. Each is also overridable per run from the matching script argument.
+  # Merge gates. Only DEFAULT_QUIET_SECS is overridable per run from a script argument; the
+  # other two belong to the RETIRED per-scan path below and are settable from nothing.
   DEFAULT_QUIET_SECS = 900            # a finished scan's newest row must be older than this
-  DEFAULT_ROW_CEILING = 2_000_000     # a scan bigger than this is reported, never half-merged
+  DEFAULT_ROW_CEILING = 2_000_000     # retired path: a bigger scan is reported, never half-merged
   DEFAULT_ABANDONED_SECS = 24 * 3600  # a non-terminal scan silent this long counts as finished
 
   # Lookup schema version assumed when the schema_version argument is left empty.
