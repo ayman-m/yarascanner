@@ -25,6 +25,91 @@ fixes without changing behaviour you rely on.
 
 ---
 
+## YARA Dataset Management pack — `YaraWipeAllDatasets` could steal a lock it could not read — 2026-08-30
+
+### Fixed — the wipe carried a forked lock, missing the two knobs written for it
+
+`YaraWipeAllDatasets`'s copy of `acquire_consolidation_lock` had drifted from
+`xdr_consolidate.py`: it took neither `unreadable_is_held` nor `on_takeover`. Its own header
+asserts the opposite, twice — *"Copied verbatim; do not let this drift from the canonical
+source"* over the lock constants, and *"Copied verbatim from the other five automations —
+keep it that way"* on `CoreApiClient`.
+
+The knobs exist for exactly this caller. The canonical docstring introduces them as being
+for *"callers whose cost of a WRONG takeover is irreversible (dataset deletion)"*, and the
+entry that added them records that **`YaraCleanup` sets both** — naming the pack's other
+dataset-deleter and not this one. The wipe was overlooked, so the guard was absent from the
+single automation where a wrong takeover cannot be undone: it deletes every
+`yara_scanner_*` dataset, and the platform has no undelete and no dataset versioning.
+
+What that cost: a lock dataset that exists but whose row cannot be read is not a stale
+leftover, it is the ordinary window right after another run created the marker, because
+`add_lookup_data` tolerates ~60s of create-lag with its retries — the dataset exists before
+its row does. The wipe read that as stale, force-deleted the other run's marker, and
+proceeded to delete every source dataset out from under a consolidation pass that was still
+working. Since consolidation's own loss in that window is permanent (a scan_id that has
+entered `held` can never be re-consolidated, because `fresh = desired - held` is empty for
+ever), the two failures compound.
+
+Fixed by porting the canonical function verbatim — all seven definitions of the pair
+(`xdr_consolidate.py` plus six automations) are now byte-identical under an AST comparison —
+and by passing `unreadable_is_held=True` at the call site, as `YaraCleanup` does. The wipe
+now stands down on an unreadable marker rather than taking over. The trade is deliberate and
+matches `YaraCleanup`: an orphaned rowless lock dataset will block every wipe until an
+operator deletes it by hand, which is the correct direction to fail for this tool.
+
+`on_takeover` is wired too, so a takeover that *does* happen (a readable, genuinely stale
+row) can never be reported as an ordinary uncontended pass: the result carries
+`lock_taken_over` / `lock_takeover_reason` and the War Room entry says the pass may have
+deleted the sources of a consolidation run still in flight.
+
+### Fixed — a lock standdown left no trace in the wipe's own audit trail
+
+`wipe_all` returned on `lock_held_by_other_run` *before* `record_wipe_run`, so the one
+outcome an operator most needs to distinguish — "another run was active, so this did
+nothing" — wrote no row at all, and was indistinguishable in `yara_scanner_wipe_runs` from a
+pass that never started. This is the same defect fixed in `YaraConsolidateSummary` earlier
+(a standdown recorded as success); it was still open here.
+
+A standdown now records itself, and with its own `mode` value, `skipped_locked`. Deriving
+`mode` from `dry_run` alone was not enough: a standdown reaches the audit row with
+`dry_run` False and `deleted_count` 0, byte-identical to a genuine executed pass that
+deleted nothing.
+
+### Fixed — the drift gate could not see the lock in the one file that had forked it
+
+`acquire_consolidation_lock` and `release_consolidation_lock` were already listed in
+`test_consolidation.py`'s `_SHARED_GATE_FUNCS`, so the gate did compare them — but only
+across `SHIPPING`, the five automations carrying the consolidation core.
+`YaraWipeAllDatasets` is deliberately not in `SHIPPING` (it has no selection rules,
+`schema_version` or retention window to compare against), and it takes the same lock on the
+same dataset as every other destructive pass. The fork therefore stood with the whole suite
+green.
+
+The new gate keys on the property that matters — **if a file takes the lock, its lock code
+must match the canonical** — and discovers lock-bearing automations from the filesystem, so
+a new one is covered the day it lands. `SHIPPING` is untouched. A companion assertion fails
+if the two sets ever coincide, so a future refactor that folds the wipe into `SHIPPING` is
+forced to revisit the gate rather than leave a silent duplicate behind.
+
+Verified by reverting the fix with the tests in place: the gate names
+`YaraWipeAllDatasets` and diffs the missing parameters, and the three new behavioural tests
+fail for three distinct reasons (takeover instead of standdown, missing `skipped_locked`
+row, `KeyError: 'lock_taken_over'`).
+
+The wipe suite's fixture also had to change, and the reason is worth recording: `FULL_TENANT`
+includes the lock dataset with no row, which under the corrected semantics means *stand
+down*. Every executed-pass test therefore started from a contended lock and asserted that
+the wipe took it over and deleted everything — the unsafe behaviour, pinned as expected.
+Those tests now start from `AT_REST_TENANT` (the same tenant without the lock dataset, which
+is the true at-rest state, since `release_consolidation_lock` deletes the marker rather than
+clearing it). The dry-run tests keep `FULL_TENANT`: a dry run takes no lock, and they need
+the marker present to prove it is preserved from the candidate list.
+
+1203 passed, 8 skipped.
+
+---
+
 ## YARA Dataset Management pack — removed `YaraConsolidateCommon` — 2026-08-20
 
 ### Removed — the shared library that nothing shared

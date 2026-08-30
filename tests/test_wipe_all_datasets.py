@@ -129,6 +129,23 @@ FULL_TENANT = [
     "not_yara_owned_at_all",                                      # never touched, ignored
 ]
 
+# The same tenant AT REST, which is FULL_TENANT without the lock dataset.
+#
+# release_consolidation_lock DELETES the lock dataset rather than clearing it, so a tenant
+# with nothing running has no lock dataset at all. A lock dataset that exists but whose row
+# cannot be read means the opposite: another run created the marker moments ago and its row
+# has not landed yet (add_lookup_data tolerates ~60s of create-lag), so an executed pass must
+# stand down rather than take over — see acquire_consolidation_lock's unreadable_is_held,
+# which this automation passes True because its response to "stale" is deleting every
+# dataset on the tenant.
+#
+# So every test whose subject is DELETION starts from here. Using FULL_TENANT for those would
+# be asking the wipe to proceed against a lock it cannot read, which is now (correctly) a
+# standdown, and the test would be asserting the unsafe behaviour rather than the deletion
+# behaviour it means to describe. The dry-run tests keep FULL_TENANT: a dry run takes no lock,
+# and they need the lock present to prove it is preserved from the candidate list.
+AT_REST_TENANT = [n for n in FULL_TENANT if n != "yara_scanner_consolidation_lock"]
+
 
 @pytest.fixture(autouse=True)
 def _reset_stubs():
@@ -240,7 +257,7 @@ def test_dry_run_says_nothing_about_passes_when_everything_fits_in_one():
 def test_executed_capped_pass_states_exactly_how_many_remain():
     demisto.args_value = {"execute": "true", "confirm": "DELETE ALL YARA DATASETS",
                           "max_deletes": "3"}
-    client = FakeTenant(FULL_TENANT)
+    client = FakeTenant(AT_REST_TENANT)
     W.CoreApiClient = lambda: client
     try:
         W.main()
@@ -252,33 +269,32 @@ def test_executed_capped_pass_states_exactly_how_many_remain():
 
 
 def test_executed_pass_deletes_everything_except_preserved():
-    client = FakeTenant(FULL_TENANT)
+    client = FakeTenant(AT_REST_TENANT)
     result = W.wipe_all(client, execute=True, log=lambda *a: None)
     assert result["dry_run"] is False
     remaining = set(client.names)
-    # The lock dataset itself is deleted as the mechanism of releasing it (not merely
-    # cleared) — see release_consolidation_lock — so it does not persist between runs,
-    # even though it is in PRESERVED_DATASETS (this pass never treats it as a delete
-    # candidate; it is simply gone by the time the next acquire recreates it). The other
-    # two pre-existing preserved names, plus the wipe-run log this pass itself created,
-    # do persist.
+    # The lock dataset this pass created for itself is deleted as the mechanism of releasing
+    # it (not merely cleared) — see release_consolidation_lock — so it does not persist
+    # between runs, even though it is in PRESERVED_DATASETS (this pass never treats it as a
+    # delete candidate; it is simply gone by the time the next acquire recreates it). The two
+    # pre-existing preserved names, plus the wipe-run log this pass itself created, do persist.
     assert remaining == {
         "yara_scanner_consolidation_runs", "yara_scanner_cleanup_runs", "yara_scanner_wipe_runs",
         "not_yara_owned_at_all",   # outside the prefix entirely; never a candidate at all
     }
     # and nothing NOT preserved survives — old schema, new schema, live matches, rotated
     # scans, consolidated targets, summary datasets, unrecognised kinds: all gone
-    for n in FULL_TENANT:
+    for n in AT_REST_TENANT:
         if n in W.PRESERVED_DATASETS or n == "not_yara_owned_at_all":
             continue
         assert n not in remaining, "%s should have been deleted" % n
-    assert result["deleted_count"] == len(FULL_TENANT) - 1 - 3  # minus non-yara, minus 3 preexisting preserved
+    assert result["deleted_count"] == len(AT_REST_TENANT) - 1 - 2  # minus non-yara, minus 2 preexisting preserved
     # the lock's own deletion (via release, not via the wipe pass) is never counted here
     assert "yara_scanner_consolidation_lock" not in result["deleted"]
 
 
 def test_executed_pass_records_itself_with_deleted_and_failed_lists():
-    client = FakeTenant(FULL_TENANT)
+    client = FakeTenant(AT_REST_TENANT)
     result = W.wipe_all(client, execute=True, log=lambda *a: None)
     assert len(client.wipe_run_rows) == 1
     row = client.wipe_run_rows[0]
@@ -297,7 +313,7 @@ def test_default_max_deletes_matches_the_documented_constant():
 
 
 def test_execute_bounds_a_pass_to_max_deletes():
-    client = FakeTenant(FULL_TENANT)   # 8 real candidates
+    client = FakeTenant(AT_REST_TENANT)   # 8 real candidates
     result = W.wipe_all(client, execute=True, max_deletes=3, log=lambda *a: None)
     assert result["stopped_early"] is True
     assert result["deleted_count"] == 3
@@ -306,7 +322,7 @@ def test_execute_bounds_a_pass_to_max_deletes():
 
 
 def test_a_pass_within_the_cap_is_not_marked_stopped_early():
-    client = FakeTenant(FULL_TENANT)
+    client = FakeTenant(AT_REST_TENANT)
     result = W.wipe_all(client, execute=True, max_deletes=100, log=lambda *a: None)
     assert result["stopped_early"] is False
     assert result["deleted_count"] == result["to_delete_count"]
@@ -320,14 +336,14 @@ def test_dry_run_ignores_max_deletes_and_reports_the_full_list():
 
 
 def test_zero_max_deletes_disables_the_cap():
-    client = FakeTenant(FULL_TENANT)
+    client = FakeTenant(AT_REST_TENANT)
     result = W.wipe_all(client, execute=True, max_deletes=0, log=lambda *a: None)
     assert result["stopped_early"] is False
     assert result["deleted_count"] == 8
 
 
 def test_stopped_early_is_recorded_in_the_audit_row():
-    client = FakeTenant(FULL_TENANT)
+    client = FakeTenant(AT_REST_TENANT)
     W.wipe_all(client, execute=True, max_deletes=2, log=lambda *a: None)
     assert client.wipe_run_rows[0]["stopped_early"] == "True"
 
@@ -348,21 +364,20 @@ def test_main_rejects_a_non_numeric_max_deletes():
 def test_main_wires_max_deletes_through_to_the_pass():
     demisto.args_value = {"execute": "true", "confirm": "DELETE ALL YARA DATASETS",
                           "max_deletes": "3"}
-    client = FakeTenant(FULL_TENANT)
+    client = FakeTenant(AT_REST_TENANT)
     W.CoreApiClient = lambda: client
     try:
         W.main()
     except SystemExit:
         pass
-    # client.deleted() also counts the lock's own acquire/release housekeeping (FULL_TENANT
-    # already has the lock dataset present, so taking it over deletes-then-recreates it) -
-    # the wipe-run audit row is what reports candidates actually wiped, cleanly.
+    # client.deleted() also counts the lock's own release (delete_dataset on the marker this
+    # pass created) - the wipe-run audit row is what reports candidates actually wiped.
     assert csp.results and csp.results[-1].outputs["deleted_count"] == 3
     assert csp.results[-1].outputs["stopped_early"] is True
 
 
 def test_executed_pass_takes_and_releases_the_lock():
-    client = FakeTenant(FULL_TENANT)
+    client = FakeTenant(AT_REST_TENANT)
     W.wipe_all(client, execute=True, log=lambda *a: None)
     assert "create_lookup_dataset:yara_scanner_consolidation_lock" in client.calls
     # released: the lock dataset survives (it's preserved) but holds no row afterward
@@ -377,8 +392,60 @@ def test_a_held_lock_blocks_the_wipe_and_deletes_nothing():
     before = set(client.names)
     result = W.wipe_all(client, execute=True, log=lambda *a: None, now_ms=99999999999999 + 1000)
     assert result["lock_held_by_other_run"] is True
-    assert set(client.names) == before
     assert result["deleted_count"] == 0
+    # nothing DELETED. The standdown does now create yara_scanner_wipe_runs to record itself
+    # (see the audit-row test below), so the tenant gains that one name and loses nothing.
+    assert before - set(client.names) == set()
+    assert set(client.names) - before <= {"yara_scanner_wipe_runs"}
+
+
+def test_an_unreadable_lock_marker_stands_the_wipe_down_rather_than_taking_over():
+    """The create-lag window, and the reason this automation passes unreadable_is_held=True.
+
+    A lock dataset that EXISTS but whose row cannot be read is not a stale leftover — it is
+    the ordinary window right after another run created the marker, because add_lookup_data
+    tolerates ~60s of create-lag, so the dataset exists before its row does. Every other
+    automation's cost of guessing wrong here is a retry. This one's is every dataset on the
+    tenant, unrecoverably, while the run that actually holds the lock is still working.
+
+    Before the fix this file's fixture made this the DEFAULT state of every executed-pass
+    test, and the wipe took the lock over and deleted everything — 1193 tests green.
+    """
+    client = FakeTenant(FULL_TENANT)      # lock dataset present...
+    client.lock_rows = []                 # ...but no readable row: another run just took it
+    before = set(client.names)
+    result = W.wipe_all(client, execute=True, log=lambda *a: None)
+    assert result["lock_held_by_other_run"] is True
+    assert result["deleted_count"] == 0
+    assert client.deleted() == [], "a wipe took over a lock it could not read"
+    assert before - set(client.names) == set()
+
+
+def test_a_lock_standdown_is_recorded_as_its_own_mode_not_as_executed():
+    """A standdown returns before any delete, landing in the audit trail with dry_run False
+    and deleted_count 0 — byte-identical to a real executed pass that deleted nothing unless
+    it carries its own mode. Recording it as "executed" made the run log unable to answer the
+    one question it exists for: did this pass do nothing, or was it never allowed to start?"""
+    client = FakeTenant(FULL_TENANT)
+    client.lock_rows = [{"holder": "someone-else", "started_ms": 99999999999999}]
+    W.wipe_all(client, execute=True, log=lambda *a: None, now_ms=99999999999999 + 1000)
+    assert len(client.wipe_run_rows) == 1
+    assert client.wipe_run_rows[0]["mode"] == "skipped_locked"
+    assert client.wipe_run_rows[0]["deleted_count"] == 0
+
+
+def test_a_taken_over_lock_is_reported_and_never_silent():
+    """If the wipe ever DOES take a lock over (a readable, genuinely stale row), the operator
+    must be able to tell that pass apart from an uncontended one — it may have deleted the
+    sources of a consolidation run that was still in flight."""
+    stale = 1_000_000_000_000
+    client = FakeTenant(FULL_TENANT)
+    client.lock_rows = [{"holder": "crashed-run", "started_ms": stale}]
+    result = W.wipe_all(client, execute=True, log=lambda *a: None,
+                        now_ms=stale + W.DEFAULT_LOCK_STALE_SECS * 1000 + 1)
+    assert result["lock_held_by_other_run"] is False
+    assert result["lock_taken_over"] is True
+    assert "taking over" in result["lock_takeover_reason"]
 
 
 # --------------------------------------------------------------------- confirm-phrase gate
@@ -393,7 +460,10 @@ def _run_main(execute=None, confirm=None):
     if confirm is not None:
         args["confirm"] = confirm
     demisto.args_value = args
-    client = FakeTenant(FULL_TENANT)
+    # At rest: these tests are about the confirm-phrase gate and what an ALLOWED pass deletes,
+    # not about lock contention. FULL_TENANT would present an unreadable lock marker and stand
+    # the pass down before it ever reached the behaviour under test.
+    client = FakeTenant(AT_REST_TENANT)
     W.CoreApiClient = lambda: client
     try:
         W.main()

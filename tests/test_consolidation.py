@@ -1380,6 +1380,91 @@ def test_pack_copy_gate_logic_matches_xdr_consolidate(automation):
             "\n--- %s\n%s" % (name, automation, mine[name], automation, pack[name]))
 
 
+# ---------------- the lock is gated by who TAKES it, not by SHIPPING membership -----------
+# acquire_consolidation_lock / release_consolidation_lock are already in _SHARED_GATE_FUNCS
+# above, so the gate does compare them - but only across SHIPPING, the five automations that
+# carry the consolidation core. YaraWipeAllDatasets is deliberately NOT in SHIPPING (it has no
+# selection rules, no schema_version, no retention window to compare - see the comment above
+# OTHER_AUTOMATIONS in test_pack_data_management.py), yet it takes the SAME lock on the SAME
+# dataset as every other destructive pass.
+#
+# That gap was not theoretical. The wipe's copy had drifted: it lost `unreadable_is_held` and
+# `on_takeover`, the two knobs xdr_consolidate.py's own docstring says exist "for callers whose
+# cost of a WRONG takeover is irreversible (dataset deletion)". That describes the wipe and
+# nothing else in the pack, so the guard was missing from the single place it mattered most -
+# an unreadable lock row is the ordinary add_data create-lag window right after another run
+# took the lock, and reading it as stale let a wipe delete every source dataset out from under
+# a consolidation pass still in flight. The whole suite stayed green throughout.
+#
+# So gate on the property that actually matters: if a file takes the lock, its lock code must
+# match the canonical. Membership of SHIPPING is irrelevant to that, and discovering the files
+# from the filesystem means a new lock-taking automation is covered the day it lands.
+_LOCK_NAMES = ("_read_lock", "acquire_consolidation_lock", "release_consolidation_lock",
+               "_LOCK_DATASET", "_LOCK_SCHEMA", "DEFAULT_LOCK_STALE_SECS")
+
+_PACK_SCRIPTS = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "xdr", "Packs", "YaraDatasetManagement", "Scripts")
+
+
+def _lock_bearing_automations():
+    """Every automation in the pack that defines acquire_consolidation_lock."""
+    found = []
+    for d in sorted(os.listdir(_PACK_SCRIPTS)):
+        path = os.path.join(_PACK_SCRIPTS, d, "%s.py" % d)
+        if not os.path.exists(path):
+            continue
+        with open(path) as fh:
+            tree = ast.parse(fh.read())
+        if any(isinstance(n, ast.FunctionDef) and n.name == "acquire_consolidation_lock"
+               for n in tree.body):
+            found.append(d)
+    return found
+
+
+def test_the_lock_gate_covers_more_than_shipping():
+    """The gate above is the reason this one exists; if the two ever coincide, say so.
+
+    If every lock-bearing automation were in SHIPPING, this file's parametrisation would be
+    redundant with test_pack_copy_gate_logic_matches_xdr_consolidate and could be deleted.
+    It is not: YaraWipeAllDatasets takes the lock and is not in SHIPPING. Assert that, so
+    that a future refactor which folds it into SHIPPING is forced to revisit this comment
+    rather than leaving a silently-duplicated gate behind."""
+    bearers = set(_lock_bearing_automations())
+    assert bearers, "no automation defines acquire_consolidation_lock — gate is stale"
+    outside = sorted(bearers - set(SHIPPING))
+    assert outside == ["YaraWipeAllDatasets"], (
+        "lock-bearing automations outside SHIPPING changed: %s. This gate exists because "
+        "SHIPPING does not cover every file that takes the lock — re-check that assumption."
+        % outside)
+
+
+@pytest.mark.parametrize("automation", _lock_bearing_automations())
+def test_lock_matches_xdr_consolidate_in_every_automation_that_takes_it(automation):
+    """THE LOCK GATE, one case per lock-bearing automation, SHIPPING or not.
+
+    Compares only the lock surface, because an automation outside SHIPPING legitimately
+    carries none of the rest of the consolidation core.
+    """
+    canonical = _logic_index(_XDR_CONSOLIDATE)
+    mine = {k: v for k, v in canonical.items() if k in _LOCK_NAMES}
+    missing = sorted(set(_LOCK_NAMES) - set(mine))
+    assert not missing, "test is stale — not found in xdr_consolidate.py: %s" % missing
+
+    path = os.path.join(_PACK_SCRIPTS, automation, "%s.py" % automation)
+    pack = {k: v for k, v in _logic_index(path).items() if k in _LOCK_NAMES}
+    for name in sorted(mine):
+        assert name in pack, (
+            "%s is missing from %s — that file takes the consolidation lock, so a lock fix "
+            "landing only in xdr_consolidate.py does nothing there" % (name, automation))
+        assert pack[name] == mine[name], (
+            "%s has drifted between xdr_consolidate.py and %s.\n"
+            "The lock is shared code in EVERY file that takes it — a copy that cannot "
+            "express unreadable_is_held/on_takeover cannot protect an irreversible pass.\n"
+            "--- xdr_consolidate\n%s\n--- %s\n%s"
+            % (name, automation, mine[name], automation, pack[name]))
+
+
 def _scanstat_src(path):
     with open(path) as fh:
         tree = ast.parse(fh.read())
