@@ -440,6 +440,39 @@ automations they call. `YaraConsolidateSummary` is self-contained
 on the `Scripts/` side too (its `Scripts/<Name>/<Name>.yml` embeds the script); the rest
 carry `script: '-'` there and are unified at upload time.
 
+### The other drift axis: the same function in nine files
+
+`.py` vs `.yml` is one way a fix goes missing. The other is *across* automations, because
+each is standalone and hand-carries its own copy of the shared code. Two gates cover that,
+and it matters which functions each one compares:
+
+| Gate | Canonical | Compares | Across |
+|---|---|---|---|
+| `tests/test_pack_data_management.py` | `xdr/xdr_data_management.py` | `_PORTED_FUNCS` — the eight classify/select functions, plus `_PORTED_CONSTS` | `SHIPPING` (the five carrying the consolidation core) |
+| `tests/test_consolidation.py` | `xdr/xdr_consolidate.py` | `_SHARED_GATE_FUNCS` — the full ported core, plus `_SHARED_CONSTS` | `SHIPPING` |
+| `tests/test_consolidation.py` (lock gate) | `xdr/xdr_consolidate.py` | the lock surface only — `_read_lock`, `acquire_consolidation_lock`, `release_consolidation_lock`, `_LOCK_DATASET`, `_LOCK_SCHEMA`, `DEFAULT_LOCK_STALE_SECS` | **every automation that defines the lock**, discovered from the filesystem |
+
+`main`, `report_datasets` and `_matches_shard_for_read` are legitimately per-file — never
+propagate those by name; doing so overwrites nine distinct `main()`s.
+
+**The consolidation lock is not in that per-file list, despite what its call sites suggest.**
+The call sites *do* legitimately differ (`YaraCleanup` passes a longer `stale_after_secs`;
+`YaraConsolidateApply` passes `unreadable_is_held=True` at both destructive call sites), but
+the function definition is identical everywhere and must stay that way. It drifted once, in
+the worst possible file: `YaraWipeAllDatasets` carried a copy missing `unreadable_is_held`
+and `on_takeover` — the two knobs `xdr_consolidate.py` documents as existing "for callers
+whose cost of a WRONG takeover is irreversible (dataset deletion)", which describes that
+automation and no other. It could not even express the guard, so it took over locks it could
+not read and deleted every dataset out from under a consolidation pass still in flight. The
+whole suite was green throughout, because the older gates only ever looked at `SHIPPING` and
+`YaraWipeAllDatasets` is deliberately not in it.
+
+That is why the third gate keys on **who takes the lock** rather than on `SHIPPING`
+membership, and discovers lock-bearing automations from the filesystem so a new one is
+covered the day it lands. If you add an automation that takes the lock, copy the function
+verbatim from `xdr/xdr_consolidate.py` and let the gate confirm it; choose the *call site*
+arguments to match the cost of a wrong takeover in that automation.
+
 **`YaraReport` and `YaraCleanup` are not tasks in the consolidation playbook**, and nothing
 in this pack schedules them. They install as standalone automations, run from the War Room
 or their own Job. That is deliberate for `YaraCleanup`: a destructive action attached to the
@@ -550,6 +583,8 @@ the YaraCleanup section above before granting this key to anything.
 | `YaraCleanup` selected almost nothing and every skip reason names the recency or consolidation rail | Working as designed, and usually one of two real conditions: scans are still writing to those shards (rail 6 — the *name*'s month is not when it was last written), or consolidation has not verified their `scan_id`s into a consolidated target (rail 7 — which still looks for the **obsolete** per-scan target name, so on a current tenant it holds back any month-suffixed shard that still carries a `scan_id`, however many consolidation passes have run). Both rails also keep a dataset when their live query **errors**, so a flaky query window looks the same. | Read the per-candidate reasons in `Yara.Cleanup.skipped` — they name the specific rail. For rail 6, let the scans finish and re-run. For rail 7, re-running consolidation will **not** clear it: satisfy yourself from `!YaraReport` and the `…_rules_<hash>` targets that the data is consolidated, then delete the shard by name. Do not lower `min_quiet_hours` to force rail 6 through; below 1h it is raised back to the floor anyway. |
 | `YaraCleanup` reports `Skipped this pass — the consolidation lock is held by another concurrent run` and deletes nothing | `YaraConsolidateApply`, the CLI, or another `YaraCleanup` run holds `yara_scanner_consolidation_lock`. On this path an existing marker whose row cannot yet be read also counts as held — that is the `add_data` create-lag window right after another run took it. | Expected when a prune overlaps the twice-daily merge Job. Re-run after the merge pass finishes. A **dry run** never takes the lock, so it is always available to see what *would* go. |
 | War Room entry contains `WARNING: another run's consolidation lock marker was present and this pass TOOK IT OVER as stale` | A previous lock holder died without releasing the marker (e.g. a platform kill mid-run, which skips the `finally`), and this pass judged it stale and proceeded. | Check `Yara.Cleanup.lock_taken_over` / `lock_takeover_reason` and confirm no consolidation pass was in fact still running — if one was, its shards were pruned concurrently. This is reported rather than silent precisely because it is not an ordinary pass. |
+| `YaraWipeAllDatasets` (or `YaraCleanup`) logs `consolidation lock marker exists but its row is unreadable ... standing down rather than taking over`, and keeps doing so on every re-run | The `yara_scanner_consolidation_lock` dataset exists but holds no readable row. Normally that is the ~60s `add_lookup_data` create-lag window right after another run took the lock, and standing down is correct. If it persists, the marker is orphaned — a run created it and died before its row landed. | First confirm nothing is actually running (`yara_scanner_consolidation_runs`, newest row). Then delete the `yara_scanner_consolidation_lock` dataset by hand; the next acquire recreates it. **Do not** "fix" this by passing `unreadable_is_held=False` for a deleting automation — refusing is the intended direction to fail when the alternative is deleting datasets out from under a live pass. |
+| `YaraWipeAllDatasets` reports `Skipped - the consolidation lock is held...` and you want to know whether an earlier run did nothing or never started | Both look identical in `Yara.WipeAll` outputs alone. | Query `yara_scanner_wipe_runs`: a standdown writes `mode = "skipped_locked"`, a real pass that found nothing to delete writes `mode = "executed"` with `deleted_count = 0`, and a dry run writes `mode = "dry_run"`. An **absent** row for a run you know was launched is the platform-timeout-kill signature — a kill runs no Python, so the audit write never executes. |
 
 ## Monitoring — `yara_scanner_consolidation_runs`
 

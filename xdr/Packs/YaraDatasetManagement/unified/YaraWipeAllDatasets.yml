@@ -186,9 +186,17 @@ script: |
 
 
   def acquire_consolidation_lock(client, log=print, now_ms=None,
-                                 stale_after_secs=DEFAULT_LOCK_STALE_SECS, holder="unknown"):
+                                 stale_after_secs=DEFAULT_LOCK_STALE_SECS, holder="unknown",
+                                 unreadable_is_held=False, on_takeover=None):
       """Best-effort mutual exclusion against the pack's other destructive automations. See
-      xdr_consolidate.py's version for the full reasoning; behaviour here is identical."""
+      xdr_consolidate.py's version for the full reasoning; behaviour here is identical.
+
+      This copy previously omitted unreadable_is_held and on_takeover, which the canonical
+      version documents as existing precisely "for callers whose cost of a WRONG takeover is
+      irreversible (dataset deletion)". That is this automation and no other, so the guard was
+      missing from the one place it matters most: an unreadable lock row is the ordinary
+      create-lag window right after another run took the lock, and treating it as stale let a
+      wipe delete every dataset out from under a consolidation pass that was still running."""
       now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
       resp = client.create_lookup_dataset(_LOCK_DATASET, _LOCK_SCHEMA)
       fresh = isinstance(resp, dict) and "dataset_name" in resp
@@ -196,11 +204,23 @@ script: |
           held_ms = _read_lock(client)
           if held_ms is not None and (now_ms - held_ms) < stale_after_secs * 1000:
               log("consolidation lock held (age %.0fs) - another run appears to be in "
-                  "progress; skipping this wipe" % ((now_ms - held_ms) / 1000.0))
+                  "progress; skipping this pass" % ((now_ms - held_ms) / 1000.0))
               return False
-          log("consolidation lock is stale or unreadable (%s) - taking over"
-              % ("age unknown" if held_ms is None
-                 else "age %.0fs" % ((now_ms - held_ms) / 1000.0)))
+          if held_ms is None and unreadable_is_held:
+              log("consolidation lock marker exists but its row is unreadable - another run "
+                  "most likely just created it (add_data create-lag); standing down rather "
+                  "than taking over")
+              return False
+          msg = ("consolidation lock is stale or unreadable (%s) - taking over"
+                 % ("age unknown" if held_ms is None
+                    else "age %.0fs" % ((now_ms - held_ms) / 1000.0)))
+          log(msg)
+          if on_takeover:
+              on_takeover(msg)
+          # Delete-then-recreate rather than just appending a fresh row: leaving the stale
+          # row(s) in place would let a future _read_lock pick up an arbitrary (not
+          # necessarily newest) row, and the dataset would accumulate one row per steal
+          # forever.
           client.delete_dataset(_LOCK_DATASET, force=True)
           client.create_lookup_dataset(_LOCK_DATASET, _LOCK_SCHEMA)
       client.add_lookup_data(_LOCK_DATASET, [{"holder": str(holder), "started_ms": now_ms}])
@@ -400,9 +420,19 @@ script: |
       exists to leave behind. Every exception is caught and only logged; failing to write
       this row must never replace the run's real outcome."""
       now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+      # A lock standdown gets its OWN mode, never "executed". It returns before any delete, so
+      # it lands here with dry_run False and deleted_count 0 - byte-identical, in the run log,
+      # to a real executed pass that deleted nothing. That is the exact question this audit
+      # trail exists to answer, and recording a standdown as "executed" made it unanswerable.
+      if result.get("lock_held_by_other_run"):
+          mode = "skipped_locked"
+      elif result.get("dry_run"):
+          mode = "dry_run"
+      else:
+          mode = "executed"
       row = {
           "run_ts_ms": now_ms,
-          "mode": "dry_run" if result.get("dry_run") else "executed",
+          "mode": mode,
           "total_found": int(result.get("total_found", 0) or 0),
           "to_delete_count": int(result.get("to_delete_count", 0) or 0),
           "deleted_count": int(result.get("deleted_count", 0) or 0),
@@ -441,6 +471,8 @@ script: |
           "to_delete": to_delete,
           "preserved": preserved_present,
           "lock_held_by_other_run": False,
+          "lock_taken_over": False,
+          "lock_takeover_reason": "",
           "stopped_early": False,
           "deleted_count": 0, "failed_count": 0, "deleted": [], "failed": [],
       }
@@ -449,10 +481,25 @@ script: |
           record_wipe_run(client, result, now_ms=now_ms, log=log)
           return result
 
+      # unreadable_is_held=True because a wrong takeover HERE is unrecoverable: an unreadable
+      # lock row is the ordinary create-lag window right after another run took the lock, and
+      # this automation's response to "stale" is to delete every yara_scanner_* dataset.
+      takeovers = []
       if not acquire_consolidation_lock(client, log=log, now_ms=now_ms,
-                                        holder="YaraWipeAllDatasets"):
+                                        holder="YaraWipeAllDatasets",
+                                        unreadable_is_held=True,
+                                        on_takeover=takeovers.append):
           result["lock_held_by_other_run"] = True
+          # Recorded, not silent: a standdown returns before any delete, so without this the
+          # run log cannot tell "stood down on the lock" from "never started" - the exact
+          # question the wipe audit trail exists to answer.
+          record_wipe_run(client, result, now_ms=now_ms, log=log)
           return result
+      if takeovers:
+          # Reported, never silent: this pass proceeded while another run's lock marker was in
+          # place, and the operator must be able to tell it apart from an uncontended pass.
+          result["lock_taken_over"] = True
+          result["lock_takeover_reason"] = takeovers[0]
       try:
           this_pass = to_delete
           if max_deletes and len(to_delete) > max_deletes:
@@ -534,6 +581,12 @@ script: |
                            .format(max_deletes, result["to_delete_count"], remaining))
           if result["failed"]:
               lines += ["", "failed:"] + ["  {}".format(n) for n in result["failed"]]
+
+      if result.get("lock_taken_over"):
+          lines.append("WARNING: another run's consolidation lock marker was present and this "
+                       "wipe TOOK IT OVER as stale ({}). If a consolidation pass was in fact "
+                       "still running, its source datasets were deleted underneath it."
+                       .format(result.get("lock_takeover_reason", "")))
 
       if result["preserved"]:
           lines += ["", "preserved (never touched):"] + ["  {}".format(n) for n in result["preserved"]]
