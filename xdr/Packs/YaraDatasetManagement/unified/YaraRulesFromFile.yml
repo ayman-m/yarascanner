@@ -1,4 +1,7 @@
 args:
+- name: entryID
+  description: War Room entry ID of the uploaded rules file. This is the argument name every Cortex content script uses. Omit it and the script finds the file itself, in order - File.EntryID in context, then the newest file entry in the War Room, then the newest attachment on this issue.
+  required: false
 - name: entry_id
   description: War Room entry ID of the uploaded rules file. Omit it and the newest file attached to this issue is used, so an analyst can attach rules at issue creation without hunting for an entry ID. Newest wins, so re-uploading a corrected file supersedes a broken one without deleting it.
   required: false
@@ -241,13 +244,59 @@ script: |
           return fh.read(), res.get("name") or str(entry_id)
 
 
-  def find_attachment_entry_id():
+  def _from_file_context():
+      """File.EntryID - where a file uploaded to the War Room lands in context.
+
+      `File` is a dict when one file is present and a list once there are several, so both
+      shapes have to be handled. Newest last, matching the attachment convention below.
+      """
+      try:
+          ctx = demisto.context() or {}
+      except Exception:
+          return None
+      f = ctx.get("File")
+      if isinstance(f, dict):
+          f = [f]
+      if not isinstance(f, list):
+          return None
+      for item in reversed(f):
+          if isinstance(item, dict):
+              eid = item.get("EntryID") or item.get("entryID") or item.get("entryId")
+              if eid:
+                  return eid
+      return None
+
+
+  def _from_war_room():
+      """Newest file entry in the War Room.
+
+      Mirrors CommonScripts/UnzipFile: enumerate with getEntries and take `entry["ID"]` of
+      entries that carry a `File` name. This is the case the incident-attachment lookup below
+      misses entirely - a file uploaded straight into the War Room is never an attachment.
+      """
+      try:
+          entries = demisto.executeCommand("getEntries", {}) or []
+      except Exception:
+          return None
+      if not isinstance(entries, list):
+          return None
+      found = None
+      for entry in entries:
+          if isinstance(entry, dict) and entry.get("File") and entry.get("ID"):
+              found = entry["ID"]          # keep going; the last one wins
+      return found
+
+
+  def _from_attachments():
       """The newest file attached to this incident, or None.
 
       Lets an analyst attach rules at issue creation without hunting for an entry id. Newest
       wins so re-uploading a corrected file supersedes the broken one without deleting it.
       """
-      inc = demisto.incident() or {}
+      try:
+          inc = demisto.incident() or {}
+      except Exception:
+          return None
       atts = inc.get("attachment") or []
       if not isinstance(atts, list) or not atts:
           return None
@@ -255,9 +304,28 @@ script: |
       return last.get("entryID") or last.get("EntryID") or last.get("entry_id")
 
 
+  def find_rules_entry_id():
+      """Locate the uploaded rules file without the analyst hunting for an entry id.
+
+      Three sources, most-specific first. Only the third was checked before, which meant a
+      file uploaded to the War Room - the ordinary way - reported "no rules file found".
+      """
+      for probe in (_from_file_context, _from_war_room, _from_attachments):
+          eid = probe()
+          if eid:
+              return eid
+      return None
+
+
+  # Kept so anything calling the old name keeps working.
+  find_attachment_entry_id = _from_attachments
+
+
   def main():
       args = demisto.args()
-      entry_id = (args.get("entry_id") or "").strip() or None
+      # `entryID` is the name every demisto content script uses (ReadFile, UnzipFile);
+      # `entry_id` is kept because this script shipped with it.
+      entry_id = (args.get("entryID") or args.get("entry_id") or "").strip() or None
       mb = args.get("max_bytes")
       try:
           max_bytes = int(mb) if mb not in (None, "") else DEFAULT_MAX_BYTES
@@ -266,7 +334,7 @@ script: |
           return
 
       if not entry_id:
-          entry_id = find_attachment_entry_id()
+          entry_id = find_rules_entry_id()
       if not entry_id:
           return_error(
               "YaraRulesFromFile: no rules file found. Attach the .yar/.txt file to this issue, "
