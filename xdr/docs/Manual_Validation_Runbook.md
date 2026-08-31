@@ -377,15 +377,31 @@ its lifecycle row is **terminal**; a scan with no terminal row at all is treated
 only after `retention_hours` (24 by default). A scan still listed as *in progress* here is
 one whose terminal row has not arrived yet.
 
-> **This is the looser of the two gates, and the difference is about 15 minutes.**
-> `YaraConsolidateStatus` asks only *terminal, or silent past `retention_hours`*. F2 and F3
-> apply one further condition before they will group a terminal scan: its newest match row
-> must be at least **900 s** old. The scanner sends the terminal row *ahead* of the upload
-> drain (B2), so grouping inside that window would copy a partial row set — permanently,
-> because the `scan_id` then counts as already consolidated and its missing rows are never
-> written. So a scan can be listed as ready here and still be left alone by F2 or F3, with
-> the reason *"finished, but its newest row is inside the 900s quiet period (rows may still
-> be draining)"*.
+> **Both gates apply the 900s quiet period — they no longer diverge.**
+> A terminal scan is not eligible until its newest match row is at least **900 s** old. The
+> scanner sends the terminal row *ahead* of the upload drain (B2), so grouping inside that
+> window would copy a partial row set — permanently, because the `scan_id` then counts as
+> already consolidated and its missing rows are never written.
+>
+> **This gate now lives in `YaraConsolidateStatus` too.** It previously asked only *terminal,
+> or silent past `retention_hours`*, which made it roughly 15 minutes looser than F2 and F3 —
+> so a scan could be listed as ready here and then be left alone by them. Status is Apply's
+> preview and the playbook feeds its `eligible_scan_ids` straight into F3, so a preview that
+> was more permissive than the run it previews was the defect. Both now apply the same
+> *(terminal AND quiet) OR aged* test, and a just-finished scan is correctly reported as
+> **pending** here, not ready.
+
+> **"Ready" is not "work is outstanding".**
+> Eligibility and outstanding work are different questions, and this is the output most often
+> misread. **Ready** means the scan passed the gate above. It says nothing about whether the
+> consolidated datasets are already up to date.
+>
+> So a tenant where everything has already been merged still lists every finished scan as
+> ready. Run F2 or F3 against it and they will correctly report *"target already current …
+> verified, not rewritten"* and write nothing. Neither output is wrong — Status answers
+> *which scans passed the gate*, F2/F3 answer *does the target need rebuilding*. Expect this
+> on any tenant you have just consolidated, including the baseline you take before a test
+> scan.
 
 ---
 
@@ -441,11 +457,26 @@ before then.
 **Do:** `!YaraConsolidateStatus`
 
 Note which `scan_id`s are eligible, and which ruleset groups they fall into. Those are the
-scans F2 and F3 will group once each has also cleared the **900-second settle window** (E2) —
-run F2 or F3 within about 15 minutes of a scan and expect some of them to be left alone for
-now. Run them before the next scan on those hosts — not because consolidation would delete
-their matches, but because that next scan will overwrite the per-host dataset and a
-consolidated target is what keeps a record.
+scans F2 and F3 will group. Run them before the next scan on those hosts — not because
+consolidation would delete their matches, but because that next scan will overwrite the
+per-host dataset and a consolidated target is what keeps a record.
+
+**Also preview the run itself:** `!YaraConsolidateApply execute="false"`
+
+> **A dry run tells you what it would GROUP, not what it would WRITE.**
+> The `execute=false` path reports the row count assembled from the **sources** and returns
+> before it ever queries the target dataset. It does not perform the already-current check,
+> because that check costs a query per ruleset group and a preview has nothing to protect by
+> paying it.
+>
+> So on a tenant that is already consolidated, the dry run says *"WOULD write N full row(s)"*
+> for the full set, and the very same command with `execute=true` then reports *"target
+> already current … verified, not rewritten"* and writes **zero**. Both are correct; they are
+> measuring different things. Treat the dry run's row count as **the size of the group**, and
+> the executed run's as **the work actually outstanding**.
+>
+> The dry run is still the number to write down before a real run — just compare it against
+> the sources, not against what the executed pass reports.
 
 ### F2 · Summary — record what matched (non-destructive)
 

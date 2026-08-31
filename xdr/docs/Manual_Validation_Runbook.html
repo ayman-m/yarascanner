@@ -429,15 +429,28 @@ macOS    /usr/local/yara_scanner/logs/scan_summary_&lt;run_id&gt;.json</code></p
       is ready once its lifecycle row is <strong>terminal</strong>; a scan with no terminal row at
       all is treated as finished only after <code>retention_hours</code> (24 by default). A scan
       still listed as <em>in progress</em> here is one whose terminal row has not arrived yet.</p></div>
-    <div class="call warn" style="margin-top:.6rem"><span class="lbl">The looser of the two gates — about 15 minutes of difference</span>
-      <p><code>YaraConsolidateStatus</code> asks only <em>terminal, or silent past
-      <code>retention_hours</code></em>. F2 and F3 apply one further condition before they will group
-      a terminal scan: its newest match row must be at least <strong>900 s</strong> old. The scanner
-      sends the terminal row <em>ahead</em> of the upload drain (B2), so grouping inside that window
-      would copy a partial row set — permanently, because the <code>scan_id</code> then counts as
-      already consolidated and its missing rows are never written. So a scan can be listed as ready
-      here and still be left alone by F2 or F3, with the reason <em>"finished, but its newest row is
-      inside the 900s quiet period (rows may still be draining)"</em>.</p></div>
+    <div class="call warn" style="margin-top:.6rem"><span class="lbl">Both gates apply the 900s quiet period — they no longer diverge</span>
+      <p>A terminal scan is not eligible until its newest match row is at least <strong>900 s</strong>
+      old. The scanner sends the terminal row <em>ahead</em> of the upload drain (B2), so grouping
+      inside that window would copy a partial row set — permanently, because the <code>scan_id</code>
+      then counts as already consolidated and its missing rows are never written.</p>
+      <p><strong>This gate now lives in <code>YaraConsolidateStatus</code> too.</strong> It previously
+      asked only <em>terminal, or silent past <code>retention_hours</code></em>, which made it roughly
+      15 minutes looser than F2 and F3 — so a scan could be listed as ready here and then be left alone
+      by them. Status is Apply's preview and the playbook feeds its <code>eligible_scan_ids</code>
+      straight into F3, so a preview that was more permissive than the run it previews was the defect.
+      Both now apply the same <em>(terminal AND quiet) OR aged</em> test, and a just-finished scan is
+      correctly reported as <strong>pending</strong> here, not ready.</p></div>
+
+    <div class="call" style="margin-top:.6rem"><span class="lbl">"Ready" is not "work is outstanding"</span>
+      <p>Eligibility and outstanding work are different questions, and this is the output most often
+      misread. <strong>Ready</strong> means the scan passed the gate above. It says nothing about
+      whether the consolidated datasets are already up to date.</p>
+      <p>So a tenant where everything has already been merged still lists every finished scan as ready.
+      Run F2 or F3 against it and they will correctly report <em>"target already current … verified,
+      not rewritten"</em> and write nothing. Neither output is wrong — Status answers <em>which scans
+      passed the gate</em>, F2/F3 answer <em>does the target need rebuilding</em>. Expect this on any
+      tenant you have just consolidated, including the baseline you take before a test scan.</p></div>
   </div></div>
 </section>
 
@@ -493,11 +506,24 @@ macOS    /usr/local/yara_scanner/logs/scan_summary_&lt;run_id&gt;.json</code></p
   <div class="step"><div class="sh"><span class="n">F1</span><span class="t">Preview first (safe)</span></div><div class="sb">
     <div class="blk"><span class="lead do">Do</span><pre><code>!YaraConsolidateStatus</code></pre>
     <p>Note the eligible <code>scan_id</code>s, and which ruleset groups they fall into — those are
-    the scans F2 and F3 will group once each has also cleared the <strong>900-second settle
-    window</strong> (E2), so run F2 or F3 within about 15 minutes of a scan and expect some of them
-    to be left alone for now. Run them before the next scan on those hosts: not because
+    the scans F2 and F3 will group. Run them before the next scan on those hosts: not because
     consolidation would delete their matches, but because that next scan will overwrite the per-host
     dataset and a consolidated target is what keeps a record.</p></div>
+
+    <div class="blk"><span class="lead do">Also preview the run itself</span><pre><code>!YaraConsolidateApply execute="false"</code></pre></div>
+
+    <div class="call warn"><span class="lbl">A dry run tells you what it would GROUP, not what it would WRITE</span>
+      <p>The <code>execute=false</code> path reports the row count assembled from the
+      <strong>sources</strong> and returns before it ever queries the target dataset. It does not
+      perform the already-current check, because that check costs a query per ruleset group and a
+      preview has nothing to protect by paying it.</p>
+      <p>So on a tenant that is already consolidated, the dry run says <em>"WOULD write N full
+      row(s)"</em> for the full set, and the very same command with <code>execute="true"</code> then
+      reports <em>"target already current … verified, not rewritten"</em> and writes <strong>zero</strong>.
+      Both are correct; they measure different things. Read the dry run's count as <strong>the size of
+      the group</strong> and the executed run's as <strong>the work actually outstanding</strong>.</p>
+      <p>The dry run is still the number to write down before a real run — just compare it against the
+      sources, not against what the executed pass reports.</p></div>
   </div></div>
 
   <div class="step"><div class="sh"><span class="n">F2</span><span class="t">Summary — record what matched (non-destructive)</span></div><div class="sb">
