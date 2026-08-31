@@ -1,4 +1,10 @@
 args:
+- name: entryID
+  description: War Room entry ID of the uploaded rules file. This is the argument name
+    every Cortex content script uses. Omit it and the script finds the file itself, in
+    order - File.EntryID in context, then the newest file entry in the War Room, then the
+    newest attachment on this issue.
+  required: false
 - name: entry_id
   description: War Room entry ID of the uploaded rules file. Omit it and the newest file attached to this issue is used, so an analyst can attach rules at issue creation without hunting for an entry ID. Newest wins, so re-uploading a corrected file supersedes a broken one without deleting it.
   required: false

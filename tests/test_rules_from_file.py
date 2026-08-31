@@ -150,3 +150,81 @@ def test_the_b64_satisfies_the_scanners_own_decoder():
     assert not missing, "could not lift from the scanner: %s" % sorted(missing)
     v = R.validate_rules(GOOD)
     assert ns["decode_yara_rules"](v["b64"]) == GOOD
+
+
+# --------------------------------------------------------------- entry discovery
+# None of this was covered before, which is why the gap survived: the script only ever
+# looked at incident attachments, so a file uploaded straight into the War Room - the
+# ordinary way - reported "no rules file found". The argument name was wrong too: every
+# Cortex content script (CommonScripts/ReadFile, CommonScripts/UnzipFile) takes `entryID`.
+
+def _reset(monkeypatch, context=None, entries=None, incident=None):
+    monkeypatch.setattr(demistomock, "context", lambda: context or {}, raising=False)
+    monkeypatch.setattr(demistomock, "incident", lambda: incident or {}, raising=False)
+    monkeypatch.setattr(demistomock, "executeCommand",
+                        lambda cmd, a=None: (entries or []) if cmd == "getEntries" else None,
+                        raising=False)
+
+
+def test_file_context_is_found(monkeypatch):
+    """File.EntryID - where an uploaded file lands. Previously invisible to this script."""
+    _reset(monkeypatch, context={"File": {"EntryID": "111@abc", "Name": "r.yar"}})
+    assert R.find_rules_entry_id() == "111@abc"
+
+
+def test_file_context_takes_the_newest_when_several(monkeypatch):
+    """`File` becomes a LIST once more than one file is present; newest wins, so a
+    corrected re-upload supersedes the broken one without anyone deleting it."""
+    _reset(monkeypatch, context={"File": [{"EntryID": "old@1"}, {"EntryID": "new@2"}]})
+    assert R.find_rules_entry_id() == "new@2"
+
+
+def test_war_room_entry_is_found(monkeypatch):
+    """getEntries + entry["ID"], the CommonScripts/UnzipFile pattern."""
+    _reset(monkeypatch, entries=[{"ID": "1@x", "File": "notes.txt"},
+                                 {"ID": "2@x", "File": "rules.yar"}])
+    assert R.find_rules_entry_id() == "2@x"
+
+
+def test_war_room_ignores_entries_that_are_not_files(monkeypatch):
+    _reset(monkeypatch, entries=[{"ID": "1@x", "Contents": "just a note"}])
+    assert R.find_rules_entry_id() is None
+
+
+def test_attachment_still_works(monkeypatch):
+    """The original path must keep working - it is how a playbook-attached file arrives."""
+    _reset(monkeypatch, incident={"attachment": [{"entryID": "att@9"}]})
+    assert R.find_rules_entry_id() == "att@9"
+
+
+def test_file_context_wins_over_attachment(monkeypatch):
+    """Most-specific source first; both can be populated at once."""
+    _reset(monkeypatch, context={"File": {"EntryID": "ctx@1"}},
+           incident={"attachment": [{"entryID": "att@1"}]})
+    assert R.find_rules_entry_id() == "ctx@1"
+
+
+def test_nothing_anywhere_returns_none(monkeypatch):
+    _reset(monkeypatch)
+    assert R.find_rules_entry_id() is None
+
+
+def test_a_probe_that_raises_does_not_break_discovery(monkeypatch):
+    """demisto.context() is not available in every execution context. A source that blows
+    up must fall through to the next one rather than failing the whole run."""
+    def boom():
+        raise RuntimeError("no context here")
+    monkeypatch.setattr(demistomock, "context", boom, raising=False)
+    monkeypatch.setattr(demistomock, "executeCommand", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(demistomock, "incident",
+                        lambda: {"attachment": [{"entryID": "att@fallback"}]}, raising=False)
+    assert R.find_rules_entry_id() == "att@fallback"
+
+
+def test_entryID_is_accepted_as_an_argument_name(monkeypatch):
+    """`entryID` is what every content script uses; `entry_id` shipped here first and must
+    keep working."""
+    import yaml as _y
+    d = _y.safe_load(open(_PY[:-3] + ".yml"))
+    names = {a["name"] for a in d["args"]}
+    assert {"entryID", "entry_id"} <= names, names
