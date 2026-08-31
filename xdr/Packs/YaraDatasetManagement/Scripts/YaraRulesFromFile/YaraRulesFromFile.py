@@ -273,9 +273,10 @@ find_attachment_entry_id = _from_attachments
 
 def main():
     args = demisto.args()
-    # `entryID` is the name every demisto content script uses (ReadFile, UnzipFile);
-    # `entry_id` is kept because this script shipped with it.
-    entry_id = (args.get("entryID") or args.get("entry_id") or "").strip() or None
+    # `entryID`, the name every Cortex content script uses (CommonScripts/ReadFile,
+    # CommonScripts/UnzipFile). One spelling only - two would just be clutter in the
+    # argument list, and nothing had consumed the old one.
+    entry_id = (args.get("entryID") or "").strip() or None
     mb = args.get("max_bytes")
     try:
         max_bytes = int(mb) if mb not in (None, "") else DEFAULT_MAX_BYTES

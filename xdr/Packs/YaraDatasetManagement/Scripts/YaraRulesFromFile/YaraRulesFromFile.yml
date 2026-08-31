@@ -5,11 +5,6 @@ args:
     order - File.EntryID in context, then the newest file entry in the War Room, then the
     newest attachment on this issue.
   required: false
-- name: entry_id
-  description: War Room entry ID of the uploaded rules file. Omit it and the newest file attached to this issue is used, so an analyst can attach rules at issue creation without hunting for an entry ID. Newest wins, so re-uploading a corrected file supersedes a broken one without deleting it.
-  required: false
-  isArray: false
-  secret: false
 - name: max_bytes
   description: Refuse a file larger than this many bytes. Defaults to 2097152 (2 MB) - a rules file bigger than that is a mistake, not a ruleset. The scanner's own ceiling is 50 MB of base64, far past anything a human attaches to an issue.
   required: false

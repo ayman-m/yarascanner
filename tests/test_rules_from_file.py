@@ -221,10 +221,13 @@ def test_a_probe_that_raises_does_not_break_discovery(monkeypatch):
     assert R.find_rules_entry_id() == "att@fallback"
 
 
-def test_entryID_is_accepted_as_an_argument_name(monkeypatch):
-    """`entryID` is what every content script uses; `entry_id` shipped here first and must
-    keep working."""
+def test_the_entry_argument_has_exactly_one_spelling(monkeypatch):
+    """`entryID` is what every Cortex content script uses (ReadFile, UnzipFile), and it is
+    the only spelling this script accepts. Carrying a second alias would put two arguments
+    that do the same thing in front of an analyst, for no benefit - nothing ever consumed
+    the old `entry_id` name."""
     import yaml as _y
     d = _y.safe_load(open(_PY[:-3] + ".yml"))
     names = {a["name"] for a in d["args"]}
-    assert {"entryID", "entry_id"} <= names, names
+    assert "entryID" in names, names
+    assert "entry_id" not in names, "two names for one argument: %s" % sorted(names)
