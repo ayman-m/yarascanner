@@ -175,7 +175,7 @@ tasks:
                 value:
                   simple: ','
       parameters:
-        simple: '{"yarafile":"${inputs.yarafile}","scan_folder":"${inputs.scan_folder}","alert_severity":"${inputs.alert_severity}","mode":"${inputs.mode}","options":"${inputs.options}"}'
+        simple: '{"yarafile":"${inputs.yarafile}","scan_folder":"${inputs.scan_folder}","alert_severity":"${inputs.alert_severity}"}'
       timeout:
         simple: ${inputs.timeout}
       polling_interval_in_seconds:
@@ -219,7 +219,7 @@ view: |-
 inputs:
 - key: script_name
   value:
-    simple: xdr_yara_scanner_v4
+    simple: xdr_yara_scanner
   required: true
   description: |-
     Exact name of the scanner script in the Action Center library. IMPORTANT: core-script-run
