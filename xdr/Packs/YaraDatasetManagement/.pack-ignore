@@ -1,0 +1,5 @@
+[file:playbook-YARA_Dataset_Consolidation.yml]
+ignore=PB105,PB114
+
+[file:YaraWipeAllDatasets.yml]
+ignore=SC105
