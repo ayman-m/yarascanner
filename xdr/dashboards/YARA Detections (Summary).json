@@ -1,0 +1,122 @@
+{
+    "dashboards_data": [
+        {
+            "name": "YARA Detections (Summary)",
+            "description": "Which YARA rules fired, on which hosts, from which ruleset - read from the SUMMARY consolidation target only (yara_scanner_summary_v4_rules_*), one row per (host, rule). This dashboard answers WHERE, never HOW MUCH: there is no file, offset or match count in this dataset. For the per-file detail behind any row here, go to the FULL target or the per-host matches dataset.",
+            "status": "ENABLED",
+            "layout": [
+                {
+                    "id": "row-0",
+                    "data": [
+                        {
+                            "key": "xql_fbb527a8aa3422b5",
+                            "data": {
+                                "type": "Custom XQL",
+                                "width": 25.0,
+                                "height": 220,
+                                "phrase": "/**************************************************************************\n  Rules Fired\n\n  How many distinct YARA rules have fired anywhere in the fleet.\n\n  Dataset(s): yara_scanner_summary_v4_rules_* - the SUMMARY consolidation\n  target, one row per (host, rule). Four columns only: scan_id, hostname,\n  rule, event_timestamp_ms. There is no file, no offset and no match count\n  here; that detail lives in the FULL target and in the per-host matches\n  datasets. Ask this dataset \"which rules fired where\", never \"how much\".\n\n  Lookup rows carry no _time - time-filter on event_timestamp_ms.\n\n  dedup scan_id, hostname, rule guards the window where a consolidation pass\n  has written a row into its per-ruleset target but not yet reconciled the\n  superseded one out. Without it a host re-scanned with the same ruleset\n  counts twice.\n**************************************************************************/\ndataset = yara_scanner_summary_v4_rules_*\n| dedup scan_id, hostname, rule\n| comp count_distinct(rule) as rules_fired\n\n| view graph type = single subtype = none header = \"Rules Fired\"\n",
+                                "time_frame": {
+                                    "relativeTime": 2592000000
+                                }
+                            }
+                        },
+                        {
+                            "key": "xql_6673a07c70a546e2",
+                            "data": {
+                                "type": "Custom XQL",
+                                "width": 25.0,
+                                "height": 220,
+                                "phrase": "/**************************************************************************\n  Hosts With Detections\n\n  How many hosts have at least one rule hit. Compare against the fleet\n  size: this counts hosts that MATCHED, not hosts that were scanned - a\n  host scanned clean never appears in this dataset at all.\n\n  Dataset(s): yara_scanner_summary_v4_rules_* - the SUMMARY consolidation\n  target, one row per (host, rule). Four columns only: scan_id, hostname,\n  rule, event_timestamp_ms. There is no file, no offset and no match count\n  here; that detail lives in the FULL target and in the per-host matches\n  datasets. Ask this dataset \"which rules fired where\", never \"how much\".\n\n  Lookup rows carry no _time - time-filter on event_timestamp_ms.\n\n  dedup scan_id, hostname, rule guards the window where a consolidation pass\n  has written a row into its per-ruleset target but not yet reconciled the\n  superseded one out. Without it a host re-scanned with the same ruleset\n  counts twice.\n**************************************************************************/\ndataset = yara_scanner_summary_v4_rules_*\n| dedup scan_id, hostname, rule\n| comp count_distinct(hostname) as hosts_with_detections\n\n| view graph type = single subtype = none header = \"Hosts With Detections\"\n",
+                                "time_frame": {
+                                    "relativeTime": 2592000000
+                                }
+                            }
+                        },
+                        {
+                            "key": "xql_2840bfc0df0eb236",
+                            "data": {
+                                "type": "Custom XQL",
+                                "width": 25.0,
+                                "height": 220,
+                                "phrase": "/**************************************************************************\n  Detections by Ruleset\n\n  Which ruleset produced each detection. The ruleset hash is the last\n  component of every scan_id and is the only part every host in one launch\n  shares, which is why consolidation keys its targets on it.\n\n  Dataset(s): yara_scanner_summary_v4_rules_* - the SUMMARY consolidation\n  target, one row per (host, rule). Four columns only: scan_id, hostname,\n  rule, event_timestamp_ms. There is no file, no offset and no match count\n  here; that detail lives in the FULL target and in the per-host matches\n  datasets. Ask this dataset \"which rules fired where\", never \"how much\".\n\n  Lookup rows carry no _time - time-filter on event_timestamp_ms.\n\n  dedup scan_id, hostname, rule guards the window where a consolidation pass\n  has written a row into its per-ruleset target but not yet reconciled the\n  superseded one out. Without it a host re-scanned with the same ruleset\n  counts twice.\n**************************************************************************/\ndataset = yara_scanner_summary_v4_rules_*\n| dedup scan_id, hostname, rule\n| alter ruleset = arrayindex(split(scan_id, \"_yara_\"), 1)\n| comp count() as detections by ruleset\n| sort desc detections\n\n| view graph type = pie subtype = full header = \"Detections by Ruleset\" xaxis = ruleset yaxis = detections\n",
+                                "time_frame": {
+                                    "relativeTime": 2592000000
+                                }
+                            }
+                        },
+                        {
+                            "key": "xql_96140b0af784fcb6",
+                            "data": {
+                                "type": "Custom XQL",
+                                "width": 25.0,
+                                "height": 220,
+                                "phrase": "/**************************************************************************\n  Rule Spread\n\n  Whether each rule is isolated or fleet-wide. A rule on one host is a\n  candidate for triage; the same rule on every host is more often a rule\n  that needs tightening than an incident that needs response.\n\n  Dataset(s): yara_scanner_summary_v4_rules_* - the SUMMARY consolidation\n  target, one row per (host, rule). Four columns only: scan_id, hostname,\n  rule, event_timestamp_ms. There is no file, no offset and no match count\n  here; that detail lives in the FULL target and in the per-host matches\n  datasets. Ask this dataset \"which rules fired where\", never \"how much\".\n\n  Lookup rows carry no _time - time-filter on event_timestamp_ms.\n\n  dedup scan_id, hostname, rule guards the window where a consolidation pass\n  has written a row into its per-ruleset target but not yet reconciled the\n  superseded one out. Without it a host re-scanned with the same ruleset\n  counts twice.\n**************************************************************************/\ndataset = yara_scanner_summary_v4_rules_*\n| dedup scan_id, hostname, rule\n| comp count_distinct(hostname) as hosts by rule\n| alter spread = if(hosts > 2, \"3+ hosts\", if(hosts = 2, \"2 hosts\", \"1 host\"))\n| comp count() as rules by spread\n| sort desc rules\n\n| view graph type = pie subtype = full header = \"Rule Spread\" xaxis = spread yaxis = rules\n",
+                                "time_frame": {
+                                    "relativeTime": 2592000000
+                                }
+                            }
+                        }
+                    ]
+                },
+                {
+                    "id": "row-1",
+                    "data": [
+                        {
+                            "key": "xql_656126cccfe5177c",
+                            "data": {
+                                "type": "Custom XQL",
+                                "width": 50.0,
+                                "height": 360,
+                                "phrase": "/**************************************************************************\n  Rule Reach\n\n  How many hosts each rule fired on. The top of this list is either a\n  genuine fleet-wide problem or a rule that is too broad - the two look\n  identical here, and the FULL target is where you tell them apart.\n\n  Dataset(s): yara_scanner_summary_v4_rules_* - the SUMMARY consolidation\n  target, one row per (host, rule). Four columns only: scan_id, hostname,\n  rule, event_timestamp_ms. There is no file, no offset and no match count\n  here; that detail lives in the FULL target and in the per-host matches\n  datasets. Ask this dataset \"which rules fired where\", never \"how much\".\n\n  Lookup rows carry no _time - time-filter on event_timestamp_ms.\n\n  dedup scan_id, hostname, rule guards the window where a consolidation pass\n  has written a row into its per-ruleset target but not yet reconciled the\n  superseded one out. Without it a host re-scanned with the same ruleset\n  counts twice.\n**************************************************************************/\ndataset = yara_scanner_summary_v4_rules_*\n| dedup scan_id, hostname, rule\n| comp count_distinct(hostname) as hosts by rule\n| sort desc hosts\n| limit 15\n\n| view graph type = column subtype = stacked header = \"Rule Reach (hosts per rule)\" xaxis = rule yaxis = hosts\n",
+                                "time_frame": {
+                                    "relativeTime": 2592000000
+                                }
+                            }
+                        },
+                        {
+                            "key": "xql_1612e8d265fcb8fb",
+                            "data": {
+                                "type": "Custom XQL",
+                                "width": 50.0,
+                                "height": 360,
+                                "phrase": "/**************************************************************************\n  Detections per Host\n\n  Distinct rules that fired on each host. A host at the top is not\n  necessarily worse off than one below it - one rule matching a thousand\n  files counts once here. Use it to pick where to look, not how bad it is.\n\n  Dataset(s): yara_scanner_summary_v4_rules_* - the SUMMARY consolidation\n  target, one row per (host, rule). Four columns only: scan_id, hostname,\n  rule, event_timestamp_ms. There is no file, no offset and no match count\n  here; that detail lives in the FULL target and in the per-host matches\n  datasets. Ask this dataset \"which rules fired where\", never \"how much\".\n\n  Lookup rows carry no _time - time-filter on event_timestamp_ms.\n\n  dedup scan_id, hostname, rule guards the window where a consolidation pass\n  has written a row into its per-ruleset target but not yet reconciled the\n  superseded one out. Without it a host re-scanned with the same ruleset\n  counts twice.\n**************************************************************************/\ndataset = yara_scanner_summary_v4_rules_*\n| dedup scan_id, hostname, rule\n| comp count_distinct(rule) as rules by hostname\n| sort desc rules\n| limit 15\n\n| view graph type = column subtype = stacked header = \"Detections per Host (distinct rules)\" xaxis = hostname yaxis = rules\n",
+                                "time_frame": {
+                                    "relativeTime": 2592000000
+                                }
+                            }
+                        }
+                    ]
+                },
+                {
+                    "id": "row-2",
+                    "data": [
+                        {
+                            "key": "xql_907c72a77a1554c7",
+                            "data": {
+                                "type": "Custom XQL",
+                                "width": 50.0,
+                                "height": 360,
+                                "phrase": "/**************************************************************************\n  Detections Over Time\n\n  Detections per day, bucketed from event_timestamp_ms. Bucketing matters:\n  grouping on the raw millisecond gives one point per scan-write instant and\n  a chart nobody can read.\n\n  Dataset(s): yara_scanner_summary_v4_rules_* - the SUMMARY consolidation\n  target, one row per (host, rule). Four columns only: scan_id, hostname,\n  rule, event_timestamp_ms. There is no file, no offset and no match count\n  here; that detail lives in the FULL target and in the per-host matches\n  datasets. Ask this dataset \"which rules fired where\", never \"how much\".\n\n  Lookup rows carry no _time - time-filter on event_timestamp_ms.\n\n  dedup scan_id, hostname, rule guards the window where a consolidation pass\n  has written a row into its per-ruleset target but not yet reconciled the\n  superseded one out. Without it a host re-scanned with the same ruleset\n  counts twice.\n**************************************************************************/\ndataset = yara_scanner_summary_v4_rules_*\n| dedup scan_id, hostname, rule\n| alter day = format_timestamp(\"%Y-%m-%d\", to_timestamp(to_integer(event_timestamp_ms), \"MILLIS\"))\n| comp count() as detections by day\n| sort asc day\n\n| view graph type = line subtype = smooth header = \"Detections Over Time\" xaxis = day yaxis = detections\n",
+                                "time_frame": {
+                                    "relativeTime": 2592000000
+                                }
+                            }
+                        },
+                        {
+                            "key": "xql_b81aded403e14b6e",
+                            "data": {
+                                "type": "Custom XQL",
+                                "width": 50.0,
+                                "height": 360,
+                                "phrase": "/**************************************************************************\n  Detection Triage Table\n\n  Every (host, rule) pair with the ruleset that produced it and when it\n  landed. This is the working list - the other widgets summarise it.\n\n  Dataset(s): yara_scanner_summary_v4_rules_* - the SUMMARY consolidation\n  target, one row per (host, rule). Four columns only: scan_id, hostname,\n  rule, event_timestamp_ms. There is no file, no offset and no match count\n  here; that detail lives in the FULL target and in the per-host matches\n  datasets. Ask this dataset \"which rules fired where\", never \"how much\".\n\n  Lookup rows carry no _time - time-filter on event_timestamp_ms.\n\n  dedup scan_id, hostname, rule guards the window where a consolidation pass\n  has written a row into its per-ruleset target but not yet reconciled the\n  superseded one out. Without it a host re-scanned with the same ruleset\n  counts twice.\n**************************************************************************/\ndataset = yara_scanner_summary_v4_rules_*\n| dedup scan_id, hostname, rule\n| alter ruleset = arrayindex(split(scan_id, \"_yara_\"), 1)\n| alter detected = format_timestamp(\"%Y-%m-%d %H:%M\", to_timestamp(to_integer(event_timestamp_ms), \"MILLIS\"))\n| fields hostname, rule, ruleset, detected\n| sort desc detected\n| limit 50\n\n| view graph type = table header = \"Detection Triage\"\n",
+                                "time_frame": {
+                                    "relativeTime": 2592000000
+                                }
+                            }
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
+}
