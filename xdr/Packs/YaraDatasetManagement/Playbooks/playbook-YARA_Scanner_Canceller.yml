@@ -1,39 +1,45 @@
 id: YARA_Scanner_Canceller
 version: -1
 name: YARA Scanner Canceller
-description: |-
-  Delivers a cooperative cancel to a running YARA scan on targeted Cortex agents.
+description: 'Delivers a cooperative cancel to a running YARA scan on targeted Cortex agents.
+
   Flow: resolve the script UID (core-get-scripts) -> resolve target endpoints
+
   (core-get-endpoints) -> run the scanner with mode=cancel (core-script-run), which drops the
-  cancel flag on each endpoint; a running scan's watcher detects it within ~5s and shuts down
-  gracefully (terminal 'cancelled' lifecycle row).
+
+  cancel flag on each endpoint; a running scan''s watcher detects it within ~5s and shuts down
+
+  gracefully (terminal ''cancelled'' lifecycle row).
+
 
   Uses the built-in "Cortex Core - IR" integration (available on Cortex XDR / XSIAM).
 
+
   PREREQUISITE: the scanner must exist in the Action Center library with exactly these 5 string
+
   inputs, in order: yarafile, scan_folder, alert_severity, mode, options (core-script-run rejects
-  a parameter set that does not match the script's defined inputs).
-starttaskid: "0"
+
+  a parameter set that does not match the script''s defined inputs).'
+starttaskid: '0'
 tasks:
-  "0":
-    id: "0"
+  '0':
+    id: '0'
     taskid: 5c2d0b20-0000-0000-0000-000000000000
     type: start
     task:
       id: 5c2d0b20-0000-0000-0000-000000000000
       version: -1
-      name: ""
+      name: ''
       iscommand: false
-      brand: ""
+      brand: ''
     nexttasks:
       '#none#':
-      - "1"
+      - '1'
     separatecontext: false
-    continueonerrortype: ""
-    view: |-
-      {"position": {"x": 450, "y": 50}}
-  "1":
-    id: "1"
+    continueonerrortype: ''
+    view: '{"position": {"x": 450, "y": 50}}'
+  '1':
+    id: '1'
     taskid: 5c2d0b20-0000-0000-0000-000000000001
     type: regular
     task:
@@ -50,13 +56,12 @@ tasks:
         simple: ${inputs.script_name}
     nexttasks:
       '#none#':
-      - "2"
+      - '2'
     separatecontext: false
-    continueonerrortype: ""
-    view: |-
-      {"position": {"x": 450, "y": 195}}
-  "2":
-    id: "2"
+    continueonerrortype: ''
+    view: '{"position": {"x": 450, "y": 195}}'
+  '2':
+    id: '2'
     taskid: 5c2d0b20-0000-0000-0000-000000000002
     type: regular
     task:
@@ -67,23 +72,22 @@ tasks:
       script: SetAndHandleEmpty
       type: regular
       iscommand: false
-      brand: ""
+      brand: ''
     scriptarguments:
       key:
         simple: script_uuid
       value:
         simple: ${Core.Scripts.script_uid}
       append:
-        simple: "false"
+        simple: 'false'
     nexttasks:
       '#none#':
-      - "3"
+      - '3'
     separatecontext: false
-    continueonerrortype: ""
-    view: |-
-      {"position": {"x": 450, "y": 340}}
-  "3":
-    id: "3"
+    continueonerrortype: ''
+    view: '{"position": {"x": 450, "y": 340}}'
+  '3':
+    id: '3'
     taskid: 5c2d0b20-0000-0000-0000-000000000003
     type: regular
     task:
@@ -118,13 +122,12 @@ tasks:
         simple: connected
     nexttasks:
       '#none#':
-      - "4"
+      - '4'
     separatecontext: false
-    continueonerrortype: ""
-    view: |-
-      {"position": {"x": 450, "y": 485}}
-  "4":
-    id: "4"
+    continueonerrortype: ''
+    view: '{"position": {"x": 450, "y": 485}}'
+  '4':
+    id: '4'
     taskid: 5c2d0b20-0000-0000-0000-000000000004
     type: regular
     task:
@@ -135,23 +138,22 @@ tasks:
       script: SetAndHandleEmpty
       type: regular
       iscommand: false
-      brand: ""
+      brand: ''
     scriptarguments:
       key:
         simple: endpoint_id
       value:
         simple: ${Core.Endpoint.endpoint_id}
       append:
-        simple: "false"
+        simple: 'false'
     nexttasks:
       '#none#':
-      - "5"
+      - '5'
     separatecontext: false
-    continueonerrortype: ""
-    view: |-
-      {"position": {"x": 450, "y": 630}}
-  "5":
-    id: "5"
+    continueonerrortype: ''
+    view: '{"position": {"x": 450, "y": 630}}'
+  '5':
+    id: '5'
     taskid: 5c2d0b20-0000-0000-0000-000000000005
     type: regular
     task:
@@ -178,20 +180,19 @@ tasks:
       parameters:
         simple: '{"yarafile":"","scan_folder":"default","alert_severity":"low","mode":"cancel","options":""}'
       timeout:
-        simple: "300"
+        simple: '300'
       polling_interval_in_seconds:
-        simple: "30"
+        simple: '30'
       polling_timeout_in_seconds:
-        simple: "300"
+        simple: '300'
     nexttasks:
       '#none#':
-      - "6"
+      - '6'
     separatecontext: false
-    continueonerrortype: ""
-    view: |-
-      {"position": {"x": 450, "y": 775}}
-  "6":
-    id: "6"
+    continueonerrortype: ''
+    view: '{"position": {"x": 450, "y": 775}}'
+  '6':
+    id: '6'
     taskid: 5c2d0b20-0000-0000-0000-000000000006
     type: title
     task:
@@ -200,29 +201,28 @@ tasks:
       name: Done
       type: title
       iscommand: false
-      brand: ""
+      brand: ''
     separatecontext: false
-    continueonerrortype: ""
-    view: |-
-      {"position": {"x": 450, "y": 920}}
+    continueonerrortype: ''
+    view: '{"position": {"x": 450, "y": 920}}'
 inputs:
 - key: script_name
   value:
     simple: xdr_yara_scanner_v4
   required: true
-  description: |-
-    Exact name of the scanner script in the Action Center library. It must be the same
-    5-input build the runner targets (inputs: yarafile, scan_folder, alert_severity, mode, options).
+  description: 'Exact name of the scanner script in the Action Center library. It must be the same
+
+    5-input build the runner targets (inputs: yarafile, scan_folder, alert_severity, mode, options).'
   playbookInputQuery: null
 - key: endpoint_hostnames
   value:
-    simple: ""
+    simple: ''
   required: false
   description: Comma-separated hostnames whose running scan should be cancelled.
   playbookInputQuery: null
 - key: endpoint_groups
   value:
-    simple: ""
+    simple: ''
   required: false
   description: Comma-separated endpoint group names to target.
   playbookInputQuery: null
@@ -233,3 +233,5 @@ outputs:
 fromversion: 6.5.0
 tests:
 - No tests (auto-formatted)
+view: "{\n  \"linkLabelsPosition\": {},\n  \"paper\": {\n    \"dimensions\": {\n      \"height\": 1170,\n      \"\
+  width\": 880,\n      \"x\": 50,\n      \"y\": 50\n    }\n  }\n}"
