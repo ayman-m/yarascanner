@@ -80,7 +80,7 @@ tasks:
         simple: 'false'
     nexttasks:
       '#none#':
-      - '7'
+      - '12'
     separatecontext: false
     continueonerrortype: ''
     view: '{"position": {"x": 450, "y": 340}}'
@@ -108,14 +108,7 @@ tasks:
                 value:
                   simple: ','
       group_name:
-        complex:
-          root: inputs.endpoint_groups
-          transformers:
-          - operator: join
-            args:
-              separator:
-                value:
-                  simple: ','
+        simple: ${target_group}
       status:
         simple: connected
     nexttasks:
@@ -123,7 +116,7 @@ tasks:
       - '4'
     separatecontext: false
     continueonerrortype: ''
-    view: '{"position": {"x": 450, "y": 630}}'
+    view: '{"position": {"x": 450, "y": 1790}}'
   '4':
     id: '4'
     taskid: 4b1c0a10-0000-0000-0000-000000000004
@@ -149,7 +142,7 @@ tasks:
       - '9'
     separatecontext: false
     continueonerrortype: ''
-    view: '{"position": {"x": 450, "y": 775}}'
+    view: '{"position": {"x": 450, "y": 1935}}'
   '5':
     id: '5'
     taskid: 4b1c0a10-0000-0000-0000-000000000005
@@ -176,7 +169,7 @@ tasks:
                 value:
                   simple: ','
       parameters:
-        simple: '{"yarafile":"${inputs.yarafile}","scan_folder":"${inputs.scan_folder}","alert_severity":"${inputs.alert_severity}"}'
+        simple: '{"yarafile":"${rules_b64}","scan_folder":"${inputs.scan_folder}","alert_severity":"${inputs.alert_severity}"}'
       timeout:
         simple: ${inputs.timeout}
     nexttasks:
@@ -184,7 +177,7 @@ tasks:
       - '6'
     separatecontext: false
     continueonerrortype: ''
-    view: '{"position": {"x": 450, "y": 1065}}'
+    view: '{"position": {"x": 450, "y": 2225}}'
   '6':
     id: '6'
     taskid: 4b1c0a10-0000-0000-0000-000000000006
@@ -198,7 +191,7 @@ tasks:
       brand: ''
     separatecontext: false
     continueonerrortype: ''
-    view: '{"position": {"x": 450, "y": 1210}}'
+    view: '{"position": {"x": 450, "y": 2370}}'
   '7':
     id: '7'
     taskid: 4b1c0a10-0000-0000-0000-000000000007
@@ -210,8 +203,8 @@ tasks:
       type: condition
       iscommand: false
       brand: ''
-      description: '`all` scans every CONNECTED endpoint. Anything else is treated as an explicit scope. Blank is
-        neither, and stops the playbook rather than quietly meaning everything.'
+      description: '`all` needs confirming before it reaches the fleet. A named group does not - the operator already
+        said what they meant.'
     separatecontext: false
     continueonerrortype: ''
     conditions:
@@ -240,12 +233,12 @@ tasks:
             iscontext: true
     nexttasks:
       all:
-      - '8'
+      - '20'
       scoped:
-      - '3'
+      - '23'
       '#default#':
       - '10'
-    view: '{"position": {"x": 450, "y": 485}}'
+    view: '{"position": {"x": 450, "y": 1210}}'
   '8':
     id: '8'
     taskid: 4b1c0a10-0000-0000-0000-000000000008
@@ -268,7 +261,7 @@ tasks:
       - '4'
     separatecontext: false
     continueonerrortype: ''
-    view: '{"position": {"x": 700, "y": 630}}'
+    view: '{"position": {"x": 1100, "y": 1790}}'
   '9':
     id: '9'
     taskid: 4b1c0a10-0000-0000-0000-000000000009
@@ -297,7 +290,7 @@ tasks:
       - '5'
       '#default#':
       - '11'
-    view: '{"position": {"x": 450, "y": 920}}'
+    view: '{"position": {"x": 450, "y": 2080}}'
   '10':
     id: '10'
     taskid: 4b1c0a10-0000-0000-0000-000000000010
@@ -311,7 +304,7 @@ tasks:
       brand: ''
     separatecontext: false
     continueonerrortype: ''
-    view: '{"position": {"x": 150, "y": 630}}'
+    view: '{"position": {"x": 150, "y": 1355}}'
   '11':
     id: '11'
     taskid: 4b1c0a10-0000-0000-0000-000000000011
@@ -325,9 +318,352 @@ tasks:
       brand: ''
     separatecontext: false
     continueonerrortype: ''
+    view: '{"position": {"x": 150, "y": 2225}}'
+  '12':
+    id: '12'
+    taskid: 4b1c0a10-0000-0000-0000-000000000012
+    type: condition
+    task:
+      id: 4b1c0a10-0000-0000-0000-000000000012
+      version: -1
+      name: Rules supplied as base64?
+      type: condition
+      iscommand: false
+      brand: ''
+      description: The yarafile input is the direct path. Empty is not a licence to fall back to whatever the scanner
+        has compiled in - a scan must run the rules someone chose.
+    separatecontext: false
+    continueonerrortype: ''
+    conditions:
+    - label: supplied
+      condition:
+      - - operator: isExists
+          left:
+            value:
+              simple: inputs.yarafile
+            iscontext: true
+    nexttasks:
+      supplied:
+      - '16'
+      '#default#':
+      - '13'
+    view: '{"position": {"x": 450, "y": 485}}'
+  '13':
+    id: '13'
+    taskid: 4b1c0a10-0000-0000-0000-000000000013
+    type: condition
+    task:
+      id: 4b1c0a10-0000-0000-0000-000000000013
+      version: -1
+      name: Was a rules file uploaded instead?
+      type: condition
+      iscommand: false
+      brand: ''
+      description: No base64, so look for an uploaded file. File.EntryID is where a .yar dropped into the issue lands
+        in context.
+    separatecontext: false
+    continueonerrortype: ''
+    conditions:
+    - label: uploaded
+      condition:
+      - - operator: isExists
+          left:
+            value:
+              simple: File.EntryID
+            iscontext: true
+    nexttasks:
+      uploaded:
+      - '14'
+      '#default#':
+      - '18'
+    view: '{"position": {"x": 450, "y": 630}}'
+  '14':
+    id: '14'
+    taskid: 4b1c0a10-0000-0000-0000-000000000014
+    type: regular
+    task:
+      id: 4b1c0a10-0000-0000-0000-000000000014
+      version: -1
+      name: Encode the uploaded rules
+      type: regular
+      iscommand: false
+      brand: ''
+      description: Validate and base64-encode the uploaded file. This also rejects a ruleset that cannot compile,
+        before a single endpoint is touched.
+      script: YaraRulesFromFile
+    separatecontext: false
+    continueonerrortype: ''
+    scriptarguments:
+      entryID:
+        simple: ${File.EntryID}
+    nexttasks:
+      '#none#':
+      - '15'
+    view: '{"position": {"x": 450, "y": 775}}'
+  '15':
+    id: '15'
+    taskid: 4b1c0a10-0000-0000-0000-000000000015
+    type: condition
+    task:
+      id: 4b1c0a10-0000-0000-0000-000000000015
+      version: -1
+      name: Did the rules encode cleanly?
+      type: condition
+      iscommand: false
+      brand: ''
+      description: YaraRulesFromFile returns valid=false with a reason rather than raising, so the failure has to
+        be branched on explicitly or a rejected ruleset would sail through as empty.
+    separatecontext: false
+    continueonerrortype: ''
+    conditions:
+    - label: valid
+      condition:
+      - - operator: isEqualString
+          left:
+            value:
+              simple: Yara.Rules.valid
+            iscontext: true
+          right:
+            value:
+              simple: 'true'
+          ignorecase: true
+    nexttasks:
+      valid:
+      - '19'
+      '#default#':
+      - '17'
+    view: '{"position": {"x": 450, "y": 920}}'
+  '16':
+    id: '16'
+    taskid: 4b1c0a10-0000-0000-0000-000000000016
+    type: regular
+    task:
+      id: 4b1c0a10-0000-0000-0000-000000000016
+      version: -1
+      name: Use the supplied base64
+      type: regular
+      iscommand: false
+      brand: ''
+      description: Operator passed base64 directly.
+      script: SetAndHandleEmpty
+    separatecontext: false
+    continueonerrortype: ''
+    scriptarguments:
+      key:
+        simple: rules_b64
+      value:
+        simple: ${inputs.yarafile}
+      append:
+        simple: 'false'
+    nexttasks:
+      '#none#':
+      - '7'
+    view: '{"position": {"x": 800, "y": 630}}'
+  '17':
+    id: '17'
+    taskid: 4b1c0a10-0000-0000-0000-000000000017
+    type: title
+    task:
+      id: 4b1c0a10-0000-0000-0000-000000000017
+      version: -1
+      name: STOPPED - the rules file could not be encoded
+      type: title
+      iscommand: false
+      brand: ''
+    separatecontext: false
+    continueonerrortype: ''
     view: '{"position": {"x": 150, "y": 1065}}'
-view: "{\n  \"linkLabelsPosition\": {},\n  \"paper\": {\n    \"dimensions\": {\n      \"height\": 1460,\n      \"\
-  width\": 1180,\n      \"x\": 50,\n      \"y\": 50\n    }\n  }\n}"
+  '18':
+    id: '18'
+    taskid: 4b1c0a10-0000-0000-0000-000000000018
+    type: title
+    task:
+      id: 4b1c0a10-0000-0000-0000-000000000018
+      version: -1
+      name: STOPPED - no rules supplied (pass yarafile, or attach a .yar)
+      type: title
+      iscommand: false
+      brand: ''
+    separatecontext: false
+    continueonerrortype: ''
+    view: '{"position": {"x": 150, "y": 775}}'
+  '19':
+    id: '19'
+    taskid: 4b1c0a10-0000-0000-0000-000000000019
+    type: regular
+    task:
+      id: 4b1c0a10-0000-0000-0000-000000000019
+      version: -1
+      name: Use the encoded file
+      type: regular
+      iscommand: false
+      brand: ''
+      description: Base64 produced from the uploaded rules file.
+      script: SetAndHandleEmpty
+    separatecontext: false
+    continueonerrortype: ''
+    scriptarguments:
+      key:
+        simple: rules_b64
+      value:
+        simple: ${Yara.Rules.b64}
+      append:
+        simple: 'false'
+    nexttasks:
+      '#none#':
+      - '7'
+    view: '{"position": {"x": 450, "y": 1065}}'
+  '20':
+    id: '20'
+    taskid: 4b1c0a10-0000-0000-0000-000000000020
+    type: collection
+    task:
+      id: 4b1c0a10-0000-0000-0000-000000000020
+      version: -1
+      name: 'Confirm: scan every connected endpoint?'
+      type: collection
+      iscommand: false
+      brand: ''
+      description: Pauses for a human. Reached only when the scope is `all`; a named group skips this.
+    separatecontext: false
+    continueonerrortype: ''
+    nexttasks:
+      '#none#':
+      - '21'
+    view: '{"position": {"x": 800, "y": 1355}}'
+    message:
+      to: null
+      subject: null
+      body:
+        simple: A YARA scan is about to target EVERY connected endpoint. Confirm, or name a group to scan instead.
+      methods: []
+      format: ''
+      bcc: null
+      cc: null
+      timings:
+        retriescount: 2
+        retriesinterval: 360
+        completeafterreplies: 1
+    form:
+      questions:
+      - id: '0'
+        label: ''
+        labelarg:
+          simple: Scan every connected endpoint?
+        required: true
+        gridcolumns: []
+        defaultrows: []
+        type: singleSelect
+        options: []
+        optionsarg:
+        - simple: Yes - scan all connected endpoints
+        - simple: No - I will name a group
+        fieldassociated: ''
+        placeholder: ''
+        tooltip: Choosing No requires a group name in the next field.
+        readonly: false
+      - id: '1'
+        label: ''
+        labelarg:
+          simple: Group name (only if you answered No)
+        required: false
+        gridcolumns: []
+        defaultrows: []
+        type: shortText
+        options: []
+        optionsarg: []
+        fieldassociated: ''
+        placeholder: ''
+        tooltip: Exact endpoint group name.
+        readonly: false
+      title: Confirm scan scope
+      description: Confirm a fleet-wide YARA scan, or narrow it to one group.
+      sender: ''
+      expired: false
+      totalanswers: 0
+  '21':
+    id: '21'
+    taskid: 4b1c0a10-0000-0000-0000-000000000021
+    type: condition
+    task:
+      id: 4b1c0a10-0000-0000-0000-000000000021
+      version: -1
+      name: Did they name a group?
+      type: condition
+      iscommand: false
+      brand: ''
+      description: A group name in answer 1 wins over the yes/no, because typing one is the more specific instruction.
+        Nothing typed falls through to the fleet-wide branch.
+    separatecontext: false
+    continueonerrortype: ''
+    conditions:
+    - label: group
+      condition:
+      - - operator: isExists
+          left:
+            value:
+              simple: Confirm scan scope.Answers.1
+            iscontext: true
+    nexttasks:
+      group:
+      - '22'
+      '#default#':
+      - '8'
+    view: '{"position": {"x": 800, "y": 1500}}'
+  '22':
+    id: '22'
+    taskid: 4b1c0a10-0000-0000-0000-000000000022
+    type: regular
+    task:
+      id: 4b1c0a10-0000-0000-0000-000000000022
+      version: -1
+      name: Use the group they named
+      type: regular
+      iscommand: false
+      brand: ''
+      description: Group supplied at the confirmation prompt.
+      script: SetAndHandleEmpty
+    separatecontext: false
+    continueonerrortype: ''
+    scriptarguments:
+      key:
+        simple: target_group
+      value:
+        simple: ${Confirm scan scope.Answers.1}
+      append:
+        simple: 'false'
+    nexttasks:
+      '#none#':
+      - '3'
+    view: '{"position": {"x": 800, "y": 1645}}'
+  '23':
+    id: '23'
+    taskid: 4b1c0a10-0000-0000-0000-000000000023
+    type: regular
+    task:
+      id: 4b1c0a10-0000-0000-0000-000000000023
+      version: -1
+      name: Use the group from inputs
+      type: regular
+      iscommand: false
+      brand: ''
+      description: Group supplied as a playbook input.
+      script: SetAndHandleEmpty
+    separatecontext: false
+    continueonerrortype: ''
+    scriptarguments:
+      key:
+        simple: target_group
+      value:
+        simple: ${inputs.endpoint_groups}
+      append:
+        simple: 'false'
+    nexttasks:
+      '#none#':
+      - '3'
+    view: '{"position": {"x": 450, "y": 1355}}'
+view: "{\n  \"linkLabelsPosition\": {},\n  \"paper\": {\n    \"dimensions\": {\n      \"height\": 2600,\n      \"\
+  width\": 1450,\n      \"x\": 50,\n      \"y\": 50\n    }\n  }\n}"
 inputs:
 - key: script_name
   value:
@@ -345,7 +681,8 @@ inputs:
   value:
     simple: ''
   required: false
-  description: Base64-encoded YARA rules. Empty uses the scanner's built-in default rule (if any).
+  description: Base64-encoded YARA rules. Leave empty and the playbook looks for an uploaded .yar via File.EntryID
+    and encodes it. If neither is present the playbook stops - it never falls back to a built-in ruleset.
   playbookInputQuery: null
 - key: scan_folder
   value:
@@ -383,15 +720,15 @@ inputs:
     simple: all
   required: false
   description: 'Comma-separated endpoint group names to scan. The literal `all` scans every CONNECTED endpoint on
-    the tenant - that is the default, and it is deliberate: it must be typed, never arrived at by leaving a box
-    empty. Leaving this AND endpoint_hostnames blank stops the playbook.'
+    the tenant - that is the default, and it is deliberate: it must be typed, never arrived at by leaving a box empty.
+    Leaving this AND endpoint_hostnames blank stops the playbook.'
   playbookInputQuery: null
 - key: timeout
   value:
     simple: '3600'
   required: false
-  description: Per-endpoint script execution timeout in seconds, enforced on the endpoint. The playbook does NOT
-    wait this long - the dispatch task returns as soon as the wave is away. Verify the wave separately with YaraScanVerify.
+  description: Per-endpoint script execution timeout in seconds, enforced on the endpoint. The playbook does NOT wait
+    this long - the dispatch task returns as soon as the wave is away. Verify the wave separately with YaraScanVerify.
   playbookInputQuery: null
 outputs:
 - contextPath: Core.ScriptResult.action_id
@@ -400,8 +737,8 @@ outputs:
 - contextPath: Core.ScriptResult.results.standard_output
   description: STDOUT/STDERR from the scanner (the SCAN_RESULT summary line). POPULATED ONLY IF THE DISPATCH TASK
     WAITS. This playbook returns as soon as the wave is away, so expect this to be empty - the scan is still running
-    on the endpoint at that point. Read the scanner's own lifecycle and match rows instead, or re-enable polling
-    on task 5 if a caller genuinely needs to block until every endpoint finishes.
+    on the endpoint at that point. Read the scanner's own lifecycle and match rows instead, or re-enable polling on
+    task 5 if a caller genuinely needs to block until every endpoint finishes.
   type: String
 - contextPath: Core.ScriptResult.results.execution_status
   description: Per-endpoint execution status. Same caveat as standard_output - not available on a dispatch-and-return.
