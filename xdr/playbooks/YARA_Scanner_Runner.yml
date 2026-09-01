@@ -221,12 +221,12 @@ tasks:
           ignorecase: true
     - label: scoped
       condition:
-      - - operator: isExists
+      - - operator: isNotEmpty
           left:
             value:
               simple: inputs.endpoint_groups
             iscontext: true
-        - operator: isExists
+      - - operator: isNotEmpty
           left:
             value:
               simple: inputs.endpoint_hostnames
@@ -337,7 +337,7 @@ tasks:
     conditions:
     - label: supplied
       condition:
-      - - operator: isExists
+      - - operator: isNotEmpty
           left:
             value:
               simple: inputs.yarafile
@@ -599,7 +599,7 @@ tasks:
     conditions:
     - label: group
       condition:
-      - - operator: isExists
+      - - operator: isNotEmpty
           left:
             value:
               simple: Confirm scan scope.Answers.1
