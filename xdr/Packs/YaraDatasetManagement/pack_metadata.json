@@ -2,7 +2,7 @@
     "name": "YARA Dataset Management",
     "description": "Automations and a playbook that consolidate finished YARA scan datasets - in full detail or as a per-(host, rule) summary - and prune old ones on a schedule, safely handling scans still in progress.",
     "support": "community",
-    "currentVersion": "1.3.0",
+    "currentVersion": "1.4.0",
     "author": "Ayman Mahmoud",
     "url": "https://github.com/ayman-m/yarascanner",
     "email": "",
