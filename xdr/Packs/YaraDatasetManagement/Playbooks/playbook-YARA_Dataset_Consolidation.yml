@@ -164,7 +164,7 @@ tasks:
       scan_id:
         simple: ${inputs.scan_id}
       retention_hours:
-        simple: ${inputs.abandoned_after_hours}
+        simple: ${inputs.retention_hours}
     nexttasks:
       '#none#':
       - '2'
@@ -272,7 +272,7 @@ tasks:
       scan_id:
         simple: ${inputs.scan_id}
       retention_hours:
-        simple: ${inputs.abandoned_after_hours}
+        simple: ${inputs.retention_hours}
     nexttasks:
       '#none#':
       - '5'
@@ -324,7 +324,11 @@ tasks:
       id: 7d3e0c30-0000-0000-0000-000000000006
       version: -1
       name: Apply consolidation
-      description: 'Groups every column of every matched-file row, across every host scanned with one ruleset, into ONE dataset per ruleset - yara_scanner_full_v<VER>_rules_<rulehash>. It reads the per-host matches datasets and deletes none of them; the only rows it removes are stale ones inside its own output dataset. It reads the scans lifecycle shards only to build the terminal map, and deletes nothing there either. Dry run unless full_execute is true.'
+      description: Groups every column of every matched-file row, across every host scanned with one ruleset, into
+        ONE dataset per ruleset - yara_scanner_full_v<VER>_rules_<rulehash>. It reads the per-host matches datasets
+        and deletes none of them; the only rows it removes are stale ones inside its own output dataset. It reads
+        the scans lifecycle shards only to build the terminal map, and deletes nothing there either. Dry run unless
+        full_execute is true.
       script: YaraConsolidateApply
       type: regular
       iscommand: false
@@ -334,7 +338,7 @@ tasks:
         complex:
           root: Yara.ConsolidateStatus.eligible_scan_ids
       retention_hours:
-        simple: ${inputs.abandoned_after_hours}
+        simple: ${inputs.retention_hours}
       row_ceiling:
         simple: ${inputs.row_ceiling}
       execute:
@@ -390,7 +394,14 @@ tasks:
       id: 7d3e0c30-0000-0000-0000-000000000008
       version: -1
       name: Flag failures for attention
-      description: Placeholder - wire this to a real notification (Slack/email/incident) once one is chosen. Today it only writes a flag to context so the failure is at least visible via the Job's own run history rather than silently repeating forever. This task is also never reached at all when task 1/4/6 errors outright (return_error halts the whole run before here) - for that case, and for a persistent/queryable history this task's own context flag does not provide, see the yara_scanner_consolidation_runs dataset and the "Consolidation Run Health" widget, written by BOTH consolidation automations on every executing pass, including one that stands down on the lock, and additionally by YaraConsolidateApply when it crashes - summary mode has no crash-recording path, so a crash there leaves no row.
+      description: Placeholder - wire this to a real notification (Slack/email/incident) once one is chosen. Today
+        it only writes a flag to context so the failure is at least visible via the Job's own run history rather
+        than silently repeating forever. This task is also never reached at all when task 1/4/6 errors outright
+        (return_error halts the whole run before here) - for that case, and for a persistent/queryable history this
+        task's own context flag does not provide, see the yara_scanner_consolidation_runs dataset and the "Consolidation
+        Run Health" widget, written by BOTH consolidation automations on every executing pass, including one that
+        stands down on the lock, and additionally by YaraConsolidateApply when it crashes - summary mode has no
+        crash-recording path, so a crash there leaves no row.
       script: SetAndHandleEmpty
       type: regular
       iscommand: false
@@ -457,7 +468,13 @@ tasks:
       id: 7d3e0c30-0000-0000-0000-00000000000b
       version: -1
       name: Which consolidation mode?
-      description: 'Branches on the consolidation_mode input. Both modes read the same source - the permanent per-host matches datasets - and NEITHER deletes a source; they differ in fidelity alone. full -> YaraConsolidateApply (every column of every matched-file row, grouped into one yara_scanner_full_v<VER>_rules_<rulehash> dataset per ruleset; it reads the SCANS lifecycle shards only to build the terminal map, and merges and deletes nothing there). summary -> YaraConsolidateSummary (one row per host+rule, into yara_scanner_summary_v<VER>_rules_<hash>). Both labels are matched explicitly and anything else goes to task 15, which does nothing at all: an unrecognised mode must never fall through to a branch the operator did not ask for.'
+      description: 'Branches on the consolidation_mode input. Both modes read the same source - the permanent per-host
+        matches datasets - and NEITHER deletes a source; they differ in fidelity alone. full -> YaraConsolidateApply
+        (every column of every matched-file row, grouped into one yara_scanner_full_v<VER>_rules_<rulehash> dataset
+        per ruleset; it reads the SCANS lifecycle shards only to build the terminal map, and merges and deletes
+        nothing there). summary -> YaraConsolidateSummary (one row per host+rule, into yara_scanner_summary_v<VER>_rules_<hash>).
+        Both labels are matched explicitly and anything else goes to task 15, which does nothing at all: an unrecognised
+        mode must never fall through to a branch the operator did not ask for.'
       type: condition
       iscommand: false
       brand: ''
@@ -507,7 +524,13 @@ tasks:
       id: 7d3e0c30-0000-0000-0000-00000000000c
       version: -1
       name: Summarise consolidation
-      description: 'Writes ONE ROW PER (host, rule) into yara_scanner_summary_v<VER>_rules_<hash>, ONE dataset per ruleset holding every host scanned with it - which rules fired on which host - and deletes nothing: no shard, no row inside one. The per-host matches dataset is permanent under the scanner''s overwrite model and stays as the deep-dive source. Takes the same consolidation lock the full branch takes. schema_version is deliberately not wired to a playbook input - the automation''s own default (the scanner''s current lookup schema version) is right for a single-version fleet, and a mid-rollout fleet should be summarised by invoking the automation directly per version rather than by giving a scheduled Job a version to go stale.'
+      description: 'Writes ONE ROW PER (host, rule) into yara_scanner_summary_v<VER>_rules_<hash>, ONE dataset per
+        ruleset holding every host scanned with it - which rules fired on which host - and deletes nothing: no shard,
+        no row inside one. The per-host matches dataset is permanent under the scanner''s overwrite model and stays
+        as the deep-dive source. Takes the same consolidation lock the full branch takes. schema_version is deliberately
+        not wired to a playbook input - the automation''s own default (the scanner''s current lookup schema version)
+        is right for a single-version fleet, and a mid-rollout fleet should be summarised by invoking the automation
+        directly per version rather than by giving a scheduled Job a version to go stale.'
       script: YaraConsolidateSummary
       type: regular
       iscommand: false
@@ -517,7 +540,7 @@ tasks:
         complex:
           root: Yara.ConsolidateStatus.eligible_scan_ids
       retention_hours:
-        simple: ${inputs.abandoned_after_hours}
+        simple: ${inputs.retention_hours}
       execute:
         simple: ${inputs.summary_execute}
     nexttasks:
@@ -537,7 +560,10 @@ tasks:
       id: 7d3e0c30-0000-0000-0000-00000000000d
       version: -1
       name: Anything failed? (summary)
-      description: 'The summary automation reports failures as Yara.ConsolidateSummary.failed, a separate context path from full mode''s Yara.ConsolidateApply.failed - so the two modes need their own check. Host shards are untouched in every failure case, in either mode, which is why a failure is a flag to read rather than an incident to chase: re-running is always safe.'
+      description: 'The summary automation reports failures as Yara.ConsolidateSummary.failed, a separate context
+        path from full mode''s Yara.ConsolidateApply.failed - so the two modes need their own check. Host shards
+        are untouched in every failure case, in either mode, which is why a failure is a flag to read rather than
+        an incident to chase: re-running is always safe.'
       type: condition
       iscommand: false
       brand: ''
@@ -572,7 +598,11 @@ tasks:
       id: 7d3e0c30-0000-0000-0000-00000000000e
       version: -1
       name: Flag summary failures for attention
-      description: 'Same placeholder as task 8, and the same caveats: it writes a flag into this run''s investigation context only, and it is never reached when task 12 errors outright. It writes the SAME key (yara_consolidate_needs_attention) as task 8 - only one of the two branches ever runs in a given pass, so the key means "the consolidation step of this run reported failures" regardless of mode. As with task 8''s, the failures behind it destroyed nothing: neither consolidation mode deletes a source, so every one of them is fixed by re-running.'
+      description: 'Same placeholder as task 8, and the same caveats: it writes a flag into this run''s investigation
+        context only, and it is never reached when task 12 errors outright. It writes the SAME key (yara_consolidate_needs_attention)
+        as task 8 - only one of the two branches ever runs in a given pass, so the key means "the consolidation
+        step of this run reported failures" regardless of mode. As with task 8''s, the failures behind it destroyed
+        nothing: neither consolidation mode deletes a source, so every one of them is fixed by re-running.'
       script: SetAndHandleEmpty
       type: regular
       iscommand: false
@@ -602,7 +632,10 @@ tasks:
       id: 7d3e0c30-0000-0000-0000-00000000000f
       version: -1
       name: Unrecognised consolidation_mode - nothing done
-      description: 'Reached when consolidation_mode is neither "full" nor "summary" - a typo, an empty value, or a condition operator that did not evaluate as expected. Nothing is merged, written or deleted, and the run ends here so the mistake shows up in the run graph instead of silently taking a branch the operator did not ask for. Set consolidation_mode to exactly "full" or exactly "summary" and re-run.'
+      description: Reached when consolidation_mode is neither "full" nor "summary" - a typo, an empty value, or
+        a condition operator that did not evaluate as expected. Nothing is merged, written or deleted, and the run
+        ends here so the mistake shows up in the run graph instead of silently taking a branch the operator did
+        not ask for. Set consolidation_mode to exactly "full" or exactly "summary" and re-run.
       type: title
       iscommand: false
       brand: ''
@@ -620,25 +653,38 @@ inputs:
   value:
     simple: full
   required: false
-  description: 'Which consolidation step runs on the eligible scans: "full" (default) runs YaraConsolidateApply, which groups every column of every matched-file row, across every host scanned with one ruleset, into ONE yara_scanner_full_v<VER>_rules_<rulehash> dataset per ruleset. "summary" runs YaraConsolidateSummary, which writes one row per (host, rule) into yara_scanner_summary_v<VER>_rules_<hash>. Both read the permanent per-host matches datasets and NEITHER deletes them, so the choice is one of fidelity and cost - full detail is roughly 40x the rows of a summary - not of what survives the pass. Either way the per-host dataset remains the deep-dive source, until the next scan on that host overwrites it. Matched exactly - any other value, including an empty one, runs NEITHER and ends the pass at a dead-end task rather than defaulting to a branch nobody asked for.'
+  description: 'Which consolidation step runs on the eligible scans: "full" (default) runs YaraConsolidateApply,
+    which groups every column of every matched-file row, across every host scanned with one ruleset, into ONE yara_scanner_full_v<VER>_rules_<rulehash>
+    dataset per ruleset. "summary" runs YaraConsolidateSummary, which writes one row per (host, rule) into yara_scanner_summary_v<VER>_rules_<hash>.
+    Both read the permanent per-host matches datasets and NEITHER deletes them, so the choice is one of fidelity
+    and cost - full detail is roughly 40x the rows of a summary - not of what survives the pass. Either way the
+    per-host dataset remains the deep-dive source, until the next scan on that host overwrites it. Matched exactly
+    - any other value, including an empty one, runs NEITHER and ends the pass at a dead-end task rather than defaulting
+    to a branch nobody asked for.'
   playbookInputQuery: null
 - key: summary_execute
   value:
     simple: 'true'
   required: false
-  description: 'Only read in summary mode. YaraConsolidateSummary is a dry run unless execute=true, so this is "true" by default - left at "false" the summary branch would report what it would write and write nothing, every scheduled run, for ever. Set it to "false" deliberately to preview a pass.'
+  description: Only read in summary mode. YaraConsolidateSummary is a dry run unless execute=true, so this is "true"
+    by default - left at "false" the summary branch would report what it would write and write nothing, every scheduled
+    run, for ever. Set it to "false" deliberately to preview a pass.
   playbookInputQuery: null
 - key: full_execute
   value:
     simple: 'true'
   required: false
-  description: 'Only read in full mode, and the exact counterpart of summary_execute. YaraConsolidateApply is now a dry run unless execute=true, so this is "true" by default - left at "false" the full branch would report what it would write and write nothing, every scheduled run, for ever. Both modes are non-destructive: both read the per-host matches datasets and neither removes them, so they stay the deep-dive source.'
+  description: 'Only read in full mode, and the exact counterpart of summary_execute. YaraConsolidateApply is now
+    a dry run unless execute=true, so this is "true" by default - left at "false" the full branch would report what
+    it would write and write nothing, every scheduled run, for ever. Both modes are non-destructive: both read the
+    per-host matches datasets and neither removes them, so they stay the deep-dive source.'
   playbookInputQuery: null
 - key: scan_id
   value:
     simple: ''
   required: false
-  description: Restrict this run to these scan_id(s) (comma-separated). Leave empty for all finished scans across the tenant.
+  description: Restrict this run to these scan_id(s) (comma-separated). Leave empty for all finished scans across
+    the tenant.
   playbookInputQuery: null
 - key: poll_interval_minutes
   value:
@@ -650,25 +696,28 @@ inputs:
   value:
     simple: '240'
   required: false
-  description: Total minutes to wait for in-progress scans before giving up on this cycle and letting the next scheduled run pick it up. This is THIS RUN's patience budget, separate from abandoned_after_hours (24h by default) which governs when a scan with no terminal lifecycle row is treated as finished and consolidated anyway to preserve its findings.
-  playbookInputQuery: null
-- key: max_scans
-  value:
-    simple: ''
-  required: false
-  description: 'NOT USED - YaraConsolidateApply has no max_scans argument, and this input is wired to no task, so setting it has no effect. A pass is bounded by row_ceiling instead, which refuses an oversized ruleset group rather than half-filling its target. Bound a pass there.'
+  description: Total minutes to wait for in-progress scans before giving up on this cycle and letting the next scheduled
+    run pick it up. This is THIS RUN's patience budget, separate from abandoned_after_hours (24h by default) which
+    governs when a scan with no terminal lifecycle row is treated as finished and consolidated anyway to preserve
+    its findings.
   playbookInputQuery: null
 - key: row_ceiling
   value:
     simple: ''
   required: false
-  description: Override the script's default row ceiling (60,000) above which a RULESET GROUP is refused rather than half-written. It is the only size bound on a pass. The default sits below the ~70,000 rows at which lookup writes were measured going dead, so a tenant whose matches legitimately exceed it wants summary mode - roughly 40x fewer rows - rather than a ceiling raised past what lookup writes survive. Leave empty to use the script default.
+  description: Override the script's default row ceiling (60,000) above which a RULESET GROUP is refused rather
+    than half-written. It is the only size bound on a pass. The default sits below the ~70,000 rows at which lookup
+    writes were measured going dead, so a tenant whose matches legitimately exceed it wants summary mode - roughly
+    40x fewer rows - rather than a ceiling raised past what lookup writes survive. Leave empty to use the script
+    default.
   playbookInputQuery: null
-- key: abandoned_after_hours
+- key: retention_hours
   value:
     simple: ''
   required: false
-  description: Override the script's default hours (24h) a non-terminal scan must be silent before it's treated as abandoned and consolidated anyway to preserve its partial findings. Leave empty to use the script default.
+  description: A scan silent this long is treated as finished even without a terminal lifecycle row. Passed to YaraConsolidateStatus,
+    YaraConsolidateApply and YaraConsolidateSummary, all of which default to 24 when it is empty. Previously named
+    abandoned_after_hours, which described a different concept from the argument it is actually wired to.
   playbookInputQuery: null
 outputs:
 - contextPath: Yara.ConsolidateStatus.eligible_count
@@ -684,24 +733,29 @@ outputs:
   description: 'Full mode only: how many ruleset groups were produced.'
   type: Number
 - contextPath: Yara.ConsolidateApply.failed
-  description: 'Full mode only: ruleset groups that failed or exceeded row_ceiling. No source data is deleted in any of those cases, so re-running is safe.'
+  description: 'Full mode only: ruleset groups that failed or exceeded row_ceiling. No source data is deleted in
+    any of those cases, so re-running is safe.'
   type: String
 - contextPath: Yara.ConsolidateApply.dry_run
-  description: 'Full mode only: true when the branch ran as a preview, i.e. full_execute was not left at its default of true.'
+  description: 'Full mode only: true when the branch ran as a preview, i.e. full_execute was not left at its default
+    of true.'
   type: Boolean
 - contextPath: Yara.ConsolidateSummary.written
   description: 'Summary mode only: summary targets written, with row count, host count and why the scan was eligible.'
   type: Unknown
 - contextPath: Yara.ConsolidateSummary.failed
-  description: 'Summary mode only: scans that could not be summarised. Host shards are untouched in every case, so re-running is safe.'
+  description: 'Summary mode only: scans that could not be summarised. Host shards are untouched in every case,
+    so re-running is safe.'
   type: Unknown
 - contextPath: Yara.ConsolidateSummary.shards_deleted
   description: 'Summary mode only: always 0. Present so a run can prove that the summary branch deleted nothing.'
   type: Number
 - contextPath: Yara.ConsolidateSummary.dry_run
-  description: 'Summary mode only: true when the branch ran as a preview, i.e. summary_execute was not left at its default of true.'
+  description: 'Summary mode only: true when the branch ran as a preview, i.e. summary_execute was not left at its
+    default of true.'
   type: Boolean
 fromversion: 6.5.0
 tests:
 - No tests (auto-formatted)
-view: "{\n  \"linkLabelsPosition\": {},\n  \"paper\": {\n    \"dimensions\": {\n      \"height\": 1800,\n      \"width\": 1300,\n      \"x\": 50,\n      \"y\": 50\n    }\n  }\n}"
+view: "{\n  \"linkLabelsPosition\": {},\n  \"paper\": {\n    \"dimensions\": {\n      \"height\": 1800,\n      \"\
+  width\": 1300,\n      \"x\": 50,\n      \"y\": 50\n    }\n  }\n}"

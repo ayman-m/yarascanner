@@ -1734,6 +1734,9 @@ def main():
                  "YaraConsolidateApply (full detail) would group; it does not preview the "
                  "scans-lifecycle merge.")
 
+    # List-valued context is APPENDED to across repeated calls in one investigation;
+    # clear it first so eligible_scan_ids/pending_scan_ids/groups never carries a prior call's entries.
+    demisto.executeCommand("DeleteContext", {"key": "Yara.ConsolidateStatus"})
     return_results(CommandResults(readable_output="\n".join(lines),
                                   outputs_prefix="Yara.ConsolidateStatus",
                                   outputs=st, raw_response=st))

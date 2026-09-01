@@ -1957,6 +1957,9 @@ def main():
     lock_events = [m for m in log_lines if "lock" in m.lower()]
     if lock_events:
         lines += ["", "lock events:"] + ["  %s" % m for m in lock_events]
+    # List-valued context is APPENDED to across repeated calls in one investigation;
+    # clear it first so written/skipped/failed never carries a prior call's entries.
+    demisto.executeCommand("DeleteContext", {"key": "Yara.ConsolidateApply"})
     return_results(CommandResults(readable_output="\n".join(lines),
                                   outputs_prefix="Yara.ConsolidateApply",
                                   outputs=result, raw_response=result))
