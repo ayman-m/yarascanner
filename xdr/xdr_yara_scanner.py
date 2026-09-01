@@ -77,43 +77,41 @@ def _coerce_flag(value):
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
-def _proxy_settings(proxy=None, ca_bundle=None):
+def _proxy_settings():
     """(proxies, verify) for every requests call the scanner makes.
 
-    proxies is None when nothing is configured, which leaves requests free to honour
-    HTTPS_PROXY / HTTP_PROXY / NO_PROXY exactly as it would have. An explicit
-    CONFIG_PROXY overrides those, because someone who filled it in meant it.
+    proxies is None when CONFIG_PROXY is empty, which leaves requests free to honour
+    HTTPS_PROXY / HTTP_PROXY / NO_PROXY exactly as it would have. An empty dict would
+    suppress that, which is not the same thing and is not what "no proxy set" means.
 
-    verify is True normally, a PEM path when the proxy terminates TLS with its own
-    certificate, or False for the deliberate "insecure" escape hatch.
+    Both values come from the CONFIG_* constants at the top of this file and from
+    nowhere else. They are not scan arguments: the Action Center passes yarafile,
+    scan_folder and alert_severity, and an operator who needs a proxy edits the script
+    once for the whole fleet rather than threading it through every dispatch.
     """
-    url = (proxy if proxy is not None else CONFIG_PROXY) or ""
-    url = str(url).strip()
+    url = str(CONFIG_PROXY or "").strip()
     proxies = {"http": url, "https": url} if url else None
-
-    ca = (ca_bundle if ca_bundle is not None else CONFIG_PROXY_CA_BUNDLE) or ""
-    ca = str(ca).strip()
-    if ca.lower() == "insecure":
-        verify = False
-    elif ca:
-        verify = ca
-    else:
-        verify = True
-    return proxies, verify
+    return proxies, bool(CONFIG_VERIFY_TLS)
 
 
-# Resolved once at import from CONFIG_PROXY / CONFIG_PROXY_CA_BUNDLE, and refreshed by
-# _refresh_proxy() when a run overrides them through options=. Every requests call in this
-# file reads these two names, so there is one place to change and no call site can be missed.
+# Resolved once from CONFIG_PROXY / CONFIG_VERIFY_TLS. Every requests call in this file
+# reads these two names, so there is one place to change and no call site can be missed.
 _PROXIES = None
 _VERIFY = True
 
 
-def _refresh_proxy(proxy=None, ca_bundle=None):
-    """Recompute the module-level proxy settings. Called once at startup and again if a run
-    passes proxy= / proxy_ca_bundle= through options."""
+def _refresh_proxy():
+    """Resolve the module-level proxy settings from the CONFIG_* constants."""
     global _PROXIES, _VERIFY
-    _PROXIES, _VERIFY = _proxy_settings(proxy, ca_bundle)
+    _PROXIES, _VERIFY = _proxy_settings()
+    if _VERIFY is False:
+        # requests warns once per session otherwise, into logs an operator has to read. The
+        # posture is announced deliberately in run() instead of arriving as library noise.
+        try:
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        except Exception:
+            pass
     return _PROXIES, _VERIFY
 
 
@@ -251,23 +249,31 @@ CONFIG_HOST_CLEANUP      = "off"        # "off" | "on_delivery" | "always"
 CONFIG_HOST_CLEANUP_KEEP = "summary"    # "nothing" | "summary" | "evidence"
 
 # --- Egress through a corporate proxy ---------------------------------------
-# Endpoints that cannot reach the tenant API directly need this. Leave both empty
-# on a network with direct egress and nothing changes.
+# Endpoints that cannot reach the tenant API directly. Leave empty on a network
+# with direct egress and nothing changes.
 #
-# CONFIG_PROXY takes one URL used for BOTH http and https, e.g.
+# One URL, used for both http and https:
 #   "http://proxy.corp.example:8080"                  (anonymous)
 #   "http://user:pass@proxy.corp.example:8080"        (basic auth)
-# For different proxies per scheme, or for anything more elaborate, set the
-# ordinary HTTPS_PROXY / HTTP_PROXY / NO_PROXY environment variables instead -
-# requests honours them, and CONFIG_PROXY simply overrides them when set.
+# Empty means "no explicit proxy" and leaves the ordinary HTTPS_PROXY / HTTP_PROXY /
+# NO_PROXY environment variables working exactly as they would have.
+CONFIG_PROXY = ""                       # "" = no explicit proxy
+
+# TLS verification for every call to the tenant API.
 #
-# CONFIG_PROXY_CA_BUNDLE points at a PEM file when the proxy terminates TLS and
-# presents its own certificate. Without it a TLS-intercepting proxy fails
-# verification and every upload is refused. "" keeps normal verification; the
-# string "insecure" disables it entirely, which is a last resort and is logged
-# loudly on every run.
-CONFIG_PROXY           = ""             # "" = no explicit proxy (env vars still apply)
-CONFIG_PROXY_CA_BUNDLE = ""             # "" = default trust store | "/path/ca.pem" | "insecure"
+# False by default so a TLS-intercepting proxy needs no configuration at all: the
+# proxy presents its own certificate, which will not validate against the public
+# roots, and trusting it would otherwise mean shipping that proxy's CA to every
+# endpoint. Turning verification off removes that step entirely.
+#
+# The trade, stated plainly because it is not recoverable by a later setting:
+# traffic stays encrypted, but the scanner no longer checks WHO it is talking to.
+# Anything able to sit in the path between the endpoint and the tenant could read
+# findings - file paths, hashes, hostnames - or return false ones. On a network
+# where you control the path, that is a reasonable trade for the simplicity. On one
+# where you do not, set this True and make sure the proxy's root CA is in the
+# endpoint's own trust store, which is where an enterprise normally puts it.
+CONFIG_VERIFY_TLS = False               # True = verify the tenant's certificate
 
 # --- Runtime profile --------------------------------------------------------
 # "full"  - full diagnostics. Performance and resource sampling run alongside the
@@ -292,7 +298,7 @@ CONFIG_ENABLE_FD_MONITOR       = False  # open file descriptors; niche, off by d
 
 CONFIG_OPTIONS = ""                     # extra "key=value,key=value" overrides applied every run (rarely needed)
 
-_refresh_proxy()   # resolve CONFIG_PROXY / CONFIG_PROXY_CA_BUNDLE now that both exist
+_refresh_proxy()   # resolve CONFIG_PROXY / CONFIG_VERIFY_TLS now that both exist
 
 # ============================================================================
 # END CUSTOMER CONFIG
@@ -939,9 +945,11 @@ _VALID_OPTION_KEYS = {
     "create_alerts", "write_dataset", "collect_files",
     "cpu_guarantee", "cpu_headroom_pct", "cpu_budget_pct", "cpu_floor_pct",
     "workers", "tenant_id", "lookup_shard",
-    "proxy", "proxy_ca_bundle",
-    "enable_perf_monitor", "enable_resource_monitor", "enable_fd_monitor", "profile",
 }
+# Proxy, TLS verification and the runtime profile are deliberately NOT options. They are
+# CONFIG_* constants edited once in this file, because they describe the environment the
+# fleet runs in rather than anything about a particular scan. The Action Center inputs stay
+# yarafile / scan_folder / alert_severity.
 
 # Options retired by the CPU-governor redesign. Accepted and translated rather than
 # rejected, so existing scripts and scheduled jobs keep running. They are translated,
@@ -7839,27 +7847,18 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
     tenant_id = _pick("tenant_id", tenant_id)
     lookup_shard = _pick("lookup_shard", lookup_shard)
 
-    # Proxy settings are resolved BEFORE the cancel short-circuit below, because a cancel is
-    # itself an API call and has to reach the tenant through the same proxy a scan would.
-    _refresh_proxy(_pick("proxy", None), _pick("proxy_ca_bundle", None))
+    # Resolved BEFORE the cancel short-circuit below: a cancel is itself an API call and has
+    # to reach the tenant through the same proxy a scan would.
+    _refresh_proxy()
     if _VERIFY is False:
-        # stderr, never stdout: stdout is capped at 10,240 characters and that budget belongs
-        # to the SCAN_RESULT line the caller parses.
-        _msg = ("WARNING: TLS verification is DISABLED for this run "
-                "(proxy_ca_bundle=insecure). Traffic to the tenant is encrypted but the peer "
-                "is not authenticated - prefer a CA bundle.")
+        # stderr, never stdout - stdout is capped at 10,240 characters and that budget
+        # belongs to the SCAN_RESULT line the caller parses. Announced on every run so the
+        # posture is never a silent one.
+        _msg = ("NOTICE: TLS verification is OFF (CONFIG_VERIFY_TLS = False). Traffic to the "
+                "tenant is encrypted, but the scanner does not authenticate the server it is "
+                "talking to. Set CONFIG_VERIFY_TLS = True where the network path is not "
+                "trusted.")
         print(_msg, file=sys.stderr)
-
-    # Diagnostics: options override the CONFIG_* defaults for this run only, by way of the
-    # env vars ScanConfig already reads.
-    for opt_key, env_name in (("enable_perf_monitor", "YARA_ENABLE_PERF_MONITOR"),
-                              ("enable_resource_monitor", "YARA_ENABLE_RESOURCE_MONITOR"),
-                              ("enable_fd_monitor", "YARA_ENABLE_FD_MONITOR")):
-        chosen = opts.get(opt_key)
-        if chosen is not None:
-            os.environ[env_name] = "true" if _coerce_flag(chosen) else "false"
-    if opts.get("profile") is not None:
-        os.environ["YARA_PROFILE"] = str(opts["profile"]).strip().lower()
 
     mode = (str(mode) if mode is not None else "scan").strip().lower() or "scan"
     if mode == "cancel":
