@@ -105,19 +105,47 @@ def _scan_for_credentials(paths, strict_placeholder=True):
 
 
 def collect_pack():
-    files = []
+    """(archive path, source file) for everything that goes in the pack.
+
+    Scripts ship UNIFIED - `Scripts/<Name>/<Name>.yml` carries the Python inline, and no
+    separate `.py` goes in the archive at all.
+
+    The split `<Name>.py` + `<Name>.yml` pair in this repo is the SOURCE form: it exists so
+    the code can be reviewed, linted and unit-tested as Python. A `.yml` whose `script:` field
+    is the literal `-` imports nothing, and a customer who is not running demisto-sdk against
+    a content repo has no way to combine the two. The distributed form of a script is one
+    self-contained yml, which is what `unified/` holds and what tools/build_pack_unified.py
+    regenerates from the source pair on every change.
+    """
+    out = []
     for name in PACK_FILES:
         p = os.path.join(PACK, name)
         if os.path.exists(p):
-            files.append(p)
+            out.append((name, p))
+
+    # Scripts: one unified yml each, named for the automation.
+    uni = os.path.join(PACK, "unified")
+    for f in sorted(os.listdir(uni)):
+        if not f.endswith(".yml"):
+            continue
+        stem = f[:-4]
+        out.append((os.path.join("Scripts", stem, f), os.path.join(uni, f)))
+
+    # Everything else the format defines, verbatim. Scripts is handled above.
     for d in PACK_DIRS:
+        if d == "Scripts":
+            continue
         root = os.path.join(PACK, d)
         if not os.path.isdir(root):
             continue
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = [x for x in dirnames if _keep(x)]
-            files += [os.path.join(dirpath, f) for f in filenames if _keep(f)]
-    return sorted(files)
+            for f in filenames:
+                if not _keep(f):
+                    continue
+                src = os.path.join(dirpath, f)
+                out.append((os.path.relpath(src, PACK), src))
+    return sorted(out)
 
 
 # Not XSOAR content, but part of the XDR deliverable.
@@ -140,6 +168,10 @@ Two halves, delivered together because they are useless apart.
                              stay with it, because a pack install marks every item
                              system-owned and item-level updates are refused after
                              that.
+
+                             Each Scripts/<Name>/<Name>.yml is a UNIFIED file - the
+                             Python is inline. There is no separate .py to pair it
+                             with, and none is needed.
 
                              SEVEN of the nine automations ship with
                              replace_with_xdr_* placeholders. Fill them in BEFORE
@@ -172,7 +204,7 @@ def main():
     unified = sorted(os.path.join(PACK, "unified", f)
                      for f in os.listdir(os.path.join(PACK, "unified")) if f.endswith(".yml"))
 
-    leaks = _scan_for_credentials(pack_files + unified)
+    leaks = _scan_for_credentials([src for _, src in pack_files] + unified)
     if leaks:
         print("REFUSING TO BUILD - real credentials found in files bound for a release:")
         for l in leaks:
@@ -182,8 +214,8 @@ def main():
 
     pack_zip = os.path.join(OUT, "YaraDatasetManagement-%s.zip" % version)
     with zipfile.ZipFile(pack_zip, "w", zipfile.ZIP_DEFLATED) as z:
-        for f in pack_files:
-            z.write(f, os.path.join("YaraDatasetManagement", os.path.relpath(f, PACK)))
+        for arc, src in pack_files:
+            z.write(src, os.path.join("YaraDatasetManagement", arc))
     print("pack archive : %s  (%d files, %.1f KB)"
           % (os.path.basename(pack_zip), len(pack_files), os.path.getsize(pack_zip) / 1024.0))
 
@@ -217,8 +249,8 @@ def main():
 
     bundle = os.path.join(OUT, "yarascanner-xdr-%s.zip" % version)
     with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as z:
-        for f in pack_files:
-            z.write(f, os.path.join("YaraDatasetManagement", os.path.relpath(f, PACK)))
+        for arc, src in pack_files:
+            z.write(src, os.path.join("YaraDatasetManagement", arc))
         for arc, src in EXTRAS:
             z.write(src, arc)
         z.writestr("README-FIRST.txt", BUNDLE_README)
