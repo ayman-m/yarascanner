@@ -102,3 +102,36 @@ def test_the_generator_reproduces_a_file_it_did_not_write():
     rendered = B.render(os.path.join(_SCRIPTS, name, "%s.yml" % name),
                         os.path.join(_SCRIPTS, name, "%s.py" % name))
     assert rendered == _read(os.path.join(_UNIFIED, "%s.yml" % name))
+
+
+def test_the_release_pack_ships_unified_scripts_not_the_source_pair():
+    """A shipped Scripts/<Name>/<Name>.yml must carry its Python inline.
+
+    The split <Name>.py + <Name>.yml pair in this repo is the SOURCE form - it exists so the
+    code can be reviewed, linted and unit-tested as Python, and the yml's `script:` field is
+    the literal `-`. Shipping that pair to a customer delivers a script that imports nothing:
+    the yml has no code, and combining the two is demisto-sdk's job against a content repo,
+    which a customer downloading a zip is not running.
+
+    A release archive once went out in exactly that state. This asserts the builder maps
+    Scripts/<Name>/<Name>.yml to the unified file rather than the source yml.
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "build_release_zip", os.path.join(_REPO, "tools", "build_release_zip.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    entries = mod.collect_pack()
+    scripts = [(arc, src) for arc, src in entries if arc.startswith("Scripts" + os.sep)]
+    assert scripts, "no Scripts/ entries in the release pack"
+
+    assert not [a for a, _ in scripts if a.endswith(".py")], (
+        "a raw .py is bound for the release archive: %s" % [a for a, _ in scripts if a.endswith(".py")])
+
+    for arc, src in scripts:
+        assert os.sep + "unified" + os.sep in src, (
+            "%s is taken from the SOURCE pair, not unified/ - it would ship with script: '-'" % arc)
+        doc = yaml.safe_load(open(src, encoding="utf-8"))
+        assert doc.get("script") not in (None, "", "-"), "%s has no inline code" % arc
+        assert len(doc["script"]) > 1000, "%s inline code looks truncated" % arc
