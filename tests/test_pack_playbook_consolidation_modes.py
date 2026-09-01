@@ -147,3 +147,32 @@ def test_every_input_a_task_reads_is_declared(pb):
     declared = {i["key"] for i in pb["inputs"]}
     undeclared = sorted(referenced - declared)
     assert not undeclared, "tasks read inputs that are not declared: %s" % undeclared
+
+
+def test_emptiness_questions_use_isNotEmpty_not_isExists(pb):
+    """isExists is TRUE for a declared-but-empty value, so it cannot ask "is there anything
+    here". Proven live on this playbook: YaraConsolidateApply reported `failed: 0` and task 7
+    still branched 'yes', running the flag-failures task on a clean run. Every successful pass
+    marked itself as needing attention.
+
+    The same operator on eligible_scan_ids / pending_scan_ids is worse rather than merely
+    noisy: 'ready' would match on an empty eligible list, so the waiting branch and the whole
+    GenericPolling path could never be reached, and Apply would be handed an empty scan_id
+    list - which it reads as "no filter", not "nothing to do".
+
+    Checking the property, not the five call sites, so a sixth cannot arrive quietly.
+    """
+    EMPTINESS = {"Yara.ConsolidateStatus.eligible_scan_ids",
+                 "Yara.ConsolidateStatus.pending_scan_ids",
+                 "Yara.ConsolidateApply.failed",
+                 "Yara.ConsolidateSummary.failed"}
+    offenders = []
+    for tid, t in pb["tasks"].items():
+        for grp in (t.get("conditions") or []):
+            for clause in grp["condition"]:
+                for cond in clause:
+                    path = (cond.get("left") or {}).get("value", {}).get("simple")
+                    if path in EMPTINESS and cond.get("operator") == "isExists":
+                        offenders.append("task %s / %s / %s" % (tid, grp["label"], path))
+    assert not offenders, (
+        "isExists cannot test emptiness - use isNotEmpty: %s" % offenders)
