@@ -249,15 +249,46 @@ CONFIG_HOST_CLEANUP      = "off"        # "off" | "on_delivery" | "always"
 CONFIG_HOST_CLEANUP_KEEP = "summary"    # "nothing" | "summary" | "evidence"
 
 # --- Egress through a corporate proxy ---------------------------------------
-# Endpoints that cannot reach the tenant API directly. Leave empty on a network
-# with direct egress and nothing changes.
+# For endpoints that cannot reach the tenant API directly. Leave it empty on a
+# network with direct egress and nothing about the scan changes.
 #
-# One URL, used for both http and https:
-#   "http://proxy.corp.example:8080"                  (anonymous)
-#   "http://user:pass@proxy.corp.example:8080"        (basic auth)
-# Empty means "no explicit proxy" and leaves the ordinary HTTPS_PROXY / HTTP_PROXY /
-# NO_PROXY environment variables working exactly as they would have.
-CONFIG_PROXY = ""                       # "" = no explicit proxy
+# ONE URL, used for BOTH http and https traffic. The scheme you write is the scheme
+# used to REACH THE PROXY - it is not the scheme of the traffic being proxied. The
+# tenant API is always https, and it is tunnelled through the proxy either way, so
+# "http://..." here is the normal and correct answer for the overwhelming majority
+# of corporate proxies.
+#
+#   CONFIG_PROXY = "http://proxy.corp.example:8080"
+#       The usual case. Plain HTTP to the proxy, which then CONNECT-tunnels the
+#       https traffic to the tenant. Use this unless you have been told otherwise.
+#
+#   CONFIG_PROXY = "http://svc-yara:S3cr3t@proxy.corp.example:8080"
+#       Same, with basic auth. Percent-encode any of : / @ ? # in the password -
+#       a literal "@" in it splits the URL in the wrong place and the connection
+#       fails with a confusing DNS error rather than an auth error.
+#
+#   CONFIG_PROXY = "https://proxy.corp.example:8443"
+#       Only when the proxy itself speaks TLS on its listener - rare, and it must
+#       be something your network team told you, not a guess. Writing https:// for
+#       an ordinary HTTP proxy fails at connect time.
+#
+#   CONFIG_PROXY = "http://10.20.30.40:3128"
+#       An IP is fine. Useful where the endpoint cannot resolve the proxy's name.
+#
+#   CONFIG_PROXY = "socks5h://proxy.corp.example:1080"
+#       SOCKS works too, but only if PySocks is installed on the endpoint. It is
+#       not in the scanner's dependencies, so treat this as unsupported unless you
+#       have put it there yourself.
+#
+# Empty means "no explicit proxy", which is NOT the same as "no proxy": it leaves
+# the ordinary HTTPS_PROXY / HTTP_PROXY / NO_PROXY environment variables working
+# exactly as they otherwise would. Set CONFIG_PROXY only when the endpoint's own
+# environment does not already carry them - filling it in overrides them.
+#
+# There is no per-host exclusion list here. If some destinations must bypass the
+# proxy, leave this empty and use NO_PROXY in the endpoint's environment, which is
+# the mechanism built for that.
+CONFIG_PROXY = ""                       # "" = no explicit proxy (env vars still apply)
 
 # TLS verification for every call to the tenant API.
 #
