@@ -178,10 +178,6 @@ tasks:
         simple: '{"yarafile":"${inputs.yarafile}","scan_folder":"${inputs.scan_folder}","alert_severity":"${inputs.alert_severity}"}'
       timeout:
         simple: ${inputs.timeout}
-      polling_interval_in_seconds:
-        simple: "60"
-      polling_timeout_in_seconds:
-        simple: ${inputs.timeout}
     nexttasks:
       '#none#':
       - "6"
@@ -273,17 +269,24 @@ inputs:
   value:
     simple: "3600"
   required: false
-  description: Per-endpoint script execution + polling timeout in seconds.
+  description: Per-endpoint script execution timeout in seconds, enforced on the endpoint.
+    The playbook does NOT wait this long - the dispatch task returns as soon as the wave is
+    away. Verify the wave separately with YaraScanVerify.
   playbookInputQuery: null
 outputs:
 - contextPath: Core.ScriptResult.action_id
   description: ID of the Action Center action initiated.
   type: Number
 - contextPath: Core.ScriptResult.results.standard_output
-  description: STDOUT/STDERR from the scanner (the SCAN_RESULT summary line).
+  description: STDOUT/STDERR from the scanner (the SCAN_RESULT summary line). POPULATED ONLY
+    IF THE DISPATCH TASK WAITS. This playbook returns as soon as the wave is away, so expect
+    this to be empty - the scan is still running on the endpoint at that point. Read the
+    scanner's own lifecycle and match rows instead, or re-enable polling on task 5 if a
+    caller genuinely needs to block until every endpoint finishes.
   type: String
 - contextPath: Core.ScriptResult.results.execution_status
-  description: Per-endpoint execution status.
+  description: Per-endpoint execution status. Same caveat as standard_output - not available
+    on a dispatch-and-return. Use YaraScanVerify to confirm the wave started.
   type: String
 fromversion: 6.5.0
 tests:
