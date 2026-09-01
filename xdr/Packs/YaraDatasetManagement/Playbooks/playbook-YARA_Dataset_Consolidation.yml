@@ -1,131 +1,17 @@
 id: YARA_Dataset_Consolidation
 version: -1
 name: YARA Dataset Consolidation
-description: 'Groups the matched-file rows every host produced under one RULESET into a single
-
-  consolidated dataset, safely handling scans still in progress. Meant to be scheduled twice
-
-  daily as a Job (Queue Handling: "Don''t trigger a new job instance" - overlapping runs are
-
-  not needed since the underlying grouping is idempotent and safe to resume, but skipping
-
-  avoids doubling tenant load for no benefit).
-
-
-  Flow: check readiness (YaraConsolidateStatus, read-only) -> if nothing is eligible but
-
-  something is still running, wait via a bounded poll (GenericPolling) and recheck once
-
-  -> if anything is eligible, run the consolidation step the consolidation_mode input
-
-  selects -> if anything failed, flag it for attention. If nothing is eligible and nothing
-
-  is in progress after the recheck, the run ends cleanly - the next scheduled trigger
-
-  picks up whatever has since finished. No state persists between runs; status and both
-
-  consolidation modes re-derive eligibility from tenant state on each call.
-
-
-  TWO CONSOLIDATION MODES, chosen by the consolidation_mode input. Both leave the scanner
-
-  untouched, both read the same source - the permanent per-host matches datasets - and
-
-  NEITHER DELETES A SOURCE. They differ in fidelity, not in what they touch.
-
-  * full (default) -> YaraConsolidateApply. Groups every column of every matched-file row,
-
-  across every host scanned with one ruleset, into ONE dataset per ruleset -
-
-  yara_scanner_full_v<VER>_rules_<rulehash>, keyed on the ruleset hash the scanner leaves at
-
-  the end of every scan_id, the only component every host in one Action Center launch
-
-  shares. It also reads the SCANS lifecycle shards, but only to build the terminal map that
-
-  decides which scans have finished: it does not merge them and does not delete them.
-
-  Consolidating the lifecycle shards is a separate concern, and nothing in the pack performs
-
-  one today. It is a DRY RUN unless full_execute is left at its default of true.
-
-  * summary -> YaraConsolidateSummary. Writes ONE ROW PER (host, rule) into
-
-  yara_scanner_summary_v<VER>_rules_<hash>, also one dataset per ruleset - which rules fired
-
-  on which host, four columns, no filenames and no per-rule counts. It is a dry run unless
-
-  summary_execute is left at its default of true.
-
-  Pick per deployment on cost, not on safety. Full detail is roughly 40x the rows of a
-
-  summary, which is why row_ceiling refuses an oversized ruleset group rather than
-
-  half-filling its target, and why a large fleet wants summary mode rather than a raised
-
-  ceiling. Neither choice is one-way, and neither costs you the file-level detail: the
-
-  per-host matches dataset (yara_scanner_matches_v4_<host>_<hex>, no month suffix) is
-
-  PERMANENT under the scanner''s overwrite model - the next scan on that host rewrites it
-
-  wholesale - so there is nothing to reclaim by deleting it, and it remains the deep-dive
-
-  source a consolidated row points back to. Re-running reconciles rather than appends, so a
-
-  ruleset consolidated in one mode can simply be consolidated in the other as well.
-
-
-  NOTE ON VERIFICATION: the condition operators (isExists on the eligible/pending
-
-  scan_id lists, and isEqualString against the consolidation_mode input in task 11) and the
-
-  GenericPolling sub-playbook''s `dt` filter are the pieces of this playbook with no local
-
-  precedent in this repo to copy from - they are believed correct from the platform''s own
-
-  documented GenericPolling/condition-task schema but have not yet been exercised against a
-
-  live run. Verify all of them on first use. Task 11 is deliberately built to fail SAFE: it
-
-  names both modes as explicit labels and sends anything else - a typo, an empty value, or
-
-  an operator that does not evaluate as expected - to a dead-end title task that writes
-
-  nothing, rather than letting an unrecognised mode fall through to a branch the operator
-
-  did not ask for.
-
-
-  CAVEAT ON DELETION SAFETY: neither mode deletes a source, so there is no delete here to
-
-  get wrong. The one remove_lookup_data full mode issues targets its OWN consolidated
-
-  dataset, dropping scan_ids the sources no longer hold - and if any source dataset cannot
-
-  be read, that removal is skipped entirely for the pass rather than guessing which rows are
-
-  genuinely stale. Two independent guards keep the per-host matches datasets out of every
-
-  destructive call site: parse_shard excludes them at enumeration time, and
-
-  _is_live_overwrite_dataset re-derives the same answer at the call itself. What genuinely
-
-  deletes in this pack is elsewhere and is never scheduled from here - YaraCleanup removes
-
-  an aged month-suffixed scans shard, and is the only thing that does, though nothing in the
-
-  pack schedules it either; the manual full-tenant wipe removes the lot. The platform has no undelete
-
-  or dataset versioning, so treat those two as one-way. Both automations are themselves dry
-
-  runs unless execute=true, but this playbook passes true in both modes by default, so a
-
-  scheduled run writes - set full_execute or summary_execute to "false" for a preview, and
-
-  use that dry-run output, or YaraConsolidateStatus, to check what a run WOULD write before
-
-  raising row_ceiling or lowering abandoned_after_hours on a live schedule.'
+description: "Groups the matched-file rows every host produced under one RULESET into a single consolidated dataset,\
+  \ safely handling scans still in progress. Meant to run twice daily as a Job.\n\nFlow: check readiness -> wait\
+  \ on a bounded poll if scans are still running -> consolidate in the mode consolidation_mode selects -> flag anything\
+  \ that failed. Nothing eligible and nothing running ends the run cleanly; the next trigger picks up whatever has\
+  \ since finished. No state persists between runs.\n\nTwo modes, both reading the same permanent per-host matches\
+  \ datasets and NEITHER DELETING A SOURCE:\n  full (default) - YaraConsolidateApply, every column of every matched-file\
+  \ row, one dataset per ruleset.\n  summary - YaraConsolidateSummary, one row per (host, rule), roughly a fortieth\
+  \ of the rows.\n\nA finished scan is not grouped until its newest row has been quiet for 900s: the scanner writes\
+  \ its terminal lifecycle row before draining its uploaders, so 'completed' does not mean the rows landed, and\
+  \ grouping inside that window would copy a partial set permanently.\n\nSee the pack README for the full reasoning,\
+  \ the safety rails and the argument tables."
 starttaskid: '0'
 tasks:
   '0':
@@ -140,7 +26,7 @@ tasks:
       brand: ''
     nexttasks:
       '#none#':
-      - '1'
+      - '16'
     separatecontext: false
     continueonerrortype: ''
     view: '{"position": {"x": 450, "y": 50}}'
@@ -170,7 +56,7 @@ tasks:
       - '2'
     separatecontext: false
     continueonerrortype: ''
-    view: '{"position": {"x": 450, "y": 195}}'
+    view: '{"position": {"x": 450, "y": 340}}'
     note: false
     timertriggers: []
     ignoreworker: false
@@ -209,7 +95,7 @@ tasks:
       - '9'
     separatecontext: false
     continueonerrortype: ''
-    view: '{"position": {"x": 450, "y": 340}}'
+    view: '{"position": {"x": 450, "y": 485}}'
     note: false
     timertriggers: []
     ignoreworker: false
@@ -247,7 +133,7 @@ tasks:
       - '4'
     separatecontext: true
     continueonerrortype: ''
-    view: '{"position": {"x": 450, "y": 485}}'
+    view: '{"position": {"x": 450, "y": 630}}'
     note: false
     timertriggers: []
     ignoreworker: false
@@ -278,7 +164,7 @@ tasks:
       - '5'
     separatecontext: false
     continueonerrortype: ''
-    view: '{"position": {"x": 450, "y": 630}}'
+    view: '{"position": {"x": 450, "y": 775}}'
     note: false
     timertriggers: []
     ignoreworker: false
@@ -308,7 +194,7 @@ tasks:
       - '9'
     separatecontext: false
     continueonerrortype: ''
-    view: '{"position": {"x": 450, "y": 775}}'
+    view: '{"position": {"x": 450, "y": 920}}'
     note: false
     timertriggers: []
     ignoreworker: false
@@ -348,7 +234,7 @@ tasks:
       - '7'
     separatecontext: false
     continueonerrortype: ''
-    view: '{"position": {"x": 250, "y": 1065}}'
+    view: '{"position": {"x": 250, "y": 1210}}'
     note: false
     timertriggers: []
     ignoreworker: false
@@ -378,7 +264,7 @@ tasks:
       - '10'
     separatecontext: false
     continueonerrortype: ''
-    view: '{"position": {"x": 250, "y": 1210}}'
+    view: '{"position": {"x": 250, "y": 1355}}'
     note: false
     timertriggers: []
     ignoreworker: false
@@ -419,7 +305,7 @@ tasks:
       - '10'
     separatecontext: false
     continueonerrortype: ''
-    view: '{"position": {"x": 50, "y": 1355}}'
+    view: '{"position": {"x": 50, "y": 1500}}'
     note: false
     timertriggers: []
     ignoreworker: false
@@ -439,7 +325,7 @@ tasks:
       - '10'
     separatecontext: false
     continueonerrortype: ''
-    view: '{"position": {"x": 1050, "y": 920}}'
+    view: '{"position": {"x": 1050, "y": 1065}}'
     note: false
     timertriggers: []
     ignoreworker: false
@@ -456,7 +342,7 @@ tasks:
       brand: ''
     separatecontext: false
     continueonerrortype: ''
-    view: '{"position": {"x": 450, "y": 1550}}'
+    view: '{"position": {"x": 450, "y": 1695}}'
     note: false
     timertriggers: []
     ignoreworker: false
@@ -508,7 +394,7 @@ tasks:
       - '15'
     separatecontext: false
     continueonerrortype: ''
-    view: '{"position": {"x": 450, "y": 920}}'
+    view: '{"position": {"x": 450, "y": 1065}}'
     note: false
     timertriggers: []
     ignoreworker: false
@@ -548,7 +434,7 @@ tasks:
       - '13'
     separatecontext: false
     continueonerrortype: ''
-    view: '{"position": {"x": 650, "y": 1065}}'
+    view: '{"position": {"x": 650, "y": 1210}}'
     note: false
     timertriggers: []
     ignoreworker: false
@@ -582,7 +468,7 @@ tasks:
       - '10'
     separatecontext: false
     continueonerrortype: ''
-    view: '{"position": {"x": 650, "y": 1210}}'
+    view: '{"position": {"x": 650, "y": 1355}}'
     note: false
     timertriggers: []
     ignoreworker: false
@@ -620,7 +506,7 @@ tasks:
       - '10'
     separatecontext: false
     continueonerrortype: ''
-    view: '{"position": {"x": 850, "y": 1355}}'
+    view: '{"position": {"x": 850, "y": 1500}}'
     note: false
     timertriggers: []
     ignoreworker: false
@@ -644,10 +530,36 @@ tasks:
       - '10'
     separatecontext: false
     continueonerrortype: ''
-    view: '{"position": {"x": 1050, "y": 1065}}'
+    view: '{"position": {"x": 1050, "y": 1210}}'
     note: false
     timertriggers: []
     ignoreworker: false
+  '16':
+    id: '16'
+    taskid: 7d3e0c30-0000-0000-0000-000000000016
+    type: regular
+    task:
+      id: 7d3e0c30-0000-0000-0000-000000000016
+      version: -1
+      name: Clear context from any previous run
+      description: Re-running this playbook on an issue that has already run it would otherwise inherit the previous
+        run's context. List-valued outputs are APPENDED to across calls in one investigation, so eligible_scan_ids,
+        pending_scan_ids and failed accumulate, and every condition downstream reads a mixture of both runs. The
+        automations clear their own keys; this clears whatever else the issue is carrying, so a re-run starts from
+        the same blank slate as a first run.
+      scriptName: DeleteContext
+      type: regular
+      iscommand: false
+      brand: ''
+    scriptarguments:
+      all:
+        simple: 'yes'
+    nexttasks:
+      '#none#':
+      - '1'
+    separatecontext: false
+    continueonerrortype: ''
+    view: '{"position": {"x": 450, "y": 195}}'
 inputs:
 - key: consolidation_mode
   value:
@@ -757,5 +669,5 @@ outputs:
 fromversion: 6.5.0
 tests:
 - No tests (auto-formatted)
-view: "{\n  \"linkLabelsPosition\": {},\n  \"paper\": {\n    \"dimensions\": {\n      \"height\": 1800,\n      \"\
-  width\": 1300,\n      \"x\": 50,\n      \"y\": 50\n    }\n  }\n}"
+view: "{\n  \"linkLabelsPosition\": {},\n  \"paper\": {\n    \"dimensions\": {\n      \"height\": 2100,\n      \"\
+  width\": 1400,\n      \"x\": 50,\n      \"y\": 50\n    }\n  }\n}"
