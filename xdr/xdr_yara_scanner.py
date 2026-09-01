@@ -57,6 +57,66 @@ import yara
 # Environment-variable helpers, used by the configuration below.
 # ============================================================================
 
+def _env_flag(name, default):
+    """Env var if set, else the CONFIG_* default. Accepts the usual truthy spellings."""
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return bool(default)
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_str(name, default):
+    raw = os.getenv(name)
+    return default if raw is None or str(raw).strip() == "" else str(raw).strip()
+
+
+def _coerce_flag(value):
+    """Accept the spellings an operator actually types in an options string."""
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _proxy_settings(proxy=None, ca_bundle=None):
+    """(proxies, verify) for every requests call the scanner makes.
+
+    proxies is None when nothing is configured, which leaves requests free to honour
+    HTTPS_PROXY / HTTP_PROXY / NO_PROXY exactly as it would have. An explicit
+    CONFIG_PROXY overrides those, because someone who filled it in meant it.
+
+    verify is True normally, a PEM path when the proxy terminates TLS with its own
+    certificate, or False for the deliberate "insecure" escape hatch.
+    """
+    url = (proxy if proxy is not None else CONFIG_PROXY) or ""
+    url = str(url).strip()
+    proxies = {"http": url, "https": url} if url else None
+
+    ca = (ca_bundle if ca_bundle is not None else CONFIG_PROXY_CA_BUNDLE) or ""
+    ca = str(ca).strip()
+    if ca.lower() == "insecure":
+        verify = False
+    elif ca:
+        verify = ca
+    else:
+        verify = True
+    return proxies, verify
+
+
+# Resolved once at import from CONFIG_PROXY / CONFIG_PROXY_CA_BUNDLE, and refreshed by
+# _refresh_proxy() when a run overrides them through options=. Every requests call in this
+# file reads these two names, so there is one place to change and no call site can be missed.
+_PROXIES = None
+_VERIFY = True
+
+
+def _refresh_proxy(proxy=None, ca_bundle=None):
+    """Recompute the module-level proxy settings. Called once at startup and again if a run
+    passes proxy= / proxy_ca_bundle= through options."""
+    global _PROXIES, _VERIFY
+    _PROXIES, _VERIFY = _proxy_settings(proxy, ca_bundle)
+    return _PROXIES, _VERIFY
+
+
 def _env_number(name, default, cast=float, minimum=None):
     """Read a numeric YARA_* env var, falling back to `default`.
 
@@ -190,7 +250,49 @@ CONFIG_ALERT_OFFSETS_PER_FINDING_MAX = 50
 CONFIG_HOST_CLEANUP      = "off"        # "off" | "on_delivery" | "always"
 CONFIG_HOST_CLEANUP_KEEP = "summary"    # "nothing" | "summary" | "evidence"
 
+# --- Egress through a corporate proxy ---------------------------------------
+# Endpoints that cannot reach the tenant API directly need this. Leave both empty
+# on a network with direct egress and nothing changes.
+#
+# CONFIG_PROXY takes one URL used for BOTH http and https, e.g.
+#   "http://proxy.corp.example:8080"                  (anonymous)
+#   "http://user:pass@proxy.corp.example:8080"        (basic auth)
+# For different proxies per scheme, or for anything more elaborate, set the
+# ordinary HTTPS_PROXY / HTTP_PROXY / NO_PROXY environment variables instead -
+# requests honours them, and CONFIG_PROXY simply overrides them when set.
+#
+# CONFIG_PROXY_CA_BUNDLE points at a PEM file when the proxy terminates TLS and
+# presents its own certificate. Without it a TLS-intercepting proxy fails
+# verification and every upload is refused. "" keeps normal verification; the
+# string "insecure" disables it entirely, which is a last resort and is logged
+# loudly on every run.
+CONFIG_PROXY           = ""             # "" = no explicit proxy (env vars still apply)
+CONFIG_PROXY_CA_BUNDLE = ""             # "" = default trust store | "/path/ca.pem" | "insecure"
+
+# --- Runtime profile --------------------------------------------------------
+# "full"  - full diagnostics. Performance and resource sampling run alongside the
+#           scan, so a slow or stalled run can be explained afterwards.
+# "light" - minimal overhead. Both monitors are forced off regardless of the
+#           CONFIG_ENABLE_* settings below. Choose this on hosts where the
+#           sampling thread itself is unwelcome.
+# The profile does NOT change worker count or CPU impact - those are
+# CONFIG_WORKERS and the CPU-governor settings above, and they apply to both.
+CONFIG_PROFILE = "full"                 # "full" | "light"
+
+# --- Diagnostics ------------------------------------------------------------
+# On by default: these are what make a slow or stalled scan explainable after the
+# fact, and a scan is not run often enough for the overhead to matter. The cost is
+# a sampling thread and some extra lines in logs/performance_<run_id>.log and
+# logs/statistics_<run_id>.log; nothing is uploaded to the tenant.
+# Turn off per run with options="enable_perf_monitor=false,enable_resource_monitor=false",
+# or with options="profile=light" to silence all of them at once.
+CONFIG_ENABLE_PERF_MONITOR     = True   # per-worker timings, queue depth, throughput
+CONFIG_ENABLE_RESOURCE_MONITOR = True   # host CPU/memory sampling alongside the scan
+CONFIG_ENABLE_FD_MONITOR       = False  # open file descriptors; niche, off by default
+
 CONFIG_OPTIONS = ""                     # extra "key=value,key=value" overrides applied every run (rarely needed)
+
+_refresh_proxy()   # resolve CONFIG_PROXY / CONFIG_PROXY_CA_BUNDLE now that both exist
 
 # ============================================================================
 # END CUSTOMER CONFIG
@@ -759,7 +861,7 @@ def _probe_auth_type(log_manager=None):
     for auth in ("advanced", "standard"):
         headers = _advanced_auth_headers() if auth == "advanced" else _standard_auth_headers()
         try:
-            resp = requests.post(url, headers=headers, json={"request": {}}, timeout=DEFAULT_TIMEOUT_SECS)
+            resp = requests.post(url, headers=headers, json={"request": {}}, timeout=DEFAULT_TIMEOUT_SECS, proxies=_PROXIES, verify=_VERIFY)
         except Exception as e:  # noqa: BLE001 - network errors leave detection for next call
             if log_manager:
                 log_manager.log_upload(f"XDR auth probe ({auth}) network error: {e}")
@@ -837,6 +939,8 @@ _VALID_OPTION_KEYS = {
     "create_alerts", "write_dataset", "collect_files",
     "cpu_guarantee", "cpu_headroom_pct", "cpu_budget_pct", "cpu_floor_pct",
     "workers", "tenant_id", "lookup_shard",
+    "proxy", "proxy_ca_bundle",
+    "enable_perf_monitor", "enable_resource_monitor", "enable_fd_monitor", "profile",
 }
 
 # Options retired by the CPU-governor redesign. Accepted and translated rather than
@@ -1891,7 +1995,7 @@ class StatisticsManager:
     def start_monitoring(self):
         """Start background performance monitoring thread."""
         if not getattr(self.config, "enable_performance_monitoring", True):
-            self.stats_logger.info("Performance monitoring disabled in light profile")
+            self.stats_logger.info("Performance monitoring is disabled for this run")
             return
         if not self.monitoring_thread or not self.monitoring_thread.is_alive():
             self.monitoring_thread = threading.Thread(target=self._monitoring_worker, daemon=True)
@@ -2450,7 +2554,7 @@ class SystemResourceMonitor:
     def start_monitoring(self):
         """Start background resource monitoring."""
         if not getattr(self.config, "enable_resource_monitoring", True):
-            self.log_manager.log_system("System resource monitoring disabled in light profile")
+            self.log_manager.log_system("System resource monitoring is disabled for this run")
             return
         if not self.process:
             return
@@ -2727,7 +2831,14 @@ class ScanConfig:
         # ("endpoint" = per-host datasets, which sidesteps the add_data concurrency race).
         self.lookup_shard = str(lookup_shard).strip() if lookup_shard else ""
         self.run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        self.light_profile = True
+        # Was hardcoded True and read nowhere, while the summary reported "light" and the
+        # startup log claimed "reduced workers, reduced monitoring" - none of which was true.
+        # It is now a real selector that decides whether the monitors run.
+        self.profile = str(_env_str("YARA_PROFILE", CONFIG_PROFILE) or "full").strip().lower()
+        if self.profile not in ("full", "light"):
+            raise ValueError(
+                "profile must be 'full' or 'light' (%r given)" % self.profile)
+        self.light_profile = (self.profile == "light")
         parsed_alert_severity = _parse_alert_severity(alert_severity, "alert_severity")
         self.alert_severity = "low" if parsed_alert_severity is None else parsed_alert_severity
 
@@ -2823,9 +2934,16 @@ class ScanConfig:
             f"YARA Scanner VERSION {__version__} (released {__release_date__})")
         self.error_logger.error_logger.info(f"Runtime posture: {self.posture}")
         self.error_logger.error_logger.info(f"Default XDR alert severity: {self.alert_severity}")
-        self.error_logger.error_logger.info(
-            "Light profile active: reduced workers, reduced monitoring, and lower-impact scan execution"
-        )
+        if self.light_profile:
+            self.error_logger.error_logger.info(
+                "Runtime profile: LIGHT - performance and resource monitoring are off. Worker "
+                "count and CPU impact are unaffected; those are CONFIG_WORKERS and the CPU "
+                "governor, and they apply to both profiles.")
+        else:
+            self.error_logger.error_logger.info(
+                "Runtime profile: FULL - performance and resource monitoring run alongside the "
+                "scan. See performance_monitoring_enabled / resource_monitoring_enabled in the "
+                "scan summary for what was actually active.")
 
         
         try:
@@ -2874,15 +2992,21 @@ class ScanConfig:
         # continuously and flooding the upload queue. To disable progress logging, set a
         # large interval rather than 0.
         self.log_interval = max(1, _env_number("YARA_PROGRESS_LOG_SECS", 30, cast=int, minimum=1))
-        self.enable_performance_monitoring = str(
-            os.getenv("YARA_ENABLE_PERF_MONITOR", "false")
-        ).strip().lower() in ("1", "true", "yes", "on")
-        self.enable_resource_monitoring = str(
-            os.getenv("YARA_ENABLE_RESOURCE_MONITOR", "false")
-        ).strip().lower() in ("1", "true", "yes", "on")
-        self.enable_fd_monitoring = str(
-            os.getenv("YARA_ENABLE_FD_MONITOR", "false")
-        ).strip().lower() in ("1", "true", "yes", "on")
+        # CONFIG_* is the default; the env var overrides it when present. These used to be
+        # env-only and defaulted off, which made them unreachable from the Action Center - it
+        # passes three inputs and sets no environment - so the diagnostics that explain a slow
+        # scan could only be enabled by editing the script.
+        self.enable_performance_monitoring = _env_flag(
+            "YARA_ENABLE_PERF_MONITOR", CONFIG_ENABLE_PERF_MONITOR)
+        self.enable_resource_monitoring = _env_flag(
+            "YARA_ENABLE_RESOURCE_MONITOR", CONFIG_ENABLE_RESOURCE_MONITOR)
+        self.enable_fd_monitoring = _env_flag(
+            "YARA_ENABLE_FD_MONITOR", CONFIG_ENABLE_FD_MONITOR)
+        if self.light_profile:
+            # The whole point of the light profile: no sampling threads.
+            self.enable_performance_monitoring = False
+            self.enable_resource_monitoring = False
+            self.enable_fd_monitoring = False
         self.track_real_paths = False
         # How often the governor refreshes its CPU reading. 1s is plenty: the actuator is a
         # per-file proportional sleep, not a hard gate, so sub-second sampling buys only
@@ -3441,7 +3565,7 @@ class ResultsUploader:
             attempt += 1
             try:
                 resp = requests.post(url=endpoint, headers=build_xdr_headers(self.log_manager),
-                                     json=payload, timeout=DEFAULT_TIMEOUT_SECS)
+                                     json=payload, timeout=DEFAULT_TIMEOUT_SECS, proxies=_PROXIES, verify=_VERIFY)
                 self._last_alert_post = time.monotonic()
                 if 200 <= resp.status_code < 300:
                     api_reply_ok = True
@@ -4168,8 +4292,7 @@ class LookupDatasetUploader:
                 _build_xdr_get_datasets_url(XDR_API_URL),
                 headers=build_xdr_headers(self.log_manager),
                 json={"request": {}},
-                timeout=DEFAULT_TIMEOUT_SECS,
-            )
+                timeout=DEFAULT_TIMEOUT_SECS, proxies=_PROXIES, verify=_VERIFY)
             if 200 <= resp.status_code < 300:
                 try:
                     body = resp.json()
@@ -4219,8 +4342,7 @@ class LookupDatasetUploader:
                         "dataset_schema": dataset_schema,
                     }
                 },
-                timeout=DEFAULT_TIMEOUT_SECS,
-            )
+                timeout=DEFAULT_TIMEOUT_SECS, proxies=_PROXIES, verify=_VERIFY)
             if 200 <= resp.status_code < 300:
                 if self.log_manager:
                     self.log_manager.log_upload(
@@ -4394,8 +4516,7 @@ class LookupDatasetUploader:
             _build_xdr_url(XDR_API_URL, XDR_START_XQL_QUERY_PATH),
             headers=build_xdr_headers(self.log_manager),
             json={"request_data": {"query": query}},
-            timeout=LOOKUP_FLUSH_QUERY_TIMEOUT,
-        )
+            timeout=LOOKUP_FLUSH_QUERY_TIMEOUT, proxies=_PROXIES, verify=_VERIFY)
         if not (200 <= resp.status_code < 300):
             if _xql_says_missing(resp.text):
                 return []
@@ -4413,8 +4534,7 @@ class LookupDatasetUploader:
                 headers=build_xdr_headers(self.log_manager),
                 json={"request_data": {"query_id": qid, "pending_flag": True,
                                        "limit": int(limit), "format": "json"}},
-                timeout=LOOKUP_FLUSH_QUERY_TIMEOUT,
-            )
+                timeout=LOOKUP_FLUSH_QUERY_TIMEOUT, proxies=_PROXIES, verify=_VERIFY)
             if not (200 <= resp.status_code < 300):
                 if _xql_says_missing(resp.text):
                     return []
@@ -4463,8 +4583,7 @@ class LookupDatasetUploader:
             headers=build_xdr_headers(self.log_manager),
             json={"request": {"dataset_name": self.matches_dataset,
                               "filters": [{"scan_id": scan_id}]}},
-            timeout=LOOKUP_FLUSH_REMOVE_TIMEOUT,
-        )
+            timeout=LOOKUP_FLUSH_REMOVE_TIMEOUT, proxies=_PROXIES, verify=_VERIFY)
         if not (200 <= resp.status_code < 300):
             if _xql_says_missing(resp.text):
                 return 0
@@ -4671,7 +4790,7 @@ class LookupDatasetUploader:
                 break
             attempt += 1
             try:
-                resp = requests.post(url, headers=build_xdr_headers(self.log_manager), json=payload, timeout=LOOKUP_POST_TIMEOUT)
+                resp = requests.post(url, headers=build_xdr_headers(self.log_manager), json=payload, timeout=LOOKUP_POST_TIMEOUT, proxies=_PROXIES, verify=_VERIFY)
                 if 200 <= resp.status_code < 300:
                     try:
                         body = resp.json()
@@ -4904,8 +5023,7 @@ class ScanStatusUploader:
                 url=_build_xdr_insert_alerts_url(XDR_API_URL),
                 headers=build_xdr_headers(),
                 json=standard_log.to_dict(),
-                timeout=10
-            )
+                timeout=10, proxies=_PROXIES, verify=_VERIFY)
             
             if response.status_code == 200:
                 logging.info("✓ Scan status uploaded successfully")
@@ -7721,6 +7839,28 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
     tenant_id = _pick("tenant_id", tenant_id)
     lookup_shard = _pick("lookup_shard", lookup_shard)
 
+    # Proxy settings are resolved BEFORE the cancel short-circuit below, because a cancel is
+    # itself an API call and has to reach the tenant through the same proxy a scan would.
+    _refresh_proxy(_pick("proxy", None), _pick("proxy_ca_bundle", None))
+    if _VERIFY is False:
+        # stderr, never stdout: stdout is capped at 10,240 characters and that budget belongs
+        # to the SCAN_RESULT line the caller parses.
+        _msg = ("WARNING: TLS verification is DISABLED for this run "
+                "(proxy_ca_bundle=insecure). Traffic to the tenant is encrypted but the peer "
+                "is not authenticated - prefer a CA bundle.")
+        print(_msg, file=sys.stderr)
+
+    # Diagnostics: options override the CONFIG_* defaults for this run only, by way of the
+    # env vars ScanConfig already reads.
+    for opt_key, env_name in (("enable_perf_monitor", "YARA_ENABLE_PERF_MONITOR"),
+                              ("enable_resource_monitor", "YARA_ENABLE_RESOURCE_MONITOR"),
+                              ("enable_fd_monitor", "YARA_ENABLE_FD_MONITOR")):
+        chosen = opts.get(opt_key)
+        if chosen is not None:
+            os.environ[env_name] = "true" if _coerce_flag(chosen) else "false"
+    if opts.get("profile") is not None:
+        os.environ["YARA_PROFILE"] = str(opts["profile"]).strip().lower()
+
     mode = (str(mode) if mode is not None else "scan").strip().lower() or "scan"
     if mode == "cancel":
         return _handle_cancel_request(tenant_id_override=tenant_id)
@@ -7878,7 +8018,7 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
             'max_workers': config.max_workers,
             'scan_queue_size': config.scan_queue_size,
             'max_file_mb': config.max_file_mb,
-            'scanner_profile': 'light',
+            'scanner_profile': getattr(config, 'profile', 'full'),
             'performance_monitoring_enabled': config.enable_performance_monitoring,
             'resource_monitoring_enabled': config.enable_resource_monitoring,
             'upload_enabled': UPLOAD_RESULTS,
@@ -7896,7 +8036,8 @@ def run(yarafile=None, scan_folder=None, alert_severity="low", mode=None, option
         if config.scan_folder and config.scan_folder.lower() != "default":
             scope_message = f"SCAN SCOPE: Limited to specified targets: {config.scan_targets}"
         else:
-            scope_message = "SCAN SCOPE: Full system scan (light profile throttling enabled)"
+            scope_message = ("SCAN SCOPE: Full system scan (CPU governor: %s)"
+                             % getattr(config, "cpu_guarantee", CONFIG_CPU_GUARANTEE))
         
         log_manager.log_system(scope_message, {'scan_targets': getattr(config, 'scan_targets', 'default')})
         
