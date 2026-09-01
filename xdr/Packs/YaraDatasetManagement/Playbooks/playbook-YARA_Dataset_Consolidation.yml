@@ -188,14 +188,14 @@ tasks:
     conditions:
     - label: ready
       condition:
-      - - operator: isExists
+      - - operator: isNotEmpty
           left:
             value:
               simple: Yara.ConsolidateStatus.eligible_scan_ids
             iscontext: true
     - label: waiting
       condition:
-      - - operator: isExists
+      - - operator: isNotEmpty
           left:
             value:
               simple: Yara.ConsolidateStatus.pending_scan_ids
@@ -296,7 +296,7 @@ tasks:
     conditions:
     - label: ready
       condition:
-      - - operator: isExists
+      - - operator: isNotEmpty
           left:
             value:
               simple: Yara.ConsolidateStatus.eligible_scan_ids
@@ -366,7 +366,7 @@ tasks:
     conditions:
     - label: 'yes'
       condition:
-      - - operator: isExists
+      - - operator: isNotEmpty
           left:
             value:
               simple: Yara.ConsolidateApply.failed
@@ -570,7 +570,7 @@ tasks:
     conditions:
     - label: 'yes'
       condition:
-      - - operator: isExists
+      - - operator: isNotEmpty
           left:
             value:
               simple: Yara.ConsolidateSummary.failed
