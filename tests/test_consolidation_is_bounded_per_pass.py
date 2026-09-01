@@ -180,10 +180,23 @@ def test_the_playbook_declares_a_full_execute_input():
         "full_execute must default to true, or every scheduled full pass is a no-op")
 
 
-def test_the_playbook_declares_a_max_scans_input():
+def test_the_playbook_declares_no_max_scans_input():
+    """The counterpart to test_the_playbook_apply_task_passes_execute_and_a_row_ceiling.
+
+    That test asserts max_scans is never PASSED to the Apply task, because the v4 path has no
+    such concept - consolidate_full writes a ruleset group as a unit and its per-pass bound is
+    row_ceiling, rows being what runs the clock out. This asserts the other half: it must not
+    be DECLARED either.
+
+    Declaring it was worse than harmless. It put a knob in front of an operator, on a playbook
+    whose whole job is a bounded pass, that was wired to nothing and silently did nothing when
+    set. An input that cannot affect the run should not be offered.
+    """
     import yaml
     path = os.path.join(_REPO, "xdr", "Packs", "YaraDatasetManagement", "Playbooks",
                         "playbook-YARA_Dataset_Consolidation.yml")
     pb = yaml.safe_load(open(path))
     keys = [i.get("key") for i in (pb.get("inputs") or [])]
-    assert "max_scans" in keys, "playbook has no max_scans input for an operator to override"
+    assert "max_scans" not in keys, (
+        "max_scans is declared but the v4 path has no such bound - it is row_ceiling")
+    assert "row_ceiling" in keys, "the bound that DOES apply must stay overridable"
