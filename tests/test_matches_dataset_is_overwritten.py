@@ -155,7 +155,11 @@ def live(monkeypatch):
     monkeypatch.setattr(m, "LOOKUP_WRITE_JITTER_SECS", 0)
 
     def _install(api):
-        monkeypatch.setattr(m.requests, "post", api.post)
+        # Patch the SESSION, not requests.post. Every outbound call now goes through the
+        # shared session so the adapter that disables verification on the proxy hop is always
+        # in the path; patching the module-level requests.post would silently intercept
+        # nothing and the fake tenant would never be called.
+        monkeypatch.setattr(m, "_http", lambda: api)
         return api
 
     return _install

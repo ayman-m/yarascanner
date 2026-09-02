@@ -175,7 +175,15 @@ def test_the_summary_scan_id_filter_has_the_same_protection(S, monkeypatch):
     from test_pack_data_management import _run_automation
 
     def fake_summarise(client, dataset, ver, qcount, log, findings=None):
-        rows = client.ds.get(dataset, [])
+        # A trailing * reads every matching dataset at once, which is what the tenant does and
+        # what main() now asks for when the shard census permits it. Dedupe below is unchanged:
+        # the fan-in groups on the same (scan_id, hostname, rule) key the loop merged on, so
+        # this stays a stand-in for the read and not a second implementation of it.
+        if dataset.endswith("*"):
+            rows = [r for n, rs in sorted(client.ds.items())
+                    if n.startswith(dataset[:-1]) for r in rs]
+        else:
+            rows = client.ds.get(dataset, [])
         out, seen = [], set()
         for r in rows:
             key = (r["scan_id"], r["hostname"], r["rule"])

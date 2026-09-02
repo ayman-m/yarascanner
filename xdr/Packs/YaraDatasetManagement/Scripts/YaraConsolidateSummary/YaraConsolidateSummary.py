@@ -1748,17 +1748,22 @@ def _matches_shard_for_read(name, ver):
 
 
 def summarise_shard(client, dataset, ver, qcount, log, findings=None):
-    """[(scan_id, hostname, rule, ts_ms_or_None)] for ONE host shard.
+    """[(scan_id, hostname, rule, ts_ms_or_None)] for ONE host shard, or for every host shard
+    at once when `dataset` is the fan-in wildcard from `_fanin_source`.
 
     Primary path is a single XQL; it falls back to one query per scan only if that query is
     rejected. `findings` accumulates the discarded count() aggregate so the run can report how
     many file-level findings collapsed into the summary; it never reaches a row.
+
+    Returns the mode as "single-query", "single-query-at-cap" (the read hit _SUMMARY_LIMIT,
+    so the caller must treat its sources as incomplete) or "per-scan".
     """
-    p = _matches_shard_for_read(dataset, ver)
-    if not p:
+    if dataset != "%s_matches_v%s_*" % (_PREFIX, ver) and not _matches_shard_for_read(dataset, ver):
         # Guards the XQL interpolation. Names reaching here are already anchored by
         # _matches_shard_for_read's regex, but the host segment originates as a HOSTNAME, so
-        # the check is made explicitly rather than assumed.
+        # the check is made explicitly rather than assumed. The one non-shard name admitted is
+        # the fan-in wildcard, spelled out here rather than pattern-matched so no hostname can
+        # reach the interpolation by resembling it.
         raise ValueError("refusing non-matches dataset in XQL: %s" % dataset)
 
     try:
@@ -1766,7 +1771,8 @@ def summarise_shard(client, dataset, ver, qcount, log, findings=None):
         # tenant a query, and the reported figure is the run's real cost.
         qcount[0] += 1
         rows = client.xql(summary_query(dataset, ver), limit=_SUMMARY_LIMIT) or []
-        if len(rows) >= _SUMMARY_LIMIT:
+        at_cap = len(rows) >= _SUMMARY_LIMIT
+        if at_cap:
             # Never silent truncation. Nothing is deleted on the strength of this read, so a
             # short read costs coverage, never data.
             log("  ! %s returned %d rows - at the %d-row read cap; its summary may be "
@@ -1782,7 +1788,7 @@ def summarise_shard(client, dataset, ver, qcount, log, findings=None):
                 except (TypeError, ValueError):
                     pass
             out.append((str(sid), str(host or ""), str(rule), _as_ms(r.get("ts"))))
-        return out, "single-query"
+        return out, ("single-query-at-cap" if at_cap else "single-query")
     except Exception as e:
         if str(ver) != "4":
             raise
@@ -1808,13 +1814,105 @@ def summarise_shard(client, dataset, ver, qcount, log, findings=None):
     return out, "per-scan fallback"
 
 
-def _lifecycle_state(client, scans_shards, log, qcount):
+def _dataset_last_updated(client):
+    """{dataset: last-updated-ms} from the dataset listing, or {} if it cannot be read.
+
+    The listing is the only tenant call that costs no query. It returns "Total Events",
+    "Total Size Stored", "Average Event Size" and "Average Daily Size" - none of which the
+    platform populates for LOOKUP datasets. Checked live: 0 of 446 LOOKUP datasets carried any
+    of them, while RAW and SYSTEM datasets did. Every YARA dataset is a LOOKUP, so a pass
+    cannot learn its own size for free and a slice size has to be chosen by the operator.
+
+    "Last Updated" IS populated, so it is what a bounded pass orders by.
+    """
+    try:
+        raw = client.get_datasets()
+    except Exception:
+        return {}
+    items = raw if isinstance(raw, list) else (
+        (raw or {}).get("data") or (raw or {}).get("datasets") or [])
+    out = {}
+    for d in items or ():
+        if not isinstance(d, dict):
+            continue
+        name = d.get("Dataset Name") or d.get("dataset_name") or d.get("name")
+        ts = d.get("Last Updated") or d.get("last_updated")
+        if name and ts is not None:
+            try:
+                out[str(name)] = int(ts)
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
+def _fanin_source(names, kind, ver, wanted):
+    """A single wildcard dataset expression covering `wanted`, or None to read shard by shard.
+
+    The read phase costs one XQL round trip per dataset, and a fleet's dataset census is
+    hosts x (1 + retained months) - so a 200-host tenant spends its entire 900s task budget
+    on round trips and is killed mid-read, having written nothing. One wildcard query
+    collapses that to a constant, because the `comp ... by` stages below group on keys that
+    are already shard-independent: the engine performs exactly the merge the Python loop
+    performs.
+
+    The guard is what makes the substitution safe rather than merely fast. A wildcard reads
+    whatever the tenant happens to hold, while the loop reads a list this module curated -
+    `_matches_shard_for_read` deliberately excludes retired per-scan copies, for one. So the
+    wildcard is used ONLY when the two are provably the same set; any extra dataset on the
+    tenant, and this returns None and the caller reads shard by shard as before. The listing
+    is already in hand, so the check costs nothing.
+    """
+    if not wanted:
+        return None
+    prefix = "%s_%s_v%s_" % (_PREFIX, kind, ver)
+    on_tenant = {n for n in names if n.startswith(prefix)}
+    if on_tenant != set(wanted):
+        return None
+    # A one-shard tenant gains nothing and would lose the per-shard error isolation below.
+    return prefix + "*" if len(on_tenant) > 1 else None
+
+
+def _lifecycle_state(client, scans_shards, log, qcount, fanin=None):
     """scan_id -> {"terminal": bool, "newest_ms": int} from ONE aggregate per shard.
 
     Reading every lifecycle row to learn a status field would be a full-table read per
     dataset; a comp stage answers the same question in one row per (scan_id, status).
     """
     state = {}
+
+    def absorb(rows):
+        for r in rows:
+            sid = r.get("scan_id")
+            if not sid:
+                continue
+            newest = _as_ms(r.get("newest")) or 0
+            cur = state.setdefault(sid, {"terminal": False, "newest_ms": 0})
+            cur["newest_ms"] = max(cur["newest_ms"], newest)
+            st = str(r.get("status") or "").lower()
+            if st in TERMINAL_LIFECYCLE:
+                cur["terminal"] = True
+
+    if fanin:
+        # One round trip for the whole fleet. On ANY failure fall through to the per-shard
+        # loop rather than returning what was collected: a half-read lifecycle reports live
+        # scans as non-terminal, and this state decides what is eligible to consolidate.
+        try:
+            qcount[0] += 1
+            absorb(client.xql("dataset = %s | comp count() as n, "
+                              "max(event_timestamp_ms) as newest by scan_id, status" % fanin,
+                              limit=10000) or [])
+            if state or not scans_shards:
+                return state
+            # Empty, with shards known to exist: the wildcard resolved to nothing rather than
+            # the fleet having no lifecycle. Accepting it would leave every scan looking
+            # non-terminal and consolidate nothing while reporting success.
+            log("  ! fleet-wide lifecycle query returned nothing though %d shard(s) exist - "
+                "falling back to one query per shard" % len(scans_shards))
+        except Exception as e:
+            log("  ! fleet-wide lifecycle query failed (%s) - falling back to one query "
+                "per shard" % str(e)[:140])
+        state = {}
+
     for ds in scans_shards:
         try:
             qcount[0] += 1
@@ -1826,16 +1924,7 @@ def _lifecycle_state(client, scans_shards, log, qcount):
             # the safe direction - it survives to the next run.
             log("  ! lifecycle unreadable for %s (%s) - its scans stay untouched" % (ds, e))
             continue
-        for r in rows:
-            sid = r.get("scan_id")
-            if not sid:
-                continue
-            newest = _as_ms(r.get("newest")) or 0
-            cur = state.setdefault(sid, {"terminal": False, "newest_ms": 0})
-            cur["newest_ms"] = max(cur["newest_ms"], newest)
-            st = str(r.get("status") or "").lower()
-            if st in TERMINAL_LIFECYCLE:
-                cur["terminal"] = True
+        absorb(rows)
     return state
 
 
@@ -1862,6 +1951,10 @@ def main():
     # to be complete - see the quiet-period note at the gate below. Overridable per run for
     # an operator who knows a wave has fully drained.
     quiet_secs = float(args.get("quiet_secs") or DEFAULT_QUIET_SECS)
+    _md = args.get("max_datasets")
+    max_datasets = int(_md) if _md not in (None, "") else None
+    if max_datasets is not None and max_datasets < 1:
+        raise ValueError("max_datasets must be 1 or more (got %r)" % _md)
     now_ms = int(time.time() * 1000)
     qcount = [0]          # XQL queries ISSUED, succeeded or not; the dataset listing is not
                           # an XQL and is reported separately rather than folded in here
@@ -1903,19 +1996,74 @@ def main():
         # reading it here is safe. See _matches_shard_for_read.
         match_ds = [n for n in names if _matches_shard_for_read(n, ver)]
         existing = set(names)
+        all_match_ds = list(match_ds)
+        bounded = bool(max_datasets and len(match_ds) > int(max_datasets))
+        if bounded:
+            # Oldest-touched first, so repeated passes drain a backlog instead of re-reading
+            # the same head of the list. `Last Updated` is the only sizing-adjacent field the
+            # dataset listing populates for LOOKUP datasets - Total Events and Total Size
+            # Stored come back None for every one of them - so ordering is all it can give.
+            lu = _dataset_last_updated(client)
+            match_ds = sorted(match_ds, key=lambda d: (lu.get(d) or 0, d))[:int(max_datasets)]
+            log("bounded pass: reading %d of %d matches shard(s), oldest first. Stale-row "
+                "removal is DISABLED for this pass - a shard that was not read cannot show "
+                "that a scan was superseded. Re-run to continue; a later unbounded pass "
+                "reconciles." % (len(match_ds), len(all_match_ds)))
         log("schema v%s: %d matches shard(s), %d scans shard(s)"
             % (ver, len(match_ds), len(scans_ds)))
 
         # ---- 1. lifecycle, so a still-running scan can be told from a finished one ------
-        state = _lifecycle_state(client, scans_ds, log, qcount)
+        state = _lifecycle_state(client, scans_ds, log, qcount,
+                                 fanin=_fanin_source(names, "scans", ver, scans_ds))
         log("lifecycle: %d scan(s) known" % len(state))
 
         # ---- 2. ONE query per host shard -> (scan_id, hostname, rule) -------------------
         # Every shard is read BEFORE any scan is written: a scan can span hosts, and its
         # summary must carry every host's rules, not the first shard's.
         by_scan = {}
-        sources_complete = True
-        for ds in sorted(match_ds):
+        # A bounded pass has deliberately not read every source, which is exactly the state
+        # stale removal must never run in: every scan in a skipped shard is absent from
+        # `observed` and would be read as superseded and deleted. Same rail as an unreadable
+        # source, set for a chosen reason rather than a failure.
+        sources_complete = not bounded
+
+        def collect(tuples):
+            for sid, host, rule, ts in tuples:
+                slot = by_scan.setdefault(sid, {})
+                prev = slot.get((host, rule))
+                slot[(host, rule)] = _max_ms(prev, ts) if prev is not None else ts
+
+        # One query for every host shard at once, when the tenant holds exactly the shards
+        # this pass curated. `summary_query` groups by (scan_id, hostname, rule) - all
+        # shard-independent - so the engine returns the same tuples the loop below would
+        # merge, and the dedupe in `collect` still runs for a host carrying both a permanent
+        # and a leftover month-suffixed shard.
+        fanin = _fanin_source(names, "matches", ver, match_ds)
+        if fanin:
+            try:
+                tuples, mode = summarise_shard(client, fanin, ver, qcount, log, findings)
+                if not tuples and match_ds:
+                    # See the lifecycle note above - an empty fleet-wide read with shards
+                    # present means the wildcard did not work, not that there is nothing.
+                    raise RuntimeError("fleet-wide matches query returned no rows though %d "
+                                       "shard(s) exist" % len(match_ds))
+                modes.add(mode)
+                collect(tuples)
+                if mode == "single-query-at-cap":
+                    # Fleet-wide, the read cap stops being a per-host inconvenience: a
+                    # truncated read makes present scans look superseded, and stale removal
+                    # would delete their rows. Same rule as an unreadable shard.
+                    sources_complete = False
+                fanin_used = True
+            except Exception as e:
+                log("  ! fleet-wide matches query failed (%s) - falling back to one query "
+                    "per shard" % str(e)[:140])
+                by_scan = {}
+                fanin_used = False
+        else:
+            fanin_used = False
+
+        for ds in ([] if fanin_used else sorted(match_ds)):
             try:
                 tuples, mode = summarise_shard(client, ds, ver, qcount, log, findings)
                 modes.add(mode)

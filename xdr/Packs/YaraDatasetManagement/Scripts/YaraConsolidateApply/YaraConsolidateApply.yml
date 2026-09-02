@@ -22,6 +22,11 @@ args:
   isArray: false
   defaultValue: '60000'
   secret: false
+- name: max_datasets
+  description: Read at most this many host datasets in one pass, oldest-updated first, so a large fleet can be drained in deliberate slices instead of one run that outgrows the 900-second task limit. Omit to read every dataset. A bounded pass DISABLES stale-row removal, because a dataset it did not read cannot show that a scan was superseded, so run one unbounded pass periodically to reconcile. The platform reports no row count or size for lookup datasets, so the right slice size has to be found by trying one. Start at 25 and raise it while runs stay well inside the time limit.
+  required: false
+  isArray: false
+  secret: false
 - name: execute
   description: Set true to actually create the consolidated dataset and write to it. Omitted or false is a dry run that reports what it would write and writes nothing.
   required: false

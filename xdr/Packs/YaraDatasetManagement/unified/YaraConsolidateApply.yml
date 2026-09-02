@@ -22,6 +22,11 @@ args:
   isArray: false
   defaultValue: '60000'
   secret: false
+- name: max_datasets
+  description: Read at most this many host datasets in one pass, oldest-updated first, so a large fleet can be drained in deliberate slices instead of one run that outgrows the 900-second task limit. Omit to read every dataset. A bounded pass DISABLES stale-row removal, because a dataset it did not read cannot show that a scan was superseded, so run one unbounded pass periodically to reconcile. The platform reports no row count or size for lookup datasets, so the right slice size has to be found by trying one. Start at 25 and raise it while runs stay well inside the time limit.
+  required: false
+  isArray: false
+  secret: false
 - name: execute
   description: Set true to actually create the consolidated dataset and write to it. Omitted or false is a dry run that reports what it would write and writes nothing.
   required: false
@@ -162,6 +167,7 @@ script: |
 
   # ---- consolidation core: naming, schemas, locking, merge gates -------------
   import collections
+  import hashlib
   import re
 
   _PREFIX = "yara_scanner"
@@ -433,6 +439,63 @@ script: |
       return out
 
 
+  def _shard_host_of(hostname):
+      """The `host` segment the scanner builds a dataset name from, for a given hostname.
+
+      Mirrors _dataset_shard_suffix in xdr_yara_scanner.py exactly - slugify, cap at 32, prefix
+      a letter if needed, append six hex of the sha1 of the ORIGINAL hostname. The hash is what
+      keeps two hosts that slugify identically in separate datasets, so it cannot be skipped.
+
+      Only source RETIREMENT depends on this, and only on the fan-in path where a row cannot say
+      which dataset it came from. A hostname that fails to resolve simply yields no mapping, so
+      that host's dataset is never a retirement candidate - the safe direction, since the cost of
+      a miss is a dataset that survives one pass longer.
+      """
+      raw = str(hostname or "")
+      if not raw:
+          return None
+      slug = re.sub(r"[^a-z0-9]+", "_", raw.lower()).strip("_")[:32] or "host"
+      if not slug[0].isalpha():
+          slug = "h_" + slug
+      return "%s_%s" % (slug, hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:6])
+
+
+  def _terminal_map_from_rows(rows):
+      """build_terminal_map's output, built from a flat row list instead of a {dataset: rows} map.
+
+      build_terminal_map derives the host by calling parse_shard on the DICT KEY, which a fan-in
+      wildcard is not - it would parse to None and every shard would be skipped, leaving an empty
+      map in which nothing is terminal and therefore nothing consolidates. That function is
+      drift-gated and shared with four other automations, so it is left exactly as it is and this
+      reads the host from the row's own `hostname` column instead.
+
+      The two key spaces differ - build_terminal_map keys on the dataset's slug_hash segment,
+      this on the raw hostname - and that is safe only because the sole consumer discards the
+      host component (`for (t_sid, _t_host), ...` in consolidate_full) and uses the key purely to
+      keep one entry per host per scan, which both spellings do equally. If a caller ever starts
+      reading that host back, these two must be reconciled first.
+      """
+      per = {}
+      for r in rows:
+          sid = r.get("scan_id")
+          if not sid:
+              continue
+          per.setdefault((sid, str(r.get("hostname") or "")), []).append(r)
+      out = {}
+      for key, rs in per.items():
+          rs_sorted = sorted(rs, key=lambda r: _as_ms(r.get("event_timestamp_ms")) or 0)
+          latest_status = rs_sorted[-1].get("status")
+          newest = None
+          for r in rs:
+              newest = _max_ms(newest, _newest_ms(r.get("event_timestamp_ms"),
+                                                  r.get("_insert_time")))
+          # action_state_for is None on every consolidate_full call, so there is no per-host
+          # Action Center state to consult and the host is not needed to resolve terminality.
+          out[key] = {"terminal": shard_is_terminal(latest_status, None),
+                      "newest_ms": newest, "status": latest_status}
+      return out
+
+
   def newest_row_age_ok(newest_ms, now_ms, quiet_secs):
       if newest_ms is None:
           return True
@@ -485,6 +548,158 @@ script: |
                  and (m.group("host") or "") != "scan")
 
 
+  def _rows_per_dataset(client, fanin, ver, log):
+      """{matches dataset: row count} for the whole fleet, in ONE aggregate query.
+
+      Counting is the cheap half of the platform. A raw pull of this fleet moved 86,824 rows and
+      took ~83s; the equivalent `comp count()` returns a handful of rows. So a pass can afford to
+      ask how big the work is before deciding how much of it to take - which matters because the
+      dataset listing cannot tell it (Total Events and Total Size Stored are None for every
+      LOOKUP dataset; see _dataset_last_updated).
+
+      Keyed by DATASET rather than scan so the caller can pick whole datasets: the scan_id and
+      hostname come back together, and the hostname resolves to the dataset the scanner wrote it
+      to. A row whose host will not resolve is simply not counted, which makes that dataset look
+      free and is the safe direction - it gets taken this pass rather than deferred forever.
+      """
+      if not fanin:
+          return {}
+      try:
+          rows = client.xql("dataset = %s | comp count() as n by scan_id, hostname" % fanin,
+                            limit=100000) or []
+      except Exception as e:
+          log("  ! could not size the fleet (%s) - taking the operator's bound, or everything "
+              "if none was given" % str(e)[:120])
+          return {}
+      out = {}
+      for r in rows:
+          host = _shard_host_of(r.get("hostname"))
+          if not host:
+              continue
+          ds = "%s_matches_v%s_%s" % (_PREFIX, ver, host)
+          try:
+              out[ds] = out.get(ds, 0) + int(r.get("n") or 0)
+          except (TypeError, ValueError):
+              pass
+      return out
+
+
+  def _plan_pass(match_ds, sizes, last_updated, max_datasets, budget, log):
+      """Which datasets this pass takes, and what is left over.
+
+      Explicit beats estimated: a max_datasets given by the operator is used as-is. With no
+      bound, datasets are taken oldest-touched first until the row budget is reached - always at
+      least one, so a single dataset larger than the whole budget still makes progress rather
+      than the pass silently doing nothing forever.
+
+      Returns (taken, remaining_count, rows_taken, why).
+      """
+      ordered = sorted(match_ds, key=lambda d: (last_updated.get(d) or 0, d))
+      if max_datasets:
+          n = int(max_datasets)
+          return (ordered[:n], max(0, len(ordered) - n),
+                  sum(sizes.get(d, 0) for d in ordered[:n]), "operator set max_datasets=%d" % n)
+      if not sizes:
+          return ordered, 0, 0, "fleet size unknown - taking everything"
+      taken, rows = [], 0
+      for d in ordered:
+          n = sizes.get(d, 0)
+          if taken and rows + n > budget:
+              break
+          taken.append(d)
+          rows += n
+      return (taken, len(ordered) - len(taken), rows,
+              "estimated from a %d-row budget" % budget)
+
+
+  def _dataset_last_updated(client):
+      """{dataset: last-updated-ms} from the dataset listing, or {} if it cannot be read.
+
+      The listing is the only tenant call that costs no query, and it is worth being precise
+      about what it does and does not carry. It returns "Total Events", "Total Size Stored",
+      "Average Event Size" and "Average Daily Size" - none of which the platform populates for
+      LOOKUP datasets. Checked against a live tenant: 0 of 446 LOOKUP datasets had any of them,
+      while RAW and SYSTEM datasets did. Every YARA dataset is a LOOKUP, so row counts and byte
+      sizes are simply not available here and a pass cannot size itself for free.
+
+      "Last Updated" IS populated, so it is what a bounded pass orders by - oldest first, which
+      drains a backlog instead of re-reading the same head of the list every run.
+      """
+      try:
+          raw = client.get_datasets()
+      except Exception:
+          return {}
+      items = raw if isinstance(raw, list) else (
+          (raw or {}).get("data") or (raw or {}).get("datasets") or [])
+      out = {}
+      for d in items or ():
+          if not isinstance(d, dict):
+              continue
+          name = d.get("Dataset Name") or d.get("dataset_name") or d.get("name")
+          ts = d.get("Last Updated") or d.get("last_updated")
+          if name and ts is not None:
+              try:
+                  out[str(name)] = int(ts)
+              except (TypeError, ValueError):
+                  pass
+      return out
+
+
+  def _fanin_source(names, kind, ver, wanted):
+      """One wildcard dataset expression covering `wanted`, or None to read shard by shard.
+
+      Identical in intent to the Summary automation's function of the same name: the read phase
+      costs one round trip per dataset, and a fleet's census is hosts x (1 + retained months),
+      so a large tenant spends its whole task budget on round trips. The guard is what makes the
+      substitution safe - a wildcard reads whatever the tenant holds, while the loop reads a list
+      this module curated, so the wildcard is used ONLY when the two are provably the same set.
+
+      Note this is NOT one of the drift-gated shared helpers. `_rows_of` is, and is deliberately
+      left untouched: changing it here would have to be mirrored byte-for-byte into every other
+      shipping automation, including ones whose read volumes make a fan-in unsafe.
+      """
+      if not wanted:
+          return None
+      prefix = "%s_%s_v%s_" % (_PREFIX, kind, ver)
+      on_tenant = {n for n in names if n.startswith(prefix)}
+      if on_tenant != set(wanted):
+          return None
+      return prefix + "*" if len(on_tenant) > 1 else None
+
+
+  def _fanin_rows(client, fanin, per_shard, log, limit=50000):
+      """Rows for every shard in one read, or None to fall back to reading them individually.
+
+      Unlike Summary, this path pulls RAW rows rather than an aggregate, so the read limit is a
+      correctness boundary and not a performance one: `observed` is built from whatever comes
+      back, and stale reconciliation deletes target rows for any scan missing from it. A read
+      that came back at the cap may therefore have silently dropped whole scans, and acting on it
+      would delete live data. At-cap is treated as failure, not as a full answer.
+      """
+      if not fanin:
+          return None
+      try:
+          rows = client.xql("dataset = %s" % fanin, limit=limit) or []
+      except Exception as e:
+          log("  ! fleet-wide read of %s failed (%s) - falling back to one query per shard"
+              % (fanin, str(e)[:120]))
+          return None
+      if len(rows) >= limit:
+          log("  ! fleet-wide read of %s came back at the %d-row cap - it may be truncated, so "
+              "it is DISCARDED and every shard is read individually instead" % (fanin, limit))
+          return None
+      if not rows and per_shard:
+          # Empty is a legitimate answer only for a tenant with no rows, and we know it holds
+          # shards. A wildcard that resolves to nothing therefore means the fan-in did not work
+          # here, not that there is nothing to read - and accepting it would consolidate NOTHING
+          # while reporting success, which is worse than being slow. Falling back costs one
+          # wasted read on a genuinely empty fleet.
+          log("  ! fleet-wide read of %s returned no rows though %d shard(s) exist - reading "
+              "them individually instead" % (fanin, len(per_shard)))
+          return None
+      return rows
+
+
   def _cleanup_verified_scan_rows(client, srcs, scan_id, log):
       """Once a scan's per-scan target is verified, strip that scan's rows out of every source
       shard, so a dashboard querying the wildcard stops double-counting it.
@@ -503,6 +718,154 @@ script: |
           except Exception as e:
               log("  scan %s: row-level cleanup of %s FAILED (leaving rows for eventual "
                   "whole-shard delete instead): %s" % (scan_id, ds, str(e)[:120]))
+
+
+  _SCAN_ID_TAIL_RE = re.compile(r"_\d{8}_\d{6}_\d+_yara_[0-9a-f]+$")
+
+
+  def _host_of_scan_id(scan_id):
+      """The hostname a scan_id was minted from, or None.
+
+      scan_id is "{hostname}_{YYYYMMDD}_{HHMMSS}_{micros}_yara_{rulehash}". Splitting on "_"
+      would be wrong - plenty of hostnames contain underscores - so the fixed-shape TAIL is
+      matched and removed, leaving the hostname whatever it contains. Anchored, so a scan_id
+      that does not have that shape yields None and the caller treats it as unknown.
+      """
+      s = str(scan_id or "")
+      m = _SCAN_ID_TAIL_RE.search(s)
+      return s[:m.start()] if m and m.start() else None
+
+
+  def _supersedable(missing, target, client, existing, ver, log):
+      """Of the scans the target holds but no source does, the ones that are genuinely superseded.
+
+      `stale = held - observed` reads a scan's absence from the sources as proof the scanner
+      overwrote it. That inference only holds while the sources are still there. Once
+      CONFIG_RETIRE_SOURCES_AFTER_FULL deletes a host's dataset, that host's scan is absent for a
+      completely different reason - it was consolidated - and the next pass would read it as
+      superseded and delete the very rows retirement was supposed to make safe. Left unguarded
+      this is not a slow leak: the second pass over a retired fleet strips the target down to
+      whatever happened to be re-scanned in between. Caught by
+      test_a_genuinely_superseded_scan_is_still_removed, which went from 596 rows to 10.
+
+      What separates the two cases is that a host's matches dataset name is STABLE - permanent
+      and overwritten in place, never rotated - so the name returns on the host's next scan:
+
+        * host's dataset PRESENT and lacks the scan -> the scanner overwrote it. Superseded.
+        * host's dataset ABSENT entirely            -> retired, and the host has not scanned
+                                                       since. Says nothing about the scan. Keep.
+
+      So retirement delays a host's reconciliation until its next scan, and never skips it.
+      """
+      missing = set(missing)
+      if not missing:
+          return missing
+      out, kept = set(), []
+      for sid in missing:
+          host = _host_of_scan_id(sid)
+          ds = "%s_matches_v%s_%s" % (_PREFIX, ver, _shard_host_of(host)) if host else None
+          if ds and ds in existing:
+              out.add(sid)
+          else:
+              kept.append(sid)
+      if kept:
+          log("  %d scan(s) held in %s have no source dataset at all - kept, since a retired "
+              "source is not evidence the scan was superseded" % (len(kept), target))
+      return out
+
+
+  def _retire_consolidated_sources(client, target, fresh, by_scan, src_of, existing,
+                                   reads_reliable, log, result):
+      """Delete the per-host source datasets whose rows are now PROVEN to be in `target`.
+
+      Full consolidation copies every column of every row, so a source whose scan is verified in
+      the target is genuinely redundant and retiring it shrinks the dataset census the read phase
+      is priced by. That only holds if "verified" means verified, so the bar here is deliberately
+      higher than the write returning success:
+
+        * the target is READ BACK and its rows counted per scan_id; a scan is verified only when
+          the target holds at least as many rows as this pass sourced for it,
+        * a dataset is retired only when EVERY scan it contributed is verified - one unverified
+          scan keeps the whole dataset,
+        * nothing is retired at all if a source could not be READ this pass (`reads_reliable`),
+          because the row count a scan was written with would then be short too, and verifying
+          the target against a short count proves nothing.
+
+      Deliberately NOT gated on `sources_complete`. That flag means "this pass looked at every
+      dataset", which is the precondition for stale REMOVAL - nothing can be called superseded
+      without looking everywhere. Retirement asks a different question, about one scan at a time,
+      and answers it by confirming PRESENCE in the target rather than inferring absence. Tying
+      the two together deadlocked the very loop this feature exists for: a bounded pass sets
+      sources_complete False, so retirement never fired, so the fleet never shrank, so every pass
+      took the same eight datasets and passes 2, 3 and 4 wrote nothing at all.
+
+      A failure to delete is logged and otherwise ignored: the rows are already safe in the
+      target, so a surviving source costs storage and a query, never data. Note this deliberately
+      does NOT route through _delete_many, which refuses the live overwrite dataset by design and
+      is drift-gated across five automations; retiring a verified source is a different act from
+      the accidental deletion that guard exists to prevent, and it is kept on its own path so
+      that guard stays exactly as strict for every other caller.
+      """
+      if not fresh:
+          return
+      if not reads_reliable:
+          log("  sources NOT retired: a source could not be read this pass, so the row count a "
+              "scan was written with may be short too and verifying against it proves nothing")
+          return
+      if target not in existing:
+          # Target was created by this very pass; the read-back below would race the write.
+          pass
+
+      try:
+          held = {}
+          for r in (client.xql("dataset = %s | comp count() as n by scan_id" % target,
+                               limit=10000) or []):
+              sid = r.get("scan_id")
+              if sid:
+                  held[str(sid)] = int(r.get("n") or 0)
+      except Exception as e:
+          log("  sources NOT retired: could not read %s back to verify the write (%s)"
+              % (target, str(e)[:120]))
+          return
+
+      verified, unverified = set(), {}
+      for sid in fresh:
+          want = len(by_scan.get(sid) or [])
+          got = held.get(str(sid))
+          if got is not None and want and got >= want:
+              verified.add(sid)
+          else:
+              unverified[sid] = (want, got)
+      for sid, (want, got) in sorted(unverified.items()):
+          log("  scan %s NOT verified in %s (sourced %d row(s), target holds %s) - its source "
+              "is kept" % (str(sid)[:34], target, want, "none" if got is None else got))
+
+      # A dataset is retired only if every scan it gave this pass is verified.
+      scans_by_ds = {}
+      for sid, dss in src_of.items():
+          for ds in dss:
+              scans_by_ds.setdefault(ds, set()).add(sid)
+      candidates = set()
+      for sid in verified:
+          candidates.update(src_of.get(sid) or ())
+      retire = sorted(ds for ds in candidates if scans_by_ds.get(ds, set()) <= verified)
+      held_back = sorted(candidates - set(retire))
+      for ds in held_back:
+          log("  keeping %s - it also holds scan(s) this pass did not verify" % ds)
+
+      done, failed_del = 0, 0
+      for ds in retire:
+          try:
+              client.delete_dataset(ds, force=True)
+              done += 1
+          except Exception as e:
+              failed_del += 1
+              log("  retire FAILED %s (rows are already in %s, so this is storage only): %s"
+                  % (ds, target, str(e)[:100]))
+      if done or failed_del:
+          log("  retired %d source dataset(s) whose rows are verified in %s%s"
+              % (done, target, ", %d could not be deleted" % failed_del if failed_del else ""))
+      result["sources_retired"] = result.get("sources_retired", 0) + done
 
 
   def _scan_stats(client, dataset, now_ms=None, log=None):
@@ -1749,12 +2112,47 @@ script: |
   # columns per (host, rule); this keeps EVERY column of every matched-file row. Same sources,
   # same grouping key, same reconciliation - the only difference is fidelity, which is exactly
   # the choice being offered to the operator.
+  # Full consolidation copies EVERY column of EVERY row into the ruleset target, so once that
+  # write is verified the per-host source dataset holds nothing the target does not. Retiring it
+  # then costs nothing and pays twice: it frees the storage, and it shrinks the dataset census
+  # that the read phase's cost is made of - a fleet that retires its sources gets cheaper to
+  # consolidate every pass instead of steadily more expensive.
+  #
+  # Off makes this automation behave exactly as it did before: sources are never touched.
+  # Two things to know before turning it on:
+  #   * SUMMARY consolidation reads the same per-host datasets. A fleet where FULL is retiring
+  #     them cannot also be summarised - pick one mode per fleet.
+  #   * After retirement the ruleset target is the only copy. There is no undelete, so a source
+  #     is retired only after its rows are READ BACK from the target and counted (see
+  #     _retire_consolidated_sources); a write that merely returned success is not enough.
+  CONFIG_RETIRE_SOURCES_AFTER_FULL = True
+
+  # Row cap for the fleet-wide raw read. Deliberately far above _rows_of's per-shard 50,000:
+  # that limit is sized for ONE host, and a fan-in asks for every host at once. Probed live -
+  # at limit=50000 the fleet read returned exactly 50000 rows against a true count of 86,824,
+  # i.e. it truncates silently and reports nothing. Truncation here is a DATA LOSS bug rather
+  # than a slow read: `observed` is built from the rows that came back and stale reconciliation
+  # deletes target rows for every scan missing from it, so a short read would delete live data
+  # for the hosts that fell off the end. _fanin_rows therefore treats a result AT this cap as a
+  # failed read and falls back to per-shard, which is why the cap is set well clear of any fleet
+  # a full-mode write could accept anyway (the per-group row ceiling is 60,000).
+  _FANIN_ROW_CAP = 400000
+
+  # Rows one pass will try to WRITE, when the operator has not said how many datasets to take.
+  # Sized from a failure, not a guess: a single group of 54,890 rows died mid-write with an
+  # HTTP 500 after roughly 19,500 had landed. A later pass wrote 14,323 rows successfully but
+  # took 952s - 106% of the 900s task limit - so surviving the write is not the same as fitting
+  # in the time, and the writes dominate at roughly 20 rows a second once batching and retries
+  # are counted. 8,000 leaves room for the reads and the target census on either side of it.
+  CONFIG_ROWS_PER_PASS = 8000
+
   DEFAULT_FULL_ROW_CEILING = 60000   # below the ~70k rows where lookup writes were seen to die
 
 
   def consolidate_full(client, ver="4", only_scan_ids=None, retention_hours=24.0,
                        row_ceiling=DEFAULT_FULL_ROW_CEILING, execute=False,
-                       now_ms=None, quiet_secs=DEFAULT_QUIET_SECS, log=print):
+                       now_ms=None, quiet_secs=DEFAULT_QUIET_SECS, max_datasets=None,
+                       log=print):
       """Group every host's full matched-file rows for one ruleset into ONE dataset.
 
       Reads the live per-host matches datasets and NEVER deletes them - they are permanent,
@@ -1769,7 +2167,12 @@ script: |
       written, skipped, failed = [], [], []
       result = {"dry_run": not execute, "written": written, "skipped": skipped,
                 "failed": failed, "rows_written": 0, "hosts": 0, "groups": 0,
-                "lock_held_by_other_run": False}
+                "lock_held_by_other_run": False,
+                # Progress across passes, so a caller can loop until it is done rather than
+                # guessing how many runs a fleet needs. datasets_remaining is the one to branch
+                # on: 0 means this pass covered everything still present.
+                "datasets_total": 0, "datasets_taken": 0, "datasets_remaining": 0,
+                "rows_planned": 0}
 
       if execute and not acquire_consolidation_lock(
               client, log=log, now_ms=now_ms, holder="YaraConsolidateApply",
@@ -1780,34 +2183,109 @@ script: |
           names = _list_yara_datasets(client)
           existing = set(names)
           match_ds = [n for n in names if _matches_shard_for_read(n, ver)]
+          existing_match_ds = list(match_ds)
+          last_updated = _dataset_last_updated(client)
           scans_ds = [n for n in names
                       if (parse_shard(n) or {}).get("kind") == "scans"
                       and str((parse_shard(n) or {}).get("ver")) == str(ver)]
           log("schema v%s: %d matches shard(s), %d scans shard(s)" % (ver, len(match_ds), len(scans_ds)))
 
-          tmap = build_terminal_map({d: _rows_of(d, client) for d in scans_ds}, None)
+          # Lifecycle first, and it fans in cheaply: a scans shard holds a couple of rows per
+          # scan, so the whole fleet's lifecycle is a few hundred rows however many hosts report.
+          scans_rows = _fanin_rows(client, _fanin_source(names, "scans", ver, scans_ds),
+                                   scans_ds, log)
+          if scans_rows is not None:
+              tmap = _terminal_map_from_rows(scans_rows)
+          else:
+              tmap = build_terminal_map({d: _rows_of(d, client) for d in scans_ds}, None)
 
           # 1. every full row, bucketed by the scan that produced it
           by_scan, newest = {}, {}
+          # scan_id -> the source dataset(s) its rows were read from. Needed only by source
+          # retirement, which must never delete a dataset holding a scan this pass did not
+          # verify - so the mapping is recorded where it is known for certain, at the read,
+          # rather than reconstructed afterwards from a hostname.
+          src_of = {}
           # Whether this pass actually saw every source. A scan missing because its source
           # could not be READ looks identical to a scan missing because it was superseded, and
           # only the second may cause a deletion - so an incomplete read disables stale removal
           # entirely rather than guessing which case it is.
           sources_complete = True
-          for ds in match_ds:
-              try:
-                  rows = _rows_of(ds, client)
-              except Exception as e:
-                  skipped.append("%s: unreadable (%s)" % (ds, str(e)[:110]))
-                  sources_complete = False
-                  continue
+          # Whether the reads this pass DID perform came back whole. Distinct from
+          # sources_complete, which says whether it read everything it COULD have: a pass that
+          # deliberately took 8 datasets of 205 read those 8 perfectly well.
+          reads_reliable = True
+
+          # An operator-set bound on how many host datasets one pass reads. The write path is
+          # what fails at fleet scale - a single group of ~55,000 rows died mid-write with an
+          # HTTP 500 after ~19,500 - so draining a large fleet in deliberate slices is the way
+          # through, and the slice size has to be the operator's to choose because what a tenant
+          # will accept in one write is not knowable from here.
+          # How much of the fleet this pass takes. Writing everything at once is what fails -
+          # one 54,890-row group died mid-write - so the pass is sized first, either to the
+          # operator's bound or to a row budget estimated from one cheap count query.
+          sizes = _rows_per_dataset(
+              client, _fanin_source(names, "matches", ver, match_ds), ver, log)
+          taken, remaining, rows_planned, why = _plan_pass(
+              match_ds, sizes, last_updated, max_datasets, CONFIG_ROWS_PER_PASS, log)
+          result["datasets_total"] = len(existing_match_ds)
+          result["datasets_taken"] = len(taken)
+          result["datasets_remaining"] = remaining
+          result["rows_planned"] = rows_planned
+          if remaining:
+              match_ds = taken
+              # A pass that deliberately skipped shards has NOT observed their scans, and that is
+              # exactly the condition stale removal must never run under: those scans are absent
+              # from `observed` and would be read as superseded and deleted. Same rail as an
+              # unreadable source, set for a chosen reason rather than a failure.
+              sources_complete = False
+              log("pass %d of %d dataset(s), %s%s. %d dataset(s) left after this one - re-run to "
+                  "continue. Stale-row removal is DISABLED while a pass is partial, since a "
+                  "shard it did not read cannot show that a scan was superseded."
+                  % (len(taken), len(existing_match_ds), why,
+                     ", ~%d row(s)" % rows_planned if rows_planned else "", remaining))
+          elif sizes:
+              log("taking all %d dataset(s), ~%d row(s) - inside the %d-row budget"
+                  % (len(taken), rows_planned, CONFIG_ROWS_PER_PASS))
+
+          def absorb(rows, ds):
               for r in rows:
                   sid = r.get("scan_id")
                   if not sid:
                       continue
                   by_scan.setdefault(sid, []).append(r)
+                  if ds is not None:
+                      src_of.setdefault(sid, set()).add(ds)
                   ts = int(r.get("event_timestamp_ms") or 0)
                   newest[sid] = max(newest.get(sid, 0), ts)
+
+          fan_matches = _fanin_rows(client, _fanin_source(names, "matches", ver, match_ds),
+                                    match_ds, log, limit=_FANIN_ROW_CAP)
+          if fan_matches is not None:
+              # One read for every host. Source attribution is rebuilt from each row's own
+              # hostname rather than from the dataset it arrived in, because a wildcard read
+              # cannot say which dataset a row came from - XQL exposes no dataset column.
+              host_to_ds = {}
+              for ds in match_ds:
+                  pp = _matches_shard_for_read(ds, ver)
+                  if pp:
+                      host_to_ds[pp["host"]] = ds
+              absorb(fan_matches, None)
+              for sid, rows_ in by_scan.items():
+                  for r in rows_:
+                      ds = host_to_ds.get(_shard_host_of(r.get("hostname")))
+                      if ds:
+                          src_of.setdefault(sid, set()).add(ds)
+          else:
+              for ds in match_ds:
+                  try:
+                      rows = _rows_of(ds, client)
+                  except Exception as e:
+                      skipped.append("%s: unreadable (%s)" % (ds, str(e)[:110]))
+                      sources_complete = False
+                      reads_reliable = False
+                      continue
+                  absorb(rows, ds)
 
           # Every scan_id the sources still hold, keyed by ruleset and taken BEFORE any gating
           # or only_scan_ids filtering. This - not the gated, filtered `desired` - is what makes
@@ -1904,17 +2382,36 @@ script: |
               # held - OBSERVED, never held - desired: see the `observed` note above. With any
               # source unread, nothing is provably superseded, so nothing is removed.
               if sources_complete:
-                  stale = sorted(held - observed.get(rh, set()))
+                  stale = sorted(_supersedable(held - observed.get(rh, set()),
+                                               target, client, existing, ver, log))
               else:
                   stale = []
                   if held - observed.get(rh, set()):
-                      skipped.append("%s: stale-row removal SKIPPED - a source dataset could "
-                                     "not be read this pass, so a scan missing from it is not "
-                                     "evidence it was superseded" % label)
+                      # Two different reasons reach here and they are not interchangeable: a
+                      # pass that CHOSE to read part of the fleet is healthy, a pass that FAILED
+                      # to read a source is not. Reporting both as "could not be read" sent me
+                      # hunting a nonexistent tenant fault.
+                      why_skipped = ("this pass deliberately read only part of the fleet"
+                                     if reads_reliable else
+                                     "a source dataset could not be read this pass")
+                      skipped.append("%s: stale-row removal SKIPPED - %s, so a scan missing from "
+                                     "the sources is not evidence it was superseded"
+                                     % (label, why_skipped))
               fresh = sorted(desired - held)
               if held and not stale and not fresh:
                   skipped.append("%s: target already current for %d scan(s) across %d host(s) "
                                  "- verified, not rewritten" % (label, len(desired), len(g["hosts"])))
+                  # Retire here too. "Already current" is the strongest form of verified there
+                  # is - the target holds these scans and this pass just confirmed it - and
+                  # retiring only after a WRITE meant a source consolidated by an earlier pass
+                  # was never retired at all. On a bounded drain that is a standstill: those
+                  # datasets stay in the census, get re-selected as the oldest every pass, and
+                  # the run reports success having moved nothing. Observed doing exactly that
+                  # for three passes over 1,163 seconds.
+                  if execute and CONFIG_RETIRE_SOURCES_AFTER_FULL:
+                      _retire_consolidated_sources(
+                          client, target, sorted(desired), by_scan, src_of, existing,
+                          reads_reliable, log, result)
                   continue
               try:
                   client.create_lookup_dataset(target, schema)
@@ -1945,6 +2442,12 @@ script: |
                                      % (label, added, len(fresh), removed, target, len(g["hosts"])))
                       result["rows_written"] += added
                       result["hosts"] = max(result["hosts"], len(g["hosts"]))
+                      # Only now, with the rows written, is it safe to consider retiring the
+                      # sources they came from - and only after reading them back.
+                      if CONFIG_RETIRE_SOURCES_AFTER_FULL:
+                          _retire_consolidated_sources(
+                              client, target, fresh, by_scan, src_of, existing,
+                              reads_reliable, log, result)
                   else:
                       failed.append("%s: write to %s returned 0 rows added after %d - re-run to "
                                     "retry (host datasets untouched)" % (label, target, added))
@@ -1961,6 +2464,44 @@ script: |
 
 
 
+  def _progress_line(result):
+      """How much of the fleet this pass covered, and whether another is needed.
+
+      Stated on every run because "it worked" and "it worked on the third of the fleet it chose
+      to look at" are different outcomes, and only one of them means the operator is finished.
+      """
+      total = int(result.get("datasets_total") or 0)
+      taken = int(result.get("datasets_taken") or 0)
+      left = int(result.get("datasets_remaining") or 0)
+      if not total:
+          return "datasets: none found for this schema version"
+      if not left:
+          return ("datasets: %d of %d - the whole fleet, so nothing is pending" % (taken, total))
+      return ("datasets: %d of %d this pass, %d still to go - RE-RUN to continue. Stale-row "
+              "removal stays off until a pass covers everything." % (taken, total, left))
+
+
+  def _sources_line(result):
+      """One line saying what happened to the per-host source datasets.
+
+      This used to be the constant "deleted: 0 - source data is never deleted", which is now
+      only true when retirement is off. A status line that states a policy rather than a result
+      is worse than no line at all once the policy became a setting, so it reports what this run
+      actually did.
+      """
+      n = int(result.get("sources_retired") or 0)
+      if not CONFIG_RETIRE_SOURCES_AFTER_FULL:
+          return ("host matches datasets retired: 0 (retirement is off - sources are kept as the "
+                  "deep-dive detail and for summary consolidation; only this automation's own "
+                  "consolidated rows are reconciled)")
+      if result.get("dry_run"):
+          return ("host matches datasets retired: 0 (dry run - retirement only happens after a "
+                  "write is read back and verified)")
+      return ("host matches datasets retired: %d (a source is deleted only once its rows are "
+              "read back from the ruleset dataset and counted; the ruleset dataset is then the "
+              "only copy)" % n)
+
+
   def main():
       args = demisto.args()
       scan_ids = argToList(args.get("scan_id")) or None
@@ -1969,6 +2510,10 @@ script: |
       rc = args.get("row_ceiling")
       row_ceiling = int(rc) if rc not in (None, "") else DEFAULT_FULL_ROW_CEILING
       execute = bool(argToBoolean(args.get("execute"))) if args.get("execute") not in (None, "") else False
+      md = args.get("max_datasets")
+      max_datasets = int(md) if md not in (None, "") else None
+      if max_datasets is not None and max_datasets < 1:
+          raise ValueError("max_datasets must be 1 or more (got %r)" % md)
       # How long a finished scan's newest row must have been quiet before its rows are trusted
       # to be complete - see the quiet-period note at the gate in consolidate_full. Overridable
       # for an operator who knows a wave has fully drained and wants to consolidate now.
@@ -1984,6 +2529,7 @@ script: |
           if execute:
               record_consolidation_run(client, "started", log=lambda *a: None)
           result = consolidate_full(client, ver=ver, only_scan_ids=scan_ids, quiet_secs=quiet_secs,
+                                    max_datasets=max_datasets,
                                     retention_hours=retention_hours, row_ceiling=row_ceiling,
                                     execute=execute, log=lambda m: log_lines.append(m))
       except Exception as ex:
@@ -2017,9 +2563,8 @@ script: |
                    "dataset(s): %d | rows: %d | skipped: %d | failed: %d"
                    % (len(result["written"]), result["rows_written"],
                       len(result["skipped"]), len(result["failed"])),
-                   "host matches datasets deleted: 0 (source data is never deleted - they are "
-                   "permanent and are the deep-dive source; only this automation's own "
-                   "consolidated rows are reconciled)"]
+                   _sources_line(result),
+                   _progress_line(result)]
           for label, items in (("WRITTEN", result["written"]), ("SKIPPED", result["skipped"]),
                                ("FAILED", result["failed"])):
               if items:

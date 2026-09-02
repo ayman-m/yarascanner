@@ -239,6 +239,39 @@ NOW_MS = 10_000_000_000
 NOW_YYYYMM = "202607"
 
 
+def _merge_fanin(query, rows):
+    """Collapse per-dataset rows the way a `comp ... by` stage does across a wildcard.
+
+    Without this the fake would return one row per (dataset, group) where the tenant returns
+    one row per group - and a test asserting the fan-in equals the loop would pass on data
+    the real platform never produces.
+    """
+    if "by " not in query:
+        return rows
+    keys = [k.strip() for k in query.rsplit(" by ", 1)[1].split(",")]
+    counts = re.findall(r"count\(\s*\)\s+as\s+([A-Za-z_][A-Za-z0-9_]*)", query)
+    maxes = [a for _c, a in
+             re.findall(r"max\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)\s+as\s+"
+                        r"([A-Za-z_][A-Za-z0-9_]*)", query)]
+    merged = {}
+    for r in rows:
+        k = tuple(r.get(x) for x in keys)
+        cur = merged.get(k)
+        if cur is None:
+            merged[k] = dict(r)
+            continue
+        for alias in counts:
+            try:
+                cur[alias] = int(cur.get(alias) or 0) + int(r.get(alias) or 0)
+            except (TypeError, ValueError):
+                pass
+        for alias in maxes:
+            a, b = cur.get(alias), r.get(alias)
+            if b is not None:
+                cur[alias] = b if a is None else max(int(a), int(b))
+    return list(merged.values())
+
+
 class FakeTenant:
     """In-memory stand-in for the pack's client interface.
 
@@ -272,15 +305,57 @@ class FakeTenant:
                 raise RuntimeError("tenant hiccup")
         m = re.match(r"dataset = (\S+)", query)
         name = m.group(1) if m else ""
-        if name and name not in self.names:
+        # A trailing * fans in across every matching dataset, which is what the live tenant
+        # does - verified against emea, where the wildcard form of both consolidation reads
+        # returned a result set identical to merging the per-shard reads. Modelling it here
+        # means the existing Summary tests exercise the fan-in path rather than only the
+        # per-shard fallback, so equivalence is enforced by every assertion they already make.
+        fanin = None
+        if name.endswith("*"):
+            fanin = sorted(n for n in self.names if n.startswith(name[:-1]))
+            if not fanin:
+                raise RuntimeError("dataset not found: %s" % name)
+        elif name and name not in self.names:
             raise RuntimeError("dataset not found: %s" % name)
         if name == K._LOCK_DATASET and "|" not in query:
             return list(self.lock_rows)
+        if fanin is not None:
+            mark = len(self.calls)
+            out = []
+            for n in fanin:
+                out.extend(self.xql(query.replace(name, n, 1), limit=limit) or [])
+            # The per-shard expansion is how this fake computes the answer, not something the
+            # tenant saw. Leaving it in `calls` would make a fanned-in run look identical to a
+            # per-shard one, which is precisely the distinction these tests exist to make.
+            del self.calls[mark:]
+            return _merge_fanin(query, out)
         if "comp max(event_timestamp_ms)" in query:
             v = self.newest.get(name)
             return [{"newest": v}] if v is not None else []
         if "by scan_id" in query:
-            return [{"scan_id": s, "n": n} for s, n in sorted(self.scans.get(name, {}).items())]
+            # Emit exactly the grouping columns the query asked for. Returning only scan_id/n
+            # regardless meant a `by scan_id, hostname, rule` aggregate came back with no rule,
+            # every row was dropped by the caller, and the result was an empty read that looks
+            # identical to a fan-in that did not work.
+            grp = [g.strip() for g in query.rsplit(" by ", 1)[1].split(",")] \
+                if " by " in query else ["scan_id"]
+            out = []
+            for s, n in sorted(self.scans.get(name, {}).items()):
+                row = {"n": n}
+                for col in grp:
+                    if col == "scan_id":
+                        row["scan_id"] = s
+                    elif col == "hostname":
+                        row["hostname"] = name.rsplit("_v4_", 1)[-1].rsplit("_", 1)[0] \
+                            if "_v4_" in name else "host"
+                    elif col == "rule":
+                        row["rule"] = "R1"
+                    elif col == "status":
+                        row["status"] = "completed"
+                    else:
+                        row[col] = None
+                out.append(row)
+            return out
         if "comp count() as n" in query:
             return [{"n": self.counts.get(name, 0)}]
         return []
