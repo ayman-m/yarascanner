@@ -16,8 +16,8 @@ an evidence ZIP and scan_summary_<run_id>.json. Every other setting lives in the
 CUSTOMER CONFIG block below. Use the `cancel` entry point to stop a running scan.
 """
 
-__version__ = "3.4.0"
-__release_date__ = "2026-08-17"
+__version__ = "3.5.0"
+__release_date__ = "2026-09-02"
 
 # Standard library imports
 import base64
