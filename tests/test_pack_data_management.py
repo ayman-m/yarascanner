@@ -354,6 +354,15 @@ class FakeTenant:
                         row["status"] = "completed"
                     else:
                         row[col] = None
+                # max(<col>) as <alias> aliases are NOT grouping columns, so the loop above
+                # never emits them - and without a `newest` the caller sees no timestamp,
+                # every scan fails the quiet/aged gate, and the pass consolidates nothing
+                # while looking like it ran. Emit them from the seeded value, defaulting old
+                # enough that a scan is eligible rather than silently skipped.
+                for _c, alias in re.findall(
+                        r"max\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)\s+as\s+"
+                        r"([A-Za-z_][A-Za-z0-9_]*)", query):
+                    row[alias] = self.newest.get(name, 1700000000000)
                 out.append(row)
             return out
         if "comp count() as n" in query:

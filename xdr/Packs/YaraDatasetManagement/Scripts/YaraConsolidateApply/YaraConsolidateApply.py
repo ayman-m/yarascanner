@@ -2065,8 +2065,9 @@ _FANIN_ROW_CAP = 400000
 # HTTP 500 after roughly 19,500 had landed. A later pass wrote 14,323 rows successfully but
 # took 952s - 106% of the 900s task limit - so surviving the write is not the same as fitting
 # in the time, and the writes dominate at roughly 20 rows a second once batching and retries
-# are counted. 8,000 leaves room for the reads and the target census on either side of it.
-CONFIG_ROWS_PER_PASS = 8000
+# are counted. 8,000 was still not enough - a pass writing 6,961 rows took 908s, 101% of the
+# budget - so 5,000, which leaves room for the reads and the target census.
+CONFIG_ROWS_PER_PASS = 5000
 
 DEFAULT_FULL_ROW_CEILING = 60000   # below the ~70k rows where lookup writes were seen to die
 
