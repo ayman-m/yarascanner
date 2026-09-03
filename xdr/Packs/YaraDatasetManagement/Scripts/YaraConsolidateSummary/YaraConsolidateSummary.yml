@@ -171,6 +171,7 @@ script: |
 
   # ---- consolidation core: naming, schemas, locking, merge gates -------------
   import collections
+  import hashlib
   import re
 
   _PREFIX = "yara_scanner"
@@ -1948,6 +1949,65 @@ script: |
       return prefix + "*" if len(on_tenant) > 1 else None
 
 
+  _SCAN_ID_TAIL_RE = re.compile(r"_\d{8}_\d{6}_\d+_yara_[0-9a-f]+$")
+
+
+  def _host_of_scan_id(scan_id):
+      """The hostname a scan_id was minted from, or None. Splitting on "_" would break any
+      hostname containing one, so the fixed-shape tail is matched and removed instead."""
+      s = str(scan_id or "")
+      m = _SCAN_ID_TAIL_RE.search(s)
+      return s[:m.start()] if m and m.start() else None
+
+
+  def _shard_host_of(hostname):
+      """The `host` segment the scanner builds a dataset name from. Mirrors
+      _dataset_shard_suffix in xdr_yara_scanner.py exactly - slugify, cap at 32, prefix a letter
+      if needed, append six hex of the sha1 of the ORIGINAL hostname."""
+      raw = str(hostname or "")
+      if not raw:
+          return None
+      slug = re.sub(r"[^a-z0-9]+", "_", raw.lower()).strip("_")[:32] or "host"
+      if not slug[0].isalpha():
+          slug = "h_" + slug
+      return "%s_%s" % (slug, hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:6])
+
+
+  def _supersedable(missing, target, existing, ver, log):
+      """Of the scans the target holds but no source does, the ones genuinely superseded.
+
+      `stale = held - observed` reads absence from the sources as proof the scanner overwrote
+      the scan. That holds while the sources are there, and stops holding the moment something
+      else removed them - which FULL consolidation now does, retiring a host dataset once its
+      rows are verified in the ruleset target. Summary reads those same host datasets, so
+      without this guard a summary pass after a full pass deletes the summary rows of every
+      host full mode retired. Seen on the lab tenant: 9 retired hosts, still held in the
+      summary target, all of them one run away from being dropped.
+
+      A host's matches dataset name is STABLE - permanent, overwritten in place, never rotated
+      - so it returns on that host's next scan. That separates the two cases:
+
+        * host dataset PRESENT, scan absent from it -> the scanner overwrote it. Superseded.
+        * host dataset ABSENT entirely              -> retired, or never created. Says nothing
+                                                       about the scan. Keep the rows.
+      """
+      missing = set(missing)
+      if not missing:
+          return missing
+      out, kept = set(), []
+      for sid in missing:
+          host = _host_of_scan_id(sid)
+          ds = "%s_matches_v%s_%s" % (_PREFIX, ver, _shard_host_of(host)) if host else None
+          if ds and ds in existing:
+              out.add(sid)
+          else:
+              kept.append(sid)
+      if kept:
+          log("  %d scan(s) held in %s have no source dataset at all - kept, since an absent "
+              "source is not evidence the scan was superseded" % (len(kept), target))
+      return out
+
+
   def _lifecycle_state(client, scans_shards, log, qcount, fanin=None):
       """scan_id -> {"terminal": bool, "newest_ms": int} from ONE aggregate per shard.
 
@@ -2254,22 +2314,43 @@ script: |
               # held - OBSERVED, never held - desired: see the `observed` note above. With any
               # source unread, nothing is provably superseded, so nothing is removed.
               if sources_complete:
-                  stale = sorted(held - observed.get(rh, set()))
+                  stale = sorted(_supersedable(held - observed.get(rh, set()),
+                                               target, existing, ver, log))
               else:
                   stale = []
                   if held - observed.get(rh, set()):
                       skipped.append("%s: stale-row removal SKIPPED - a source dataset could "
                                      "not be read this pass, so a scan missing from it is not "
                                      "evidence it was superseded" % label)
-              fresh = sorted(desired - held)      # new to this target
-              if held and not stale and not fresh:
-                  skipped.append("%s: target already current for %d scan(s) across %d host(s) "
-                                 "- verified, not rewritten" % (label, len(desired), len(g["hosts"])))
+              # Every scan observed this pass is rewritten, not just the ones the target
+              # does not already hold. A re-run is a REFRESH: the rows this pass read from the
+              # host datasets replace whatever the target holds for those same scans. Skipping
+              # when the scan_id set happened to match meant a target that had been partially
+              # written, hand-edited, or left short by a failed batch stayed wrong forever,
+              # because scan_id equality was taken as proof the CONTENT was equal too.
+              fresh = sorted(desired)
+              refreshed = sorted(desired & held)   # rewritten rather than newly added
+              if not fresh and not stale:
+                  skipped.append("%s: nothing observed for this ruleset this pass - target left "
+                                 "exactly as it is" % label)
                   continue
 
               try:
                   client.create_lookup_dataset(target, SUMMARY_SCHEMA)
                   removed = 0
+                  if refreshed:
+                      # Same narrow deletion as `stale` below, against this automation's OWN
+                      # output: clear the rows for the scans about to be rewritten. Without it a
+                      # refresh would append a second copy of every (host, rule) pair, and the
+                      # summary would silently double.
+                      try:
+                          client.remove_lookup_data(
+                              target, [{"scan_id": s} for s in refreshed])
+                      except Exception as e:
+                          failed.append("%s: could not clear %d scan(s) before refreshing them "
+                                        "in %s (%s) - NOT written, to avoid duplicating rows"
+                                        % (label, len(refreshed), target, str(e)[:90]))
+                          continue
                   if stale:
                       # The ONLY deletion this automation performs, and it is against its own
                       # output: rows for a scan the source no longer holds. Source shards are
@@ -2292,10 +2373,10 @@ script: |
                           break
                       added += got
                   if ok:
-                      written.append("%s: wrote %d row(s) for %d new scan(s), dropped %d stale "
-                                     "row(s) -> %s (%d host(s) total, %s)"
-                                     % (label, added, len(fresh), removed, target,
-                                        len(g["hosts"]), why))
+                      written.append("%s: wrote %d row(s) for %d scan(s) (%d refreshed), "
+                                     "dropped %d stale row(s) -> %s (%d host(s) total, %s)"
+                                     % (label, added, len(fresh), len(refreshed), removed,
+                                        target, len(g["hosts"]), why))
                   else:
                       failed.append("%s: write to %s returned 0 rows added after %d - re-run to "
                                     "retry (host shards untouched)" % (label, target, added))
