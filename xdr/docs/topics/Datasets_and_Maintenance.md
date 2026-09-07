@@ -336,14 +336,45 @@ knowing before a very high-frequency schedule.
 
 ### Worked example — the two modes are independent
 
-Observed on a live tenant, 2026-08-26, three hosts scanned by one Action Center launch:
+Observed on a live tenant, 2026-08-26, three hosts scanned by one Action Center launch.
+`Summary` returns its War Room output as markdown, while `Apply` and `Status` return plain
+text — which is why the block below mixes the two:
 
 ```
 !YaraConsolidateSummary schema_version="4" retention_hours="24" execute="true"
-  EXECUTED.  XQL calls: 6 (+1 dataset listing)  [single-query]
-  written: 1 | skipped: 0 | failed: 0 | file-level findings collapsed: 1134
-  rules 90149530ddc2: wrote 24 row(s) for 3 new scan(s), dropped 0 stale row(s)
-                      -> yara_scanner_summary_v4_rules_90149530ddc2 (3 host(s) total, completed)
+
+### YARA summary consolidation - EXECUTED
+_Per-ruleset summary targets were created and written._
+
+|  |  |
+|---|---|
+| **Targets** | 1 written |
+| **Rows** | 24 written |
+| **Hosts covered** | 3 |
+| **Scans covered** | 3 |
+| **Skipped** | 0 |
+| **Failed** | 0 |
+| **Source datasets deleted** | 0 - this automation has no deletion path |
+| **Sources read** | 3 of 3 host matches dataset(s) |
+| **Stale-row removal** | enabled |
+| **XQL calls** | 6, plus 1 dataset listing (not an XQL) |
+| **Read mode** | single-query |
+
+**Detail collapsed.** The host datasets hold **1,134** file-level findings - one for every (file, rule) pair, so a file that matched three rules counts three times. Grouped by (host, rule) they become **24** rows, a **47.2x** reduction. Both figures cover everything this pass READ, written and skipped alike, so the ratio does not move with the gate. No detail is lost: the per-file rows stay in the host matches dataset, which this automation never touches, and every summary row points back to it.
+
+#### Written
+| Ruleset | Rows | Hosts | Scans | Refreshed | Stale rows dropped | Eligible because | Target |
+|---|---|---|---|---|---|---|---|
+| 90149530ddc2 | 24 | 3 | 3 | 0 | 0 | completed | `yara_scanner_summary_v4_rules_90149530ddc2` |
+
+#### Settings this run used
+| Argument | Value | What it controls |
+|---|---|---|
+| `schema_version` | 4 | which shards are in scope, and which query shape reads them |
+| `quiet_secs` | 900 | how long a FINISHED scan's newest row must have been quiet before its rows are trusted to be complete |
+| `retention_hours` | 24 | fallback only: a scan that never reported a terminal status is treated as finished once its newest row is this old. NOT a deletion window - this automation deletes nothing |
+| `max_datasets` | all | host datasets read per pass, oldest-updated first. A bounded pass disables stale-row removal |
+| `execute` | true | false previews, true creates and writes |
 
 !YaraConsolidateApply schema_version="4" retention_hours="24" row_ceiling="60000" execute="false"
   DRY RUN - nothing was created or written.  FULL consolidation: every column of every matched-file row.
@@ -375,9 +406,9 @@ To check whether the work has already been done, look for the output datasets:
 | Has the compact rule/host record been written? | `yara_scanner_summary_v4_rules_<hash>` exists |
 | Has the full per-file detail been written? | `yara_scanner_full_v4_rules_<hash>` exists |
 
-**The same 1,134 detections, two fidelities:** `Summary` collapses them to **24** rows of
-`(host, rule)`; `Apply` keeps all **1,012** matched-file rows with every column. Both land in
-one dataset per ruleset, and neither touches the per-host sources.
+**The same 1,134 file-level findings, two fidelities:** `Summary` collapses them to **24** rows
+of `(host, rule)`; `Apply` keeps the **1,012** matched-file rows they fold into (§6), with every
+column. Both land in one dataset per ruleset, and neither touches the per-host sources.
 
 Both are visible in `!YaraReport`.
 

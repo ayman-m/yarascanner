@@ -107,7 +107,7 @@ the same rows to one per (host, rule). Same sources, same grouping key, same rec
 | Per-rule counts | derivable: every matched file is its own row | **deliberately absent.** A count column turns every dashboard query over the summary into an aggregation over numbers instead of a distinct-set lookup. |
 | Source dataset afterwards | **untouched.** The per-host matches dataset is never deleted: `parse_shard` excludes it at enumeration time, and `_is_live_overwrite_dataset` re-derives the same answer at each destructive call site. The single `remove_lookup_data` call is against **its own output**, dropping `scan_id`s the sources no longer hold | **untouched.** Identical posture, enforced by the same two guards: no `delete_dataset` and no row removal on any path this automation reaches. Its single `remove_lookup_data` call is against **its own output** too, dropping `scan_id`s the sources no longer hold. `shards_deleted` is always `0` and is reported so a playbook can assert it. |
 | Read cost | reads every host's matched-file rows in full | **one XQL per host dataset**, which expands the v4 `rules` JSON array and groups inside the engine, so the rows never leave the tenant |
-| Write verification | reconciles on `scan_id` sets: unchanged hosts are left alone, a re-scanned host's rows are replaced, and a run with nothing changed is a verified no-op | the same reconciliation on the same `scan_id` sets — unchanged hosts left alone, a re-scanned host's rows replaced, nothing changed a verified no-op. Nothing is deleted either way, so a partial write is fixed by re-running |
+| Write verification | reconciles on `scan_id` sets: unchanged hosts are left alone, a re-scanned host's rows are replaced, and a run with nothing changed is a verified no-op | the same reconciliation on the same `scan_id` sets, but a re-run **refreshes** rather than skipping: it rewrites the rows for every scan it observed, so a target whose `scan_id` set is unchanged is still rebuilt from the sources — `scans_refreshed` reports how many scans that covered. Nothing is deleted either way, so a partial write is fixed by re-running |
 | Default | **dry run** unless `execute=true` | **dry run** unless `execute=true` |
 
 **Which one to use.**
@@ -163,22 +163,85 @@ by the automation's own default; a fleet mid-rollout should be summarised by inv
 number that will go stale. (The automation handles both shapes: v4 expands the `rules` JSON
 array, v2/v3 read their scalar `rule` column.)
 
-Summary-mode results land under `Yara.ConsolidateSummary.*`: `written`, `skipped`, `failed`,
-`dry_run`, `xql_calls`, `query_modes`, `findings_collapsed` (how much file-level detail the
-summary collapsed — reported only, never written into a row), `shards_deleted` (always `0`),
-plus the `schema_version` and `retention_hours` the run used. A failure here never destroyed
-anything, so it is a flag to read rather than an incident to chase: host shards are untouched
-in every failure case and **re-running is always safe**.
+Summary-mode results land under `Yara.ConsolidateSummary.*`. **`status` is the one field to
+branch on** — `success`, `partial_failure` or `dry_run` — and everything else explains it.
+`written`, `skipped` and `failed` are **lists of objects**, not sentences to pattern-match:
+
+* **`written[]`** — `action` (`wrote`, or `would_write` in a dry run), `ruleset`, `target`,
+  `rows`, `hosts`, `scans`, `scans_refreshed` (`null` in a dry run — nothing was refreshed),
+  `stale_rows_removed`, `estimated_kb`, `eligibility`.
+* **`skipped[]`** — `name`, `reason`, `detail`, `scan_id`, `hostname`, `dataset`, `ruleset`.
+* **`failed[]`** — `reason`, `detail`, `ruleset`, `target`, `sources_untouched`.
+
+**Both `reason` fields are closed vocabularies**, so a playbook filters on a field instead of
+matching prose: a skip is one of `scan_in_progress`, `quiet_period`, `no_rule_hash`,
+`source_unreadable`, `stale_removal_disabled` or `nothing_observed`; a failure is one of
+`target_unreadable`, `refresh_clear_failed`, `write_incomplete` or `write_error`. Those values
+are the stable half of the record and are safe to match on by name — `detail` is the readable
+sentence beside them, and is not.
+
+The counts alongside are `targets_written`, `rows_written`, `hosts_covered`, `scans_covered`,
+`skipped_count`, `failed_count`, `sources_read` / `sources_total`, `bounded_pass`,
+`stale_removal_enabled`, `quiet_secs`, `max_datasets` and a `warnings` list, plus the
+unchanged `dry_run`, `xql_calls`, `query_modes`, `shards_deleted` (always `0`), and the
+`schema_version` and `retention_hours` the run used — the last of those being the *fallback*
+eligibility threshold described above, never a deletion window.
+
+**`findings_collapsed` is what summary mode is for, stated as a number.** It is the total
+count of the (file × rule) **findings** behind the summary — a file that matched three rules
+counts three times — summed over every scan the pass *read*, gated or not. On its own it means
+nothing. Divide it by `summary_rows_observed`, the (host, rule) pairs those same findings
+collapse into over the **same** population, and you get `collapse_ratio` — the figure that says
+what the mode is buying you. Note that `summary_rows_observed` is **not** `rows_written`:
+`rows_written` counts only what passed the eligibility gate, which is why the ratio is quoted
+over the population read rather than the population written.
+
+A failure here never destroyed anything, so it is a flag to read rather than an incident to
+chase: every `failed[]` record asserts `sources_untouched: true` — it is stated on each record
+rather than left to be inferred — host shards are untouched in every failure case, and
+**re-running is always safe**.
 
 **On a tenant with no YARA datasets yet, every one of those counts comes back `0` and every
-list comes back empty — that is the correct result, not a broken deployment.** The first line
-reads `DRY RUN - nothing was created or written.  XQL calls: 0 (+1 dataset listing)`, with
-`EXECUTED.` in place of the dry-run head when `execute=true`, followed by
-`written: 0 | skipped: 0 | failed: 0 | file-level findings collapsed: 0`; `written`,
-`skipped` and `query_modes` come back empty, while `schema_version` and `retention_hours`
-still report what the run used. There is no host shard to read — nothing is misconfigured.
-Budget for the wait, though: `execute=true` with nothing to do still takes ~70s in-process
-(~100-110s as seen in the War Room), while the dry run returns in about a second.
+list comes back empty — that is the correct result, not a broken deployment.** The whole War
+Room entry, verbatim:
+
+```
+### YARA summary consolidation - DRY RUN
+_Nothing was created or written. Re-run with `execute=true` to apply exactly this._
+
+|  |  |
+|---|---|
+| **Targets** | 0 would be written |
+| **Rows** | 0 would be written |
+| **Hosts covered** | 0 |
+| **Scans covered** | 0 |
+| **Skipped** | 0 |
+| **Failed** | 0 |
+| **Source datasets deleted** | 0 - this automation has no deletion path |
+| **Sources read** | 0 of 0 host matches dataset(s) |
+| **Stale-row removal** | enabled |
+| **XQL calls** | 0, plus 1 dataset listing (not an XQL) |
+| **Read mode** | none |
+
+#### Settings this run used
+| Argument | Value | What it controls |
+|---|---|---|
+| `schema_version` | 4 | which shards are in scope, and which query shape reads them |
+| `quiet_secs` | 900 | how long a FINISHED scan's newest row must have been quiet before its rows are trusted to be complete |
+| `retention_hours` | 24 | fallback only: a scan that never reported a terminal status is treated as finished once its newest row is this old. NOT a deletion window - this automation deletes nothing |
+| `max_datasets` | all | host datasets read per pass, oldest-updated first. A bounded pass disables stale-row removal |
+| `execute` | false - dry run | false previews, true creates and writes |
+```
+
+There is no `#### Would write` section because there is nothing to write, and no
+`#### Skipped` or `#### Failed` section because nothing was gated or went wrong — those
+headings appear only when they have rows under them. With `execute=true` the heading becomes
+`### YARA summary consolidation - EXECUTED` and the counts read "written" instead of "would be
+written"; the numbers are the same zeros. `written`, `skipped` and `query_modes` come back
+empty, while `schema_version` and `retention_hours` still report what the run used. There is
+no host shard to read — nothing is misconfigured. Budget for the wait, though: `execute=true`
+with nothing to do still takes ~70s in-process (~100-110s as seen in the War Room), while the
+dry run returns in about a second.
 
 **Two consequences of the consolidated targets, stated rather than defended against.** Both
 modes' targets are invisible to `YaraCleanup` by construction — `NAME_RE` parses only
@@ -576,8 +639,8 @@ the YaraCleanup section above before granting this key to anything.
 | Job history shows "0 scan(s) consolidated" every run, nothing actually being merged | Consolidation lock held by another concurrent run (the CLI's `xdr_data_management.py --consolidate --yes`, or an overlapping Job execution) | Check `Yara.ConsolidateApply.lock_held_by_other_run` in context, or just read the readable output — it now says "Skipped this pass — consolidation lock is held by another concurrent run" instead of looking identical to a genuinely-empty pass. Confirm the Job's Queue Handling is set to "Don't trigger a new job instance" and that no one is running the CLI `--consolidate --yes` concurrently. |
 | The playbook run ends at **"Unrecognised consolidation_mode - nothing done"** and nothing was merged or written | `consolidation_mode` is neither exactly `full` nor exactly `summary` — a typo, a capitalised value, or an empty one. This is the designed fail-safe, not a bug: neither branch deletes source data, but an unrecognised mode must never silently pick one for you. | Set the input to exactly `full` or exactly `summary` and re-run. If it is already one of those, the `isEqualString` condition in task 11 is the thing to verify against the live tenant (see the playbook description's NOTE ON VERIFICATION) — it has no local precedent in this repo. |
 | Full mode runs every pass, reports rows it "WOULD write", and never writes any | `full_execute` was set to `false` (or the automation was invoked directly without `execute=true`). **`YaraConsolidateApply` is a dry run by default** — a bare `!YaraConsolidateApply` writes nothing and deletes nothing. | Leave the playbook's `full_execute` at its default of `true`. The War Room entry names the mode it ran in on its first line — `DRY RUN - nothing was created or written.` vs `EXECUTED.` |
-| Summary mode runs every pass, reports rows it "WOULD write", and never writes any | `summary_execute` was set to `false` (or the automation was invoked directly without `execute=true`). `YaraConsolidateSummary` is a dry run by default. | Leave the playbook's `summary_execute` at its default of `true`. The War Room entry names the mode it ran in on its first line — `DRY RUN - nothing was created or written.` vs `EXECUTED.` |
-| Summary mode reports failures in `Yara.ConsolidateSummary.failed` | A write or a count query failed for that scan. **Nothing was destroyed** — this automation touches no source data, and the message says `host shards untouched`. | Re-run; it is idempotent. Reconciliation is on `scan_id` sets, not on row counts: a target already holding exactly this run's `scan_id`s is verified and left alone, `scan_id`s new to it are written, and rows for a `scan_id` no longer present in any source are dropped from the target — the one removal this automation makes, and it is against its own output. If a source dataset could not be read that pass, that removal is skipped entirely and the run says so. |
+| Summary mode runs every pass, reports rows under `#### Would write`, and never writes any | `summary_execute` was set to `false` (or the automation was invoked directly without `execute=true`). `YaraConsolidateSummary` is a dry run by default. | Leave the playbook's `summary_execute` at its default of `true`. The War Room entry names the mode it ran in in its heading — `### YARA summary consolidation - DRY RUN` vs `### YARA summary consolidation - EXECUTED` — and `status` carries the same answer as `dry_run` or `success`. Each `written[]` record says it too, as `action: "would_write"` rather than `"wrote"`. |
+| Summary mode reports failures in `Yara.ConsolidateSummary.failed` | A write or a count query failed for that ruleset target. **Nothing was destroyed** — this automation touches no source data, and every `failed[]` record asserts `sources_untouched: true` alongside a `reason` from the closed set `target_unreadable`, `refresh_clear_failed`, `write_incomplete`, `write_error`. Match on `reason`, not on the readable `detail`. | Re-run; it is idempotent. Reconciliation is on `scan_id` sets, not on row counts, but a re-run does **not** leave a matching target alone: it **refreshes**, rewriting the rows for every scan it observed, so a target whose `scan_id` set is unchanged is still rewritten from the sources and `scans_refreshed` reports how many scans that covered. Rows for a `scan_id` no longer present in any source are dropped from the target — the one removal this automation makes, and it is against its own output. If a source dataset could not be read that pass, that removal is skipped entirely and the run says so, in `skipped[]` and in `stale_removal_enabled`. |
 | `YaraCleanup` reports `Nothing selected and nothing deleted: no retention window was given` | Neither `older_than_months` nor `delete_legacy=true` was passed. This is not a failure — it is the "a bare invocation must never delete" property, and no API call was made at all. | Pass a retention window (`older_than_months=N`) and/or `delete_legacy=true`. There is deliberately no default window to fall back on. |
 | `YaraCleanup` ran `EXECUTED` but deleted far less than expected, and `Yara.Cleanup.newer` is non-empty | Rail 4 vetoed those datasets: they are on a **higher** schema version than the `schema_version` argument, i.e. the argument is stale-LOW. | Set `schema_version` to what the fleet actually writes (`YARA_LOOKUP_SCHEMA_VER` on the endpoints). Run `YaraReport` first — its "newer schema" bucket shows the same thing without touching anything. |
 | `YaraCleanup` selected almost nothing and every skip reason names the recency or consolidation rail | Working as designed, and usually one of two real conditions: scans are still writing to those shards (rail 6 — the *name*'s month is not when it was last written), or consolidation has not verified their `scan_id`s into a consolidated target (rail 7 — which still looks for the **obsolete** per-scan target name, so on a current tenant it holds back any month-suffixed shard that still carries a `scan_id`, however many consolidation passes have run). Both rails also keep a dataset when their live query **errors**, so a flaky query window looks the same. | Read the per-candidate reasons in `Yara.Cleanup.skipped` — they name the specific rail. For rail 6, let the scans finish and re-run. For rail 7, re-running consolidation will **not** clear it: satisfy yourself from `!YaraReport` and the `…_rules_<hash>` targets that the data is consolidated, then delete the shard by name. Do not lower `min_quiet_hours` to force rail 6 through; below 1h it is raised back to the floor anyway. |

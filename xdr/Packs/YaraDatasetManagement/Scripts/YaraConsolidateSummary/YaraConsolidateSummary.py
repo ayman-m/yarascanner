@@ -2091,6 +2091,259 @@ def _lifecycle_state(client, scans_shards, log, qcount, fanin=None):
     return state
 
 
+# ---------------------------------------------------------------------------------------
+# RUN RECORDS AND THE WAR ROOM REPORT
+#
+# written / skipped / failed are CONTEXT before they are prose: a playbook filters on them.
+# So each entry is an OBJECT with a stable key set and a `reason` drawn from a closed
+# vocabulary, and the sentence a human reads survives as `detail` rather than BEING the
+# record. Every entry carries every key even where one does not apply, because a transformer
+# filtering on a key that is only sometimes present matches nothing and reports no error -
+# the failure mode is a silently empty branch, which is the worst kind to debug.
+#
+# The markdown is rendered FROM the result dict and from nothing else, so the table an
+# operator reads and the context a playbook branches on cannot disagree. The previous version
+# formatted its sentences and its context from separate expressions, which is exactly how a
+# report comes to state a number that is nowhere in the context.
+# ---------------------------------------------------------------------------------------
+
+SKIP_REASONS = {
+    "scan_in_progress":
+        "no terminal lifecycle status yet, and younger than retention_hours - still running",
+    "quiet_period":
+        "finished, but its newest match row is inside the quiet window. The scanner writes its "
+        "terminal row BEFORE the uploaders drain, so rows may still be landing; summarising "
+        "now would copy a partial set and the loss would be permanent",
+    "no_rule_hash":
+        "the scan_id carries no ruleset hash, so there is no target dataset to group it into",
+    "source_unreadable":
+        "the host matches dataset could not be read this pass",
+    "stale_removal_disabled":
+        "the target holds scans this pass did not observe, but a source went unread - their "
+        "absence is not evidence of supersession, so no row was removed",
+    "nothing_observed":
+        "no scan for this ruleset survived the gate this pass - the target was left as it is",
+}
+
+FAIL_REASONS = {
+    "target_unreadable": "the existing target could not be read, so nothing was written",
+    "refresh_clear_failed":
+        "the rows for the scans about to be refreshed could not be cleared, so nothing was "
+        "written - appending over them would have duplicated every (host, rule) pair",
+    "write_incomplete": "a write batch reported 0 rows added part-way through",
+    "write_error": "the write raised",
+}
+
+
+def _skipped_record(reason, detail, scan_id=None, hostname=None, dataset=None, ruleset=None):
+    """One `skipped` entry. `dataset` is the SOURCE the rows live in for a scan-level skip and
+    the TARGET for a ruleset-level one; it is None only where no dataset is implicated."""
+    return {"name": scan_id or (("rules %s" % ruleset) if ruleset else (dataset or "")),
+            "reason": reason, "detail": detail, "scan_id": scan_id, "hostname": hostname,
+            "dataset": dataset, "ruleset": ruleset}
+
+
+def _failed_record(reason, detail, ruleset=None, target=None):
+    """One `failed` entry. sources_untouched is asserted rather than computed: no code path in
+    this automation touches a host shard, so every failure leaves the sources intact and a
+    re-run is always safe. A playbook can now prove that from the record instead of the docs."""
+    return {"reason": reason, "detail": detail, "ruleset": ruleset, "target": target,
+            "sources_untouched": True}
+
+
+def _written_record(action, ruleset, target, rows, hosts, scans, eligibility,
+                    scans_refreshed=None, stale_rows_removed=0):
+    """One `written` entry. `action` is the field a playbook branches on - "would_write" or
+    "wrote" - so it never has to parse a sentence to learn whether anything really landed.
+    scans_refreshed is None in a dry run, not 0: the target is never read, so how many of these
+    scans it already holds is genuinely unknown, and reporting 0 would be a claim."""
+    return {"action": action, "ruleset": ruleset, "target": target,
+            "rows": int(rows), "hosts": int(hosts), "scans": int(scans),
+            "scans_refreshed": scans_refreshed,
+            "stale_rows_removed": int(stale_rows_removed),
+            "estimated_kb": round(int(rows) * _SUMMARY_ROW_BYTES / 1024.0, 1),
+            "eligibility": eligibility}
+
+
+def _matches_by_host(names, ver):
+    """{shard host segment: [matches dataset, ...]} built once from the listing already in
+    hand, live dataset first. A host can hold both its permanent overwrite dataset and a
+    leftover month-suffixed one, and the rows a fan-in read returned may have come from
+    either - so the lookup answers with what the tenant actually has rather than only the
+    canonical name."""
+    out = {}
+    prefix = "%s_matches_v%s_" % (_PREFIX, ver)
+    for n in names:
+        p = _matches_shard_for_read(n, ver)
+        if p:
+            out.setdefault(p["host"], []).append(n)
+    for host in out:
+        out[host].sort(key=lambda n: (n != prefix + host, n))   # live one first
+    return out
+
+
+def _source_dataset_of(scan_id, by_host):
+    """(hostname, source dataset) for a scan, from the name derivation alone - no query.
+
+    The dataset name is a pure function of the hostname (_shard_host_of mirrors the
+    scanner's own suffixing), which is the same derivation _supersedable acts on. Here it is
+    only REPORTED, so a skipped record can name the dataset its rows sit in. None means the
+    scan_id would not parse or the tenant holds no matching dataset - never a guess."""
+    host = _host_of_scan_id(scan_id)
+    if not host:
+        return None, None
+    found = by_host.get(_shard_host_of(host)) or []
+    return host, (found[0] if found else None)
+
+
+def _n(v):
+    """Thousands-separated. The numbers this reports run to six figures."""
+    try:
+        return format(int(v), ",d")
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def _md_table(headers, rows):
+    """A markdown table, or "" when there is nothing to put in it. Cells are escaped: rule
+    names and hostnames reach here from a ruleset and from an endpoint, and a single pipe in
+    either would silently shear a column off every row below it."""
+    if not rows:
+        return ""
+
+    def cell(v):
+        return str("" if v is None else v).replace("|", "\\|").replace("\n", " ")
+
+    out = ["| " + " | ".join(cell(h) for h in headers) + " |",
+           "|" + "|".join("---" for _ in headers) + "|"]
+    for r in rows:
+        out.append("| " + " | ".join(cell(v) for v in r) + " |")
+    return "\n".join(out)
+
+
+_MD_ROW_CAP = 50
+
+
+def _md_capped(headers, rows, context_key):
+    """_md_table, truncated. The context keeps every entry, so a 200-host pass cannot push the
+    counts off the top of the War Room - the same trade YaraReport makes for the scan log."""
+    body = _md_table(headers, rows[:_MD_ROW_CAP])
+    if len(rows) > _MD_ROW_CAP:
+        body += ("\n\n_... and %s more - the full list is in `%s`._"
+                 % (_n(len(rows) - _MD_ROW_CAP), context_key))
+    return body
+
+
+def render_run_markdown(result, warnings=(), lock_events=()):
+    """The War Room report for one pass, rendered from the result dict alone."""
+    dry = bool(result.get("dry_run"))
+    verb = "would be written" if dry else "written"
+    out = ["### YARA summary consolidation - %s" % ("DRY RUN" if dry else "EXECUTED"),
+           "_%s_" % ("Nothing was created or written. Re-run with `execute=true` to apply "
+                     "exactly this." if dry
+                     else "Per-ruleset summary targets were created and written."),
+           ""]
+
+    facts = [
+        ("Targets", "%s %s" % (_n(result["targets_written"]), verb)),
+        ("Rows", "%s %s" % (_n(result["rows_written"]), verb)),
+        ("Hosts covered", _n(result["hosts_covered"])),
+        ("Scans covered", _n(result["scans_covered"])),
+        ("Skipped", _n(result["skipped_count"])),
+        ("Failed", _n(result["failed_count"])),
+        ("Source datasets deleted", "0 - this automation has no deletion path"),
+        ("Sources read", "%s of %s host matches dataset(s)%s"
+                         % (_n(result["sources_read"]), _n(result["sources_total"]),
+                            " - bounded by max_datasets" if result["bounded_pass"] else "")),
+        ("Stale-row removal", "enabled" if result["stale_removal_enabled"]
+                              else "DISABLED this pass - see Skipped"),
+        ("XQL calls", "%s, plus 1 dataset listing (not an XQL)" % _n(result["xql_calls"])),
+        ("Read mode", ", ".join(result["query_modes"]) or "none"),
+    ]
+    out.append(_md_table(["", ""], [("**%s**" % k, v) for k, v in facts]))
+
+    # The number that means nothing on its own. BOTH SIDES of the ratio cover the same
+    # population - every (host, rule) pair this pass observed, gated or not - because a
+    # fleet-wide numerator over post-gate rows would inflate the reduction by exactly whatever
+    # the gate held back, and would swing run to run for reasons unrelated to how much detail
+    # actually collapsed.
+    if result.get("findings_collapsed"):
+        out += ["", "**Detail collapsed.** The host datasets hold **%s** file-level findings "
+                    "- one for every (file, rule) pair, so a file that matched three rules "
+                    "counts three times. Grouped by (host, rule) they become **%s** rows%s. "
+                    "Both figures cover everything this pass READ, written and skipped alike, "
+                    "so the ratio does not move with the gate. No detail is lost: the "
+                    "per-file rows stay in the host matches dataset, which this automation "
+                    "never touches, and every summary row points back to it."
+                % (_n(result["findings_collapsed"]), _n(result["summary_rows_observed"]),
+                   (", a **%.1fx** reduction" % result["collapse_ratio"])
+                   if result.get("collapse_ratio") else "")]
+
+    if result["written"]:
+        if dry:
+            out += ["", "#### Would write",
+                    _md_capped(["Ruleset", "Rows", "Hosts", "Scans", "Est. size",
+                                "Eligible because", "Target"],
+                               [(w["ruleset"], _n(w["rows"]), _n(w["hosts"]), _n(w["scans"]),
+                                 "%s KB" % w["estimated_kb"], w["eligibility"],
+                                 "`%s`" % w["target"]) for w in result["written"]],
+                               "Yara.ConsolidateSummary.written")]
+        else:
+            out += ["", "#### Written",
+                    _md_capped(["Ruleset", "Rows", "Hosts", "Scans", "Refreshed",
+                                "Stale rows dropped", "Eligible because", "Target"],
+                               [(w["ruleset"], _n(w["rows"]), _n(w["hosts"]), _n(w["scans"]),
+                                 _n(w["scans_refreshed"]), _n(w["stale_rows_removed"]),
+                                 w["eligibility"], "`%s`" % w["target"])
+                                for w in result["written"]],
+                               "Yara.ConsolidateSummary.written")]
+
+    if result["skipped"]:
+        out += ["", "#### Skipped - nothing was touched",
+                _md_capped(["Scan or ruleset", "Dataset", "Reason", "Detail"],
+                           [(s["name"], ("`%s`" % s["dataset"]) if s["dataset"] else "-",
+                             "`%s`" % s["reason"], s["detail"]) for s in result["skipped"]],
+                           "Yara.ConsolidateSummary.skipped")]
+
+    if result["failed"]:
+        out += ["", "#### Failed",
+                _md_capped(["Ruleset", "Target", "Reason", "Detail"],
+                           [(f["ruleset"] or "-",
+                             ("`%s`" % f["target"]) if f["target"] else "-",
+                             "`%s`" % f["reason"], f["detail"]) for f in result["failed"]],
+                           "Yara.ConsolidateSummary.failed"),
+                "", "_Host shards are untouched in every one of these cases - no source "
+                    "dataset and no row inside one is ever deleted by this automation - so "
+                    "re-running is always safe._"]
+
+    if warnings:
+        out += ["", "#### Warnings"] + ["- %s" % w for w in list(warnings)[:20]]
+
+    out += ["", "#### Settings this run used",
+            _md_table(["Argument", "Value", "What it controls"], [
+                ("`schema_version`", result["schema_version"],
+                 "which shards are in scope, and which query shape reads them"),
+                ("`quiet_secs`", _n(result["quiet_secs"]),
+                 "how long a FINISHED scan's newest row must have been quiet before its rows "
+                 "are trusted to be complete"),
+                ("`retention_hours`", _n(result["retention_hours"]),
+                 "fallback only: a scan that never reported a terminal status is treated as "
+                 "finished once its newest row is this old. NOT a deletion window - this "
+                 "automation deletes nothing"),
+                ("`max_datasets`", _n(result["max_datasets"]) if result["max_datasets"]
+                                   else "all",
+                 "host datasets read per pass, oldest-updated first. A bounded pass disables "
+                 "stale-row removal"),
+                ("`execute`", "false - dry run" if dry else "true",
+                 "false previews, true creates and writes"),
+            ])]
+
+    if lock_events:
+        out += ["", "#### Lock events"] + ["- %s" % m for m in lock_events]
+
+    return "\n".join(out)
+
+
 def main():
     args = demisto.args()
     only = argToList(args.get("scan_id")) or None
@@ -2123,6 +2376,13 @@ def main():
                           # an XQL and is reported separately rather than folded in here
     findings = [0]        # the discarded count() aggregate, summed for the report line
     written, skipped, failed, modes = [], [], [], set()
+    covered_hosts, covered_scans = set(), set()
+    # Pre-initialised because the report tail below reads all of these. They are all assigned
+    # inside the try, which today has no `except` - so the tail is unreachable on a raise -
+    # but that is a property of the current control flow rather than of these names.
+    by_scan, match_ds, all_match_ds, existing = {}, [], [], set()
+    matches_by_host = {}
+    bounded, sources_complete = False, True
 
     client = CoreApiClient()
 
@@ -2159,6 +2419,9 @@ def main():
         # reading it here is safe. See _matches_shard_for_read.
         match_ds = [n for n in names if _matches_shard_for_read(n, ver)]
         existing = set(names)
+        # Built once here rather than per skipped scan: the listing is already in hand, and a
+        # 200-host pass can skip 200 scans.
+        matches_by_host = _matches_by_host(names, ver)
         all_match_ds = list(match_ds)
         bounded = bool(max_datasets and len(match_ds) > int(max_datasets))
         if bounded:
@@ -2231,7 +2494,8 @@ def main():
                 tuples, mode = summarise_shard(client, ds, ver, qcount, log, findings)
                 modes.add(mode)
             except Exception as e:
-                skipped.append("%s: unreadable (%s)" % (ds, str(e)[:120]))
+                skipped.append(_skipped_record(
+                    "source_unreadable", "unreadable (%s)" % str(e)[:120], dataset=ds))
                 # A scan missing because its source could not be READ looks identical to a
                 # scan missing because it was superseded, and only the second may cause a
                 # deletion - so an incomplete read disables stale removal entirely.
@@ -2286,16 +2550,21 @@ def main():
             quiet = bool(newest) and (now_ms - newest) >= quiet_secs * 1000
             aged = bool(newest) and (now_ms - newest) >= cutoff_ms
             if not (terminal and quiet) and not aged:
-                skipped.append(
-                    "%s: %s - left alone"
-                    % (sid[:34],
-                       "finished, but its newest row is inside the %ds quiet period (rows "
-                       "may still be draining)" % quiet_secs if terminal
-                       else "scan still in progress"))
+                _host, _ds = _source_dataset_of(sid, matches_by_host)
+                skipped.append(_skipped_record(
+                    "quiet_period" if terminal else "scan_in_progress",
+                    ("finished, but its newest row is inside the %gs quiet period - rows may "
+                     "still be draining, so it is left alone" % quiet_secs) if terminal
+                    else "scan still in progress - left alone",
+                    scan_id=sid, hostname=_host, dataset=_ds))
                 continue
             rh = rule_hash_of(sid)
             if not rh:
-                skipped.append("%s: no ruleset hash in scan_id - cannot be grouped" % sid[:34])
+                _host, _ds = _source_dataset_of(sid, matches_by_host)
+                skipped.append(_skipped_record(
+                    "no_rule_hash",
+                    "no ruleset hash in the scan_id - there is no target to group it into",
+                    scan_id=sid, hostname=_host, dataset=_ds))
                 continue
             g = groups.setdefault(rh, {"rows": [], "sids": set(), "hosts": set(), "why": set()})
             for (host, rule), ts in sorted(pairs.items()):
@@ -2313,13 +2582,12 @@ def main():
             rows = [_coerce_row(r, SUMMARY_SCHEMA) for r in g["rows"]]
             desired = set(g["sids"])
             why = ", ".join(sorted(g["why"]))
-            label = "rules %s" % rh
 
             if dry:
-                written.append("%s: WOULD write %d (host, rule) row(s) from %d host(s) / "
-                               "%d scan(s) -> %s (%s, ~%.1f KB)"
-                               % (label, len(rows), len(g["hosts"]), len(desired), target,
-                                  why, len(rows) * _SUMMARY_ROW_BYTES / 1024.0))
+                written.append(_written_record("would_write", rh, target, len(rows),
+                                               len(g["hosts"]), len(desired), why))
+                covered_hosts |= g["hosts"]
+                covered_scans |= desired
                 continue
 
             # Which scans does the target already hold? A re-scan mints a NEW scan_id (new
@@ -2334,8 +2602,10 @@ def main():
                         if r.get("scan_id"):
                             held.add(str(r.get("scan_id")))
                 except Exception as e:
-                    failed.append("%s: could not read existing target %s (%s) - NOT written"
-                                  % (label, target, str(e)[:100]))
+                    failed.append(_failed_record(
+                        "target_unreadable",
+                        "could not read the existing target (%s) - nothing was written"
+                        % str(e)[:100], ruleset=rh, target=target))
                     continue
 
             # held - OBSERVED, never held - desired: see the `observed` note above. With any
@@ -2345,10 +2615,14 @@ def main():
                                              target, existing, ver, log))
             else:
                 stale = []
-                if held - observed.get(rh, set()):
-                    skipped.append("%s: stale-row removal SKIPPED - a source dataset could "
-                                   "not be read this pass, so a scan missing from it is not "
-                                   "evidence it was superseded" % label)
+                _unobserved = held - observed.get(rh, set())
+                if _unobserved:
+                    skipped.append(_skipped_record(
+                        "stale_removal_disabled",
+                        "%d scan(s) in the target were not observed this pass, but a source "
+                        "went unread - their absence is not evidence they were superseded, "
+                        "so no row was removed" % len(_unobserved),
+                        dataset=target, ruleset=rh))
             # Every scan observed this pass is rewritten, not just the ones the target
             # does not already hold. A re-run is a REFRESH: the rows this pass read from the
             # host datasets replace whatever the target holds for those same scans. Skipping
@@ -2358,8 +2632,10 @@ def main():
             fresh = sorted(desired)
             refreshed = sorted(desired & held)   # rewritten rather than newly added
             if not fresh and not stale:
-                skipped.append("%s: nothing observed for this ruleset this pass - target left "
-                               "exactly as it is" % label)
+                skipped.append(_skipped_record(
+                    "nothing_observed",
+                    "no scan for this ruleset survived the gate this pass - the target was "
+                    "left exactly as it is", dataset=target, ruleset=rh))
                 continue
 
             try:
@@ -2374,9 +2650,11 @@ def main():
                         client.remove_lookup_data(
                             target, [{"scan_id": s} for s in refreshed])
                     except Exception as e:
-                        failed.append("%s: could not clear %d scan(s) before refreshing them "
-                                      "in %s (%s) - NOT written, to avoid duplicating rows"
-                                      % (label, len(refreshed), target, str(e)[:90]))
+                        failed.append(_failed_record(
+                            "refresh_clear_failed",
+                            "could not clear %d scan(s) before refreshing them (%s) - nothing "
+                            "was written, to avoid duplicating every (host, rule) pair"
+                            % (len(refreshed), str(e)[:90]), ruleset=rh, target=target))
                         continue
                 if stale:
                     # The ONLY deletion this automation performs, and it is against its own
@@ -2400,15 +2678,19 @@ def main():
                         break
                     added += got
                 if ok:
-                    written.append("%s: wrote %d row(s) for %d scan(s) (%d refreshed), "
-                                   "dropped %d stale row(s) -> %s (%d host(s) total, %s)"
-                                   % (label, added, len(fresh), len(refreshed), removed,
-                                      target, len(g["hosts"]), why))
+                    written.append(_written_record(
+                        "wrote", rh, target, added, len(g["hosts"]), len(fresh), why,
+                        scans_refreshed=len(refreshed), stale_rows_removed=removed))
+                    covered_hosts |= g["hosts"]
+                    covered_scans |= set(fresh)
                 else:
-                    failed.append("%s: write to %s returned 0 rows added after %d - re-run to "
-                                  "retry (host shards untouched)" % (label, target, added))
+                    failed.append(_failed_record(
+                        "write_incomplete",
+                        "a write batch returned 0 rows added after %d - re-run to retry"
+                        % added, ruleset=rh, target=target))
             except Exception as e:
-                failed.append("%s: %s - host shards untouched" % (label, str(e)[:140]))
+                failed.append(_failed_record("write_error", str(e)[:140],
+                                             ruleset=rh, target=target))
 
         # ---- 4. NO SOURCE DATA IS EVER DELETED -----------------------------------------
         # No delete_dataset and no _delete_many anywhere in this file, and nothing at all is
@@ -2429,50 +2711,64 @@ def main():
             except Exception as e:
                 log("lock release failed: %s" % e)
 
-    head = "DRY RUN - nothing was created or written." if dry else "EXECUTED."
-    out = ["%s  XQL calls: %d (+1 dataset listing)%s"
-           % (head, qcount[0],
-              ("  [%s]" % ", ".join(sorted(modes))) if modes else ""),
-           "written: %d | skipped: %d | failed: %d | file-level findings collapsed: %d"
-           % (len(written), len(skipped), len(failed), findings[0]),
-           "host shards deleted: 0 (source data is never deleted - the host dataset is the "
-           "deep-dive source; only this automation's own summary rows are reconciled)"]
-    for label, items in (("WRITTEN", written), ("SKIPPED", skipped), ("FAILED", failed)):
-        if items:
-            out.append("")
-            out.append("%s:" % label)
-            out += ["  " + s for s in items[:60]]
-            if len(items) > 60:
-                out.append("  ... and %d more" % (len(items) - 60))
+    # Sorted so like sits with like: a 200-host pass skips in runs of one reason, and an
+    # operator reading the table wants the three that failed the gate for a DIFFERENT reason
+    # to be adjacent rather than scattered through the scan_id ordering.
+    skipped.sort(key=lambda r: (r["reason"], r["name"]))
+    failed.sort(key=lambda r: (r["reason"], r["ruleset"] or ""))
+
+    # Fallbacks and truncated reads were previously visible only to a log nobody surfaced: the
+    # run reported success while quietly reading through the per-scan fallback, or off the top
+    # of the read cap. They are the run's own caveats about its numbers, so they travel WITH
+    # the numbers.
+    warn_lines = [m.strip().lstrip("! ").strip() for m in log_lines
+                  if m.strip().startswith("!")]
     lock_log = [m for m in log_lines if "lock" in m.lower()]
-    if lock_log:
-        out.append("")
-        out.append("lock events:")
-        out += ["  " + m for m in lock_log]
+
+    # BOTH SIDES of the collapse ratio cover the same population - every (host, rule) pair
+    # this pass observed, gated or not. Dividing a fleet-wide numerator by only the rows that
+    # reached a target would inflate the reduction by whatever the gate held back, and would
+    # swing run to run for reasons that have nothing to do with how much detail collapsed.
+    summary_rows_observed = sum(len(p) for p in by_scan.values())
+
+    result = {"status": ("dry_run" if dry
+                         else ("partial_failure" if failed else "success")),
+              "dry_run": dry, "schema_version": ver,
+              "xql_calls": qcount[0], "query_modes": sorted(modes),
+              "written": written, "skipped": skipped, "failed": failed,
+              "warnings": warn_lines,
+              "targets_written": len(written),
+              "rows_written": sum(int(w["rows"]) for w in written),
+              "hosts_covered": len(covered_hosts), "scans_covered": len(covered_scans),
+              "skipped_count": len(skipped), "failed_count": len(failed),
+              "findings_collapsed": findings[0],
+              "summary_rows_observed": summary_rows_observed,
+              "collapse_ratio": (round(findings[0] / float(summary_rows_observed), 1)
+                                 if summary_rows_observed else None),
+              "sources_read": len(match_ds), "sources_total": len(all_match_ds),
+              "bounded_pass": bounded, "stale_removal_enabled": sources_complete,
+              "shards_deleted": 0,
+              "retention_hours": retention_hours, "quiet_secs": quiet_secs,
+              "max_datasets": max_datasets}
 
     # List-valued context is APPENDED to across repeated calls in one investigation; clear
     # it first so written/skipped/failed never carry a prior call's entries.
     demisto.executeCommand("DeleteContext", {"key": "Yara.ConsolidateSummary"})
-    result = {"dry_run": dry, "xql_calls": qcount[0], "written": written,
-              "skipped": skipped, "failed": failed, "schema_version": ver,
-              "retention_hours": retention_hours, "shards_deleted": 0,
-              "findings_collapsed": findings[0], "query_modes": sorted(modes)}
     # Summary was the one mutating automation with no audit row, so a scheduled
     # summarisation could not be confirmed from the tenant the way a consolidation can.
     # Dry runs are not recorded: they change nothing, and a row per preview would bury the
     # writes this log exists to evidence.
     if execute:
         # No lock branch here on purpose: a standdown returns above, before this point.
-        _status = "partial_failure" if failed else "success"
         record_consolidation_run(
-            client, _status,
+            client, result["status"],
             result={"consolidated_count": len(written), "failed_count": len(failed),
                     "failed_scan_ids": [], "failed_reasons": {}},
             log=lambda *a: None)
 
-    return_results(CommandResults(readable_output="\n".join(out),
-                                  outputs_prefix="Yara.ConsolidateSummary", outputs=result,
-                                  raw_response=result))
+    return_results(CommandResults(
+        readable_output=render_run_markdown(result, warn_lines, lock_log),
+        outputs_prefix="Yara.ConsolidateSummary", outputs=result, raw_response=result))
 
 
 if __name__ in ("__main__", "__builtin__", "builtins"):

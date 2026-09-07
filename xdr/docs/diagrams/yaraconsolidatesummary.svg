@@ -90,8 +90,8 @@
 <line x1="487" y1="1202" x2="340" y2="1232" class="arr" marker-end="url(#arrow)"/>
 <rect x="60" y="1232" width="560" height="76" rx="8" fill="#fdf3e0" stroke="#d9a441" stroke-width="0.5"/>
 <text class="th" x="340" y="1250" text-anchor="middle" dominant-baseline="central">Check existing target</text>
-<text class="ts" x="340" y="1269" text-anchor="middle" dominant-baseline="central">Same count skips, other counts fail</text>
-<text class="fn" x="340" y="1290" text-anchor="middle" dominant-baseline="central">_count</text>
+<text class="ts" x="340" y="1269" text-anchor="middle" dominant-baseline="central">Observed scans rewritten, superseded rows dropped</text>
+<text class="fn" x="340" y="1290" text-anchor="middle" dominant-baseline="central">remove_lookup_data</text>
 <line x1="340" y1="1308" x2="340" y2="1330" class="arr" marker-end="url(#arrow)"/>
 <rect x="60" y="1330" width="560" height="76" rx="8" fill="#e6f4f1" stroke="#4fa896" stroke-width="0.5"/>
 <text class="th" x="340" y="1348" text-anchor="middle" dominant-baseline="central">Write 4-column summary</text>

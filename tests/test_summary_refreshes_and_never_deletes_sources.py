@@ -124,7 +124,16 @@ def test_a_second_run_rewrites_rather_than_skipping():
     assert writes, (
         "the pass wrote nothing to a target it already held - it skipped instead of "
         "refreshing: %s" % text[:300])
-    assert "not rewritten" not in text
+    # Asserted against the RECORD, not the prose. This used to read
+    # `assert "not rewritten" not in text`, which the markdown rewrite quietly made vacuous:
+    # the sentence it was watching for no longer exists in any output, so the assertion could
+    # not fail whatever the automation did. A negative match on prose stops guarding the
+    # moment the prose changes, and says nothing when it does.
+    written = res.outputs["written"]
+    assert [w["action"] for w in written] == ["wrote"]
+    assert written[0]["scans_refreshed"] == len(HOSTS), (
+        "the pass reported %d scan(s) refreshed, not %d - it added rather than rewrote"
+        % (written[0]["scans_refreshed"], len(HOSTS)))
 
 
 def test_a_refresh_clears_before_writing_so_rows_do_not_double():

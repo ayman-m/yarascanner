@@ -527,10 +527,83 @@ macOS    /usr/local/yara_scanner/logs/scan_summary_&lt;run_id&gt;.json</code></p
   </div></div>
 
   <div class="step"><div class="sh"><span class="n">F2</span><span class="t">Summary — record what matched (non-destructive)</span></div><div class="sb">
-    <div class="blk"><span class="lead do">Do</span><pre><code>!YaraConsolidateSummary execute="false"</code></pre>
-    <p>Then for real:</p><pre><code>!YaraConsolidateSummary execute="true"</code></pre></div>
-    <div class="blk"><span class="lead exp">Expect</span><p><code>DRY RUN - nothing was created or written.</code> and a list of what it <em>would</em> write. The real run reports <code>EXECUTED.</code>, writes to <code>yara_scanner_summary_v4_rules_&lt;rulehash&gt;</code> and reports <strong><code>host shards deleted: 0</code></strong> — summary mode never deletes.</p>
-      <p><strong>Verify the source survived:</strong></p>
+    <div class="call warn"><span class="lbl">Summary's readable output is markdown</span>
+      <p>It renders in the War Room as headings and tables. The plain-text lines earlier revisions of
+      this runbook told you to look for are gone — there is no
+      <code>DRY RUN - nothing was created or written.</code> sentence, no
+      <code>host shards deleted: 0</code> line, and no uppercase <code>WRITTEN:</code> /
+      <code>SKIPPED:</code> / <code>FAILED:</code> blocks. Check the heading text and the table row
+      labels below instead.</p>
+      <p>This is Summary only. <code>YaraConsolidateApply</code> (F3) still reports in plain text, and
+      the F3 strings below are unchanged.</p></div>
+
+    <div class="blk"><span class="lead do">Do</span><pre><code>!YaraConsolidateSummary execute="false"</code></pre></div>
+    <div class="blk"><span class="lead exp">Expect</span><p>A report headed
+      <code>### YARA summary consolidation - DRY RUN</code>, with <em>"Nothing was created or written.
+      Re-run with <code>execute=true</code> to apply exactly this."</em> directly under it. Then check,
+      by eye:</p>
+      <ul style="margin-bottom:.5rem">
+      <li>a key/value table whose left column reads <strong>Targets</strong>, <strong>Rows</strong>,
+        <strong>Hosts covered</strong>, <strong>Scans covered</strong>, <strong>Skipped</strong>,
+        <strong>Failed</strong>, <strong>Source datasets deleted</strong>,
+        <strong>Sources read</strong>, <strong>Stale-row removal</strong>, <strong>XQL calls</strong>,
+        <strong>Read mode</strong> — in that order. On this path <strong>Targets</strong> and
+        <strong>Rows</strong> are phrased <em>"N would be written"</em>.</li>
+      <li><strong>Source datasets deleted</strong> reads
+        <code>0 - this automation has no deletion path</code>. That row is what replaced
+        <code>host shards deleted: 0</code>, and it is the non-destructive claim you are signing
+        off.</li>
+      <li><strong>Sources read</strong> reads <em>"N of N host matches dataset(s)"</em>. The two
+        numbers matching is how you know the pass was not bounded by <code>max_datasets</code> — a
+        bounded pass also turns <strong>Stale-row removal</strong> off.</li>
+      <li>a <strong><code>#### Would write</code></strong> table, one row per ruleset group, with the
+        columns <code>Ruleset | Rows | Hosts | Scans | Est. size | Eligible because | Target</code>.
+        The <strong>Target</strong> cell is the
+        <code>yara_scanner_summary_v4_rules_&lt;rulehash&gt;</code> dataset it would create.</li>
+      <li>a <strong>Detail collapsed.</strong> paragraph whenever anything was read — <em>"The host
+        datasets hold <strong>130,657</strong> file-level findings - one for every (file, rule) pair, so a file that matched three rules counts three times. Grouped by (host, rule) they become <strong>1,127</strong> rows, a
+        <strong>115.9x</strong> reduction."</em> Both figures cover everything the pass
+        <strong>read</strong>, gated or not, so the ratio does not move with the gate. That also means
+        the row count in this sentence is <strong>not</strong> the row count in the table above, which
+        counts only what passed the gate.</li>
+      <li>a <strong><code>#### Settings this run used</code></strong> table listing
+        <code>schema_version</code>, <code>quiet_secs</code>, <code>retention_hours</code>,
+        <code>max_datasets</code> and <code>execute</code>, with <code>execute</code> reading
+        <code>false - dry run</code>. Read the <code>retention_hours</code> row exactly as it describes
+        itself — <em>"fallback only: a scan that never reported a terminal status is treated as
+        finished once its newest row is this old. NOT a deletion window - this automation deletes
+        nothing"</em>.</li>
+      </ul>
+      <p>A <strong><code>#### Skipped - nothing was touched</code></strong> table appears only when
+      something was gated. Its columns are
+      <code>Scan or ruleset | Dataset | Reason | Detail</code>, and <strong>Reason</strong> comes from
+      a closed set: <code>scan_in_progress</code>, <code>quiet_period</code>, <code>no_rule_hash</code>,
+      <code>source_unreadable</code>, <code>stale_removal_disabled</code>,
+      <code>nothing_observed</code>. A scan you have just run showing <code>quiet_period</code> —
+      <em>"finished, but its newest row is inside the 900s quiet period - rows may still be draining,
+      so it is left alone"</em> — is the E2 gate working, not a fault. <code>#### Failed</code> and
+      <code>#### Warnings</code> likewise appear only when they have something to report; on a clean
+      pass neither is present and the <strong>Failed</strong> row of the key/value table reads
+      <code>0</code>.</p></div>
+
+    <div class="blk"><span class="lead do">Then for real</span><pre><code>!YaraConsolidateSummary execute="true"</code></pre></div>
+    <div class="blk"><span class="lead exp">Expect</span><p>The same report, with exactly these
+      differences:</p>
+      <ul style="margin-bottom:.5rem">
+      <li>the heading is <code>### YARA summary consolidation - EXECUTED</code>, and the line under it
+        reads <em>"Per-ruleset summary targets were created and written."</em></li>
+      <li><strong>Targets</strong> and <strong>Rows</strong> are phrased <em>"N written"</em> — on a
+        single-ruleset test, <code>1 written</code> and something like <code>24 written</code>.</li>
+      <li><strong><code>#### Would write</code></strong> is replaced by
+        <strong><code>#### Written</code></strong>, which carries two more columns:
+        <code>Ruleset | Rows | Hosts | Scans | Refreshed | Stale rows dropped | Eligible because |
+        Target</code>.</li>
+      <li><code>execute</code> in the settings table reads <code>true</code>.</li>
+      </ul></div>
+    <div class="blk"><span class="lead fail">Fails if</span><p><strong>Source datasets deleted</strong>
+      reads anything other than <code>0 - this automation has no deletion path</code>. It is the same
+      on both paths — summary mode never deletes.</p></div>
+    <div class="blk"><span class="lead do">Verify the source survived</span>
       <pre><code>dataset = &lt;MATCHES&gt; | comp count() as rows by scan_id</code></pre>
       <p>Unchanged. That's the proof summary mode is safe to schedule.</p></div>
   </div></div>
@@ -604,7 +677,16 @@ macOS    /usr/local/yara_scanner/logs/scan_summary_&lt;run_id&gt;.json</code></p
     <div class="blk"><span class="lead do">Do</span><p>Start <code>!YaraConsolidateApply execute="true"</code> and, while it runs, start a <strong>second</strong> one from another War Room tab.</p>
       <p><strong><code>execute="true"</code> is required for this test.</strong> A dry run takes no
       lock — it has nothing to serialise — so two concurrent previews will both simply run.</p></div>
-    <div class="blk"><span class="lead exp">Expect</span><p><em>"Skipped this pass — the consolidation lock is held by another concurrent run."</em> and nothing touched. <code>!YaraConsolidateSummary execute="true"</code> takes the same lock, so a Summary pass and an Apply pass will not overlap either.</p>
+    <div class="blk"><span class="lead exp">Expect</span><p><em>"Skipped this pass — the consolidation lock is held by another concurrent run."</em> and nothing touched.</p>
+      <p><code>!YaraConsolidateSummary execute="true"</code> takes the <strong>same</strong> lock, so a
+      Summary pass and an Apply pass will not overlap either — but it stands down in its own words.
+      Summary returns exactly this, and nothing else:</p>
+      <pre><code>Another consolidation run holds the lock - nothing was touched.</code></pre>
+      <p><strong>This one path is not markdown.</strong> That single sentence is the entire readable
+      output: no <code>### YARA summary consolidation</code> heading, no key/value table, no sections.
+      Its context is only <code>{"status": "lock_held_by_other_run"}</code> — none of the usual
+      counters are set, so a playbook branching on this pass should branch on that
+      <code>status</code>.</p>
       <p><strong>Why it matters:</strong> the lock serialises <strong>writers</strong>, not deleters.
       Concurrent writers to one lookup dataset lose rows — measured at 87% loss with eight of them —
       and two passes reconciling the same consolidated target would each compute <em>stale</em> from a

@@ -652,13 +652,41 @@ outputs:
   description: 'Full mode only: true when the branch ran as a preview, i.e. full_execute was not left at its default
     of true.'
   type: Boolean
+- contextPath: Yara.ConsolidateSummary.status
+  description: 'Summary mode only: one of success, partial_failure or dry_run. The single field to branch on -
+    it saves testing three lists to learn what happened.'
+  type: String
 - contextPath: Yara.ConsolidateSummary.written
-  description: 'Summary mode only: summary targets written, with row count, host count and why the scan was eligible.'
+  description: 'Summary mode only: one OBJECT per summary target written, keyed action / ruleset / target / rows
+    / hosts / scans / scans_refreshed / stale_rows_removed / estimated_kb / eligibility. Objects rather than
+    sentences, so a task can filter on a field instead of matching prose.'
+  type: Unknown
+- contextPath: Yara.ConsolidateSummary.skipped
+  description: 'Summary mode only: one OBJECT per thing left alone, keyed name / reason / detail / scan_id /
+    hostname / dataset / ruleset. reason is a closed set - scan_in_progress, quiet_period, no_rule_hash,
+    source_unreadable, stale_removal_disabled, nothing_observed - so it is safe to match on. Nothing in this
+    list was touched.'
   type: Unknown
 - contextPath: Yara.ConsolidateSummary.failed
-  description: 'Summary mode only: scans that could not be summarised. Host shards are untouched in every case,
-    so re-running is safe.'
+  description: 'Summary mode only: one OBJECT per ruleset that could not be written, keyed reason / detail /
+    ruleset / target / sources_untouched. Host shards are untouched in every case, so re-running is safe.'
   type: Unknown
+- contextPath: Yara.ConsolidateSummary.warnings
+  description: 'Summary mode only: caveats the run has about its own numbers - a read that hit the row cap, a
+    fleet-wide query that fell back to one query per shard. Empty on a clean pass.'
+  type: Unknown
+- contextPath: Yara.ConsolidateSummary.rows_written
+  description: 'Summary mode only: total (host, rule) rows across every target written, or in a preview that would
+    be written.'
+  type: Number
+- contextPath: Yara.ConsolidateSummary.collapse_ratio
+  description: 'Summary mode only: findings_collapsed / summary_rows_observed - how many file-level findings one
+    summary row stands for. The number that says what summary mode is buying.'
+  type: Number
+- contextPath: Yara.ConsolidateSummary.stale_removal_enabled
+  description: 'Summary mode only: whether the pass was allowed to remove superseded rows from its own targets.
+    False after a bounded pass or an unreadable source, which needs a later unbounded pass to reconcile.'
+  type: Boolean
 - contextPath: Yara.ConsolidateSummary.shards_deleted
   description: 'Summary mode only: always 0. Present so a run can prove that the summary branch deleted nothing.'
   type: Number

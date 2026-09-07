@@ -480,13 +480,58 @@ per-host dataset and a consolidated target is what keeps a record.
 
 ### F2 · Summary — record what matched (non-destructive)
 
+> **Summary's readable output is markdown.** It renders in the War Room as headings and
+> tables. The plain-text lines earlier revisions of this runbook told you to look for are
+> gone — there is no `DRY RUN - nothing was created or written.` sentence, no
+> `host shards deleted: 0` line, and no uppercase `WRITTEN:` / `SKIPPED:` / `FAILED:` blocks.
+> Check the heading text and the table row labels below instead.
+>
+> This is Summary only. `YaraConsolidateApply` (F3) still reports in plain text, and the F3
+> strings below are unchanged.
+
 **Do:**
 
 ```
 !YaraConsolidateSummary execute="false"
 ```
 
-**Expect:** `DRY RUN - nothing was created or written.` and a list of what it *would* write.
+**Expect:** a report headed `### YARA summary consolidation - DRY RUN`, with
+*"Nothing was created or written. Re-run with `execute=true` to apply exactly this."*
+directly under it. Then check, by eye:
+
+- a key/value table whose left column reads **Targets**, **Rows**, **Hosts covered**,
+  **Scans covered**, **Skipped**, **Failed**, **Source datasets deleted**, **Sources read**,
+  **Stale-row removal**, **XQL calls**, **Read mode** — in that order. On this path
+  **Targets** and **Rows** are phrased *"N would be written"*
+- **Source datasets deleted** reads `0 - this automation has no deletion path`. That row is
+  what replaced `host shards deleted: 0`, and it is the non-destructive claim you are
+  signing off
+- **Sources read** reads *"N of N host matches dataset(s)"*. The two numbers matching is how
+  you know the pass was not bounded by `max_datasets` — a bounded pass also turns
+  **Stale-row removal** off
+- a **`#### Would write`** table, one row per ruleset group, with the columns
+  `Ruleset | Rows | Hosts | Scans | Est. size | Eligible because | Target`. The **Target**
+  cell is the `yara_scanner_summary_v4_rules_<rulehash>` dataset it would create
+- a **Detail collapsed.** paragraph whenever anything was read — *"The host datasets hold
+  **130,657** file-level findings - one for every (file, rule) pair, so a file that matched three rules counts three times. Grouped by
+  (host, rule) they become **1,127** rows, a **115.9x** reduction."* Both figures cover
+  everything the pass **read**, gated or not, so the ratio does not move with the gate. That
+  also means the row count in this sentence is **not** the row count in the table above,
+  which counts only what passed the gate
+- a **`#### Settings this run used`** table listing `schema_version`, `quiet_secs`,
+  `retention_hours`, `max_datasets` and `execute`, with `execute` reading `false - dry run`.
+  Read the `retention_hours` row exactly as it describes itself — *"fallback only: a scan
+  that never reported a terminal status is treated as finished once its newest row is this
+  old. NOT a deletion window - this automation deletes nothing"*
+
+A **`#### Skipped - nothing was touched`** table appears only when something was gated. Its
+columns are `Scan or ruleset | Dataset | Reason | Detail`, and **Reason** comes from a closed
+set: `scan_in_progress`, `quiet_period`, `no_rule_hash`, `source_unreadable`,
+`stale_removal_disabled`, `nothing_observed`. A scan you have just run showing `quiet_period`
+— *"finished, but its newest row is inside the 900s quiet period - rows may still be
+draining, so it is left alone"* — is the E2 gate working, not a fault. `#### Failed` and
+`#### Warnings` likewise appear only when they have something to report; on a clean pass
+neither is present and the **Failed** row of the key/value table reads `0`.
 
 Then run it for real:
 
@@ -494,8 +539,19 @@ Then run it for real:
 !YaraConsolidateSummary execute="true"
 ```
 
-**Expect:** `EXECUTED.`, rows written to `yara_scanner_summary_v4_rules_<rulehash>`, and
-**`host shards deleted: 0`** — summary mode never deletes.
+**Expect:** the same report, with exactly these differences:
+
+- the heading is `### YARA summary consolidation - EXECUTED`, and the line under it reads
+  *"Per-ruleset summary targets were created and written."*
+- **Targets** and **Rows** are phrased *"N written"* — on a single-ruleset test, `1 written`
+  and something like `24 written`
+- **`#### Would write`** is replaced by **`#### Written`**, which carries two more columns:
+  `Ruleset | Rows | Hosts | Scans | Refreshed | Stale rows dropped | Eligible because | Target`
+- `execute` in the settings table reads `true`
+
+**Fails if:** **Source datasets deleted** reads anything other than
+`0 - this automation has no deletion path`. It is the same on both paths — summary mode never
+deletes.
 
 **Verify the source survived:**
 
@@ -610,8 +666,20 @@ serialise — so two concurrent previews will both simply run.
 
 **Expect:** the second returns
 *"Skipped this pass — the consolidation lock is held by another concurrent run."*
-and touches nothing. `!YaraConsolidateSummary execute="true"` takes the same lock, so a
-Summary pass and an Apply pass will not overlap either.
+and touches nothing.
+
+`!YaraConsolidateSummary execute="true"` takes the **same** lock, so a Summary pass and an
+Apply pass will not overlap either — but it stands down in its own words. Summary returns
+exactly this, and nothing else:
+
+```
+Another consolidation run holds the lock - nothing was touched.
+```
+
+**This one path is not markdown.** That single sentence is the entire readable output: no
+`### YARA summary consolidation` heading, no key/value table, no sections. Its context is
+only `{"status": "lock_held_by_other_run"}` — none of the usual counters are set, so a
+playbook branching on this pass should branch on that `status`.
 
 **Why it matters:** the lock serialises **writers**, not deleters. Concurrent writers to one
 lookup dataset lose rows — measured at 87% loss with eight of them — and two passes

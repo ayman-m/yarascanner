@@ -399,12 +399,31 @@ written, and untouched hosts are not rewritten at all.
 > detail has to survive.
 
 > **On a tenant with no YARA datasets yet, summary mode is a clean no-op.** Dry run and
-> `execute=true` alike report `XQL calls: 0 (+1 dataset listing)`,
-> `written: 0 | skipped: 0 | failed: 0 | file-level findings collapsed: 0` and
-> `host shards deleted: 0 (source data is never deleted — the host dataset is the deep-dive
-> source; only this automation's own summary rows are reconciled)`, with `written`, `skipped`
-> and `query_modes` empty. That deletion counter is a constant zero, not a tally — zero here
-> is the correct result, not a misconfiguration.
+> `execute=true` alike return every counter at zero, with `written`, `skipped`, `failed`,
+> `warnings` and `query_modes` empty. The readable output is markdown, and the whole card is:
+>
+> ```
+> ### YARA summary consolidation - DRY RUN
+> _Nothing was created or written. Re-run with `execute=true` to apply exactly this._
+>
+> |  |  |
+> |---|---|
+> | **Targets** | 0 would be written |
+> | **Rows** | 0 would be written |
+> | **Hosts covered** | 0 |
+> | **Scans covered** | 0 |
+> | **Skipped** | 0 |
+> | **Failed** | 0 |
+> | **Source datasets deleted** | 0 - this automation has no deletion path |
+> | **Sources read** | 0 of 0 host matches dataset(s) |
+> | **Stale-row removal** | enabled |
+> | **XQL calls** | 0, plus 1 dataset listing (not an XQL) |
+> | **Read mode** | none |
+> ```
+>
+> A **Settings this run used** table follows it; there is no collapse line, because nothing was
+> read to collapse. That deletion counter is a constant zero, not a tally — this automation has
+> no deletion path at all, so zero here is the correct result, not a misconfiguration.
 
 ### YaraCleanup's safety rails
 
@@ -466,16 +485,28 @@ superseded.
 
 ### Pass outcomes
 
-| Outcome | Meaning | Action |
-|---|---|---|
-| `WOULD write …` | Dry run — the default — reporting the write it would perform | Re-run with `execute=true` |
-| `target already current … verified, not rewritten` | Held scan_ids already match the sources | None — success |
-| `scan still in progress - left alone` | No terminal lifecycle row and not yet past `retention_hours` | Deferred; picked up next pass |
-| `finished, but its newest row is inside the 900s quiet period (rows may still be draining) - left alone` | Terminal, but its newest match row is younger than `quiet_secs` (**900s**) | Deferred; picked up once the scan has been quiet that long |
-| `no ruleset hash in scan_id - cannot be grouped` | scan_id predates the ruleset-hash suffix | Nothing to group it by; rescan |
-| `<dataset>: unreadable` | A source matches dataset could not be read | Its rows are absent this pass, **and stale-row removal is skipped for every group** |
-| `exceeds the full-consolidation ceiling` | Group larger than `row_ceiling` (60,000) | **Refused before writing**, not half-built. Use `Summary`, or raise `row_ceiling` deliberately |
-| `could not read existing target` | Target exists but its scan_id set could not be read | Nothing written for that group — re-run |
+**The two automations report an outcome differently, and the difference matters if you are
+automating against it.** `Apply` still reports each outcome as a prose string. `Summary`'s
+`written`, `skipped` and `failed` are lists of **objects**, so a playbook filters on a field
+instead of matching prose. Check the automation column before you match on anything.
+
+| Automation | Outcome | Meaning | Action |
+|---|---|---|---|
+| `Summary` | `written[].action` = `would_write`, under the **Would write** heading | Dry run — the default — reporting the write it would perform | Re-run with `execute=true` |
+| `Apply` | `target already current … verified, not rewritten` | Held scan_ids already match the sources | None — success |
+| `Summary` | `skipped[].reason` = `scan_in_progress` | No terminal lifecycle row and not yet past `retention_hours` | Deferred; picked up next pass |
+| `Summary` | `skipped[].reason` = `quiet_period` | Terminal, but its newest match row is younger than `quiet_secs` (**900s**) | Deferred; picked up once the scan has been quiet that long |
+| `Summary` | `skipped[].reason` = `no_rule_hash` | scan_id predates the ruleset-hash suffix | Nothing to group it by; rescan |
+| `Summary` | `skipped[].reason` = `source_unreadable` | A source matches dataset could not be read — the entry names it in `dataset` | Its rows are absent this pass, **and stale-row removal is skipped for every group** |
+| `Apply` | `exceeds the full-consolidation ceiling` | Group larger than `row_ceiling` (60,000) | **Refused before writing**, not half-built. Use `Summary`, or raise `row_ceiling` deliberately |
+| `Summary` | `failed[].reason` = `target_unreadable` | Target exists but its scan_id set could not be read | Nothing written for that group — re-run |
+
+`Summary`'s `reason` is a **closed set**, so a filter on it cannot silently stop matching when
+the wording changes. `skipped[].reason` is one of `scan_in_progress`, `quiet_period`,
+`no_rule_hash`, `source_unreadable`, `stale_removal_disabled` or `nothing_observed`;
+`failed[].reason` is one of `target_unreadable`, `refresh_clear_failed`, `write_incomplete` or
+`write_error`, and every `failed` entry also carries `sources_untouched: true`. The `detail`
+beside each is the human sentence the War Room renders — match on `reason`, never on `detail`.
 
 **Refusal is a safety feature, not an error.** In every one of these branches the source
 datasets are untouched and the target is either correct or unwritten — never half-filled.
@@ -706,11 +737,11 @@ Every one of these was observed live during validation.
 | Scan "completed" but rows missing | Run timeout expired mid-drain | Check `delivery_shortfall`. Raise the timeout ([§5](#5-sizing-the-run-timeout--the-drain-problem)) |
 | Scan shows `running` forever | Console Cancel, or terminal row lost | 24h cutoff rescues it. Use the `cancel` entry point instead |
 | No `scan_summary_*.json` | Run killed before completing | Confirms a mid-drain kill |
-| Consolidation reports 0 candidates, exits clean | **The scans were gated, not invisible.** Both modes read the permanent per-host matches dataset deliberately, through a wider read-only inclusion than `parse_shard`'s — so zero here means every scan was skipped: still running, inside the 900s quiet period, no ruleset hash in its `scan_id`, or already reconciled. **A genuine `schema_version` mismatch** also reads as zero — those datasets classify as "newer" and are correctly left alone. (`no matches shards found` belongs to the retired per-scan merge; no live entry point emits it) | Read the `SKIPPED:` lines — they name the gate per scan. `YaraConsolidateStatus` shows whether any scan is eligible at all. Suspect `schema_version` (**4**) only after those check out |
+| Consolidation reports 0 candidates, exits clean | **The scans were gated, not invisible.** Both modes read the permanent per-host matches dataset deliberately, through a wider read-only inclusion than `parse_shard`'s — so zero here means every scan was skipped: still running, inside the 900s quiet period, no ruleset hash in its `scan_id`, or already reconciled. **A genuine `schema_version` mismatch** also reads as zero — those datasets classify as "newer" and are correctly left alone. (`no matches shards found` belongs to the retired per-scan merge; no live entry point emits it) | In `Summary`, read the **Skipped - nothing was touched** table, or walk `Yara.ConsolidateSummary.skipped` — one object per scan, each naming its gate in `reason` and the scan in `scan_id`. `YaraConsolidateStatus` shows whether any scan is eligible at all. Suspect `schema_version` (**4**) only after those check out |
 | A ruleset group reported `REFUSED` | The group exceeds `row_ceiling` (60,000 rows) | **Safe** — nothing written for that group, sources untouched. Use `Summary` at that scale, or raise `row_ceiling` deliberately |
 | "Lock held by another run" | Genuine concurrency, **or** a stale lock from a killed pass | Check the runs tracker before clearing ([§9](#9-the-consolidation-lock)) |
 | Consolidation stalls indefinitely | Pass killed at the task timeout holding the lock | Scope the next pass with `scan_id` ([§8](#8-consolidation-mechanics-and-safety-rails)). The 20-minute stale window releases the lock; clear it only if confirmed dead |
-| Summary mode writes 0 rows | Scan still in progress (correctly skipped), genuinely no matches, or the host was re-scanned and its matches dataset overwritten | Check the skip reasons. An overwritten scan produces no skip reason — it is simply absent |
+| Summary mode writes 0 rows | Scan still in progress (correctly skipped), genuinely no matches, or the host was re-scanned and its matches dataset overwritten | Check `Yara.ConsolidateSummary.skipped[].reason`. An overwritten scan produces no skipped entry at all — it is simply absent |
 | 401 on every automation call | Standard key in an Advanced-key slot, or rotated key | Regenerate an **Advanced** key; edit all **seven** that carry the CONFIGURATION banner — `YaraScanVerify` and `YaraWipeAllDatasets` included |
 | Dataset grows despite overwrite | Query Center permission missing on the **scanner's** key | Grant `investigation_query_view` |
 | `add_data` rows silently skipped | Row carries a field outside the dataset's schema | Schema can't be altered in place — bump the version tag |
