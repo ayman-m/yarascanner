@@ -1,69 +1,79 @@
 args:
-- name: entryID
-  description: War Room entry ID of the uploaded rules file. This is the argument name
-    every Cortex content script uses. Omit it and the script finds the file itself, in
-    order - File.EntryID in context, then the newest file entry in the War Room, then the
-    newest attachment on this issue.
+- description: War Room entry ID of the uploaded rules file. This is the argument name every Cortex content script uses. Omit it and the script finds the file itself, in order - File.EntryID in context, then the newest file entry in the War Room, then the newest attachment on this issue.
+  name: entryID
   required: false
-- name: max_bytes
-  description: Refuse a file larger than this many bytes. Defaults to 2097152 (2 MB) - a rules file bigger than that is a mistake, not a ruleset. The scanner's own ceiling is 50 MB of base64, far past anything a human attaches to an issue.
-  required: false
+- defaultValue: '2097152'
+  description: 'Refuse a file larger than this many bytes. Defaults to 2097152 (2 MB) - a rules file bigger than that is a mistake, not a ruleset. The scanner''s own ceiling is 50 MB of base64, far past anything a human attaches to an issue. 0 turns the size check OFF: no ceiling is applied, and Yara.Rules.max_bytes is then null rather than 0, because nothing judged the file. A negative value is refused - it would reject every possible upload. ASYMMETRY WITH YaraRulesDecode, deliberate: 0 is accepted here and turns the size check off, reporting max_bytes=null in context and "no ceiling applied" in the report so it is never silent. YaraRulesDecode REFUSES 0, because it has a `validate` argument and validate=false is its documented way to skip the gate. This automation has no such argument, so 0 is the only escape hatch it can offer. A negative value is refused by both.'
   isArray: false
-  defaultValue: '2097152'
+  name: max_bytes
+  required: false
   secret: false
-comment: >-
-  Reads an operator-uploaded YARA rules file from the War Room, VALIDATES it, and returns the
-  base64 the Action Center scanner takes as its yarafile input - plus the ruleset hash the
-  scan's results will be consolidated under. Validates harder than the scanner does on purpose:
-  decode_yara_rules on the endpoint only checks that the input base64-decodes and contains the
-  word "rule", which is right for a per-host check but means a malformed pack compile-fails on
-  every host in a wave. This runs once, before dispatch, and refuses an empty file, a PDF or
-  other binary, an oversized file, text with no rule declarations, unbalanced braces, and any
-  rule missing its condition section. It CANNOT prove a pack compiles - libyara is not in this
-  image, and rules valid on one agent can still fail on another (base64/base64wide modifiers,
-  pe.* fields are Windows-only). failed_rules on the scan's lifecycle row stays the authority
-  on what actually compiled. Needs no tenant credentials - it reads a file and returns text.
+comment: 'Reads an operator-uploaded YARA rules file from the War Room, VALIDATES it, and returns the base64 the Action Center scanner takes as its yarafile input - plus the ruleset hash the scan''s results will be consolidated under. Validates harder than the scanner does on purpose: decode_yara_rules on the endpoint only checks that the input base64-decodes and contains the word "rule", which is right for a per-host check but means a malformed pack compile-fails on every host in a wave. This runs once, before dispatch, and refuses an empty file, a PDF or other binary, an oversized file, text with no rule declarations, unbalanced braces, and any rule missing its condition section. It CANNOT prove a pack compiles - libyara is not in this image, and rules valid on one agent can still fail on another (base64/base64wide modifiers, pe.* fields are Windows-only). failed_rules on the scan''s lifecycle row stays the authority on what actually compiled. Needs no tenant credentials - it reads a file and returns text.'
 commonfields:
   id: YaraRulesFromFile
   version: -1
-enabled: true
-name: YaraRulesFromFile
-outputs:
-- contextPath: Yara.Rules.valid
-  description: True if the file passed every pre-dispatch check. Branch on this.
-  type: Boolean
-- contextPath: Yara.Rules.errors
-  description: Why it was rejected, each naming what to fix. Empty when valid.
-  type: String
-- contextPath: Yara.Rules.b64
-  description: Base64 of the rules text - pass straight to the scanner's yarafile input. Empty when invalid.
-  type: String
-- contextPath: Yara.Rules.rule_hash
-  description: First 12 hex of sha256 over the rules text, computed exactly as the scanner does, so it is the hash the consolidated datasets are named after (yara_scanner_summary_v4_rules_<hash>, yara_scanner_full_v4_rules_<hash>).
-  type: String
-- contextPath: Yara.Rules.rule_count
-  description: How many rule declarations were found.
-  type: Number
-- contextPath: Yara.Rules.rule_names
-  description: The rule names, in file order.
-  type: String
-- contextPath: Yara.Rules.size_bytes
-  description: Size of the decoded rules text in bytes.
-  type: Number
-- contextPath: Yara.Rules.filename
-  description: Name of the file that was read.
-  type: String
-- contextPath: Yara.Rules.entry_id
-  description: War Room entry ID actually used, whether supplied or auto-discovered.
-  type: String
-script: '-'
-system: false
-tags: []
-timeout: 300
-type: python
-subtype: python3
 dockerimage: demisto/python3:3.11.10.116949
+enabled: true
 fromversion: 6.5.0
 marketplaces:
 - xsoar
 - marketplacev2
+name: YaraRulesFromFile
+outputs:
+- contextPath: Yara.Rules.valid
+  description: True if the file passed every pre-dispatch check. Branch on this. True exactly when errors is empty - the two cannot disagree, and this is the one to branch on because a playbook cannot cheaply test a context array for emptiness.
+  type: Boolean
+- contextPath: Yara.Rules.errors
+  description: One OBJECT per rejection, never a sentence, so a playbook can branch on the code instead of substring-matching prose written for a human. Empty when valid. Today it holds at most one entry - validation returns at the first failure - so errors[0] is the rejection; it stays a list because that is the shape validation owes. Keys below.
+  type: Unknown
+- contextPath: Yara.Rules.errors.reason
+  description: 'A CLOSED set, safe to match on in a playbook: not_text, empty, too_large, pdf, binary, no_rules, unbalanced_braces, missing_condition, unrecognised. `unrecognised` is the catch-all for a validation message this automation''s mapping does not know; no current validation branch produces it, and a test drives every branch to keep it that way.'
+  type: String
+- contextPath: Yara.Rules.errors.detail
+  description: The same rejection as one sentence naming what to fix, for a human reading the War Room. Verbatim from the validator, which shares it byte-for-byte with YaraRulesDecode.
+  type: String
+- contextPath: Yara.Rules.errors.observed
+  description: 'What the file actually has, where the reason is about a number: the size in bytes for too_large, the NET brace depth for unbalanced_braces (positive = that many blocks left open, negative = that many unexpected closing braces), the `condition:` section count for missing_condition. Null on every other reason - present but null, never absent.'
+  type: Number
+- contextPath: Yara.Rules.errors.expected
+  description: 'What it needed instead: 0 for unbalanced_braces, and the rule count for missing_condition (every rule requires one condition). Null on every other reason.'
+  type: Number
+- contextPath: Yara.Rules.errors.limit
+  description: 'The ceiling that was exceeded - only ever set on too_large, where it repeats Yara.Rules.max_bytes on the record itself so the entry is readable on its own. Null on every other reason. Yara.Rules.max_bytes is the authoritative copy: it is set on every run, including the ones that passed.'
+  type: Number
+- contextPath: Yara.Rules.b64
+  description: Base64 of the rules text - pass straight to the scanner's yarafile input. A single string, not a list. Empty when invalid.
+  type: String
+- contextPath: Yara.Rules.rule_hash
+  description: First 12 hex of sha256 over the rules text, computed exactly as the scanner does, so it is the hash the consolidated datasets are named after. Empty when invalid.
+  type: String
+- contextPath: Yara.Rules.summary_target
+  description: 'The per-ruleset summary dataset this scan''s results will consolidate into - yara_scanner_summary_v4_rules_<rule_hash>. Derived from rule_hash, and published because the naming convention is this pack''s, not something a caller should rebuild: getting it wrong points a dashboard at a dataset that will never exist. Empty when invalid.'
+  type: String
+- contextPath: Yara.Rules.full_target
+  description: The per-ruleset full-detail dataset, yara_scanner_full_v4_rules_<rule_hash>. Same derivation and same reason as summary_target. Empty when invalid.
+  type: String
+- contextPath: Yara.Rules.rule_count
+  description: 'How many rule declarations were found - always len(rule_names), on every path. Kept beside the list because a transformer cannot cheaply take the length of a context array; rule_names is the authoritative copy of the data itself. 0 means the file holds no rules ONLY when the scan ran: on a rejection that returned before it (reason not_text, empty, too_large, pdf or binary) nothing was counted, so branch on errors[].reason rather than reading 0 as a finding. The War Room report says ''not counted'' there rather than 0.'
+  type: Number
+- contextPath: Yara.Rules.rule_names
+  description: The rule names, in file order. Plain strings, one per declaration.
+  type: String
+- contextPath: Yara.Rules.size_bytes
+  description: Size of the decoded rules text in bytes. 0 when the file could not be decoded as text at all, which is the only case where it was never measured.
+  type: Number
+- contextPath: Yara.Rules.max_bytes
+  description: 'The size ceiling this run judged the file against - the max_bytes argument, or the 2097152 default. Echoed so a run that PASSED still says which limit it passed; errors[].limit repeats it on a too_large record only. NULL when max_bytes=0 was passed, which turns the size check off: no ceiling was applied, so there is none to report, and reporting 0 would say a file had passed a zero-byte limit.'
+  type: Number
+- contextPath: Yara.Rules.filename
+  description: 'Name of the file that was read, or NULL when the War Room entry carries no name. Null rather than the entry id: substituting the id produced a filename a caller could not tell from a real one. Fall back to entry_id for something to display.'
+  type: String
+- contextPath: Yara.Rules.entry_id
+  description: War Room entry ID actually used, whether supplied or auto-discovered. Always set.
+  type: String
+script: '-'
+subtype: python3
+system: false
+tags: []
+timeout: 300
+type: python

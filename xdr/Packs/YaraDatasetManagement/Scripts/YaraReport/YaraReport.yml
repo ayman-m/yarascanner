@@ -13,40 +13,55 @@ enabled: true
 name: YaraReport
 outputs:
 - contextPath: Yara.Report.now_yyyymm
-  description: The month this inventory was taken, YYYYMM. Ages are measured against it.
+  description: The month this inventory was taken, YYYYMM. Every age_months on a dataset record is measured against it.
   type: String
 - contextPath: Yara.Report.schema_version
-  description: The lookup schema version treated as current. Decides which datasets count as legacy (older) and which as newer (higher, never pruned).
+  description: The lookup schema version treated as current for this run. It decides which datasets carry state "legacy" (an older or unversioned schema) and which carry "newer" (a higher version, never pruned).
   type: String
-- contextPath: Yara.Report.report
-  description: The rendered human-readable inventory, one table per dataset type.
+- contextPath: Yara.Report.datasets
+  description: 'THE AUTHORITATIVE LIST: one record per yara_scanner_* lookup dataset on the tenant - current-schema, legacy and newer-schema alike, so nothing here is answered over a different population than anything else. Every record carries the same nine keys (name, type, kind, host, month, age_months, state, detail, remedy) even where one does not apply, because a transformer filtering on a sometimes-absent key matches nothing and reports no error. Records are ordered by (state, name). Classified from the dataset NAME alone, so the whole inventory costs one API call and no query. Where this and by_type could ever disagree, this is the one to trust.'
+  type: Unknown
+- contextPath: Yara.Report.datasets.name
+  description: The dataset name, exactly as the tenant lists it.
+  type: String
+- contextPath: Yara.Report.datasets.type
+  description: 'What the dataset IS, from its name. Closed set: host_matches (one per host, that host''s latest scan, replaced wholesale by the next), host_scans (one per host per retained month, lifecycle rows, append-only, the only kind that rotates), consolidated_full and consolidated_summary (this pack''s own consolidation output, fleet-wide per ruleset, no host in the name), retired_scan_target (from the withdrawn per-scan merge, which nothing produces now) and internal (the FALLBACK bucket: a yara_scanner_* name none of the types above matched, such as yara_scanner_summary_v4 with no _rules_<hash> tail. The pack''s own consolidation lock and run-record datasets are NOT yara-owned, are dropped before this inventory is built, and never appear here - so a record typed internal is a name of unknown origin, which is exactly what its own state and detail say).'
+  type: String
+- contextPath: Yara.Report.datasets.kind
+  description: 'The shard kind the name declares: "matches" or "scans", or "" for a name that carries neither - this pack''s own consolidated output, an unrecognised name, or a legacy name that predates the _vN segment. Not derivable from type: a retired_scan_target exists in both kinds.'
+  type: String
+- contextPath: Yara.Report.datasets.host
+  description: The host segment of the name, or "" where the name carries none - consolidated output spans hosts, and an unparsed name yields nothing. Never null.
+  type: String
+- contextPath: Yara.Report.datasets.month
+  description: The YYYYMM rotation suffix, or "" for an unsuffixed dataset (overwrite, frozen, not_rotated, consolidated and pack_output all have none). Never null.
+  type: String
+- contextPath: Yara.Report.datasets.age_months
+  description: Whole months from datasets.month to now_yyyymm. Null - not 0 - whenever month is "", because "no rotation suffix" is not an age of zero.
+  type: Number
+- contextPath: Yara.Report.datasets.state
+  description: 'The dataset''s posture, and the field to branch on. CLOSED vocabulary, exactly these nine values: overwrite (the scanner''s permanent per-host matches dataset, v4+ and unsuffixed by design, replaced wholesale each scan); rotated (a month-suffixed rotation shard, the only shape retention pruning ever selects); frozen (unsuffixed but rotated siblings exist - a pre-rotation leftover that is no longer growing); not_rotated (unsuffixed with no rotated sibling - rotation is off for that deployment and the dataset grows without bound); consolidated (a per-scan target from the retired per-scan merge - output, finished, never a cleanup candidate); pack_output (this pack''s own summary or full rollup - type says which); unrecognised (inside the current-schema name filter but outside the yara_scanner naming contract); legacy (an older or unversioned schema); newer (a higher schema version than schema_version assumes, never pruned). frozen and not_rotated are the two that need OPPOSITE advice and are deliberately never merged.'
+  type: String
+- contextPath: Yara.Report.datasets.detail
+  description: One sentence saying what this dataset's state means for THIS dataset - the prose an operator reads, carried beside the code rather than instead of it. Never branch on it; branch on state.
+  type: String
+- contextPath: Yara.Report.datasets.remedy
+  description: The operator action this dataset needs, or "" where it needs none - which is every state except not_rotated (set CONFIG_LOOKUP_ROTATION="monthly" in the scanner) and newer (raise schema_version). Filtering datasets on a non-empty remedy is the supported way to ask "does anything here need doing".
   type: String
 - contextPath: Yara.Report.by_type
-  description: The dataset breakdown, keyed by what each dataset IS. Every bucket carries count, names and by_state. Buckets are host_matches (one per host, that host's latest scan, replaced wholesale by the next), host_scans (one per host per retained month, lifecycle rows, append-only, the only kind that rotates), consolidated_summary and consolidated_full (this pack's own consolidation output, fleet-wide, no host in the name), retired_scan_target (from the withdrawn per-scan merge) and internal (the consolidation lock and run record). Classified from the dataset name alone, so no query is issued. This is the ONLY place the dataset name lists appear.
-  type: Unknown
-- contextPath: Yara.Report.by_type_counts
-  description: Count per bucket of by_type, for branching without walking the lists.
-  type: Unknown
-- contextPath: Yara.Report.datasets
-  description: Per-dataset detail - name, type, kind, host, month, age_months, state. The only place age and month are carried; a different shape from by_type rather than a second copy of it.
+  description: 'A GROUPED VIEW of `datasets`, for branching without walking every record: one entry per type bucket, each carrying count and names, and every bucket present even when empty. by_type[t].names is exactly the sorted names of the records in `datasets` whose type is t, over the same population - it adds the grouping and nothing else. `datasets` is authoritative; nothing about a dataset except its name and type appears here, and the state lists that used to hang off each bucket are gone (state is carried on the record).'
   type: Unknown
 - contextPath: Yara.Report.current_count
-  description: Datasets on the current schema version.
+  description: 'How many datasets are on the current schema version - equivalently, how many records in `datasets` have a state other than legacy or newer. NOT len(datasets): that counts all three schema buckets.'
   type: Number
-- contextPath: Yara.Report.legacy
-  description: Datasets on an older or unversioned schema. Safe to prune; orthogonal to type.
-  type: Unknown
 - contextPath: Yara.Report.legacy_count
-  description: How many datasets are on an older or unversioned schema.
+  description: How many datasets are on an older or unversioned schema - the number of `datasets` records with state "legacy". The names are on those records; they are not repeated as a separate list.
   type: Number
-- contextPath: Yara.Report.newer
-  description: Datasets on a HIGHER schema version than assumed. Never pruned - their presence means the assumed current version is stale.
-  type: Unknown
 - contextPath: Yara.Report.newer_count
-  description: How many datasets are on a higher schema version than assumed.
+  description: How many datasets are on a HIGHER schema version than assumed - the number of `datasets` records with state "newer". Anything above zero means the schema_version argument is stale, and YaraCleanup will refuse blanket legacy deletion while it is.
   type: Number
 - contextPath: Yara.Report.total_count
-  description: Every yara_scanner_* lookup dataset on the tenant.
+  description: 'Every yara_scanner_* lookup dataset on the tenant: len(datasets), and the sum of current_count, legacy_count and newer_count. The headline number.'
   type: Number
 script: '-'
 system: false

@@ -237,9 +237,12 @@ R = YaraReport
 # --------------------------------------------------------------- fake tenant
 NOW_MS = 10_000_000_000
 def _state(rep, kind, state):
-    """State lists now live under by_type[kind]["by_state"], not as top-level keys - one
-    place holds the names instead of two or three spellings of the same list."""
-    return ((rep["by_type"].get(kind) or {}).get("by_state") or {}).get(state) or []
+    """The names of one (type, state) bucket, derived from `datasets` - which is now the ONE
+    place a dataset's state is published. It used to be nested under by_type[kind]["by_state"]
+    as well, so the (name -> state) map appeared twice and a reader could not tell which
+    spelling to trust; by_type carries the grouping and nothing else now."""
+    return sorted(d["name"] for d in rep["datasets"]
+                  if d["type"] == kind and d["state"] == state)
 
 
 def _names(rep, kind):
@@ -437,6 +440,22 @@ def _prune(client, **kw):
     kw.setdefault("now_yyyymm", NOW_YYYYMM)
     kw.setdefault("log", lambda *a: None)
     return K.prune_datasets(client, **kw)
+
+
+def _kept(result, name=None, reason=None):
+    """The `skipped` records matching a dataset name and/or a closed reason code.
+
+    Yara.Cleanup.skipped holds OBJECTS, so the rail assertions below name the code the rail
+    publishes rather than substring-matching the sentence it happens to be worded with today.
+    That is the whole point of the conversion: rewording a message for clarity must not
+    silently stop a filter from matching. The shapes and the closed vocabulary itself are
+    pinned in tests/test_cleanup_reports_objects_not_prose.py.
+    """
+    for s in result["skipped"]:
+        assert isinstance(s, dict), "skipped holds a bare %s: %r" % (type(s).__name__, s)
+    return [s for s in result["skipped"]
+            if (name is None or s["name"] == name)
+            and (reason is None or s["reason"] == reason)]
 
 
 # The version this suite's `_v2_` dataset fixtures are written against. Deliberately NOT
@@ -743,7 +762,7 @@ def test_rail1_never_deletes_the_current_month():
     t = FakeTenant([ds])
     r = _prune(t, older_than_months=0, execute=True)
     assert r["deleted"] == [] and ds in t.names
-    assert any(ds in s and "current month" in s for s in r["skipped"])
+    assert _kept(r, ds, "current_month")
 
 
 def test_rail1_still_holds_when_the_age_window_does_not_cover_it():
@@ -754,7 +773,7 @@ def test_rail1_still_holds_when_the_age_window_does_not_cover_it():
     t = FakeTenant([ds])
     r = _prune(t, older_than_months=-1, execute=True)
     assert r["deleted"] == [] and ds in t.names
-    assert any(ds in s and "current month" in s for s in r["skipped"])
+    assert _kept(r, ds, "current_month")
 
 
 def test_rail2_never_deletes_a_future_month():
@@ -762,7 +781,7 @@ def test_rail2_never_deletes_a_future_month():
     t = FakeTenant([ds])
     r = _prune(t, older_than_months=0, execute=True)
     assert r["deleted"] == [] and ds in t.names
-    assert any(ds in s and "future" in s for s in r["skipped"])
+    assert _kept(r, ds, "future_month")
 
 
 def test_rail2_still_holds_when_the_age_window_does_not_cover_it():
@@ -773,7 +792,7 @@ def test_rail2_still_holds_when_the_age_window_does_not_cover_it():
     t = FakeTenant([ds])
     r = _prune(t, older_than_months=-1, execute=True)
     assert r["deleted"] == [] and ds in t.names
-    assert any(ds in s and "future" in s for s in r["skipped"])
+    assert _kept(r, ds, "future_month")
 
 
 def test_rail3_never_deletes_an_unsuffixed_dataset():
@@ -783,7 +802,7 @@ def test_rail3_never_deletes_an_unsuffixed_dataset():
     t = FakeTenant([ds])
     r = _prune(t, older_than_months=0, execute=True)
     assert r["deleted"] == [] and ds in t.names
-    assert any(ds in s and "not rotated" in s for s in r["skipped"])
+    assert _kept(r, ds, "unrotated_growing")
 
 
 # ------------------------------------------- the v4 overwrite matches dataset
@@ -804,7 +823,7 @@ def _classify_at_v4(impl, names):
 def test_the_v4_matches_dataset_is_not_reported_as_unrotated():
     ds = "yara_scanner_matches_v4_hostA_abc123"
     r = _classify_at_v4(R, [ds])
-    assert _state(r, "host_matches", "overwrite") == [ds], r["by_type"]["host_matches"]
+    assert _state(r, "host_matches", "overwrite") == [ds], r["datasets"]
     assert _state(r, "host_matches", "not_rotated") == [] and _state(r, "host_matches", "frozen") == []
     assert [d["state"] for d in r["datasets"]] == ["overwrite"]
 
@@ -887,7 +906,7 @@ def test_rail4_reports_the_newer_bucket_it_vetoed():
     t = FakeTenant([ds])
     r = _prune(t, older_than_months=0, execute=True)
     assert r["newer"] == [ds] and r["newer_count"] == 1
-    assert any(ds in s and "NEWER schema" in s and "schema_version" in s for s in r["skipped"])
+    assert _kept(r, ds, "newer_schema")
 
 
 def test_rail5_never_deletes_a_dataset_that_reaches_the_selector_unparsed():
@@ -899,7 +918,7 @@ def test_rail5_never_deletes_a_dataset_that_reaches_the_selector_unparsed():
     t = FakeTenant([ds])
     r = _prune(t, older_than_months=0, execute=True)
     assert r["deleted"] == [] and ds in t.names
-    assert any(ds in s and "not a YARA dataset name" in s for s in r["skipped"])
+    assert _kept(r, ds, "not_yara_name")
 
 
 def test_a_foreign_dataset_never_reaches_the_selector_at_all():
@@ -917,7 +936,7 @@ def test_rail6_never_deletes_a_shard_still_being_written_to():
     t = FakeTenant([ds], newest={ds: NOW_MS - 60_000})     # 1 minute ago
     r = _prune(t, older_than_months=0, execute=True)
     assert r["deleted"] == [] and ds in t.names
-    assert any(ds in s and "may still be writing" in s for s in r["skipped"])
+    assert _kept(r, ds, "within_quiet_period")
 
 
 def test_rail6_cannot_be_switched_off_from_the_console():
@@ -944,7 +963,7 @@ def test_rail6_skips_to_be_safe_when_the_recency_query_errors():
     t = FakeTenant([ds], error_on=("comp max(event_timestamp_ms)",))
     r = _prune(t, older_than_months=0, execute=True)
     assert r["deleted"] == [] and ds in t.names
-    assert any("could not check recency" in s for s in r["skipped"])
+    assert _kept(r, ds, "recency_check_failed")
 
 
 def test_rail7_never_deletes_a_shard_holding_an_unconsolidated_scan():
@@ -955,7 +974,8 @@ def test_rail7_never_deletes_a_shard_holding_an_unconsolidated_scan():
     t = FakeTenant([ds], scans={ds: {"S1": 463}})
     r = _prune(t, older_than_months=0, execute=True)
     assert r["deleted"] == [] and ds in t.names
-    assert any(ds in s and "S1" in s and "would lose data" in s for s in r["skipped"])
+    kept = _kept(r, ds, "unconsolidated_scans")
+    assert kept and kept[0]["stuck_scan_ids"] == ["S1"]
 
 
 def test_rail7_skips_to_be_safe_when_the_consolidation_query_errors():
@@ -963,7 +983,7 @@ def test_rail7_skips_to_be_safe_when_the_consolidation_query_errors():
     t = FakeTenant([ds], error_on=("by scan_id",))
     r = _prune(t, older_than_months=0, execute=True)
     assert r["deleted"] == [] and ds in t.names
-    assert any("could not check consolidation state" in s for s in r["skipped"])
+    assert _kept(r, ds, "consolidation_check_failed")
 
 
 def test_a_consolidated_per_scan_target_is_never_a_deletion_candidate():
@@ -975,7 +995,7 @@ def test_a_consolidated_per_scan_target_is_never_a_deletion_candidate():
     t = FakeTenant([target], counts={target: 500}, scans={target: {"S1": 500}})
     r = _prune(t, older_than_months=6, execute=True)
     assert r["deleted"] == [] and target in t.names
-    assert any(target in s and "per-scan consolidated target" in s for s in r["skipped"])
+    assert _kept(r, target, "retired_scan_target")
 
 
 def test_a_timestamp_shaped_slug_does_not_crash_either_automation():
@@ -1115,7 +1135,8 @@ def test_schema_version_is_wired_through_both_automations():
     import YaraReport
     ds = "yara_scanner_matches_v3_h_202601"
     out = _run_automation(YaraReport, {"schema_version": "3"}, FakeTenant([ds]))
-    assert out.outputs["current_count"] == 1 and out.outputs["newer"] == []
+    assert out.outputs["current_count"] == 1 and out.outputs["newer_count"] == 0
+    assert [d["state"] for d in out.outputs["datasets"]] == ["rotated"]
 
     t = FakeTenant([ds])
     out = _run_automation(YaraCleanup, {"older_than_months": "0", "schema_version": "3"}, t)
@@ -1282,7 +1303,9 @@ def test_the_automation_surfaces_a_lock_takeover_to_the_operator():
     out = _run_automation(YaraCleanup, {"older_than_months": "0", "execute": "true"}, t)
     assert out.outputs["lock_taken_over"] is True
     assert "TOOK IT OVER" in out.readable_output
-    assert "lock events:" in out.readable_output
+    assert "#### Lock events" in out.readable_output
+    # ... and reaches a playbook now too, not only the War Room.
+    assert [e["event"] for e in out.outputs["lock_events"]] == ["stale_marker_taken_over"]
 
 
 # ------------------------------------------------ nothing asked for, nothing done
@@ -1320,9 +1343,8 @@ def test_every_skipped_candidate_reports_its_own_reason():
                    scans={stuck: {"S9": 12}})
     r = _prune(t, older_than_months=0, execute=True)
     assert r["deleted"] == []
-    joined = "\n".join(r["skipped"])
     for name in (current_month, future, unrotated, busy, stuck):
-        assert name in joined, "no skip reason surfaced for %s" % name
+        assert _kept(r, name), "no skip reason surfaced for %s" % name
     assert r["skipped_count"] == len(r["skipped"]) == 5
 
 
@@ -1332,7 +1354,7 @@ def test_legacy_datasets_left_out_of_scope_are_reported_too():
     legacy = "yara_scanner_matches_v1_h_202601"
     t = FakeTenant([legacy])
     r = _prune(t, older_than_months=0, execute=True)
-    assert any(legacy in s and "delete_legacy was not set" in s for s in r["skipped"])
+    assert _kept(r, legacy, "legacy_not_requested")
 
 
 def test_the_automation_surfaces_every_skip_reason_to_the_operator():
@@ -1341,16 +1363,17 @@ def test_the_automation_surfaces_every_skip_reason_to_the_operator():
     unrotated = "yara_scanner_matches_v2_hostB"
     t = FakeTenant([unrotated])
     out = _run_automation(YaraCleanup, {"older_than_months": "0"}, t)
-    assert any(unrotated in s and "not rotated" in s for s in out.outputs["skipped"])
+    assert _kept(out.outputs, unrotated, "unrotated_growing")
     assert unrotated in out.readable_output
-    assert "kept, with reason" in out.readable_output
+    assert "#### Kept - nothing was deleted" in out.readable_output
 
 
 def test_the_automation_records_the_scope_it_ran_with():
     import YaraCleanup
     t = FakeTenant(["yara_scanner_matches_v2_hostB"])
     out = _run_automation(YaraCleanup, {"older_than_months": "0"}, t)
-    assert "schema v2" in out.readable_output and "min_quiet_hours" in out.readable_output
+    md = out.readable_output
+    assert "| `schema_version` | v2 |" in md and "`min_quiet_hours`" in md
 
 
 # ---------------------------------------------------------------- legacy path
@@ -1369,10 +1392,10 @@ def test_delete_legacy_applies_the_same_rails_as_the_age_path():
     assert r["deleted"] == [dead]
     for kept in (writing, history, unconsolidated):
         assert kept in t.names
-        assert any(kept in s for s in r["skipped"]), "no reason given for keeping %s" % kept
-    assert any(writing in s and "may still be writing" in s for s in r["skipped"])
-    assert any(history in s and "ALL pre-rotation history" in s for s in r["skipped"])
-    assert any(unconsolidated in s and "would lose data" in s for s in r["skipped"])
+        assert _kept(r, kept), "no reason given for keeping %s" % kept
+    assert _kept(r, writing, "within_quiet_period")
+    assert _kept(r, history, "legacy_unsuffixed")
+    assert _kept(r, unconsolidated, "unconsolidated_scans")
 
 
 def test_delete_legacy_is_refused_outright_while_a_newer_schema_exists():
@@ -1383,7 +1406,8 @@ def test_delete_legacy_is_refused_outright_while_a_newer_schema_exists():
     t = FakeTenant([legacy, newer])
     r = _prune(t, delete_legacy=True, execute=True)
     assert r["deleted"] == [] and legacy in t.names and newer in t.names
-    assert any("NEWER schema" in s and "cannot be trusted" in s for s in r["skipped"])
+    refusal = _kept(r, reason="legacy_refused_newer_schema_present")
+    assert refusal and refusal[0]["newer_datasets"] == [newer] and refusal[0]["name"] == ""
 
 
 def test_a_too_high_schema_version_cannot_delete_the_live_tenant():
@@ -1422,6 +1446,11 @@ def test_a_delete_failure_does_not_strand_the_rest_of_the_cleanup():
     r = _prune(t, delete_legacy=True, execute=True)
     assert r["deleted"] == [b] and r["failed_count"] == 1
     assert r["failed"][0]["dataset"] == a and "dependencies" in r["failed"][0]["error"]
+    # The closed code beside the API's text: "re-run with force=true" is actionable,
+    # "dataset has dependencies" is a sentence a playbook would have to grep for.
+    assert r["failed"][0]["reason"] == "delete_refused_dependencies"
+    assert r["failed"][0]["path"] == "legacy"
+    assert r["status"] == "partial_failure"
 
 
 # ------------------------------------------------------------- the audit trail
@@ -1475,8 +1504,11 @@ def test_the_report_flags_frozen_separately_from_not_rotated():
     assert _state(r, "host_matches", "not_rotated") == [lonely]
     states = {d["name"]: d["state"] for d in r["datasets"]}
     assert states == {frozen: "frozen", sibling: "rotated", lonely: "not_rotated"}
-    assert "abandoned pre-rotation" not in r["report"]   # that wording is a SKIP reason
-    assert "predate rotation" in r["report"] and "NOT rotated" in r["report"]
+    # Opposite advice means opposite REMEDIES, carried on the record rather than left to a
+    # sentence a caller would have to substring-match.
+    remedies = {d["name"]: d["remedy"] for d in r["datasets"]}
+    assert remedies[frozen] == "" and remedies[sibling] == ""
+    assert "CONFIG_LOOKUP_ROTATION" in remedies[lonely]
 
 
 def test_consolidated_targets_are_not_reported_as_unrotated():
@@ -1490,8 +1522,9 @@ def test_consolidated_targets_are_not_reported_as_unrotated():
     assert _state(r, "host_scans", "not_rotated") == [] and _state(r, "host_matches", "not_rotated") == []
     assert _state(r, "host_scans", "frozen") == [] and _state(r, "host_matches", "frozen") == []
     assert sorted(_names(r, "retired_scan_target")) == sorted([t1, t2])
-    assert "CONFIG_LOOKUP_ROTATION" not in r["report"]
-    assert "CONSOLIDATED TARGETS" in r["report"]
+    # Nothing here needs an operator to change a scanner setting, so no record carries one.
+    assert [d["remedy"] for d in r["datasets"]] == ["", "", ""]
+    assert _state(r, "retired_scan_target", "consolidated") == sorted([t1, t2])
 
 
 def test_the_report_carries_age_kind_host_and_the_other_schema_buckets():
@@ -1502,8 +1535,13 @@ def test_the_report_carries_age_kind_host_and_the_other_schema_buckets():
     row = [d for d in r["datasets"] if d["name"] == rotated][0]
     assert row["kind"] == "scans" and row["host"] == "hostA"
     assert row["month"] == "202601" and row["age_months"] == 6
-    assert r["legacy"] == [legacy] and r["newer"] == [newer]
-    assert r["current_count"] == 1 and r["now_yyyymm"] == NOW_YYYYMM
+    # The schema buckets are STATES on the one record list, not two more name lists beside
+    # it - so there is no second population to fall out of step with `datasets`.
+    assert _state(r, "host_matches", "legacy") == [legacy]
+    assert _state(r, "host_matches", "newer") == [newer]
+    assert r["legacy_count"] == 1 and r["newer_count"] == 1
+    assert r["current_count"] == 1 and r["total_count"] == 3
+    assert r["now_yyyymm"] == NOW_YYYYMM
 
 
 def test_the_report_automation_writes_nothing_and_returns_the_rendered_table():
@@ -1524,14 +1562,16 @@ def test_the_report_automation_gives_the_two_conditions_opposite_advice():
     sibling = "yara_scanner_matches_v2_hostA_202601"
     lonely = "yara_scanner_matches_v2_hostB"
     out = _run_automation(YaraReport, {}, FakeTenant([frozen, sibling, lonely]))
-    headline = out.readable_output.split("```")[0]
-    frozen_line = [ln for ln in headline.splitlines() if "frozen" in ln]
-    unrot_line = [ln for ln in headline.splitlines() if "NOT rotated" in ln]
-    assert len(frozen_line) == 1 and len(unrot_line) == 1
-    assert frozen_line[0] != unrot_line[0]              # two buckets, not one collapsed count
-    assert frozen in frozen_line[0] and lonely in unrot_line[0]
-    assert "CONFIG_LOOKUP_ROTATION" in unrot_line[0]
+    md = out.readable_output
+    frozen_line = [ln for ln in md.splitlines() if frozen + "`" in ln]
+    unrot_line = [ln for ln in md.splitlines() if lonely + "`" in ln]
+    assert len(frozen_line) == 1                        # once, in the per-dataset table
+    assert len(unrot_line) == 2                         # and again under Needs attention
+    assert "`frozen`" in frozen_line[0] and "`not_rotated`" in unrot_line[0]
+    assert any("CONFIG_LOOKUP_ROTATION" in ln for ln in unrot_line)
     assert "CONFIG_LOOKUP_ROTATION" not in frozen_line[0]
+    # Two buckets, not one collapsed count: the frozen dataset is never offered a remedy.
+    assert "#### Needs attention" in md and frozen not in md.split("#### Every dataset")[0]
 
 
 # --------------------------------------------------- the .yml half of the contract
@@ -1623,17 +1663,58 @@ def test_the_cleanup_yml_allows_for_its_unbounded_query_fan_out():
     assert _yml("YaraCleanup")["timeout"] > _yml("YaraReport")["timeout"]
 
 
+def _cleanup_gate_result():
+    """One YaraCleanup pass that populates every list its yml declares object keys for.
+
+    `warnings` and `lock_events` are produced by the automation rather than by prune_datasets
+    (argument coercion happens in main(), and lock events are structured out of the run's own
+    log), so this drives main() rather than the library. It runs on the real clock, like every
+    other main()-level fixture in this file - hence strftime rather than NOW_YYYYMM.
+    """
+    import YaraCleanup
+
+    current_month = "yara_scanner_matches_v2_h_%s" % time.strftime("%Y%m")   # -> skipped
+    aged = "yara_scanner_matches_v2_g_202001"                                # -> failed
+
+    class Flaky(FakeTenant):
+        def delete_dataset(self, dataset_name, force=False):
+            if dataset_name == aged:
+                raise RuntimeError("dataset has dependencies")
+            return FakeTenant.delete_dataset(self, dataset_name, force=force)
+
+    t = Flaky([current_month, aged, K._LOCK_DATASET])
+    # Stale by a wide margin, so the pass takes the marker over -> one lock_events entry.
+    t.lock_rows = [{"holder": "YaraConsolidateApply",
+                    "started_ms": int(time.time() * 1000)
+                    - (K.PRUNE_LOCK_STALE_SECS + 3600) * 1000}]
+    # min_quiet_hours below the floor -> one warnings entry.
+    return _run_automation(YaraCleanup, {"older_than_months": "0", "min_quiet_hours": "0",
+                                         "execute": "true"}, t).outputs
+
+
 def test_every_declared_output_is_actually_produced():
     for module_name, result in (
-            ("YaraCleanup", _prune(FakeTenant(["yara_scanner_matches_v2_h_202601"]),
-                                   older_than_months=0, delete_legacy=True, execute=True)),
+            ("YaraCleanup", _cleanup_gate_result()),
             ("YaraReport", R.report_datasets(FakeTenant(["yara_scanner_matches_v2_h_202601"]),
                                              now_yyyymm=NOW_YYYYMM))):
         doc = _yml(module_name)
         prefix = doc["outputs"][0]["contextPath"].rsplit(".", 1)[0]
         for out in doc["outputs"]:
             key = out["contextPath"][len(prefix) + 1:]
-            assert key in result, "%s declares %s but never produces it" % (module_name, key)
+            head, _, leaf = key.partition(".")
+            assert head in result, "%s declares %s but never produces it" % (module_name, key)
+            if not leaf:
+                continue
+            # A declared OBJECT KEY of a list-valued output. The list has to be populated by
+            # this scenario and every element has to carry the key - a key present on only
+            # some entries is a transformer that matches some of the time, which is worse
+            # than one that never does, because it looks like it works.
+            entries = result[head] or []
+            assert entries, "%s declares %s but %s is empty here" % (module_name, key, head)
+            for entry in entries:
+                assert leaf in entry, (
+                    "%s declares %s but a %s entry does not carry it: %s"
+                    % (module_name, key, head, sorted(entry)))
 
 
 def test_the_context_prefix_follows_the_packs_own_convention():

@@ -56,7 +56,7 @@ question resolves faster once you know which one you are looking at.
 | Summary-only consolidation | `YaraConsolidateSummary` | `summarise_shard` — `Scripts/YaraConsolidateSummary/YaraConsolidateSummary.py:1744`; reads via `_matches_shard_for_read` — `:1721`; names via `summary_target_for_rules` — `:1675` |
 | Older **per-scan** merge, deletes verified sources (CLI only) | `xdr_data_management.py --consolidate` | `run_consolidation` — `xdr_consolidate.py:643`; `target_name` — `:184` |
 | Inventory every dataset | `YaraReport` | `report_datasets` — `Scripts/YaraReport/YaraReport.py:1249` (no copy in `xdr_consolidate.py`) |
-| **Prune old datasets** (destructive) | `YaraCleanup` | `prune_datasets` — `Scripts/YaraCleanup/YaraCleanup.py:1332` (no copy in `xdr_consolidate.py`) |
+| **Prune old datasets** (destructive) | `YaraCleanup` | `prune_datasets` — `Scripts/YaraCleanup/YaraCleanup.py` (no copy in `xdr_consolidate.py`) |
 | ↳ pick rotated candidates + rails | cleanup core | `select_rotated_for_deletion` — `xdr_data_management.py:140` |
 | ↳ pick legacy candidates + rails | cleanup core | `select_legacy_for_deletion` — `:271` |
 | **Delete every dataset, no exceptions** (destructive, hand-run only) | `YaraWipeAllDatasets` | `wipe_all` → `list_all_yara_datasets` — `Scripts/YaraWipeAllDatasets/YaraWipeAllDatasets.py` (self-contained; no canonical CLI copy — see the pack README) |
@@ -337,8 +337,8 @@ knowing before a very high-frequency schedule.
 ### Worked example — the two modes are independent
 
 Observed on a live tenant, 2026-08-26, three hosts scanned by one Action Center launch.
-`Summary` returns its War Room output as markdown, while `Apply` and `Status` return plain
-text — which is why the block below mixes the two:
+All three now return their War Room output as markdown — headings and tables — so the block
+below shows the rendered form of each, run one after the other:
 
 ```
 !YaraConsolidateSummary schema_version="4" retention_hours="24" execute="true"
@@ -377,17 +377,42 @@ _Per-ruleset summary targets were created and written._
 | `execute` | true | false previews, true creates and writes |
 
 !YaraConsolidateApply schema_version="4" retention_hours="24" row_ceiling="60000" execute="false"
-  DRY RUN - nothing was created or written.  FULL consolidation: every column of every matched-file row.
-  dataset(s): 1 | rows: 1012 | skipped: 0 | failed: 0
-  host matches datasets deleted: 0 (source data is never deleted ...)
-  rules 90149530ddc2: WOULD write 1012 full row(s) from 3 host(s) / 3 scan(s)
-                      -> yara_scanner_full_v4_rules_90149530ddc2
+
+### YARA full consolidation - DRY RUN
+_Every column of every matched-file row, grouped by ruleset. Nothing was created or written. Re-run with `execute=true` to apply exactly this._
+
+|  |  |
+|---|---|
+| **Outcome** | `dry_run` |
+| **Targets** | 1 would be written |
+| **Rows** | 1,012 would be written |
+| **Ruleset groups** | 1 |
+| **Hosts covered** | 3 |
+| **Skipped** | 0 |
+| **Failed** | 0 |
+| **Source datasets** | host matches datasets retired: 0 (dry run - retirement only happens after a write is read back and verified) |
+| **Fleet progress** | datasets: 3 of 3 - the whole fleet, so nothing is pending |
+
+#### Would write
+| Ruleset | Rows | Hosts | Scans | Target |
+|---|---|---|---|---|
+| 90149530ddc2 | 1,012 | 3 | 3 | `yara_scanner_full_v4_rules_90149530ddc2` |
 
 !YaraConsolidateStatus
-  3 scan(s) ready to consolidate, in 1 ruleset group(s)
-  ready: xdr-agent_20260825_103650..., xdragent2_20260825_103653..., xdragent_20260825_103654...
-  rules 90149530ddc2: 3 scan(s) across 3 host(s) -> one summary dataset and/or one full
-                      dataset (xdr-agent, xdragent, xdragent2)
+  ### YARA consolidation readiness - 3 ready, 0 pending
+  | **Ready to consolidate** | 3 |
+  | **Still pending**        | 0 |
+  | **Ruleset groups**       | 1 - one summary and/or one full dataset each |
+
+  #### Ready to consolidate
+  | Scan                          | Ruleset      | Hosts     | Ready because         | Newest row |
+  | xdr-agent_20260825_103650...  | 90149530ddc2 | xdr-agent | `terminal_and_quiet`  | 3.4h ago   |
+  | xdragent2_20260825_103653...  | 90149530ddc2 | xdragent2 | `terminal_and_quiet`  | 3.4h ago   |
+  | xdragent_20260825_103654...   | 90149530ddc2 | xdragent  | `terminal_and_quiet`  | 3.4h ago   |
+
+  #### Ruleset groups a run would produce
+  | Ruleset      | Scans | Hosts                             | Summary target                               | Full target                               |
+  | 90149530ddc2 | 3     | xdr-agent, xdragent, xdragent2    | `yara_scanner_summary_v4_rules_90149530ddc2` | `yara_scanner_full_v4_rules_90149530ddc2` |
 ```
 
 **`Status` still lists all three as ready, and that is correct.** Readiness means the scan is
@@ -396,8 +421,11 @@ unconsolidated. A finished scan stays ready however many times you group it, bec
 modes are idempotent: re-running reconciles rather than appends.
 
 So read `Status` as "what would a consolidation run group right now", not as a to-do list that
-empties. The grouping line is the useful part: **1 ruleset group, 3 scans, 3 hosts** tells you a
-run produces exactly one dataset covering all three.
+empties. The **Ruleset groups** table is the useful part: **1 group, 3 scans, 3 hosts** tells you
+a run produces exactly one dataset covering all three, and names it. Every scan also comes back
+in context as an object carrying a `reason` code — `terminal_and_quiet` or `aged_out` when it is
+ready, `scan_in_progress` / `quiet_period` / `no_lifecycle_row` / `no_timestamp` when it is not —
+so a playbook branches on the code rather than on the sentence beside it.
 
 To check whether the work has already been done, look for the output datasets:
 

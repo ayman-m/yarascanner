@@ -125,14 +125,17 @@ def test_corrupted_base64_is_refused_rather_than_decoded_to_garbage(dec):
     corrupt = good[:8] + "!!*(" + good[8:]
     d = dec.decode_rules(corrupt)
     assert d["ok"] is False
-    assert any("base64" in e.lower() for e in d["errors"]), d["errors"]
+    # `errors` carries objects, not sentences - branch on the code, read the detail.
+    assert [e["reason"] for e in d["errors"]] == ["bad_alphabet"], d["errors"]
+    assert "base64" in d["errors"][0]["detail"].lower(), d["errors"]
 
 
 def test_urlsafe_base64_is_named_rather_than_failing_obscurely(dec):
     payload = b"rule R {\n  condition:\n    true\n}\n" + b"\xfb\xff\xfe"
     d = dec.decode_rules(base64.urlsafe_b64encode(payload).decode())
     assert d["ok"] is False
-    assert any("url-safe" in e.lower() for e in d["errors"]), d["errors"]
+    assert [e["reason"] for e in d["errors"]] == ["urlsafe_b64"], d["errors"]
+    assert "url-safe" in d["errors"][0]["detail"].lower(), d["errors"]
 
 
 def test_whitespace_and_line_wrapping_are_repaired(enc, dec):
@@ -179,7 +182,8 @@ def test_a_non_yara_payload_is_refused_and_still_shown(dec):
     pdf = base64.b64encode(b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\n").decode()
     strict = dec.decode_rules(pdf)
     assert strict["ok"] is False
-    assert any("pdf" in e.lower() for e in strict["errors"]), strict["errors"]
+    assert [e["reason"] for e in strict["errors"]] == ["pdf"], strict["errors"]
+    assert "pdf" in strict["errors"][0]["detail"].lower(), strict["errors"]
     assert "%PDF-" in strict["rules"], "the operator cannot see what it actually was"
 
     loose = dec.decode_rules(pdf, validate=False)
@@ -191,7 +195,7 @@ def test_empty_input_is_refused_with_an_actionable_message(dec):
     for value in ("", "   \n  ", None):
         d = dec.decode_rules(value)
         assert d["ok"] is False
-        assert d["errors"]
+        assert [e["reason"] for e in d["errors"]] == ["no_input"], d["errors"]
 
 
 # --- the two copies must never disagree about what a valid ruleset is --------------------

@@ -635,45 +635,63 @@ outputs:
 - contextPath: Yara.ConsolidateStatus.eligible_count
   description: Number of scans found eligible on the last status check.
   type: Number
-- contextPath: Yara.ConsolidateApply.written
-  description: 'Full mode only: one line per consolidated dataset written, or in a dry run that would be written.'
+- contextPath: Yara.ConsolidateApply.status
+  description: 'Full mode only: one of success, partial_failure, dry_run or skipped_locked. The single field to
+    branch on - it saves testing the three lists and lock_held_by_other_run separately. partial_failure is reported
+    on a DRY RUN too, because a row_ceiling refusal is a real refusal whichever mode found it and dry run is the
+    automation''s default mode; dry_run, the boolean below, is what says which mode ran.'
   type: String
+- contextPath: Yara.ConsolidateApply.written
+  description: 'Full mode only: one OBJECT per per-ruleset full target written, or in a dry run that WOULD be written,
+    keyed action / ruleset / target / rows / hosts / scans / scans_new / stale_rows_removed. action is "wrote" or
+    "would_write", so a task never has to read a verb out of a sentence to learn whether rows landed. Objects rather
+    than sentences, so a task can filter on a field instead of matching prose.'
+  type: Unknown
 - contextPath: Yara.ConsolidateApply.rows_written
   description: 'Full mode only: total full-detail rows written across all ruleset groups.'
   type: Number
 - contextPath: Yara.ConsolidateApply.groups
   description: 'Full mode only: how many ruleset groups were produced.'
   type: Number
+- contextPath: Yara.ConsolidateApply.skipped
+  description: 'Full mode only: one OBJECT per thing left alone, keyed name / reason / detail / scan_id / hostname
+    / dataset / ruleset. reason is a closed set - scan_in_progress, quiet_period, no_rule_hash, source_unreadable,
+    stale_removal_disabled_bounded, stale_removal_disabled_unreadable, target_already_current - so it is safe to
+    match on. Nothing in this list was touched.'
+  type: Unknown
 - contextPath: Yara.ConsolidateApply.failed
-  description: 'Full mode only: ruleset groups that failed or exceeded row_ceiling. No source data is deleted in
-    any of those cases, so re-running is safe.'
-  type: String
+  description: 'Full mode only: one OBJECT per ruleset group that did not complete, keyed reason / detail / ruleset
+    / target / rows / row_ceiling / rows_added_before_failure / sources_untouched. reason is a closed set - row_ceiling_exceeded
+    (an operator decision: nothing was attempted and a re-run changes nothing until the ceiling is raised or the
+    fleet is summarised), target_unreadable, write_incomplete, write_error (those three are retryable). Task 7 tests
+    this list with isNotEmpty and task 8 copies it whole, so both read objects. No source data is deleted in any
+    of these cases, and every record asserts sources_untouched, so re-running is safe.'
+  type: Unknown
 - contextPath: Yara.ConsolidateApply.dry_run
   description: 'Full mode only: true when the branch ran as a preview, i.e. full_execute was not left at its default
     of true.'
   type: Boolean
 - contextPath: Yara.ConsolidateSummary.status
-  description: 'Summary mode only: one of success, partial_failure or dry_run. The single field to branch on -
-    it saves testing three lists to learn what happened.'
+  description: 'Summary mode only: one of success, partial_failure or dry_run. The single field to branch on - it
+    saves testing three lists to learn what happened.'
   type: String
 - contextPath: Yara.ConsolidateSummary.written
   description: 'Summary mode only: one OBJECT per summary target written, keyed action / ruleset / target / rows
-    / hosts / scans / scans_refreshed / stale_rows_removed / estimated_kb / eligibility. Objects rather than
-    sentences, so a task can filter on a field instead of matching prose.'
+    / hosts / scans / scans_refreshed / stale_rows_removed / estimated_kb / eligibility. Objects rather than sentences,
+    so a task can filter on a field instead of matching prose.'
   type: Unknown
 - contextPath: Yara.ConsolidateSummary.skipped
-  description: 'Summary mode only: one OBJECT per thing left alone, keyed name / reason / detail / scan_id /
-    hostname / dataset / ruleset. reason is a closed set - scan_in_progress, quiet_period, no_rule_hash,
-    source_unreadable, stale_removal_disabled, nothing_observed - so it is safe to match on. Nothing in this
-    list was touched.'
+  description: 'Summary mode only: one OBJECT per thing left alone, keyed name / reason / detail / scan_id / hostname
+    / dataset / ruleset. reason is a closed set - scan_in_progress, quiet_period, no_rule_hash, source_unreadable,
+    stale_removal_disabled, nothing_observed - so it is safe to match on. Nothing in this list was touched.'
   type: Unknown
 - contextPath: Yara.ConsolidateSummary.failed
-  description: 'Summary mode only: one OBJECT per ruleset that could not be written, keyed reason / detail /
-    ruleset / target / sources_untouched. Host shards are untouched in every case, so re-running is safe.'
+  description: 'Summary mode only: one OBJECT per ruleset that could not be written, keyed reason / detail / ruleset
+    / target / sources_untouched. Host shards are untouched in every case, so re-running is safe.'
   type: Unknown
 - contextPath: Yara.ConsolidateSummary.warnings
-  description: 'Summary mode only: caveats the run has about its own numbers - a read that hit the row cap, a
-    fleet-wide query that fell back to one query per shard. Empty on a clean pass.'
+  description: 'Summary mode only: caveats the run has about its own numbers - a read that hit the row cap, a fleet-wide
+    query that fell back to one query per shard. Empty on a clean pass.'
   type: Unknown
 - contextPath: Yara.ConsolidateSummary.rows_written
   description: 'Summary mode only: total (host, rule) rows across every target written, or in a preview that would

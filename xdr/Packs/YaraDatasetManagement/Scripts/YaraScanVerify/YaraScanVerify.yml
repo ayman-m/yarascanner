@@ -10,24 +10,12 @@ args:
   isArray: false
   secret: false
 - name: schema_version
-  description: Lookup schema version to read. Defaults to 4.
+  description: 'Lookup schema version, recorded on the result as schema_version and reported in the War Room run log. It does NOT select what is read: both queries use the unversioned yara_scanner_scans* and yara_scanner_matches* wildcards, which span every schema version, so changing it changes nothing about the verdict. Defaults to 4.'
   required: false
   isArray: false
   defaultValue: '4'
   secret: false
-comment: >-
-  Bounded confirmation that a dispatched wave actually STARTED. It does not wait for
-  completion - a full scan runs 24-29 minutes plus upload drain, and this answers a much
-  cheaper question in a few minutes. Measured on the tenant, the initiated lifecycle row lands
-  +17 to +20 seconds after dispatch, so that is the signal. The 600-second running heartbeat
-  cannot be: its first row arrives at ~10.3 minutes, roughly double a five-minute gate, so
-  waiting for it either false-alarms on every wave or stops the gate being short. Match rows
-  are positive evidence only - their presence proves the whole path works, their absence
-  proves nothing, because a clean host legitimately has none, so a host is never failed for
-  having none. Verdicts - ok - every dispatched host started. partial - some started.
-  wave_dead - none did, which usually means a bad ruleset, a wrong script UID or a failed
-  delivery, and is the case this gate exists to catch in minutes rather than never. unknown -
-  the query itself failed, which is NOT evidence a scan failed and must not page anyone.
+comment: 'Bounded confirmation that a dispatched wave actually STARTED. It does not wait for completion - a full scan runs 24-29 minutes plus upload drain, and this answers a much cheaper question in a few minutes. Measured on the tenant, the initiated lifecycle row lands +17 to +20 seconds after dispatch, so that is the signal. The 600-second running heartbeat cannot be: its first row arrives at ~10.3 minutes, roughly double a five-minute gate, so waiting for it either false-alarms on every wave or stops the gate being short. Match rows are positive evidence only - their presence proves the whole path works, their absence proves nothing, because a clean host legitimately has none, so a host is never failed for having none. Verdicts - ok - every dispatched host started. partial - some started. wave_dead - none did, which usually means a bad ruleset, a wrong script UID or a failed delivery, and is the case this gate exists to catch in minutes rather than never. unknown - the query itself failed, which is NOT evidence a scan failed and must not page anyone.'
 commonfields:
   id: YaraScanVerify
   version: -1
@@ -35,26 +23,83 @@ enabled: true
 name: YaraScanVerify
 outputs:
 - contextPath: Yara.ScanVerify.verdict
-  description: ok | partial | wave_dead | unknown. Branch on this.
+  description: ok | partial | wave_dead | unknown. THE key to branch on. ok - every dispatched host wrote a lifecycle row since dispatch. partial - some did. wave_dead - none did, which usually means a bad ruleset, a wrong script UID or a failed delivery. unknown - the lifecycle query itself failed, which is NOT evidence a scan failed and must not page anyone; see errors.
+  type: String
+- contextPath: Yara.ScanVerify.dispatch_ms
+  description: The epoch-millisecond bound every query in this run used, echoed back so the report and any caller agree on which window was checked. A host's rows count only if they are newer than this.
+  type: Number
+- contextPath: Yara.ScanVerify.schema_version
+  description: 'The schema_version argument this run was given, recorded for the run log. It does not select what is read: both queries use the unversioned yara_scanner_scans* and yara_scanner_matches* wildcards, which span every schema version.'
+  type: String
+- contextPath: Yara.ScanVerify.hosts
+  description: THE AUTHORITATIVE per-host structure - one object per dispatched host, on every path including the one where the query failed. dispatched, started, not_started, match_rows_total and match_evidence are all derivable from it and are published only because they are the branch-friendly forms a playbook wants without running a set difference in a transformer. Where this and any of them could ever disagree, this is the one to trust. Sorted by reason then hostname, so the hosts that need looking at come first.
+  type: Unknown
+- contextPath: Yara.ScanVerify.hosts.hostname
+  description: The hostname as the CALLER spelled it, not as the lifecycle row spelled it. Matching is case-insensitive; reporting is not, so this joins against dispatched/started/not_started with no lowercasing.
+  type: String
+- contextPath: Yara.ScanVerify.hosts.started
+  description: true, false, or NULL. Null means unknown because the lifecycle query failed - it is not the same as false, and filtering hosts on started == false would otherwise sweep up every host of a wave nobody could read. Check verdict != unknown, or reason, first.
+  type: Boolean
+- contextPath: Yara.ScanVerify.hosts.states
+  description: The lifecycle states seen for this host since dispatch, sorted, drawn from initiated | running | completed | cancelled | failed. Empty when the host has written no qualifying row, and empty when the query failed - hosts.reason tells those two apart.
+  type: Unknown
+- contextPath: Yara.ScanVerify.hosts.match_rows
+  description: 'How many match rows landed for this host since dispatch. NULL, never 0, whenever nothing was measured - the match-evidence query failed, or the lifecycle query failed first and the match query was never issued: 0 is a measurement and null is the absence of one. match_evidence says which. Evidence only - it never decides the verdict, and a clean host legitimately has none.'
+  type: Number
+- contextPath: Yara.ScanVerify.hosts.match_evidence
+  description: observed | none_yet | unavailable | not_attempted. observed - at least one match row landed, which proves the whole path works. none_yet - the query answered and this host had none, which is never a failure. unavailable - the query ran and failed, so nothing is known. not_attempted - the lifecycle query failed first, so the match query was never issued; nothing is known here either, but no match-query failure happened and none is claimed.
+  type: String
+- contextPath: Yara.ScanVerify.hosts.reason
+  description: 'Why this host reads as it does, from the CLOSED set started | no_lifecycle_row | lifecycle_unreadable. started - a lifecycle row in a started state landed since dispatch. no_lifecycle_row - none did, which is not necessarily a failure: a host offline at dispatch stays due for the next wave. lifecycle_unreadable - the query failed, so nothing is known about this host. Filter on this, not on the sentence.'
+  type: String
+- contextPath: Yara.ScanVerify.hosts.detail
+  description: 'The human sentence for this host - the states seen, or why none were. Present on every entry. For reading, not for matching: reason is the field with a stable vocabulary.'
   type: String
 - contextPath: Yara.ScanVerify.dispatched
-  description: Hostnames the wave was dispatched to.
+  description: Hostnames the wave was dispatched to, sorted, in the caller's own spelling. Equal to the hostname of every entry in hosts.
   type: String
 - contextPath: Yara.ScanVerify.started
-  description: Hostnames with a lifecycle row written since dispatch.
+  description: 'Hostnames with a lifecycle row written since dispatch, sorted. Exactly the hosts entries whose started is true. INVARIANT: whenever verdict is not unknown, started and not_started are disjoint and their union is dispatched. On verdict unknown BOTH are empty - nothing was read, so neither claim can be made - and hosts still lists every dispatched host with started null.'
   type: String
 - contextPath: Yara.ScanVerify.not_started
-  description: Hostnames with no lifecycle row yet. Not necessarily failed - a host offline at dispatch simply stays due for the next wave.
+  description: Hostnames with no lifecycle row yet, sorted. Exactly the hosts entries whose started is false. Not necessarily failed - a host offline at dispatch simply stays due for the next wave. See started for the invariant that ties these three lists together.
   type: String
-- contextPath: Yara.ScanVerify.states
-  description: Per host, which lifecycle states have been seen since dispatch.
-  type: Unknown
-- contextPath: Yara.ScanVerify.match_rows
-  description: Per host, how many match rows have landed since dispatch. Evidence only - never used to decide the verdict.
-  type: Unknown
-- contextPath: Yara.ScanVerify.error
-  description: Why the verdict is unknown. Empty otherwise.
+- contextPath: Yara.ScanVerify.dispatched_count
+  description: len(dispatched). Published so the War Room report and a playbook can quote the same number.
+  type: Number
+- contextPath: Yara.ScanVerify.started_count
+  description: len(started).
+  type: Number
+- contextPath: Yara.ScanVerify.not_started_count
+  description: len(not_started). 0 when verdict is unknown, because not_started is empty there - read verdict before this.
+  type: Number
+- contextPath: Yara.ScanVerify.match_evidence
+  description: 'observed | none_yet | unavailable | not_attempted, for the wave. A computed roll-up, not a restatement: unavailable dominates, so a failed evidence query can never read as a clean wave, and observed needs only one host to have matched. not_attempted is the lifecycle-failure path, where the match query is never issued at all - it is NOT unavailable, which states that the match query itself ran and failed, and would put a failure in a caller''s context that appears nowhere in errors. Evidence only - it never decides verdict.'
   type: String
+- contextPath: Yara.ScanVerify.match_rows_total
+  description: Match rows across every dispatched host since dispatch. NULL, never 0, whenever nothing was measured - see match_evidence for whether the match query failed or was never issued. Per-host figures are in hosts.match_rows.
+  type: Number
+- contextPath: Yara.ScanVerify.errors
+  description: One object per query that raised this run. Empty on a clean run. A query failure is never evidence a scan failed.
+  type: Unknown
+- contextPath: Yara.ScanVerify.errors.reason
+  description: Why the query failed, from the CLOSED set lifecycle_query_failed | match_query_failed. lifecycle_query_failed - the scan lifecycle read raised; the verdict becomes unknown, never wave_dead. match_query_failed - the match-evidence read raised; the verdict is unaffected, but an absent match count now means 'not known' rather than 'none'.
+  type: String
+- contextPath: Yara.ScanVerify.errors.detail
+  description: The human sentence, including what the failure does and does not mean for the verdict. For reading; branch on reason or fatal.
+  type: String
+- contextPath: Yara.ScanVerify.errors.stage
+  description: 'Which read failed: lifecycle or match_evidence. Present on every entry.'
+  type: String
+- contextPath: Yara.ScanVerify.errors.exception
+  description: The exception text, truncated to 160 characters. Diagnostic only - never match on it.
+  type: String
+- contextPath: Yara.ScanVerify.errors.fatal
+  description: Whether this failure cost us the verdict. True only for lifecycle_query_failed. It folds in the rule a caller would get wrong - that a failed match query removes evidence and nothing else - so nobody has to know which stage is which.
+  type: Boolean
+- contextPath: Yara.ScanVerify.error_count
+  description: len(errors). 0 on a clean run.
+  type: Number
 script: '-'
 system: false
 tags: []

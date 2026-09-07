@@ -51,30 +51,129 @@ commonfields:
 enabled: true
 name: YaraConsolidateApply
 outputs:
+- contextPath: Yara.ConsolidateApply.status
+  description: 'One of "success", "partial_failure", "dry_run" or "skipped_locked". partial_failure means something is in `failed`, and it is reported on a DRY RUN too: the ceiling refusal is the only failure a dry run can produce, dry run is the default mode, and it is the one refusal an operator has to act on - so status must not hide it behind the mode. dry_run therefore means a preview with nothing in `failed`, and the `dry_run` BOOLEAN, not this field, is what says which mode ran. skipped_locked means another run held the consolidation lock and this pass did nothing - see lock_standdown_reason for which of the two lock refusals it was. The single field a playbook should branch on - it saves testing `failed` and `lock_held_by_other_run` separately, and it is the same value written to the yara_scanner_consolidation_runs audit row.'
+  type: String
 - contextPath: Yara.ConsolidateApply.dry_run
-  description: True if this was a dry run.
+  description: 'True unless execute=true was passed. When true nothing was created, written or deleted, and every `written` entry has action=would_write. THE authority on the mode: `status` answers "did anything go wrong" and reads partial_failure on a dry run that refused a group, so a caller that needs to know whether this was a preview reads this key. Authoritative too on the lock-standdown and ceiling-refused paths, where `written` is empty and there is no action field to read.'
   type: Boolean
 - contextPath: Yara.ConsolidateApply.written
-  description: One line per consolidated dataset written.
+  description: One OBJECT per per-ruleset full target written, or in a dry run that WOULD be written. Keys below. Never a preformatted string - branch on the fields.
+  type: Unknown
+- contextPath: Yara.ConsolidateApply.written.action
+  description: Either "wrote" or "would_write". Branch on this rather than on dry_run when you care whether rows actually landed; the two entry shapes used to be distinguishable only by the verb in a sentence.
   type: String
-- contextPath: Yara.ConsolidateApply.rows_written
-  description: Total full rows written across all ruleset groups.
+- contextPath: Yara.ConsolidateApply.written.ruleset
+  description: The ruleset hash the target is keyed on - the trailing _yara_<hash> of every scan_id in it.
+  type: String
+- contextPath: Yara.ConsolidateApply.written.target
+  description: 'The full dataset written: yara_scanner_full_v<VER>_rules_<ruleset>.'
+  type: String
+- contextPath: Yara.ConsolidateApply.written.rows
+  description: Full rows written, or that would be written. AUTHORITATIVE per group; the top-level rows_written is exactly the sum of this field across the list.
   type: Number
-- contextPath: Yara.ConsolidateApply.groups
-  description: How many ruleset groups were produced.
+- contextPath: Yara.ConsolidateApply.written.hosts
+  description: Distinct hosts those rows cover. AUTHORITATIVE per group; the top-level `hosts` is a fleet-wide distinct count over every group, not the sum or the max of this field.
   type: Number
-- contextPath: Yara.ConsolidateApply.hosts
-  description: Largest host count in any one group.
+- contextPath: Yara.ConsolidateApply.written.scans
+  description: Distinct scans the target holds for this ruleset after the pass - the reconciled set, not only the new ones.
+  type: Number
+- contextPath: Yara.ConsolidateApply.written.scans_new
+  description: 'Of `scans`, how many this pass actually added because the target did not already hold them. NULL in a dry run: the target is never read on that path, so how many it already holds is unknown and 0 would be a claim.'
+  type: Number
+- contextPath: Yara.ConsolidateApply.written.stale_rows_removed
+  description: Rows dropped from the target because their scan is superseded - the scanner overwrote that host's matches dataset, so the scan_id is gone from every source. Always 0 while stale-row removal is disabled (see the skipped reasons stale_removal_disabled_*).
   type: Number
 - contextPath: Yara.ConsolidateApply.skipped
-  description: Scans left alone, with the reason.
+  description: One OBJECT per thing left alone, with the reason. Nothing in this list was touched. Three entity kinds share the list - a source dataset, a scan, or a ruleset group - and `reason` is what tells them apart. Keys below.
+  type: Unknown
+- contextPath: Yara.ConsolidateApply.skipped.name
+  description: 'The entity this entry is about: the scan_id for a scan-level skip, "rules <hash>" for a ruleset-level one, or the dataset name for a source that could not be read. Display only - filter on scan_id / ruleset / dataset instead.'
+  type: String
+- contextPath: Yara.ConsolidateApply.skipped.reason
+  description: 'CLOSED vocabulary, one of: scan_in_progress (no terminal lifecycle status yet and younger than retention_hours); quiet_period (finished, but its newest match row is inside quiet_secs, so rows may still be draining); no_rule_hash (the scan_id carries no ruleset hash, so there is no target to group it into); source_unreadable (a host matches dataset could not be read this pass); stale_removal_disabled_bounded (the target holds scans this pass did not observe, but the pass deliberately read only part of the fleet, so nothing was removed); stale_removal_disabled_unreadable (same, but because a source could not be read - a fault, not a choice); target_already_current (the target already holds exactly these scans and nothing is superseded - a verified no-op). Add a code here and to SKIP_REASONS in the script together.'
+  type: String
+- contextPath: Yara.ConsolidateApply.skipped.detail
+  description: The human sentence, including any numbers or truncated error text. Read it, do not match on it - the wording is free to change, `reason` is not.
+  type: String
+- contextPath: Yara.ConsolidateApply.skipped.scan_id
+  description: The scan this entry is about, WHOLE - null for a dataset-level or ruleset-level skip. The prose this replaced truncated the scan_id to 34 characters, which cut off the run_id and the ruleset hash on every real scan.
+  type: String
+- contextPath: Yara.ConsolidateApply.skipped.hostname
+  description: 'The endpoint the scan ran on, as the scanner wrote it: taken from the scan_id where its fixed _yara_<hash> tail parses, and from the rows'' own hostname column where it does not - so a no_rule_hash entry, whose scan_id by definition has no parseable tail, names its host instead of reporting null every time. Null only where no single hostname is knowable: source_unreadable (the read that would have carried it is the one that failed - its `dataset` names the host, in the scanner''s slug_hash form) and the ruleset-level entries, which span the fleet.'
+  type: String
+- contextPath: Yara.ConsolidateApply.skipped.dataset
+  description: 'The dataset implicated: the SOURCE the rows sit in for a scan-level or source_unreadable skip, the consolidated TARGET for a ruleset-level one. Null where none is.'
+  type: String
+- contextPath: Yara.ConsolidateApply.skipped.ruleset
+  description: The ruleset hash, where known - present on ruleset-level entries and on any scan whose scan_id carries one. Null for no_rule_hash and for source_unreadable.
   type: String
 - contextPath: Yara.ConsolidateApply.failed
-  description: Groups that failed or exceeded row_ceiling.
+  description: One OBJECT per ruleset group that did not complete. Non-empty means the pass needs attention; `reason` says whether a re-run will fix it. Keys below.
+  type: Unknown
+- contextPath: Yara.ConsolidateApply.failed.reason
+  description: 'CLOSED vocabulary, one of: row_ceiling_exceeded (the group is larger than row_ceiling and was REFUSED rather than half-filled - nothing was attempted, and a re-run changes nothing until the ceiling is raised or the fleet is summarised instead); target_unreadable (the existing target could not be read, so nothing was written); write_incomplete (a write batch reported 0 rows added part-way through); write_error (the write raised). The first is an operator decision and the last three are retryable - they used to be indistinguishable without parsing English. Add a code here and to FAIL_REASONS in the script together.'
   type: String
-- contextPath: Yara.ConsolidateApply.lock_held_by_other_run
-  description: True if this pass stood down because another run holds the consolidation lock.
+- contextPath: Yara.ConsolidateApply.failed.detail
+  description: The human sentence, including the truncated exception text for write_error. Read it, do not match on it.
+  type: String
+- contextPath: Yara.ConsolidateApply.failed.ruleset
+  description: The ruleset hash of the group that failed.
+  type: String
+- contextPath: Yara.ConsolidateApply.failed.target
+  description: The full dataset the group would have been written to.
+  type: String
+- contextPath: Yara.ConsolidateApply.failed.rows
+  description: 'Rows the group holds: the whole group for row_ceiling_exceeded, target_unreadable and write_error, and the rows this pass was adding for write_incomplete.'
+  type: Number
+- contextPath: Yara.ConsolidateApply.failed.row_ceiling
+  description: The ceiling that refused the group. Populated for row_ceiling_exceeded only - null everywhere else, because no other failure involves it.
+  type: Number
+- contextPath: Yara.ConsolidateApply.failed.rows_added_before_failure
+  description: Rows that had already landed in the target when the write stopped. Populated for write_incomplete only; null elsewhere. A re-run picks up from there.
+  type: Number
+- contextPath: Yara.ConsolidateApply.failed.sources_untouched
+  description: Always true. The only path that deletes a host matches dataset is source retirement, which runs solely after a write has succeeded AND been read back - so every failure leaves the sources intact and re-running is always safe. Carried on the record so a playbook can prove it rather than trusting the documentation.
   type: Boolean
+- contextPath: Yara.ConsolidateApply.targets_written
+  description: len(written). A count beside its list, by house convention - `written` is authoritative.
+  type: Number
+- contextPath: Yara.ConsolidateApply.rows_written
+  description: Total full rows written across all ruleset groups, exactly sum(written[].rows). `written` is authoritative; this is the total the report and the run-log row use.
+  type: Number
+- contextPath: Yara.ConsolidateApply.hosts
+  description: 'Distinct hosts this pass covered, across EVERY ruleset group - written, already-current and ceiling-refused alike. Not a sum or a max of written[].hosts: a host scanned with two rulesets counts once. It was previously the largest host count in any one WRITTEN group, which reported 0 on a fully converged fleet, where every group is already current and nothing is rewritten.'
+  type: Number
+- contextPath: Yara.ConsolidateApply.groups
+  description: How many ruleset groups this pass produced - written, skipped as already-current and failed together. Always >= targets_written.
+  type: Number
+- contextPath: Yara.ConsolidateApply.skipped_count
+  description: len(skipped). A count beside its list - `skipped` is authoritative.
+  type: Number
+- contextPath: Yara.ConsolidateApply.failed_count
+  description: len(failed). A count beside its list - `failed` is authoritative.
+  type: Number
+- contextPath: Yara.ConsolidateApply.sources_retired
+  description: Host matches datasets DELETED this pass because every scan they held was read back out of the consolidated target and counted. Always present, 0 when retirement is off, on every dry run and on a lock standdown. Only ever non-zero when CONFIG_RETIRE_SOURCES_AFTER_FULL is true in the script.
+  type: Number
+- contextPath: Yara.ConsolidateApply.lock_held_by_other_run
+  description: True if this pass stood down because another run holds the consolidation lock. Nothing was read, written or deleted; status is skipped_locked and lock_standdown_reason says which of the two refusals it was.
+  type: Boolean
+- contextPath: Yara.ConsolidateApply.lock_standdown_reason
+  description: 'Why this pass stood down, null on every pass that took the lock. CLOSED vocabulary of two, because acquire_consolidation_lock refuses for two different reasons and the operator response differs: held_by_running_pass (the marker row was readable and another run is genuinely in progress - wait for it to finish) and marker_unreadable (the marker exists but its row could not be read, which is normally the add_data create-lag window moments after another run took it - re-run shortly; a marker that stays unreadable for hours is orphaned by a killed run and must be deleted by hand). The report used to assert the first of these on both paths, so a create-lag race and a real collision rendered identically. Add a code here and to LOCK_STANDDOWN_REASONS in the script together.'
+  type: String
+- contextPath: Yara.ConsolidateApply.datasets_total
+  description: Host matches datasets present for this schema version when the pass started - the whole fleet, not the slice this pass took.
+  type: Number
+- contextPath: Yara.ConsolidateApply.datasets_taken
+  description: Of datasets_total, how many this pass actually read. Bounded by max_datasets, or by the internal row budget when max_datasets is omitted.
+  type: Number
+- contextPath: Yara.ConsolidateApply.datasets_remaining
+  description: 'datasets_total - datasets_taken. THE ONE TO BRANCH ON when draining a large fleet: 0 means this pass covered everything still present, so no further pass is owed and stale-row removal was live. Kept as its own key rather than left as arithmetic because it is the loop condition.'
+  type: Number
+- contextPath: Yara.ConsolidateApply.rows_planned
+  description: Rows this pass expected to read, estimated from one count query before reading. 0 when that estimate was unavailable. Compare with rows_written to see how much of the plan the gate held back.
+  type: Number
 script: |
   """YaraConsolidateApply - FULL consolidation: every column of every matched-file row.
 
@@ -102,7 +201,10 @@ script: |
   Re-running reconciles rather than appends: unchanged hosts are left alone, a re-scanned
   host's rows are replaced, and a run with nothing changed is a verified no-op. Every call
   re-reads tenant-wide state, so run it once per pass rather than speculatively. If another
-  run holds the consolidation lock, this pass stands down and reports lock_held_by_other_run.
+  run holds the consolidation lock, this pass stands down and reports lock_held_by_other_run,
+  with lock_standdown_reason saying WHICH refusal it was - a pass genuinely in progress, or a
+  marker whose row has not landed yet (see LOCK_STANDDOWN_REASONS). The two need different
+  responses from the operator, so the report never states one of them for the other.
 
   ARGUMENTS
     scan_id          Restrict the consolidation to these scan_id(s), comma-separated. Omit to
@@ -114,8 +216,25 @@ script: |
     row_ceiling      Refuse a ruleset group larger than this many rows rather than half-filling
                      the target. This is the pass's only size bound - there is no max_scans
                      argument. Defaults to DEFAULT_FULL_ROW_CEILING (60000).
+    max_datasets     Read at most this many host datasets in one pass, oldest-updated first, so
+                     a large fleet drains in deliberate slices instead of one run that outgrows
+                     the 900s task limit. Omit to read every dataset, sized against
+                     CONFIG_ROWS_PER_PASS. A bounded pass DISABLES stale-row removal - a dataset
+                     it did not read cannot show that a scan was superseded - so run one
+                     unbounded pass periodically to reconcile. datasets_remaining says whether
+                     another pass is owed.
+    quiet_secs       How long a FINISHED scan's newest match row must have been quiet before its
+                     rows are trusted to be complete. Defaults to DEFAULT_QUIET_SECS (900). The
+                     scanner writes its terminal lifecycle row BEFORE draining the uploaders, so
+                     consolidating inside that window copies a partial row set and the loss is
+                     permanent.
     execute          true to create the consolidated dataset and write to it. Anything else,
                      including absent, is a dry run.
+
+  OUTPUT. written / skipped / failed are lists of OBJECTS, not sentences - each carries a
+  `reason` (skipped, failed) or an `action` (written) from a closed vocabulary, plus the human
+  sentence as `detail`. See SKIP_REASONS and FAIL_REASONS, and the .yml, which declares every
+  key including the object keys.
   """
 
   # ############################################################################
@@ -1655,6 +1774,36 @@ script: |
       return candidates, skipped
 
 
+  DATASET_TYPES = ("host_matches", "host_scans", "consolidated_full", "consolidated_summary",
+                   "retired_scan_target", "internal")
+
+  _TYPE_TITLES = (
+      ("host_matches",         "PER-HOST FINDINGS  - latest scan per host, replaced wholesale "
+                               "by the next scan"),
+      # Deliberately does NOT name the rotation setting. That string appears only in the
+      # not_rotated advice below, where it is actionable; printing it on every run tells an
+      # operator whose rotation is already correct to go and change it.
+      ("host_scans",           "PER-HOST SCAN LOG  - lifecycle rows, append-only, one dataset "
+                               "per host per retained month"),
+      ("consolidated_summary", "CONSOLIDATED (SUMMARY) - one row per (host, rule) per ruleset, "
+                               "fleet-wide"),
+      ("consolidated_full",    "CONSOLIDATED (FULL)    - every column of every matched-file row "
+                               "per ruleset, fleet-wide"),
+      ("retired_scan_target",  "RETIRED PER-SCAN TARGETS - from the withdrawn per-scan merge; "
+                               "nothing produces these now"),
+      # NOT the pack's own lock or run record. yara_scanner_consolidation_lock,
+      # yara_scanner_consolidation_runs and yara_scanner_cleanup_runs all fail YARA_OWNED_RE,
+      # so no inventory ever lists them and this bucket has never held one. It is
+      # dataset_type's FALLBACK - a yara-owned name none of the rows above matched - and
+      # calling it "the consolidation lock and run record" had the By type table asserting a
+      # provenance for a dataset whose own record says its origin is unknown.
+      ("internal",             "UNPARSED NAME - a yara_scanner_* name none of the rows above "
+                               "matched; the pack's lock and run-record datasets are not "
+                               "yara-owned and never appear here"),
+  )
+
+  _COUNT_ONLY_TYPES = ("host_scans",)
+
   def dataset_type(name):
       """Which of DATASET_TYPES this dataset is, from the name alone. Never queries."""
       n = str(name or "")
@@ -1673,34 +1822,25 @@ script: |
           return "host_scans"
       return "internal"
 
-  def group_by_type(names, state_of=None):
-      """{type: {"count": n, "names": [...], "by_state": {state: [...]}}}.
+  def group_by_type(names):
+      """{type: {"count": n, "names": [...]}} - the dataset list grouped by what each dataset
+      IS, decided from the name alone.
 
-      ONE place in the context holds the dataset lists. State is nested under the type it
-      belongs to rather than repeated as a parallel top-level key, because every state is a
-      state OF a type - `overwrite` only ever describes a host_matches dataset, `frozen` and
-      `not_rotated` only ever a host_scans one - and publishing both spellings meant the same
-      names appeared two or three times in one context blob, which then hit the display cap
-      and truncated the part an operator actually wanted.
+      A GROUPED VIEW of report_datasets' `datasets` list, never a second copy of the facts on
+      it: the only thing this adds is the grouping. `datasets` is the authoritative record, and
+      by_type[t]["names"] is exactly sorted(d["name"] for d in datasets if d["type"] == t) over
+      the same population - so the two can never answer the same question differently.
+
+      State used to be nested here as well, under "by_state", which published the
+      (name -> state) map twice - once here and once as datasets[].state - and left a reader
+      with no way to tell which spelling to trust. State is carried on the record only.
 
       Every type bucket is present even when empty, so a caller can index it without testing.
-      Within a bucket only the states that actually occur appear, so an empty deployment does
-      not carry six empty state lists per type.
       """
       buckets = {t: [] for t in DATASET_TYPES}
       for n in names or ():
           buckets[dataset_type(n)].append(n)
-      out = {}
-      for t, ns in buckets.items():
-          ns = sorted(ns)
-          entry = {"count": len(ns), "names": ns}
-          if state_of is not None:
-              states = {}
-              for n in ns:
-                  states.setdefault(state_of.get(n) or "unknown", []).append(n)
-              entry["by_state"] = {k: sorted(v) for k, v in sorted(states.items())}
-          out[t] = entry
-      return out
+      return {t: {"count": len(ns), "names": sorted(ns)} for t, ns in buckets.items()}
 
   def render_by_type(current, legacy, newer, now_yyyymm):
       """One table per KIND OF DATASET, so the inventory can be read without knowing the
@@ -1874,69 +2014,115 @@ script: |
       """READ-ONLY inventory of every yara_scanner_* lookup dataset. Issues exactly one API
       call (the dataset listing) and never writes or deletes.
 
-      Returns the rendered text under "report", plus the same information structured for
-      context in three states that need different advice:
-        overwrite     a permanent per-host matches dataset - replaced wholesale at the start
-                      of every scan, so unsuffixed is its correct steady state
-        frozen        unsuffixed, but rotated siblings exist - a pre-rotation leftover
-        not_rotated   unsuffixed with no rotated siblings - rotation is off and it will grow
-        consolidated  a per-scan target (…_v<N>_scan_<slug>) - finished and immutable by design
+      Returns ONE RECORD PER DATASET under "datasets" - the authoritative row, carrying name,
+      type, kind, host, month and age_months alongside a `state` drawn from the closed
+      DATASET_STATES vocabulary, the `detail` sentence that state means for THIS dataset, and
+      the `remedy` an operator would act on (empty for every state that needs no action).
+      Every record carries every key even where one does not apply: a transformer filtering on
+      a sometimes-absent key matches nothing and reports no error, which is a silently empty
+      branch rather than a failure anyone sees.
+
+      The record covers CURRENT, LEGACY and NEWER schema datasets alike - the schema buckets
+      are STATES ("legacy", "newer") rather than separate name lists, so no two keys in this
+      dict answer the same question over different populations. Records are ordered by
+      (state, name), so like sits with like in the context and in the rendered table.
+
+      "by_type" is a grouped VIEW of that same list and nothing more; `datasets` is what to
+      trust. The rendered fixed-width inventory is NOT returned: it is a second spelling of
+      everything here, and the automation renders the War Room's markdown from this dict
+      instead. render_report survives for the CLI, which prints it to a terminal.
       """
       now_yyyymm = now_yyyymm or datetime.date.today().strftime("%Y%m")
       current, legacy, newer = classify_yara_datasets(client)
-      datasets, frozen, not_rotated, consolidated, overwrite = [], [], [], [], []
+      datasets = []
+
+      def _age(info):
+          month = (info or {}).get("month")
+          return months_between(month, now_yyyymm) if month else None
+
+      def _record(name, state, detail, remedy="", info=None):
+          return {"name": name, "type": dataset_type(name),
+                  "kind": (info or {}).get("kind") or "",
+                  "host": (info or {}).get("host") or "",
+                  "month": (info or {}).get("month") or "",
+                  "age_months": _age(info),
+                  "state": state, "detail": detail, "remedy": remedy}
+
       for name in current:
           info = parse_dataset_name(name)
           if info is None:
-              datasets.append({"name": name, "type": dataset_type(name),
-                               "kind": (("full" if "_full_v" in name else "summary")
-                                        if is_pack_output_dataset(name) else ""),
-                               "host": "", "month": "", "age_months": None,
-                               "state": (("full" if "_full_v" in name else "summary")
-                                         if is_pack_output_dataset(name) else "unrecognised")})
+              # NAME_RE deliberately refuses to parse this pack's own consolidated output -
+              # that refusal IS safety rail 5. `type` already says which of the two it is
+              # (consolidated_summary / consolidated_full), so neither `state` nor `kind`
+              # spells that same fact a second time.
+              pack = is_pack_output_dataset(name)
+              datasets.append(_record(
+                  name, "pack_output" if pack else "unrecognised",
+                  "this pack's own consolidated output - a cross-host rollup for one ruleset, "
+                  "not a rotation shard, and never a retention candidate" if pack else
+                  "matches the current-schema name filter but not the yara_scanner naming "
+                  "contract - never a retention candidate, and its origin is unknown"))
               continue
           if info["scan_target"]:
-              state, age = "consolidated", None
-              consolidated.append(name)
+              datasets.append(_record(
+                  name, "consolidated",
+                  "per-scan target from the retired per-scan merge - consolidation output, "
+                  "unrotated by design, finished and not growing; on a tenant that ran that "
+                  "merge it can be the only surviving copy of that scan", info=info))
           elif info["overwrite"]:
-              state, age = "overwrite", None
-              overwrite.append(name)
+              datasets.append(_record(
+                  name, "overwrite",
+                  "permanent per-host matches dataset - the scanner replaces it wholesale at "
+                  "the start of every scan, so it is bounded by that overwrite rather than by "
+                  "rotation and an unsuffixed name is correct here", info=info))
           elif info["month"]:
-              state, age = "rotated", months_between(info["month"], now_yyyymm)
+              datasets.append(_record(
+                  name, "rotated",
+                  "rotation shard for %s, %d month(s) old"
+                  % (info["month"], months_between(info["month"], now_yyyymm)), info=info))
+          elif has_rotated_sibling(name, current):
+              datasets.append(_record(
+                  name, "frozen",
+                  "unsuffixed, but rotated siblings exist for this host - a pre-rotation "
+                  "leftover; writes moved to the dated names, so it is frozen and not growing",
+                  info=info))
           else:
-              age = None
-              if has_rotated_sibling(name, current):
-                  state = "frozen"
-                  frozen.append(name)
-              else:
-                  state = "not_rotated"
-                  not_rotated.append(name)
-          datasets.append({"name": name, "type": dataset_type(name), "kind": info["kind"],
-                           "host": info["host"] or "", "month": info["month"] or "",
-                           "age_months": age, "state": state})
-      state_of = {d["name"]: d.get("state") for d in datasets}
-      for n in legacy:
-          state_of.setdefault(n, "legacy")
-      for n in newer:
-          state_of.setdefault(n, "newer")
-      by_type = group_by_type(current + legacy + newer, state_of)
+              datasets.append(_record(
+                  name, "not_rotated",
+                  "unsuffixed with no rotated sibling - rotation is off for that deployment, "
+                  "so this dataset grows without bound until add_data merge time exceeds the "
+                  "client timeout and it goes write-dead",
+                  remedy='set CONFIG_LOOKUP_ROTATION="monthly" in the scanner',
+                  info=info))
+      for name in legacy:
+          datasets.append(_record(
+              name, "legacy",
+              "on an older or unversioned schema - prunable by YaraCleanup with "
+              "delete_legacy, subject to its own rails", info=parse_dataset_name(name)))
+      for name in newer:
+          datasets.append(_record(
+              name, "newer",
+              "on a HIGHER schema version than the %s this run assumes - never pruned, "
+              "because a host reading a stale version must not delete a future schema's data"
+              % YARA_SCHEMA_VERSION,
+              remedy="raise schema_version to the version the fleet actually writes",
+              info=parse_dataset_name(name)))
+      datasets.sort(key=lambda d: (d["state"], d["name"]))
       return {
           "now_yyyymm": now_yyyymm,
           "schema_version": YARA_SCHEMA_VERSION,
-          "report": render_report(current, legacy, newer, now_yyyymm),
-          # THE dataset breakdown. Split by what each dataset IS, with its state nested
-          # underneath. Nothing else in this dict repeats these names - see group_by_type.
-          "by_type": by_type,
-          "by_type_counts": {t: v["count"] for t, v in by_type.items()},
-          # Per-dataset detail: host, month, age. A different SHAPE, not a second copy of the
-          # lists - this is the only place age_months and month are carried.
+          # THE per-dataset record, and the only place any fact about a dataset is carried.
           "datasets": datasets,
-          # Schema buckets. Orthogonal to type: a legacy dataset still has a type, and pruning
-          # decisions are made on schema version rather than on what the dataset holds.
-          "legacy": legacy, "legacy_count": len(legacy),
-          "newer": newer, "newer_count": len(newer),
+          # A grouped VIEW of `datasets` - count and names per type bucket, so a caller can
+          # branch on "how many host_scans" without walking every record. Same population,
+          # same names; `datasets` is authoritative if the two could ever disagree.
+          "by_type": group_by_type([d["name"] for d in datasets]),
+          # The schema-bucket verdict. Counts rather than lists, because the names are already
+          # on the records: a caller wanting them filters `datasets` on state legacy / newer.
           "current_count": len(current),
-          "total_count": len(current) + len(legacy) + len(newer),
+          "legacy_count": len(legacy),
+          "newer_count": len(newer),
+          "total_count": len(datasets),
       }
 
 
@@ -2253,6 +2439,181 @@ script: |
   DEFAULT_FULL_ROW_CEILING = 60000   # below the ~70k rows where lookup writes were seen to die
 
 
+  # ---------------------------------------------------------------------------------------
+  # RUN RECORDS AND THE WAR ROOM REPORT
+  #
+  # written / skipped / failed are CONTEXT before they are prose: the shipped consolidation
+  # playbook tests isNotEmpty on `failed` and copies it wholesale into an operator flag. So each
+  # entry is an OBJECT with a stable key set and a `reason` drawn from a closed vocabulary, and
+  # the sentence a human reads survives as `detail` rather than BEING the record. Every entry
+  # carries every key even where one does not apply, because a transformer filtering on a key
+  # that is only sometimes present matches nothing and reports no error - the failure mode is a
+  # silently empty branch, which is the worst kind to debug.
+  #
+  # The markdown is rendered FROM the result dict and from nothing else, so the table an
+  # operator reads and the context a playbook branches on cannot disagree. The previous version
+  # joined plain lines and recomputed its header counts from len() expressions the context never
+  # published - which is exactly how a report comes to state a number that is nowhere in context.
+  # It also rendered wrong: XSOAR reads readable_output AS markdown, so single newlines
+  # collapsed and the whole report reflowed into one paragraph.
+  # ---------------------------------------------------------------------------------------
+
+  SKIP_REASONS = {
+      "scan_in_progress":
+          "no terminal lifecycle status yet, and younger than retention_hours - still running",
+      "quiet_period":
+          "finished, but its newest match row is inside the quiet window. The scanner writes its "
+          "terminal row BEFORE the uploaders drain, so rows may still be landing; consolidating "
+          "now would copy a partial set and the loss would be permanent",
+      "no_rule_hash":
+          "the scan_id carries no ruleset hash, so there is no target dataset to group it into",
+      "source_unreadable":
+          "the host matches dataset could not be read this pass",
+      "stale_removal_disabled_bounded":
+          "the target holds scans this pass did not observe, but this pass deliberately read "
+          "only part of the fleet - their absence is not evidence of supersession, so no row "
+          "was removed",
+      "stale_removal_disabled_unreadable":
+          "the target holds scans this pass did not observe, but a source dataset could not be "
+          "read this pass - their absence is not evidence of supersession, so no row was removed",
+      "target_already_current":
+          "the target already holds exactly these scans and nothing is superseded - verified, "
+          "not rewritten",
+  }
+
+  FAIL_REASONS = {
+      "row_ceiling_exceeded":
+          "the group is larger than row_ceiling, so it was REFUSED rather than half-filled. "
+          "Nothing was attempted - this is an operator decision, not a transient fault",
+      "target_unreadable": "the existing target could not be read, so nothing was written",
+      "write_incomplete": "a write batch reported 0 rows added part-way through",
+      "write_error": "the write raised",
+  }
+
+  # Why a pass stood down on the lock. acquire_consolidation_lock refuses for TWO different
+  # reasons and returns the same False for both, and the report used to assert the first of
+  # them unconditionally - so a create-lag race and a genuine collision rendered
+  # byte-identically and an operator could not tell "another pass is running" from "another
+  # pass started a second ago and its marker row has not landed yet". The two need different
+  # responses: the first says wait for the pass, the second says re-run in a minute, and a
+  # marker that stays unreadable for hours is an orphan to delete by hand.
+  LOCK_STANDDOWN_REASONS = {
+      "held_by_running_pass":
+          "the consolidation lock is held by another concurrent run",
+      "marker_unreadable":
+          "the consolidation lock marker exists but its row could not be read - most likely "
+          "another run created it moments ago (add_data create-lag)",
+  }
+
+
+  def _lock_standdown_reason(messages):
+      """Which of acquire_consolidation_lock's two refusals this was, from what it logged.
+
+      acquire_consolidation_lock is byte-gated across five automations (it is in
+      _SHARED_GATE_FUNCS), so it cannot be given a return code to say which branch refused;
+      what it CAN be asked for is the message it wrote, since the caller supplies the log sink.
+      Exactly one of the two refusal branches logs before returning False, and only the
+      unreadable-marker one says so - the takeover branch that also uses that word returns True
+      and never reaches here.
+
+      An empty message list is not classified as either: a standdown we cannot explain must not
+      be reported as one we can. It yields None, and the renderer says only that the lock could
+      not be taken.
+      """
+      for m in messages or ():
+          if "unreadable" in str(m):
+              return "marker_unreadable"
+      return "held_by_running_pass" if messages else None
+
+
+  def _skipped_record(reason, detail, scan_id=None, hostname=None, dataset=None, ruleset=None):
+      """One `skipped` entry. `dataset` is the SOURCE the rows live in for a scan-level skip and
+      the TARGET for a ruleset-level one; it is None only where no dataset is implicated.
+
+      scan_id is carried WHOLE. The prose this replaced truncated it to 34 characters, which is
+      shorter than any real scan_id - the run_id and the ruleset hash were always cut off, so
+      the identity could not be recovered from the sentence at all."""
+      return {"name": scan_id or (("rules %s" % ruleset) if ruleset else (dataset or "")),
+              "reason": reason, "detail": detail, "scan_id": scan_id, "hostname": hostname,
+              "dataset": dataset, "ruleset": ruleset}
+
+
+  def _failed_record(reason, detail, ruleset=None, target=None, rows=None, row_ceiling=None,
+                     rows_added_before_failure=None):
+      """One `failed` entry.
+
+      `reason` is what separates a ceiling REFUSAL - nothing attempted, the operator must pick a
+      different mode or raise the ceiling - from a transient write fault that a re-run fixes.
+      The playbook raises one flag for both, and before this they were distinguishable only by
+      reading English.
+
+      sources_untouched is asserted rather than computed: the only path in this automation that
+      deletes a source is _retire_consolidated_sources, which runs solely inside the branch where
+      a write succeeded AND was read back. Every failure therefore leaves the host datasets
+      intact and a re-run is always safe - a playbook can now prove that from the record instead
+      of trusting the docs."""
+      return {"reason": reason, "detail": detail, "ruleset": ruleset, "target": target,
+              "rows": rows, "row_ceiling": row_ceiling,
+              "rows_added_before_failure": rows_added_before_failure,
+              "sources_untouched": True}
+
+
+  def _written_record(action, ruleset, target, rows, hosts, scans, scans_new=None,
+                      stale_rows_removed=0):
+      """One `written` entry. `action` is the field a playbook branches on - "would_write" or
+      "wrote" - so it never has to read a verb out of a sentence to learn whether anything really
+      landed. The dry-run and execute sentences used to carry DIFFERENT fact sets, so a caller
+      parsing one silently mis-read the other.
+
+      scans_new is None in a dry run, not 0: the target is never read on that path, so how many
+      of these scans it already holds is genuinely unknown and reporting 0 would be a claim.
+
+      No `detail` here on purpose - every fact on this record is a field, so a sentence would
+      only restate them, and a rendered-text key beside the data it renders is the duplication
+      this rework exists to remove."""
+      return {"action": action, "ruleset": ruleset, "target": target,
+              "rows": int(rows), "hosts": int(hosts), "scans": int(scans),
+              "scans_new": scans_new, "stale_rows_removed": int(stale_rows_removed)}
+
+
+  def _source_dataset_of(scan_id, src_of):
+      """The source dataset a scan's rows were READ from this pass, or None.
+
+      Taken from the mapping recorded at the read rather than re-derived from the hostname, so a
+      skipped record names the dataset the rows actually came from and costs no query. A scan can
+      legitimately span more than one dataset (a host holding both its live overwrite dataset and
+      a leftover month-suffixed one); the first by name is reported, and `hostname` on the same
+      record is what identifies the host itself."""
+      dss = sorted(src_of.get(scan_id) or ())
+      return dss[0] if dss else None
+
+
+  def _hostname_of(scan_id, by_scan):
+      """The endpoint a scan ran on, from the scan_id where it parses and from the ROWS where it
+      does not.
+
+      _host_of_scan_id resolves the host by matching and stripping the fixed
+      `_YYYYMMDD_HHMMSS_micros_yara_<hash>` tail, which means it returns None for precisely the
+      scan_ids that have no ruleset hash - the input of the `no_rule_hash` skip. So that reason,
+      the one skip whose whole complaint is that the scan_id is malformed, reported
+      `hostname: null` on every single entry while the yml promised null only "where no single
+      host is implicated". One host is implicated, and this pass has already read its rows.
+
+      The rows carry the hostname column the scanner wrote, which is the same value the scan_id
+      was minted from and the same value _shard_host_of maps to the dataset name. A scan_id is
+      per-host by construction, so the first non-empty hostname across its rows is the host;
+      if the rows are gone or carry none, this yields None and the caller reports null honestly.
+      """
+      host = _host_of_scan_id(scan_id)
+      if host:
+          return host
+      for r in (by_scan or {}).get(scan_id) or ():
+          hn = r.get("hostname")
+          if hn:
+              return str(hn)
+      return None
+
+
   def consolidate_full(client, ver="4", only_scan_ids=None, retention_hours=24.0,
                        row_ceiling=DEFAULT_FULL_ROW_CEILING, execute=False,
                        now_ms=None, quiet_secs=DEFAULT_QUIET_SECS, max_datasets=None,
@@ -2269,19 +2630,43 @@ script: |
       cutoff_ms = float(retention_hours) * 3600 * 1000
       only = set(only_scan_ids or []) or None
       written, skipped, failed = [], [], []
-      result = {"dry_run": not execute, "written": written, "skipped": skipped,
-                "failed": failed, "rows_written": 0, "hosts": 0, "groups": 0,
+      result = {"status": "dry_run" if not execute else "success",
+                "dry_run": not execute, "written": written, "skipped": skipped,
+                "failed": failed,
+                "targets_written": 0, "skipped_count": 0, "failed_count": 0,
+                "rows_written": 0, "hosts": 0, "groups": 0,
                 "lock_held_by_other_run": False,
+                # WHY the pass stood down, not just that it did. Always present and null on
+                # every path that took the lock, so a consumer can read it without testing
+                # for the key first. See LOCK_STANDDOWN_REASONS.
+                "lock_standdown_reason": None,
+                # ALWAYS present, even at 0. It used to be set only where retirement reached its
+                # tail - absent on every dry run, every lock standdown and every unreadable
+                # target - and a transformer filtering on a sometimes-absent key matches nothing
+                # and reports no error.
+                "sources_retired": 0,
                 # Progress across passes, so a caller can loop until it is done rather than
                 # guessing how many runs a fleet needs. datasets_remaining is the one to branch
                 # on: 0 means this pass covered everything still present.
                 "datasets_total": 0, "datasets_taken": 0, "datasets_remaining": 0,
                 "rows_planned": 0}
 
+      # The lock's own log lines are captured as well as forwarded: acquire_consolidation_lock
+      # returns a bare False for two different refusals, and the message it writes is the only
+      # thing that separates them. Reporting one of them as though it were the other is exactly
+      # the confidently-wrong line this report exists to stop making.
+      lock_msgs = []
+
+      def _lock_log(m):
+          lock_msgs.append(m)
+          log(m)
+
       if execute and not acquire_consolidation_lock(
-              client, log=log, now_ms=now_ms, holder="YaraConsolidateApply",
+              client, log=_lock_log, now_ms=now_ms, holder="YaraConsolidateApply",
               unreadable_is_held=True):
           result["lock_held_by_other_run"] = True
+          result["status"] = "skipped_locked"
+          result["lock_standdown_reason"] = _lock_standdown_reason(lock_msgs)
           return result
       try:
           names = _list_yara_datasets(client)
@@ -2385,7 +2770,12 @@ script: |
                   try:
                       rows = _rows_of(ds, client)
                   except Exception as e:
-                      skipped.append("%s: unreadable (%s)" % (ds, str(e)[:110]))
+                      skipped.append(_skipped_record(
+                          "source_unreadable",
+                          "%s could not be read this pass (%s), so the scans it holds were "
+                          "neither consolidated nor counted as superseded"
+                          % (ds, str(e)[:110]),
+                          dataset=ds))
                       sources_complete = False
                       reads_reliable = False
                       continue
@@ -2432,16 +2822,20 @@ script: |
               quiet = bool(newest.get(sid)) and (now_ms - newest[sid]) >= quiet_secs * 1000
               aged = bool(newest.get(sid)) and (now_ms - newest[sid]) >= cutoff_ms
               if not (terminal and quiet) and not aged:
-                  skipped.append(
-                      "%s: %s - left alone"
-                      % (str(sid)[:34],
-                         "finished, but its newest row is inside the %ds quiet period (rows "
-                         "may still be draining)" % quiet_secs if terminal
-                         else "scan still in progress"))
+                  skipped.append(_skipped_record(
+                      "quiet_period" if terminal else "scan_in_progress",
+                      ("finished, but its newest row is inside the %ds quiet period (rows may "
+                       "still be draining) - left alone" % quiet_secs) if terminal
+                      else "scan still in progress - left alone",
+                      scan_id=sid, hostname=_hostname_of(sid, by_scan),
+                      dataset=_source_dataset_of(sid, src_of), ruleset=rule_hash_of(sid)))
                   continue
               rh = rule_hash_of(sid)
               if not rh:
-                  skipped.append("%s: no ruleset hash in scan_id - cannot be grouped" % str(sid)[:34])
+                  skipped.append(_skipped_record(
+                      "no_rule_hash", "no ruleset hash in scan_id - cannot be grouped",
+                      scan_id=sid, hostname=_hostname_of(sid, by_scan),
+                      dataset=_source_dataset_of(sid, src_of)))
                   continue
               g = groups.setdefault(rh, {"rows": [], "sids": set(), "hosts": set()})
               g["rows"].extend(by_scan[sid])
@@ -2455,21 +2849,20 @@ script: |
               target = full_target_for_rules(ver, rh)
               rows = [_coerce_row(r, schema) for r in g["rows"]]
               desired = set(g["sids"])
-              label = "rules %s" % rh
 
               if row_ceiling and len(rows) > row_ceiling:
-                  failed.append("%s: %d row(s) exceeds the full-consolidation ceiling of %d - "
-                                "REFUSED rather than half-filling %s. Use "
-                                "YaraConsolidateSummary for a fleet this size, or raise "
-                                "row_ceiling deliberately."
-                                % (label, len(rows), row_ceiling, target))
+                  failed.append(_failed_record(
+                      "row_ceiling_exceeded",
+                      "%d row(s) exceeds the full-consolidation ceiling of %d - REFUSED rather "
+                      "than half-filling %s. Use YaraConsolidateSummary for a fleet this size, "
+                      "or raise row_ceiling deliberately."
+                      % (len(rows), row_ceiling, target),
+                      ruleset=rh, target=target, rows=len(rows), row_ceiling=row_ceiling))
                   continue
 
               if not execute:
-                  written.append("%s: WOULD write %d full row(s) from %d host(s) / %d scan(s) "
-                                 "-> %s" % (label, len(rows), len(g["hosts"]), len(desired), target))
-                  result["rows_written"] += len(rows)
-                  result["hosts"] = max(result["hosts"], len(g["hosts"]))
+                  written.append(_written_record("would_write", rh, target, len(rows),
+                                                 len(g["hosts"]), len(desired)))
                   continue
 
               held = set()
@@ -2480,8 +2873,11 @@ script: |
                           if r.get("scan_id"):
                               held.add(str(r.get("scan_id")))
                   except Exception as e:
-                      failed.append("%s: could not read existing target %s (%s) - NOT written"
-                                    % (label, target, str(e)[:100]))
+                      failed.append(_failed_record(
+                          "target_unreadable",
+                          "could not read the existing target %s (%s) - NOT written"
+                          % (target, str(e)[:100]),
+                          ruleset=rh, target=target, rows=len(rows)))
                       continue
               # held - OBSERVED, never held - desired: see the `observed` note above. With any
               # source unread, nothing is provably superseded, so nothing is removed.
@@ -2498,13 +2894,19 @@ script: |
                       why_skipped = ("this pass deliberately read only part of the fleet"
                                      if reads_reliable else
                                      "a source dataset could not be read this pass")
-                      skipped.append("%s: stale-row removal SKIPPED - %s, so a scan missing from "
-                                     "the sources is not evidence it was superseded"
-                                     % (label, why_skipped))
+                      skipped.append(_skipped_record(
+                          "stale_removal_disabled_bounded" if reads_reliable
+                          else "stale_removal_disabled_unreadable",
+                          "stale-row removal SKIPPED - %s, so a scan missing from the sources "
+                          "is not evidence it was superseded" % why_skipped,
+                          dataset=target, ruleset=rh))
               fresh = sorted(desired - held)
               if held and not stale and not fresh:
-                  skipped.append("%s: target already current for %d scan(s) across %d host(s) "
-                                 "- verified, not rewritten" % (label, len(desired), len(g["hosts"])))
+                  skipped.append(_skipped_record(
+                      "target_already_current",
+                      "target already current for %d scan(s) across %d host(s) - verified, not "
+                      "rewritten" % (len(desired), len(g["hosts"])),
+                      dataset=target, ruleset=rh))
                   # Retire here too. "Already current" is the strongest form of verified there
                   # is - the target holds these scans and this pass just confirmed it - and
                   # retiring only after a WRITE meant a source consolidated by an earlier pass
@@ -2541,11 +2943,9 @@ script: |
                           break
                       added += got
                   if ok:
-                      written.append("%s: wrote %d full row(s) for %d new scan(s), dropped %d "
-                                     "stale row(s) -> %s (%d host(s) total)"
-                                     % (label, added, len(fresh), removed, target, len(g["hosts"])))
-                      result["rows_written"] += added
-                      result["hosts"] = max(result["hosts"], len(g["hosts"]))
+                      written.append(_written_record(
+                          "wrote", rh, target, added, len(g["hosts"]), len(desired),
+                          scans_new=len(fresh), stale_rows_removed=removed))
                       # Only now, with the rows written, is it safe to consider retiring the
                       # sources they came from - and only after reading them back.
                       if CONFIG_RETIRE_SOURCES_AFTER_FULL:
@@ -2553,17 +2953,55 @@ script: |
                               client, target, fresh, by_scan, src_of, existing,
                               reads_reliable, log, result)
                   else:
-                      failed.append("%s: write to %s returned 0 rows added after %d - re-run to "
-                                    "retry (host datasets untouched)" % (label, target, added))
+                      failed.append(_failed_record(
+                          "write_incomplete",
+                          "write to %s returned 0 rows added after %d - re-run to retry (host "
+                          "datasets untouched)" % (target, added),
+                          ruleset=rh, target=target, rows=len(add_rows),
+                          rows_added_before_failure=added))
               except Exception as e:
-                  failed.append("%s: %s - host datasets untouched" % (label, str(e)[:140]))
+                  failed.append(_failed_record(
+                      "write_error",
+                      "%s - host datasets untouched" % str(e)[:140],
+                      ruleset=rh, target=target, rows=len(rows)))
           result["groups"] = len(groups)
+          # Distinct hosts this pass GROUPED, across every ruleset group - written,
+          # already-current and refused alike. The old key was a max over written groups only,
+          # so a fully converged fleet - the steady state this automation exists to reach, where
+          # every group takes the already-current branch - reported 0 hosts on a complete
+          # success. Per-group host counts live on each `written` record.
+          result["hosts"] = len({h for g in groups.values() for h in g["hosts"] if h})
       finally:
           if execute:
               try:
                   release_consolidation_lock(client, log=log)
               except Exception as e:
                   log("lock release failed: %s" % e)
+
+      # Sorted so like sits with like: a 200-host pass skips in runs of one reason, and an
+      # operator reading the table wants the entries that failed the gate for a DIFFERENT
+      # reason to be adjacent rather than scattered through the scan_id ordering.
+      skipped.sort(key=lambda r: (r["reason"], r["name"]))
+      failed.sort(key=lambda r: (r["reason"], r["ruleset"] or ""))
+
+      # Derived from the lists themselves rather than accumulated alongside them, so the total
+      # and its operands cannot drift: rows_written is exactly sum(w["rows"] for w in written),
+      # and each operand is now a field on a record instead of a number embedded in a sentence.
+      result["rows_written"] = sum(int(w["rows"]) for w in written)
+      result["targets_written"] = len(written)
+      result["skipped_count"] = len(skipped)
+      result["failed_count"] = len(failed)
+      # partial_failure is decided by `failed`, NOT by the mode. It used to be set only on the
+      # executing path, so a dry run that REFUSED a ruleset group still reported status
+      # "dry_run" - and the yml says status is the single field to branch on, saving a caller
+      # from testing `failed` separately. Dry run is the DEFAULT mode and row_ceiling_exceeded
+      # is the only failure reachable on it, so the one refusal an operator has to act on was
+      # exactly the one status hid. `dry_run` (the boolean) remains authoritative for the mode;
+      # status now answers "did anything go wrong", on both paths, which is what it claims to.
+      if failed:
+          result["status"] = "partial_failure"
+      elif not result["dry_run"]:
+          result["status"] = "success"
       return result
 
 
@@ -2606,6 +3044,164 @@ script: |
               "only copy)" % n)
 
 
+  _MD_ROW_CAP = 50
+
+
+  def _n(v):
+      """Thousands-separated. The numbers this reports run to six figures.
+
+      Integral values print as integers, floats included: the settings arrive as
+      float(args.get(...)), and "900.0" in a table reads as a typo rather than a default.
+
+      A NON-integral float keeps its fraction. The previous version went through int(), which
+      silently truncated - a quiet_secs of 900.5 printed as 900 while the context carried 900.5,
+      so the report and the context stated different numbers. That is the one disagreement this
+      renderer exists to make impossible, and it was being introduced by the formatter itself.
+      """
+      try:
+          f = float(v)
+      except (TypeError, ValueError):
+          return str(v)
+      return format(int(f), ",d") if f.is_integer() else format(f, ",g")
+
+
+  def _md_table(headers, rows):
+      """A markdown table, or "" when there is nothing to put in it. Cells are escaped: rule
+      names and hostnames reach here from a ruleset and from an endpoint, and a single pipe in
+      either would silently shear a column off every row below it."""
+      if not rows:
+          return ""
+
+      def cell(v):
+          return str("" if v is None else v).replace("|", "\\|").replace("\n", " ")
+
+      out = ["| " + " | ".join(cell(h) for h in headers) + " |",
+             "|" + "|".join("---" for _ in headers) + "|"]
+      for r in rows:
+          out.append("| " + " | ".join(cell(v) for v in r) + " |")
+      return "\n".join(out)
+
+
+  def _md_capped(headers, rows, context_key):
+      """_md_table, truncated. The context keeps every entry, so a 200-host pass cannot push the
+      counts off the top of the War Room - the same trade YaraReport makes for the scan log."""
+      body = _md_table(headers, rows[:_MD_ROW_CAP])
+      if len(rows) > _MD_ROW_CAP:
+          body += ("\n\n_... and %s more - the full list is in `%s`._"
+                   % (_n(len(rows) - _MD_ROW_CAP), context_key))
+      return body
+
+
+  def render_run_markdown(result, lock_events=()):
+      """The War Room report for one pass, rendered from the result dict alone.
+
+      Every number here is read from a published key, so the table an operator reads and the
+      context a playbook branches on cannot disagree. The version this replaced recomputed its
+      header counts from len() expressions the context never carried.
+
+      `lock_events` is rendered on EVERY path, the standdown included. It used to be dropped
+      there by an early return - so the one report whose entire content is "another run has the
+      lock" was also the one that withheld the lock diagnostics main() had already collected for
+      it, and the two very different standdowns rendered byte-identically."""
+      def _with_lock_events(lines):
+          if lock_events:
+              lines = list(lines) + ["", "#### Lock events"] + ["- %s" % m for m in lock_events]
+          return "\n".join(lines)
+
+      if result.get("lock_held_by_other_run"):
+          # Stated from the reason the lock refusal actually recorded. Asserting contention on
+          # both paths made a create-lag race - which clears itself in about a minute - read as
+          # a pass that is genuinely running, and a marker orphaned by a killed run read as
+          # either.
+          why = LOCK_STANDDOWN_REASONS.get(
+              result.get("lock_standdown_reason"),
+              "the consolidation lock could not be taken")
+          return _with_lock_events(
+              ["### YARA full consolidation - STOOD DOWN", "",
+               "_Skipped this pass: %s. Nothing was read, created, written or deleted._" % why])
+
+      dry = bool(result.get("dry_run"))
+      verb = "would be written" if dry else "written"
+      if not dry:
+          lead = "Per-ruleset full targets were created and written."
+      elif not result["failed"]:
+          lead = ("Nothing was created or written. Re-run with `execute=true` to apply exactly "
+                  "this.")
+      else:
+          # A preview holding a refusal is not a preview of a clean run, so it must not offer
+          # to "apply exactly this" - for the refused group an executing re-run would refuse
+          # identically. Which sentence gets made is decided by the REASON codes on the records
+          # rather than by "it is a dry run, so it must have been the ceiling": the ceiling is
+          # the only failure a dry run can reach today, and a claim about what a re-run will do
+          # has to stay true if that ever stops being so.
+          refused = [f for f in result["failed"]
+                     if (f or {}).get("reason") == "row_ceiling_exceeded"]
+          if len(refused) == result["failed_count"]:
+              lead = ("Nothing was created or written, and %s ruleset group(s) were REFUSED "
+                      "outright - see **Failed** below. An `execute=true` re-run refuses them "
+                      "again until the ceiling is raised or the fleet is summarised instead."
+                      % _n(result["failed_count"]))
+          else:
+              lead = ("Nothing was created or written, and %s ruleset group(s) did not "
+                      "complete even as a preview - see **Failed** below." % _n(
+                          result["failed_count"]))
+      out = ["### YARA full consolidation - %s" % ("DRY RUN" if dry else "EXECUTED"),
+             "_Every column of every matched-file row, grouped by ruleset. %s_" % lead,
+             ""]
+
+      facts = [
+          ("Outcome", "`%s`" % result["status"]),
+          ("Targets", "%s %s" % (_n(result["targets_written"]), verb)),
+          ("Rows", "%s %s" % (_n(result["rows_written"]), verb)),
+          ("Ruleset groups", _n(result["groups"])),
+          ("Hosts covered", _n(result["hosts"])),
+          ("Skipped", _n(result["skipped_count"])),
+          ("Failed", _n(result["failed_count"])),
+          ("Source datasets", _sources_line(result)),
+          ("Fleet progress", _progress_line(result)),
+      ]
+      out.append(_md_table(["", ""], [("**%s**" % k, v) for k, v in facts]))
+
+      if result["written"]:
+          if dry:
+              out += ["", "#### Would write",
+                      _md_capped(["Ruleset", "Rows", "Hosts", "Scans", "Target"],
+                                 [(w["ruleset"], _n(w["rows"]), _n(w["hosts"]), _n(w["scans"]),
+                                   "`%s`" % w["target"]) for w in result["written"]],
+                                 "Yara.ConsolidateApply.written")]
+          else:
+              out += ["", "#### Written",
+                      _md_capped(["Ruleset", "Rows", "Hosts", "Scans", "New scans",
+                                  "Stale rows dropped", "Target"],
+                                 [(w["ruleset"], _n(w["rows"]), _n(w["hosts"]), _n(w["scans"]),
+                                   _n(w["scans_new"]), _n(w["stale_rows_removed"]),
+                                   "`%s`" % w["target"]) for w in result["written"]],
+                                 "Yara.ConsolidateApply.written")]
+
+      if result["skipped"]:
+          out += ["", "#### Skipped - nothing was touched",
+                  _md_capped(["Scan or ruleset", "Dataset", "Reason", "Detail"],
+                             [(s["name"], ("`%s`" % s["dataset"]) if s["dataset"] else "-",
+                               "`%s`" % s["reason"], s["detail"]) for s in result["skipped"]],
+                             "Yara.ConsolidateApply.skipped")]
+
+      if result["failed"]:
+          out += ["", "#### Failed",
+                  _md_capped(["Ruleset", "Target", "Reason", "Detail"],
+                             [(f["ruleset"] or "-",
+                               ("`%s`" % f["target"]) if f["target"] else "-",
+                               "`%s`" % f["reason"], f["detail"]) for f in result["failed"]],
+                             "Yara.ConsolidateApply.failed"),
+                  "", "_Host matches datasets are untouched in every one of these cases - a "
+                      "source is only ever retired after its rows are read back out of the "
+                      "target - so re-running is always safe. `row_ceiling_exceeded` is the "
+                      "one that will not fix itself: nothing was attempted, and the group "
+                      "stays refused until the ceiling is raised or the fleet is summarised "
+                      "instead._"]
+
+      return _with_lock_events(out)
+
+
   def main():
       args = demisto.args()
       scan_ids = argToList(args.get("scan_id")) or None
@@ -2645,44 +3241,29 @@ script: |
       if execute:
           # A pass that stood down on the lock did NO work, and recording that as "success"
           # made it indistinguishable from a genuine no-op in the run log - the exact question
-          # the log exists to answer. It gets its own status.
-          if result.get("lock_held_by_other_run"):
-              status = "skipped_locked"
-          elif result["failed"]:
-              status = "partial_failure"
-          else:
-              status = "success"
+          # the log exists to answer. It gets its own status, and that status is now the same
+          # published `status` key a playbook reads, rather than a second expression computed
+          # here that could disagree with it.
           record_consolidation_run(
-              client, status,
-              result={"consolidated_count": len(result["written"]),
-                      "failed_count": len(result["failed"]),
-                      "failed_scan_ids": [], "failed_reasons": {}},
+              client, result["status"],
+              result={"consolidated_count": result["targets_written"],
+                      "failed_count": result["failed_count"],
+                      # Apply fails per RULESET, not per scan, so failed_scan_ids stays empty
+                      # and the reasons are keyed by ruleset hash. The column used to be
+                      # hardcoded {} even on a partial_failure, which made the queryable audit
+                      # trail assert that nothing had failed on every failing run.
+                      "failed_scan_ids": [],
+                      "failed_reasons": {(f["ruleset"] or f["target"] or "?"): f["reason"]
+                                         for f in result["failed"]}},
               log=lambda *a: None)
 
-      if result.get("lock_held_by_other_run"):
-          lines = ["Skipped this pass - the consolidation lock is held by another concurrent run."]
-      else:
-          head = "DRY RUN - nothing was created or written." if result["dry_run"] else "EXECUTED."
-          lines = ["%s  FULL consolidation: every column of every matched-file row." % head,
-                   "dataset(s): %d | rows: %d | skipped: %d | failed: %d"
-                   % (len(result["written"]), result["rows_written"],
-                      len(result["skipped"]), len(result["failed"])),
-                   _sources_line(result),
-                   _progress_line(result)]
-          for label, items in (("WRITTEN", result["written"]), ("SKIPPED", result["skipped"]),
-                               ("FAILED", result["failed"])):
-              if items:
-                  lines += ["", "%s:" % label] + ["  %s" % x for x in items]
-
-      # Filter FIRST: a dry run takes no lock, so the header would otherwise print with
+      # Filter FIRST: a dry run takes no lock, so the heading would otherwise print with
       # nothing under it and read as a section that failed to render.
       lock_events = [m for m in log_lines if "lock" in m.lower()]
-      if lock_events:
-          lines += ["", "lock events:"] + ["  %s" % m for m in lock_events]
       # List-valued context is APPENDED to across repeated calls in one investigation;
       # clear it first so written/skipped/failed never carries a prior call's entries.
       demisto.executeCommand("DeleteContext", {"key": "Yara.ConsolidateApply"})
-      return_results(CommandResults(readable_output="\n".join(lines),
+      return_results(CommandResults(readable_output=render_run_markdown(result, lock_events),
                                     outputs_prefix="Yara.ConsolidateApply",
                                     outputs=result, raw_response=result))
 

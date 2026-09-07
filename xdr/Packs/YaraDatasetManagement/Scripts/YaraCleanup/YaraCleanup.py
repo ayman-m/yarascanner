@@ -1143,6 +1143,36 @@ def select_legacy_for_deletion(legacy_names, newer_names=(), now_yyyymm=None):
     return candidates, skipped
 
 
+DATASET_TYPES = ("host_matches", "host_scans", "consolidated_full", "consolidated_summary",
+                 "retired_scan_target", "internal")
+
+_TYPE_TITLES = (
+    ("host_matches",         "PER-HOST FINDINGS  - latest scan per host, replaced wholesale "
+                             "by the next scan"),
+    # Deliberately does NOT name the rotation setting. That string appears only in the
+    # not_rotated advice below, where it is actionable; printing it on every run tells an
+    # operator whose rotation is already correct to go and change it.
+    ("host_scans",           "PER-HOST SCAN LOG  - lifecycle rows, append-only, one dataset "
+                             "per host per retained month"),
+    ("consolidated_summary", "CONSOLIDATED (SUMMARY) - one row per (host, rule) per ruleset, "
+                             "fleet-wide"),
+    ("consolidated_full",    "CONSOLIDATED (FULL)    - every column of every matched-file row "
+                             "per ruleset, fleet-wide"),
+    ("retired_scan_target",  "RETIRED PER-SCAN TARGETS - from the withdrawn per-scan merge; "
+                             "nothing produces these now"),
+    # NOT the pack's own lock or run record. yara_scanner_consolidation_lock,
+    # yara_scanner_consolidation_runs and yara_scanner_cleanup_runs all fail YARA_OWNED_RE,
+    # so no inventory ever lists them and this bucket has never held one. It is
+    # dataset_type's FALLBACK - a yara-owned name none of the rows above matched - and
+    # calling it "the consolidation lock and run record" had the By type table asserting a
+    # provenance for a dataset whose own record says its origin is unknown.
+    ("internal",             "UNPARSED NAME - a yara_scanner_* name none of the rows above "
+                             "matched; the pack's lock and run-record datasets are not "
+                             "yara-owned and never appear here"),
+)
+
+_COUNT_ONLY_TYPES = ("host_scans",)
+
 def dataset_type(name):
     """Which of DATASET_TYPES this dataset is, from the name alone. Never queries."""
     n = str(name or "")
@@ -1161,34 +1191,25 @@ def dataset_type(name):
         return "host_scans"
     return "internal"
 
-def group_by_type(names, state_of=None):
-    """{type: {"count": n, "names": [...], "by_state": {state: [...]}}}.
+def group_by_type(names):
+    """{type: {"count": n, "names": [...]}} - the dataset list grouped by what each dataset
+    IS, decided from the name alone.
 
-    ONE place in the context holds the dataset lists. State is nested under the type it
-    belongs to rather than repeated as a parallel top-level key, because every state is a
-    state OF a type - `overwrite` only ever describes a host_matches dataset, `frozen` and
-    `not_rotated` only ever a host_scans one - and publishing both spellings meant the same
-    names appeared two or three times in one context blob, which then hit the display cap
-    and truncated the part an operator actually wanted.
+    A GROUPED VIEW of report_datasets' `datasets` list, never a second copy of the facts on
+    it: the only thing this adds is the grouping. `datasets` is the authoritative record, and
+    by_type[t]["names"] is exactly sorted(d["name"] for d in datasets if d["type"] == t) over
+    the same population - so the two can never answer the same question differently.
+
+    State used to be nested here as well, under "by_state", which published the
+    (name -> state) map twice - once here and once as datasets[].state - and left a reader
+    with no way to tell which spelling to trust. State is carried on the record only.
 
     Every type bucket is present even when empty, so a caller can index it without testing.
-    Within a bucket only the states that actually occur appear, so an empty deployment does
-    not carry six empty state lists per type.
     """
     buckets = {t: [] for t in DATASET_TYPES}
     for n in names or ():
         buckets[dataset_type(n)].append(n)
-    out = {}
-    for t, ns in buckets.items():
-        ns = sorted(ns)
-        entry = {"count": len(ns), "names": ns}
-        if state_of is not None:
-            states = {}
-            for n in ns:
-                states.setdefault(state_of.get(n) or "unknown", []).append(n)
-            entry["by_state"] = {k: sorted(v) for k, v in sorted(states.items())}
-        out[t] = entry
-    return out
+    return {t: {"count": len(ns), "names": sorted(ns)} for t, ns in buckets.items()}
 
 def render_by_type(current, legacy, newer, now_yyyymm):
     """One table per KIND OF DATASET, so the inventory can be read without knowing the
@@ -1329,7 +1350,14 @@ _CLEANUP_RUNS_SCHEMA = {
 
 def record_cleanup_run(client, result, now_ms=None, log=print):
     """Best-effort: write ONE row per prune pass. Every exception is caught and only logged -
-    failing to write this row must never replace the run's real outcome."""
+    failing to write this row must never replace the run's real outcome.
+
+    skipped_reasons carries (name, reason) only, not the whole record. The column is capped at
+    8000 characters and a full record runs to several hundred bytes, so dumping them whole
+    would have truncated the audit row at roughly a third of the candidates it holds today -
+    a regression introduced by making `skipped` structured, paid for here instead. The name
+    and the closed reason code are what a query over this dataset can actually use; the
+    sentence is in the War Room entry for the run."""
     now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
     otm = result.get("older_than_months")
     row = {
@@ -1346,7 +1374,9 @@ def record_cleanup_run(client, result, now_ms=None, log=print):
         "failed_count": int(result.get("failed_count", 0) or 0),
         "skipped_count": int(result.get("skipped_count", 0) or 0),
         "deleted": json.dumps(result.get("deleted", []))[:4000],
-        "skipped_reasons": json.dumps(result.get("skipped", []))[:8000],
+        "skipped_reasons": json.dumps(
+            [{"name": s.get("name", ""), "reason": s.get("reason", "")}
+             for s in (result.get("skipped") or []) if isinstance(s, dict)])[:8000],
         "lock_taken_over": str(bool(result.get("lock_taken_over"))),
     }
     try:
@@ -1362,70 +1392,452 @@ def report_datasets(client, now_yyyymm=None):
     """READ-ONLY inventory of every yara_scanner_* lookup dataset. Issues exactly one API
     call (the dataset listing) and never writes or deletes.
 
-    Returns the rendered text under "report", plus the same information structured for
-    context in three states that need different advice:
-      overwrite     a permanent per-host matches dataset - replaced wholesale at the start
-                    of every scan, so unsuffixed is its correct steady state
-      frozen        unsuffixed, but rotated siblings exist - a pre-rotation leftover
-      not_rotated   unsuffixed with no rotated siblings - rotation is off and it will grow
-      consolidated  a per-scan target (…_v<N>_scan_<slug>) - finished and immutable by design
+    Returns ONE RECORD PER DATASET under "datasets" - the authoritative row, carrying name,
+    type, kind, host, month and age_months alongside a `state` drawn from the closed
+    DATASET_STATES vocabulary, the `detail` sentence that state means for THIS dataset, and
+    the `remedy` an operator would act on (empty for every state that needs no action).
+    Every record carries every key even where one does not apply: a transformer filtering on
+    a sometimes-absent key matches nothing and reports no error, which is a silently empty
+    branch rather than a failure anyone sees.
+
+    The record covers CURRENT, LEGACY and NEWER schema datasets alike - the schema buckets
+    are STATES ("legacy", "newer") rather than separate name lists, so no two keys in this
+    dict answer the same question over different populations. Records are ordered by
+    (state, name), so like sits with like in the context and in the rendered table.
+
+    "by_type" is a grouped VIEW of that same list and nothing more; `datasets` is what to
+    trust. The rendered fixed-width inventory is NOT returned: it is a second spelling of
+    everything here, and the automation renders the War Room's markdown from this dict
+    instead. render_report survives for the CLI, which prints it to a terminal.
     """
     now_yyyymm = now_yyyymm or datetime.date.today().strftime("%Y%m")
     current, legacy, newer = classify_yara_datasets(client)
-    datasets, frozen, not_rotated, consolidated, overwrite = [], [], [], [], []
+    datasets = []
+
+    def _age(info):
+        month = (info or {}).get("month")
+        return months_between(month, now_yyyymm) if month else None
+
+    def _record(name, state, detail, remedy="", info=None):
+        return {"name": name, "type": dataset_type(name),
+                "kind": (info or {}).get("kind") or "",
+                "host": (info or {}).get("host") or "",
+                "month": (info or {}).get("month") or "",
+                "age_months": _age(info),
+                "state": state, "detail": detail, "remedy": remedy}
+
     for name in current:
         info = parse_dataset_name(name)
         if info is None:
-            datasets.append({"name": name, "type": dataset_type(name),
-                             "kind": (("full" if "_full_v" in name else "summary")
-                                      if is_pack_output_dataset(name) else ""),
-                             "host": "", "month": "", "age_months": None,
-                             "state": (("full" if "_full_v" in name else "summary")
-                                       if is_pack_output_dataset(name) else "unrecognised")})
+            # NAME_RE deliberately refuses to parse this pack's own consolidated output -
+            # that refusal IS safety rail 5. `type` already says which of the two it is
+            # (consolidated_summary / consolidated_full), so neither `state` nor `kind`
+            # spells that same fact a second time.
+            pack = is_pack_output_dataset(name)
+            datasets.append(_record(
+                name, "pack_output" if pack else "unrecognised",
+                "this pack's own consolidated output - a cross-host rollup for one ruleset, "
+                "not a rotation shard, and never a retention candidate" if pack else
+                "matches the current-schema name filter but not the yara_scanner naming "
+                "contract - never a retention candidate, and its origin is unknown"))
             continue
         if info["scan_target"]:
-            state, age = "consolidated", None
-            consolidated.append(name)
+            datasets.append(_record(
+                name, "consolidated",
+                "per-scan target from the retired per-scan merge - consolidation output, "
+                "unrotated by design, finished and not growing; on a tenant that ran that "
+                "merge it can be the only surviving copy of that scan", info=info))
         elif info["overwrite"]:
-            state, age = "overwrite", None
-            overwrite.append(name)
+            datasets.append(_record(
+                name, "overwrite",
+                "permanent per-host matches dataset - the scanner replaces it wholesale at "
+                "the start of every scan, so it is bounded by that overwrite rather than by "
+                "rotation and an unsuffixed name is correct here", info=info))
         elif info["month"]:
-            state, age = "rotated", months_between(info["month"], now_yyyymm)
+            datasets.append(_record(
+                name, "rotated",
+                "rotation shard for %s, %d month(s) old"
+                % (info["month"], months_between(info["month"], now_yyyymm)), info=info))
+        elif has_rotated_sibling(name, current):
+            datasets.append(_record(
+                name, "frozen",
+                "unsuffixed, but rotated siblings exist for this host - a pre-rotation "
+                "leftover; writes moved to the dated names, so it is frozen and not growing",
+                info=info))
         else:
-            age = None
-            if has_rotated_sibling(name, current):
-                state = "frozen"
-                frozen.append(name)
-            else:
-                state = "not_rotated"
-                not_rotated.append(name)
-        datasets.append({"name": name, "type": dataset_type(name), "kind": info["kind"],
-                         "host": info["host"] or "", "month": info["month"] or "",
-                         "age_months": age, "state": state})
-    state_of = {d["name"]: d.get("state") for d in datasets}
-    for n in legacy:
-        state_of.setdefault(n, "legacy")
-    for n in newer:
-        state_of.setdefault(n, "newer")
-    by_type = group_by_type(current + legacy + newer, state_of)
+            datasets.append(_record(
+                name, "not_rotated",
+                "unsuffixed with no rotated sibling - rotation is off for that deployment, "
+                "so this dataset grows without bound until add_data merge time exceeds the "
+                "client timeout and it goes write-dead",
+                remedy='set CONFIG_LOOKUP_ROTATION="monthly" in the scanner',
+                info=info))
+    for name in legacy:
+        datasets.append(_record(
+            name, "legacy",
+            "on an older or unversioned schema - prunable by YaraCleanup with "
+            "delete_legacy, subject to its own rails", info=parse_dataset_name(name)))
+    for name in newer:
+        datasets.append(_record(
+            name, "newer",
+            "on a HIGHER schema version than the %s this run assumes - never pruned, "
+            "because a host reading a stale version must not delete a future schema's data"
+            % YARA_SCHEMA_VERSION,
+            remedy="raise schema_version to the version the fleet actually writes",
+            info=parse_dataset_name(name)))
+    datasets.sort(key=lambda d: (d["state"], d["name"]))
     return {
         "now_yyyymm": now_yyyymm,
         "schema_version": YARA_SCHEMA_VERSION,
-        "report": render_report(current, legacy, newer, now_yyyymm),
-        # THE dataset breakdown. Split by what each dataset IS, with its state nested
-        # underneath. Nothing else in this dict repeats these names - see group_by_type.
-        "by_type": by_type,
-        "by_type_counts": {t: v["count"] for t, v in by_type.items()},
-        # Per-dataset detail: host, month, age. A different SHAPE, not a second copy of the
-        # lists - this is the only place age_months and month are carried.
+        # THE per-dataset record, and the only place any fact about a dataset is carried.
         "datasets": datasets,
-        # Schema buckets. Orthogonal to type: a legacy dataset still has a type, and pruning
-        # decisions are made on schema version rather than on what the dataset holds.
-        "legacy": legacy, "legacy_count": len(legacy),
-        "newer": newer, "newer_count": len(newer),
+        # A grouped VIEW of `datasets` - count and names per type bucket, so a caller can
+        # branch on "how many host_scans" without walking every record. Same population,
+        # same names; `datasets` is authoritative if the two could ever disagree.
+        "by_type": group_by_type([d["name"] for d in datasets]),
+        # The schema-bucket verdict. Counts rather than lists, because the names are already
+        # on the records: a caller wanting them filters `datasets` on state legacy / newer.
         "current_count": len(current),
-        "total_count": len(current) + len(legacy) + len(newer),
+        "legacy_count": len(legacy),
+        "newer_count": len(newer),
+        "total_count": len(datasets),
     }
+
+
+# ---------------------------------------------------------------------------------------
+# RUN RECORDS AND THE WAR ROOM REPORT
+#
+# `selected`, `deleted` and `newer` are lists of DATASET NAMES - identifiers, which are data
+# already - and stay plain strings. `skipped` and `failed` carried sentences written for a
+# human, so a playbook that wanted to act on one of them - tell a still-writing shard from an
+# unreadable query, tell rail 6 from rail 7 - had to substring-match prose. That is a contract
+# nobody can change and nobody can rely on: reword a message for clarity and every filter
+# downstream stops matching, silently, with no error anywhere.
+#
+# So each entry is an OBJECT with a stable key set and a `reason` from a CLOSED vocabulary,
+# and the sentence survives as `detail` rather than BEING the record. Every entry carries
+# every key even where one does not apply, because a transformer filtering on a key that is
+# only sometimes present matches nothing and reports no error - a silently empty branch,
+# which is the worst kind to debug.
+#
+# WHY THE SENTENCES ARE PARSED RATHER THAN REPLACED. Seventeen of the nineteen skip sentences
+# are built inside select_rotated_for_deletion, filter_recently_written, filter_unconsolidated
+# and select_legacy_for_deletion, and those four are compared byte-for-byte against
+# xdr/xdr_data_management.py across all five shipping automations by
+# tests/test_pack_data_management.py's drift gate. Rewriting them here would turn that gate
+# red for every automation at once. So the conversion happens at the BOUNDARY: the rails keep
+# returning their strings, and prune_datasets maps each one to a record - knowing which rail
+# produced it and which selection path it was on. That is also how the two sentences that are
+# IDENTICAL on both paths ("current month", "dated in the future") become distinguishable,
+# which no amount of substring matching downstream could ever do.
+#
+# _classify_skip is pinned template-by-template by
+# tests/test_cleanup_reports_objects_not_prose.py, so a reworded rail fails a test here rather
+# than quietly landing in context as `unclassified`.
+#
+# The markdown report is rendered FROM the result dict and from nothing else, so the table an
+# operator reads and the context a playbook branches on cannot disagree.
+# ---------------------------------------------------------------------------------------
+
+SKIP_REASONS = {
+    "pack_output_full":
+        "this pack's own FULL cross-host rollup (yara_scanner_full_v<N>_rules_<hash>) - "
+        "consolidation output, never a rotation shard and never a retention candidate",
+    "pack_output_summary":
+        "this pack's own SUMMARY cross-host rollup (yara_scanner_summary_v<N>_rules_<hash>) - "
+        "consolidation output, never a rotation shard and never a retention candidate",
+    "not_yara_name":
+        "the name is outside the yara_scanner_<kind>_v<N> naming contract, so nothing about "
+        "it can be derived safely and it can never be a candidate",
+    "retired_scan_target":
+        "a per-scan consolidated target from the retired per-scan merge - consolidation "
+        "output, and on a tenant that ran that merge it can be that scan's only copy",
+    "overwrite_dataset":
+        "the scanner's permanent per-host matches dataset - replaced wholesale at the start "
+        "of every scan, so it is bounded by that overwrite rather than by rotation",
+    "unrotated_frozen":
+        "unsuffixed, but rotated siblings exist - an abandoned pre-rotation leftover, frozen "
+        "rather than growing",
+    "unrotated_growing":
+        "unsuffixed with no rotated siblings - rotation is off and it will grow without "
+        "bound; deleting it would destroy ALL history for that host, not one month",
+    "current_month":
+        "dated in the CURRENT month - a scan may be writing to it right now",
+    "future_month":
+        "dated in the future, which means clock skew - never a candidate",
+    "inside_window":
+        "older than the current month, but still inside the older_than_months window",
+    "recency_check_failed":
+        "the recency query errored, so rail 6 could not be evaluated - kept, because rail 6 "
+        "fails closed",
+    "within_quiet_period":
+        "its newest row is younger than min_quiet_hours, so a scan may still be writing to "
+        "it whatever its month label says",
+    "consolidation_check_failed":
+        "the consolidation-state query errored, so rail 7 could not be evaluated - kept, "
+        "because rail 7 fails closed",
+    "unconsolidated_scans":
+        "it still holds scan_id(s) that no per-scan target has verified, so deleting it "
+        "would lose that scan's only copy",
+    "legacy_refused_newer_schema_present":
+        "a WHOLE-PATH refusal rather than a per-dataset skip, so `name` is empty: at least "
+        "one NEWER-schema dataset exists, which proves schema_version is stale, so the whole "
+        "legacy classification is untrustworthy and delete_legacy selected nothing",
+    "legacy_unsuffixed":
+        "an unsuffixed legacy dataset holds ALL pre-rotation history for that host, so it is "
+        "never a blanket candidate; delete it by name if you want the space",
+    "newer_schema":
+        "on a HIGHER schema version than this run assumes - never pruned; if that is "
+        "unexpected, the schema_version argument is stale",
+    "legacy_not_requested":
+        "a legacy-schema dataset that was never a candidate this run, because delete_legacy "
+        "was not set",
+    "unclassified":
+        "the rail's sentence matched no template this automation knows - the mapping in "
+        "_classify_skip is stale relative to the selector that produced it. `detail` still "
+        "carries the sentence verbatim; this is a bug here, not a condition on the tenant",
+}
+
+# Which of the seven numbered safety rails kept the candidate, or None where the guard is real
+# but unnumbered - the pack's own consolidation output, a retired per-scan target, the
+# retention window itself, and the legacy bucket nobody asked for.
+SKIP_RAILS = {
+    "pack_output_full": 5, "pack_output_summary": 5, "not_yara_name": 5,
+    "retired_scan_target": None, "overwrite_dataset": None,
+    "unrotated_frozen": 3, "unrotated_growing": 3, "legacy_unsuffixed": 3,
+    "current_month": 1, "future_month": 2, "inside_window": None,
+    "recency_check_failed": 6, "within_quiet_period": 6,
+    "consolidation_check_failed": 7, "unconsolidated_scans": 7,
+    "legacy_refused_newer_schema_present": 4, "newer_schema": 4,
+    "legacy_not_requested": None, "unclassified": None,
+}
+
+# Which selection path the candidate was on when it was kept. The same rail fires on both
+# paths and produces the SAME sentence on each, so this is the only thing that separates them.
+SKIP_PATHS = {
+    "retention": "the older_than_months path, over datasets on the current schema version",
+    "legacy": "the delete_legacy path, over datasets on an older/unversioned schema",
+    "schema": "neither path - rail 4 vetoed the dataset before either could see it",
+}
+
+# Each rail sentence mapped to its code by the one fragment of it that no other template
+# shares. Checked in order, first match wins. Substring-matching prose is exactly what this
+# change exists to spare a playbook author - it is done ONCE, here, next to the vocabulary,
+# under a test that feeds every literal template through it.
+#
+# ORDER IS MOST-SPECIFIC-FIRST, and the two "could not check ..." markers lead deliberately.
+# Rails 6 and 7 interpolate the TENANT'S RAW EXCEPTION TEXT into their sentence, so an
+# arbitrary API error string is scanned against this whole table. Three markers below are
+# generic enough for real error text to collide with - "current month", "dated in the future",
+# "-month window" - and while they were tested first, an error like
+#     "ds: could not check recency (HTTP 400: query over current month partition failed) ..."
+# classified as `current_month`, rail 1: a name-only rail that issues no query, on a skip that
+# happened precisely BECAUSE a query failed. The `error` field came back empty with it,
+# because the extraction below only runs on the matching branch. A playbook watching for a
+# rail that FAILED CLOSED - the case an operator most needs - matched nothing.
+_SKIP_MARKERS = (
+    ("could not check recency", "recency_check_failed"),
+    ("could not check consolidation state", "consolidation_check_failed"),
+    ("full consolidation OUTPUT", "pack_output_full"),
+    ("summary consolidation OUTPUT", "pack_output_summary"),
+    ("not a YARA dataset name", "not_yara_name"),
+    ("per-scan consolidated target", "retired_scan_target"),
+    ("permanent per-host matches dataset", "overwrite_dataset"),
+    ("abandoned pre-rotation dataset", "unrotated_frozen"),
+    ("not rotated (no YYYYMM)", "unrotated_growing"),
+    ("holds ALL pre-rotation history", "legacy_unsuffixed"),
+    ("current month", "current_month"),
+    ("dated in the future", "future_month"),
+    ("-month window", "inside_window"),
+    ("a scan may still be writing", "within_quiet_period"),
+    ("still holds unconsolidated scan(s)", "unconsolidated_scans"),
+    ("refusing blanket legacy deletion", "legacy_refused_newer_schema_present"),
+    ("NEWER schema version than this code understands", "newer_schema"),
+    ("legacy schema, but delete_legacy was not set", "legacy_not_requested"),
+)
+
+# The numbers and identifiers the sentences fold in. Pulled back out so a caller never has to.
+_RE_SKIP_WINDOW = re.compile(r"(\d+) month\(s\) old, inside the (\d+)-month window")
+_RE_SKIP_QUIET = re.compile(r"newest row is only ([0-9.]+)h old")
+_RE_SKIP_RECENCY_ERR = re.compile(
+    r"could not check recency \((.*)\) - skipping to be safe", re.S)
+_RE_SKIP_CONSOL_ERR = re.compile(
+    r"could not check consolidation state \((.*)\) - skipping to be safe", re.S)
+_RE_SKIP_STUCK = re.compile(r"still holds unconsolidated scan\(s\) (.+?) \(row_ceiling_exceeded")
+
+# The two fail-closed rails, recognised STRUCTURALLY - by the same expression that extracts
+# the tenant's error - before any substring in _SKIP_MARKERS is looked at. Substring order
+# alone is not enough here: the sentence embeds text this automation did not write, and the
+# only part of it that is ours is the template around it. re.S so a multi-line exception
+# body (an HTML error page, a traceback) still matches the shape rather than falling through
+# to a marker that happens to appear inside the body.
+_SKIP_STRUCTURAL = (
+    (_RE_SKIP_RECENCY_ERR, "recency_check_failed"),
+    (_RE_SKIP_CONSOL_ERR, "consolidation_check_failed"),
+)
+
+
+def _skipped_record(reason, detail, name="", path="", age_months=None, window_months=None,
+                    newest_age_hours=None, stuck_scan_ids=None, newer_datasets=None,
+                    error=""):
+    """One `skipped` entry. EVERY key is present on EVERY entry, null where it does not apply.
+
+    `name` is the dataset the rail kept, and is "" only for the one whole-path refusal
+    (legacy_refused_newer_schema_present), which is about the run rather than a dataset.
+    `detail` is the rail's own sentence, verbatim - the record's provenance, not its contract.
+    """
+    return {"name": name, "reason": reason, "detail": detail, "path": path,
+            "rail": SKIP_RAILS.get(reason),
+            "age_months": age_months, "window_months": window_months,
+            "newest_age_hours": newest_age_hours,
+            "stuck_scan_ids": list(stuck_scan_ids or []),
+            "newer_datasets": list(newer_datasets or []),
+            "error": error}
+
+
+def _classify_skip(text, path, candidates=(), newer_names=()):
+    """Map one rail sentence to a `skipped` record. See the boundary note above for why this
+    parses rather than replaces.
+
+    `candidates` is the list the rail was given, so the dataset name is RECOGNISED rather than
+    guessed at by splitting on a colon - a name that ever contained one would otherwise be
+    silently truncated. `newer_names` fills newer_datasets on the whole-path refusal from the
+    real list, recovering what the sentence had already capped at five.
+    """
+    s = str(text)
+    name = ""
+    for n in sorted(candidates or (), key=len, reverse=True):
+        if s.startswith("%s: " % n):
+            name = n
+            break
+    if not name and ": " in s:
+        head = s.split(": ", 1)[0]
+        if head and " " not in head:      # a whole-path refusal opens with a sentence, not a name
+            name = head
+
+    reason = ""
+    for rx, code in _SKIP_STRUCTURAL:
+        if rx.search(s):
+            reason = code
+            break
+    if not reason:
+        reason = "unclassified"
+        for marker, code in _SKIP_MARKERS:
+            if marker in s:
+                reason = code
+                break
+
+    age = window = quiet_h = None
+    stuck, newer, err = [], [], ""
+    if reason == "inside_window":
+        m = _RE_SKIP_WINDOW.search(s)
+        if m:
+            age, window = int(m.group(1)), int(m.group(2))
+    elif reason == "within_quiet_period":
+        m = _RE_SKIP_QUIET.search(s)
+        if m:
+            quiet_h = float(m.group(1))
+    elif reason == "recency_check_failed":
+        m = _RE_SKIP_RECENCY_ERR.search(s)
+        err = m.group(1) if m else ""
+    elif reason == "consolidation_check_failed":
+        m = _RE_SKIP_CONSOL_ERR.search(s)
+        err = m.group(1) if m else ""
+    elif reason == "unconsolidated_scans":
+        m = _RE_SKIP_STUCK.search(s)
+        if m:
+            # The rail prints only the first five, and nothing in the sentence says whether
+            # there were more. Reported as what it is: the first five it named.
+            stuck = [p.strip() for p in m.group(1).split(",") if p.strip()]
+    elif reason == "legacy_refused_newer_schema_present":
+        newer = list(newer_names or [])
+
+    return _skipped_record(reason, s, name=name, path=path, age_months=age,
+                           window_months=window, newest_age_hours=quiet_h,
+                           stuck_scan_ids=stuck, newer_datasets=newer, error=err)
+
+
+FAIL_REASONS = {
+    "delete_refused_dependencies":
+        "delete_dataset refused the dataset because something still depends on it - re-run "
+        "with force=true if you mean to drop it anyway. Read off the API's own error text, "
+        "which is the only signal the platform gives",
+    "delete_failed":
+        "delete_dataset raised for some other reason - `error` carries the API's text",
+}
+
+
+def _failed_record(dataset, error, path=""):
+    """One `failed` entry. `error` is the API's own text, truncated - it is this list's
+    `detail`, and there is deliberately no second key restating it. A record here means the
+    dataset was NOT deleted and the rest of the pass continued."""
+    text = str(error)[:200]
+    reason = ("delete_refused_dependencies" if "depend" in text.lower() else "delete_failed")
+    return {"dataset": dataset, "reason": reason, "error": text, "path": path}
+
+
+WARN_REASONS = {
+    "older_than_months_clamped":
+        "older_than_months was negative and was clamped to 0. A negative window means "
+        "nothing beyond 0 and would leave rails 1 and 2 as the only thing between the prune "
+        "and a live shard",
+    "min_quiet_hours_floored":
+        "min_quiet_hours was below the floor and was raised to it. Below 1h the value does "
+        "not relax rail 6, it DISABLES it",
+}
+
+
+def _warning_record(reason, detail, argument, requested, applied):
+    """One `warnings` entry: an argument this run did not use as given. Without it a clamped
+    run publishes the CLAMPED value with nothing anywhere saying it was changed."""
+    return {"reason": reason, "detail": detail, "argument": argument,
+            "requested": "" if requested is None else str(requested),
+            "applied": str(applied)}
+
+
+LOCK_EVENTS = {
+    "held_by_other_run":
+        "another run's lock was live, so this pass stood down and deleted nothing",
+    "unreadable_marker_stood_down":
+        "the lock marker existed but its row was unreadable - most likely another run had "
+        "just created it, so this pass stood down rather than take it over",
+    "stale_marker_taken_over":
+        "a lock marker was present but judged stale, and this pass took it over and "
+        "proceeded",
+    "release_failed":
+        "the lock could not be released at the end of the pass - it will block the next run "
+        "until it ages out",
+    "stood_down":
+        "the pass stood down on the lock and deleted nothing. It says only THAT, never who "
+        "holds it - the event beside this one carries the specific finding, which is either "
+        "held_by_other_run or unreadable_marker_stood_down",
+    "other":
+        "a lock line this automation does not have a code for; `detail` carries it verbatim",
+}
+
+_LOCK_MARKERS = (
+    ("stood down on the consolidation lock", "stood_down"),
+    ("could not release consolidation lock", "release_failed"),
+    ("marker exists but its row is unreadable", "unreadable_marker_stood_down"),
+    ("is stale or unreadable", "stale_marker_taken_over"),
+    ("held by another run", "held_by_other_run"),
+    ("consolidation lock held (age", "held_by_other_run"),
+)
+
+
+def _lock_event(line):
+    """A lock log line as a record, or None if the line is not about the lock.
+
+    Lock events reached the operator by scraping the log for the word "lock" and reached a
+    playbook not at all, so a lock this pass failed to RELEASE - which blocks the next run
+    until it ages out - was invisible to anything automated."""
+    s = str(line)
+    if "lock" not in s.lower():
+        return None
+    for marker, event in _LOCK_MARKERS:
+        if marker in s:
+            return {"event": event, "detail": s}
+    return {"event": "other", "detail": s}
 
 
 def _live_rails(client, names, min_quiet_hours, now_ms, log):
@@ -1462,16 +1874,38 @@ def prune_datasets(client, older_than_months=None, delete_legacy=False,
     """
     now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
     now_yyyymm = now_yyyymm or datetime.date.today().strftime("%Y%m")
+
+    # Every lock line this pass emits, structured, in order and at most one per event. The
+    # SAME list object goes into the result dict below, so the release attempt in the finally
+    # - which runs after `return result` has evaluated - still lands in what the caller gets.
+    lock_events = []
+
+    def lock_log(m):
+        ev = _lock_event(m)
+        if ev and not any(e["event"] == ev["event"] for e in lock_events):
+            lock_events.append(ev)
+        log(m)
+
     result = {
+        # ONE key to branch on, folding in the precedence a caller would otherwise have to
+        # rebuild from the four booleans below and would get wrong: nothing_requested beats a
+        # held lock beats dry_run, and an executed pass is "partial_failure" the moment any
+        # delete raised. The booleans stay because each is independently meaningful.
+        "status": "",
         "dry_run": not execute,
         "nothing_requested": False,
         "lock_held_by_other_run": False,
         "lock_taken_over": False,
         "lock_takeover_reason": "",
+        "lock_events": lock_events,
         "older_than_months": older_than_months,
         "delete_legacy": bool(delete_legacy),
         "min_quiet_hours": float(min_quiet_hours),
         "schema_version": YARA_SCHEMA_VERSION,
+        # Argument coercion happens in main(), so this is empty when prune_datasets is driven
+        # as a library. Declared here all the same: a key that only sometimes exists is the
+        # same silently-empty branch the object conversion exists to remove.
+        "warnings": [],
         "selected": [], "selected_count": 0,
         "deleted": [], "deleted_count": 0,
         "failed": [], "failed_count": 0,
@@ -1481,17 +1915,27 @@ def prune_datasets(client, older_than_months=None, delete_legacy=False,
 
     if older_than_months is None and not delete_legacy:
         result["nothing_requested"] = True
+        result["status"] = "nothing_requested"
         log("no retention window (older_than_months) and delete_legacy is false — nothing "
             "selected, nothing deleted")
         return result
 
     takeovers = []
     if execute and not acquire_consolidation_lock(
-            client, log=log, now_ms=now_ms, holder=holder,
+            client, log=lock_log, now_ms=now_ms, holder=holder,
             stale_after_secs=PRUNE_LOCK_STALE_SECS, unreadable_is_held=True,
             on_takeover=takeovers.append):
         result["lock_held_by_other_run"] = True
-        log("consolidation lock is held by another run — deleting nothing this pass")
+        result["status"] = "lock_held"
+        # Worded from what acquire_consolidation_lock actually established. It returns the
+        # same False whether it READ a live lock or merely found a marker whose row it could
+        # not read, and this line used to assert the first in both cases - which the
+        # classifier then turned into a `held_by_other_run` lock_event. That is worse than a
+        # misleading sentence: a playbook filtering lock_events for a genuine contention got
+        # a false positive out of a pass that never identified a holder. The specific finding
+        # is already recorded by acquire_consolidation_lock's own line, so say only what is
+        # true of BOTH paths here and let that line carry the distinction.
+        lock_log("stood down on the consolidation lock — deleting nothing this pass")
         return result
     if takeovers:
         # Reported, never silent: this pass proceeded while another run's lock marker was in
@@ -1501,36 +1945,51 @@ def prune_datasets(client, older_than_months=None, delete_legacy=False,
 
     try:
         current, legacy, newer = classify_yara_datasets(client)   # rail 4 lives here
-        targets, skipped = [], []
+        targets, skipped, path_of = [], [], {}
         result["newer"], result["newer_count"] = newer, len(newer)
         for n in newer:
-            skipped.append("%s: NEWER schema version than this code understands - never "
-                           "pruned (rail 4); if that is unexpected, the schema_version "
-                           "argument (currently v%s) is stale" % (n, YARA_SCHEMA_VERSION))
+            # Built as a record directly rather than through _classify_skip: this sentence is
+            # written HERE, in free code, so there is no gated producer to stay faithful to.
+            skipped.append(_skipped_record(
+                "newer_schema",
+                "%s: NEWER schema version than this code understands - never pruned "
+                "(rail 4); if that is unexpected, the schema_version argument (currently v%s) "
+                "is stale" % (n, YARA_SCHEMA_VERSION), name=n, path="schema"))
         if older_than_months is not None:
             t, s = select_rotated_for_deletion(current, older_than_months, now_yyyymm)
-            skipped += s
+            skipped += [_classify_skip(x, "retention", current) for x in s]
             t, s2 = _live_rails(client, t, min_quiet_hours, now_ms, log)
-            skipped += s2
+            skipped += [_classify_skip(x, "retention", current) for x in s2]
+            path_of.update((n, "retention") for n in t)
             targets += t
         if delete_legacy:
             t, s = select_legacy_for_deletion(legacy, newer, now_yyyymm)
-            skipped += s
+            skipped += [_classify_skip(x, "legacy", legacy, newer) for x in s]
             t, s2 = _live_rails(client, t, min_quiet_hours, now_ms, log)
-            skipped += s2
+            skipped += [_classify_skip(x, "legacy", legacy) for x in s2]
+            path_of.update((n, "legacy") for n in t)
             targets += t
         else:
             for n in legacy:
-                skipped.append("%s: legacy schema, but delete_legacy was not set" % n)
+                skipped.append(_skipped_record(
+                    "legacy_not_requested",
+                    "%s: legacy schema, but delete_legacy was not set" % n,
+                    name=n, path="legacy"))
+
+        # Sorted so like sits with like: a tenant with 200 kept candidates keeps them in runs
+        # of one reason, and an operator reading the table wants the three held by a DIFFERENT
+        # rail adjacent rather than scattered through the dataset-name ordering.
+        skipped.sort(key=lambda r: (r["reason"], r["name"]))
 
         result["selected"] = targets
         result["selected_count"] = len(targets)
         result["skipped"] = skipped
         result["skipped_count"] = len(skipped)
-        for s in skipped:
-            log("  skip  %s" % s)
+        for r in skipped:
+            log("  skip  [%s] %s" % (r["reason"], r["detail"]))
 
         if not execute:
+            result["status"] = "dry_run"
             log("DRY RUN — %d dataset(s) would be deleted, nothing touched" % len(targets))
             return result
 
@@ -1541,15 +2000,16 @@ def prune_datasets(client, older_than_months=None, delete_legacy=False,
                 log("  deleted %s" % name)
             except Exception as e:
                 # Continue: one dataset with dependencies must not strand the whole cleanup.
-                result["failed"].append({"dataset": name, "error": str(e)[:200]})
+                result["failed"].append(_failed_record(name, e, path_of.get(name, "")))
                 log("  FAILED  %s: %s" % (name, e))
         result["deleted_count"] = len(result["deleted"])
         result["failed_count"] = len(result["failed"])
+        result["status"] = "partial_failure" if result["failed"] else "success"
         record_cleanup_run(client, result, now_ms=now_ms, log=log)
         return result
     finally:
         if execute:
-            release_consolidation_lock(client, log=log)
+            release_consolidation_lock(client, log=lock_log)
 
 
 # ---- API client -------------------------------------------------------------
@@ -1708,6 +2168,258 @@ def _flag(args, name):
     return argToBoolean(value)
 
 
+_MD_ROW_CAP = 50
+
+
+def _n(v):
+    """Thousands-separated. The numbers this reports run to six figures.
+
+    Integral values print as integers, floats included: the settings arrive as
+    float(args.get(...)), and "900.0" in a table reads as a typo rather than a default.
+
+    A NON-integral float keeps its fraction. The previous version went through int(), which
+    silently truncated - a quiet_secs of 900.5 printed as 900 while the context carried 900.5,
+    so the report and the context stated different numbers. That is the one disagreement this
+    renderer exists to make impossible, and it was being introduced by the formatter itself.
+    """
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    return format(int(f), ",d") if f.is_integer() else format(f, ",g")
+
+
+def _md_table(headers, rows):
+    """A markdown table, or "" when there is nothing to put in it. Cells are escaped: rule
+    names and hostnames reach here from a ruleset and from an endpoint, and a single pipe in
+    either would silently shear a column off every row below it."""
+    if not rows:
+        return ""
+
+    def cell(v):
+        return str("" if v is None else v).replace("|", "\\|").replace("\n", " ")
+
+    out = ["| " + " | ".join(cell(h) for h in headers) + " |",
+           "|" + "|".join("---" for _ in headers) + "|"]
+    for r in rows:
+        out.append("| " + " | ".join(cell(v) for v in r) + " |")
+    return "\n".join(out)
+
+
+def _md_capped(headers, rows, context_key):
+    """_md_table, truncated. The context keeps every entry, so a 200-host pass cannot push the
+    counts off the top of the War Room - the same trade YaraReport makes for the scan log."""
+    body = _md_table(headers, rows[:_MD_ROW_CAP])
+    if len(rows) > _MD_ROW_CAP:
+        body += ("\n\n_... and %s more - the full list is in `%s`._"
+                 % (_n(len(rows) - _MD_ROW_CAP), context_key))
+    return body
+
+
+_HEADLINES = {
+    "nothing_requested": ("NOTHING REQUESTED",
+                          "No retention window was given (`older_than_months`) and "
+                          "`delete_legacy` is false, so nothing was selected and no API call "
+                          "was made. This automation has no default window on purpose - a "
+                          "bare invocation must never delete."),
+    "lock_held": ("STOOD DOWN - LOCK HELD",
+                  "The consolidation lock is held by another run (YaraConsolidateApply, or "
+                  "another scheduled execution). Nothing was deleted. Pruning and "
+                  "consolidation mutate the same shards, so this pass stands down rather "
+                  "than race it."),
+    "lock_unreadable": ("STOOD DOWN - LOCK MARKER UNREADABLE",
+                        "A lock marker exists but its row could not be read, so this pass "
+                        "stood down without establishing WHO holds it. Almost always another "
+                        "run created it moments ago and the row has not landed yet; the same "
+                        "signature also fits a marker orphaned by a killed pass, which clears "
+                        "itself once it ages out. Nothing was deleted either way - standing "
+                        "down is the safe direction when the holder is unknown."),
+    "dry_run": ("DRY RUN",
+                "Nothing was deleted. Re-run with `execute=true` to apply exactly this."),
+    "success": ("EXECUTED", "Datasets were deleted. This cannot be undone."),
+    "partial_failure": ("EXECUTED WITH FAILURES",
+                        "Datasets were deleted and at least one delete raised. The failures "
+                        "are listed below; every other candidate went through."),
+}
+
+
+def _lock_cell(result):
+    """What this pass actually did with the consolidation lock, in one sentence.
+
+    Every branch here is a FACT the pass recorded. It used to be derived from `not dry`,
+    which is a proxy, and the proxy is wrong on two reachable paths:
+
+      * `nothing_requested` returns from prune_datasets BEFORE acquire_consolidation_lock is
+        reached, so an `execute=true` pass with no window took no lock at all - and the
+        summary row said "taken and released by this run" over a pass that made zero API
+        calls of any kind. That is the shape of a scheduled job whose older_than_months
+        templated out empty.
+      * A pass whose RELEASE raised still holds the marker. The Lock events table right below
+        said `release_failed`, the summary row said "taken and released", and the summary row
+        is the one read first. A lock left behind blocks the next run until it ages out,
+        which is the single failure `lock_events` was added to surface.
+    """
+    if result.get("lock_held_by_other_run"):
+        # acquire_consolidation_lock returns the same False for two different findings, and
+        # only ONE of them establishes a holder. An unreadable marker row means the pass
+        # never read who owns it - saying "held by another run" there states a fact it did
+        # not establish, and the lock_events row directly below says so in as many words.
+        # Same shape as the two paths above, found in the same place: the summary row talking
+        # over the structured signal that contradicts it.
+        if any((e or {}).get("event") == "unreadable_marker_stood_down"
+               for e in (result.get("lock_events") or [])):
+            return ("a marker is present but its row could not be read - stood down without "
+                    "establishing who holds it")
+        return "held by another run - stood down"
+    if (result.get("status") or "") == "nothing_requested":
+        return ("never taken - nothing was requested, so the pass returned before "
+                "acquiring it")
+    if result.get("dry_run"):
+        return "not taken - a dry run never takes it"
+    if any((e or {}).get("event") == "release_failed"
+           for e in (result.get("lock_events") or [])):
+        return ("taken%s, and NOT RELEASED - see Lock events; the marker is still on the "
+                "tenant and blocks the next run until it ages out"
+                % (" OVER as stale" if result.get("lock_taken_over") else ""))
+    if result.get("lock_taken_over"):
+        return "TAKEN OVER as stale - see the warning below"
+    return "taken and released by this run"
+
+
+def _execute_cell(result):
+    """What `execute` MEANT for this pass, not what it was set to.
+
+    "true - deletes were applied" was printed whenever the run was not a dry run, including
+    the two paths that return before a single delete is attempted (nothing_requested, and
+    standing down on a held lock). The count is the fact; read it instead.
+    """
+    if result.get("dry_run"):
+        return "false - nothing was deleted"
+    status = result.get("status") or ""
+    if status == "nothing_requested":
+        return "true - but nothing was requested, so nothing was deleted"
+    if status == "lock_held":
+        return "true - but another run held the lock, so nothing was deleted"
+    return "true - %s dataset(s) deleted, irreversibly" % _n(result.get("deleted_count") or 0)
+
+
+def render_run_markdown(result):
+    """The War Room report for one pass, rendered from the result dict ALONE.
+
+    Nothing here reads a log line, an argument or a local: every number in this report is a
+    number in the context, so the table an operator reads and the branch a playbook takes
+    cannot disagree. The previous version built its lines with
+    `lines += ["  skip  {}".format(s) for s in result["skipped"]]`, which prints a dict's repr
+    the moment an entry stops being a string - silent garbage rather than a loud TypeError.
+    Tables replace it.
+
+    `newer` is deliberately NOT given a section of its own: every dataset in it is already in
+    the Kept table under `newer_schema`, and printing it twice is how a reader ends up unsure
+    which listing is authoritative.
+    """
+    status = result.get("status") or ("dry_run" if result.get("dry_run") else "success")
+    # `lock_held` covers both standdowns; only the readable one identified a holder.
+    if status == "lock_held" and any(
+            (e or {}).get("event") == "unreadable_marker_stood_down"
+            for e in (result.get("lock_events") or [])):
+        status_key = "lock_unreadable"
+    else:
+        status_key = status
+    headline, blurb = _HEADLINES.get(status_key, (status.upper(), ""))
+    dry = bool(result.get("dry_run"))
+    out = ["### YARA dataset cleanup - %s" % headline, "_%s_" % blurb, ""]
+
+    window = result.get("older_than_months")
+    lock = _lock_cell(result)
+    out.append(_md_table(["", ""], [("**%s**" % k, v) for k, v in [
+        ("Status", "`%s`" % status),
+        ("Selected", "%s dataset(s)%s" % (_n(result["selected_count"]),
+                                          " that WOULD be deleted" if dry else "")),
+        ("Deleted", "%s%s" % (_n(result["deleted_count"]),
+                              " - nothing was touched" if dry else "")),
+        ("Failed", _n(result["failed_count"])),
+        ("Kept", "%s candidate(s), each with the rail that kept it" % _n(result["skipped_count"])),
+        ("Vetoed by rail 4", "%s dataset(s) on a newer schema - listed under Kept, reason "
+                             "`newer_schema`, and repeated in `Yara.Cleanup.newer`"
+                             % _n(result["newer_count"])),
+        ("Retention window", "none" if window is None else "older than %s whole month(s)"
+                             % _n(window)),
+        ("Legacy schema", "in scope" if result["delete_legacy"] else "NOT in scope"),
+        ("Consolidation lock", lock),
+    ]]))
+
+    if result.get("lock_taken_over"):
+        out += ["", "> **WARNING:** another run's consolidation lock marker was present and "
+                    "this pass **TOOK IT OVER** as stale (%s). If a consolidation pass was in "
+                    "fact still running, its shards were pruned concurrently."
+                    % (result.get("lock_takeover_reason") or "no reason recorded")]
+
+    # `selected` gets a table of its own on a DRY RUN only. On an executed pass it is exactly
+    # deleted + the failed datasets, both tabled below, and printing it a third time would
+    # leave a reader working out which of three listings to trust.
+    if dry and result["selected"]:
+        out += ["", "#### Would delete",
+                _md_capped(["Dataset"], [("`%s`" % n,) for n in result["selected"]],
+                           "Yara.Cleanup.selected")]
+
+    if result["deleted"]:
+        out += ["", "#### Deleted - irreversibly",
+                _md_capped(["Dataset"], [("`%s`" % n,) for n in result["deleted"]],
+                           "Yara.Cleanup.deleted")]
+
+    if result["failed"]:
+        out += ["", "#### Failed to delete - still on the tenant",
+                _md_capped(["Dataset", "Path", "Reason", "What the API said"],
+                           [("`%s`" % f["dataset"], f["path"] or "-", "`%s`" % f["reason"],
+                             f["error"]) for f in result["failed"]],
+                           "Yara.Cleanup.failed")]
+
+    # Uncapped in the CONTEXT, capped in this table: a dataset silently not deleted is
+    # indistinguishable from a bug, so every reason is kept - but a 200-candidate tenant must
+    # not push the counts off the top of the War Room to say so.
+    if result["skipped"]:
+        out += ["", "#### Kept - nothing was deleted",
+                _md_capped(["Dataset", "Path", "Rail", "Reason", "Detail"],
+                           [(("`%s`" % s["name"]) if s["name"] else "_(whole path)_",
+                             s["path"] or "-",
+                             s["rail"] if s["rail"] is not None else "-",
+                             "`%s`" % s["reason"], s["detail"])
+                            for s in result["skipped"]],
+                           "Yara.Cleanup.skipped")]
+
+    if result.get("warnings"):
+        out += ["", "#### Warnings - an argument was not used as given",
+                _md_table(["Argument", "Requested", "Applied", "Why"],
+                          [("`%s`" % w["argument"], w["requested"], w["applied"], w["detail"])
+                           for w in result["warnings"]])]
+
+    out += ["", "#### Settings this run used",
+            _md_table(["Argument", "Value", "What it controls"], [
+                ("`schema_version`", "v%s" % result["schema_version"],
+                 "which datasets count as current, legacy or newer - and so whether this run "
+                 "had any scope at all"),
+                ("`older_than_months`", "none" if window is None else _n(window),
+                 "the retention window over CURRENT-schema rotated datasets; none means that "
+                 "path selected nothing"),
+                ("`delete_legacy`", "true" if result["delete_legacy"] else "false",
+                 "whether older/unversioned-schema datasets were in scope; the same rails "
+                 "apply to them either way"),
+                ("`min_quiet_hours`", "%sh" % result["min_quiet_hours"],
+                 "rail 6's threshold: a dataset written to more recently than this is kept, "
+                 "whatever its month label says"),
+                ("`execute`", _execute_cell(result),
+                 "false previews, true deletes whole datasets irreversibly"),
+            ])]
+
+    if result.get("lock_events"):
+        out += ["", "#### Lock events",
+                _md_table(["Event", "Detail"],
+                          [("`%s`" % e["event"], e["detail"])
+                           for e in result["lock_events"]])]
+
+    return "\n".join(out)
+
+
 def main():
     args = demisto.args()
     notes = []
@@ -1722,10 +2434,12 @@ def main():
         older_than_months = args.get("older_than_months")
         older_than_months = int(older_than_months) if older_than_months not in (None, "") else None
         if older_than_months is not None and older_than_months < 0:
-            notes.append("older_than_months was negative ({}); clamped to 0. A negative window "
-                         "means nothing beyond 0 (\"every month before the current one\") and "
-                         "would leave rails 1 and 2 as the only thing standing between the "
-                         "prune and a live shard.".format(args.get("older_than_months")))
+            notes.append(_warning_record(
+                "older_than_months_clamped",
+                "A negative window means nothing beyond 0 (\"every month before the current "
+                "one\") and would leave rails 1 and 2 as the only thing standing between the "
+                "prune and a live shard.",
+                "older_than_months", args.get("older_than_months"), 0))
             older_than_months = 0
 
         min_quiet_hours = args.get("min_quiet_hours")
@@ -1734,10 +2448,12 @@ def main():
         if min_quiet_hours < MIN_ALLOWED_QUIET_HOURS:
             # 0 or a negative switches rail 6 off entirely rather than relaxing it: the
             # comparison `(now - newest) < 0` is false even for a row written a second ago.
-            notes.append("min_quiet_hours was {} — below the {}h floor, which would DISABLE the "
-                         "recency rail rather than relax it. Raised to {}h for this run."
-                         .format(args.get("min_quiet_hours"), MIN_ALLOWED_QUIET_HOURS,
-                                 MIN_ALLOWED_QUIET_HOURS))
+            notes.append(_warning_record(
+                "min_quiet_hours_floored",
+                "Below the {}h floor, which would DISABLE the recency rail rather than relax "
+                "it: `(now - newest) < 0` is false even for a row written a second ago. "
+                "Raised to the floor for this run.".format(MIN_ALLOWED_QUIET_HOURS),
+                "min_quiet_hours", args.get("min_quiet_hours"), MIN_ALLOWED_QUIET_HOURS))
             min_quiet_hours = MIN_ALLOWED_QUIET_HOURS
 
         kwargs = {
@@ -1755,6 +2471,10 @@ def main():
         return_error("YaraCleanup: invalid argument ({}). Nothing was deleted.".format(ex))
         return
 
+    # A sink, not a source. The run's narration is kept out of the War Room entirely - the
+    # report below is rendered from the result dict and from nothing else, and the one part of
+    # the log an operator needed (the lock) is now a structured `lock_events` list instead of
+    # a substring scrape over these lines.
     log_lines = []
     try:
         result = prune_datasets(CoreApiClient(), log=lambda m: log_lines.append(m), **kwargs)
@@ -1763,61 +2483,18 @@ def main():
         return_error("YaraCleanup failed: {}".format(ex))
         return
 
-    if result["nothing_requested"]:
-        lines = ["Nothing selected and nothing deleted: no retention window was given "
-                 "(older_than_months) and delete_legacy is false. This automation has no "
-                 "default window on purpose — a bare invocation must never delete."]
-    elif result["lock_held_by_other_run"]:
-        lines = ["Skipped this pass — the consolidation lock is held by another concurrent "
-                 "run (YaraConsolidateApply, or another scheduled execution). Nothing was "
-                 "deleted. Pruning and consolidation mutate the same shards, so this run "
-                 "stands down rather than race it."]
-    elif result["dry_run"]:
-        lines = ["DRY RUN — nothing was deleted. {} dataset(s) WOULD be deleted; re-run with "
-                 "execute=true to apply.".format(result["selected_count"])]
-        lines += ["  would delete  {}".format(n) for n in result["selected"]]
-    else:
-        lines = ["EXECUTED — {} dataset(s) deleted, {} failed.".format(
-            result["deleted_count"], result["failed_count"])]
-        lines += ["  deleted  {}".format(n) for n in result["deleted"]]
-        lines += ["  FAILED   {}: {}".format(f["dataset"], f["error"]) for f in result["failed"]]
-
-    # The scope this run actually ran with: schema_version decides whether it had any scope
-    # at all, and min_quiet_hours is rail 6's threshold.
-    lines.append("scope: schema v{}, window={}, delete_legacy={}, min_quiet_hours={}".format(
-        result["schema_version"],
-        "none" if result["older_than_months"] is None else result["older_than_months"],
-        result["delete_legacy"], result["min_quiet_hours"]))
-    lines += ["NOTE: {}".format(n) for n in notes]
-
-    if result.get("lock_taken_over"):
-        lines.append("WARNING: another run's consolidation lock marker was present and this "
-                     "pass TOOK IT OVER as stale ({}). If a consolidation pass was in fact "
-                     "still running, its shards were pruned concurrently."
-                     .format(result.get("lock_takeover_reason", "")))
-
-    # Every skipped candidate's reason, uncapped: a dataset silently not deleted is
-    # indistinguishable from a bug, and this entry is the run's audit trail.
-    if result["skipped"]:
-        lines.append("")
-        lines.append("{} candidate(s) kept, with reason:".format(result["skipped_count"]))
-        lines += ["  skip  {}".format(s) for s in result["skipped"]]
-
-    # Lock events (takeover, failed release) exist ONLY in the library's log, not in the
-    # structured result, and here they separate a routine pass from one that ran alongside a
-    # consolidation.
-    lock_log = [m for m in log_lines if "lock" in m.lower()]
-    if lock_log:
-        lines.append("")
-        lines.append("lock events:")
-        lines += ["  {}".format(m) for m in lock_log]
+    # Argument clamping used to reach the operator as a NOTE line and reach a playbook not at
+    # all: a run that silently clamped older_than_months=-3 to 0 published older_than_months=0
+    # with nothing anywhere saying it had been changed, so a caller could not tell the window
+    # it asked for from the window that ran.
+    result["warnings"] = notes
 
     # List-valued context is APPENDED to across repeated calls in one investigation; clear
     # it first so selected/deleted/skipped never carry a prior call's entries.
     demisto.executeCommand("DeleteContext", {"key": "Yara.Cleanup"})
 
     return_results(CommandResults(
-        readable_output="\n".join(lines),
+        readable_output=render_run_markdown(result),
         outputs_prefix="Yara.Cleanup",
         outputs=result,
         raw_response=result,

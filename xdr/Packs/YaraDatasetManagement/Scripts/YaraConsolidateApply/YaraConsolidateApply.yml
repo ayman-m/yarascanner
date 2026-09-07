@@ -51,30 +51,129 @@ commonfields:
 enabled: true
 name: YaraConsolidateApply
 outputs:
+- contextPath: Yara.ConsolidateApply.status
+  description: 'One of "success", "partial_failure", "dry_run" or "skipped_locked". partial_failure means something is in `failed`, and it is reported on a DRY RUN too: the ceiling refusal is the only failure a dry run can produce, dry run is the default mode, and it is the one refusal an operator has to act on - so status must not hide it behind the mode. dry_run therefore means a preview with nothing in `failed`, and the `dry_run` BOOLEAN, not this field, is what says which mode ran. skipped_locked means another run held the consolidation lock and this pass did nothing - see lock_standdown_reason for which of the two lock refusals it was. The single field a playbook should branch on - it saves testing `failed` and `lock_held_by_other_run` separately, and it is the same value written to the yara_scanner_consolidation_runs audit row.'
+  type: String
 - contextPath: Yara.ConsolidateApply.dry_run
-  description: True if this was a dry run.
+  description: 'True unless execute=true was passed. When true nothing was created, written or deleted, and every `written` entry has action=would_write. THE authority on the mode: `status` answers "did anything go wrong" and reads partial_failure on a dry run that refused a group, so a caller that needs to know whether this was a preview reads this key. Authoritative too on the lock-standdown and ceiling-refused paths, where `written` is empty and there is no action field to read.'
   type: Boolean
 - contextPath: Yara.ConsolidateApply.written
-  description: One line per consolidated dataset written.
+  description: One OBJECT per per-ruleset full target written, or in a dry run that WOULD be written. Keys below. Never a preformatted string - branch on the fields.
+  type: Unknown
+- contextPath: Yara.ConsolidateApply.written.action
+  description: Either "wrote" or "would_write". Branch on this rather than on dry_run when you care whether rows actually landed; the two entry shapes used to be distinguishable only by the verb in a sentence.
   type: String
-- contextPath: Yara.ConsolidateApply.rows_written
-  description: Total full rows written across all ruleset groups.
+- contextPath: Yara.ConsolidateApply.written.ruleset
+  description: The ruleset hash the target is keyed on - the trailing _yara_<hash> of every scan_id in it.
+  type: String
+- contextPath: Yara.ConsolidateApply.written.target
+  description: 'The full dataset written: yara_scanner_full_v<VER>_rules_<ruleset>.'
+  type: String
+- contextPath: Yara.ConsolidateApply.written.rows
+  description: Full rows written, or that would be written. AUTHORITATIVE per group; the top-level rows_written is exactly the sum of this field across the list.
   type: Number
-- contextPath: Yara.ConsolidateApply.groups
-  description: How many ruleset groups were produced.
+- contextPath: Yara.ConsolidateApply.written.hosts
+  description: Distinct hosts those rows cover. AUTHORITATIVE per group; the top-level `hosts` is a fleet-wide distinct count over every group, not the sum or the max of this field.
   type: Number
-- contextPath: Yara.ConsolidateApply.hosts
-  description: Largest host count in any one group.
+- contextPath: Yara.ConsolidateApply.written.scans
+  description: Distinct scans the target holds for this ruleset after the pass - the reconciled set, not only the new ones.
+  type: Number
+- contextPath: Yara.ConsolidateApply.written.scans_new
+  description: 'Of `scans`, how many this pass actually added because the target did not already hold them. NULL in a dry run: the target is never read on that path, so how many it already holds is unknown and 0 would be a claim.'
+  type: Number
+- contextPath: Yara.ConsolidateApply.written.stale_rows_removed
+  description: Rows dropped from the target because their scan is superseded - the scanner overwrote that host's matches dataset, so the scan_id is gone from every source. Always 0 while stale-row removal is disabled (see the skipped reasons stale_removal_disabled_*).
   type: Number
 - contextPath: Yara.ConsolidateApply.skipped
-  description: Scans left alone, with the reason.
+  description: One OBJECT per thing left alone, with the reason. Nothing in this list was touched. Three entity kinds share the list - a source dataset, a scan, or a ruleset group - and `reason` is what tells them apart. Keys below.
+  type: Unknown
+- contextPath: Yara.ConsolidateApply.skipped.name
+  description: 'The entity this entry is about: the scan_id for a scan-level skip, "rules <hash>" for a ruleset-level one, or the dataset name for a source that could not be read. Display only - filter on scan_id / ruleset / dataset instead.'
+  type: String
+- contextPath: Yara.ConsolidateApply.skipped.reason
+  description: 'CLOSED vocabulary, one of: scan_in_progress (no terminal lifecycle status yet and younger than retention_hours); quiet_period (finished, but its newest match row is inside quiet_secs, so rows may still be draining); no_rule_hash (the scan_id carries no ruleset hash, so there is no target to group it into); source_unreadable (a host matches dataset could not be read this pass); stale_removal_disabled_bounded (the target holds scans this pass did not observe, but the pass deliberately read only part of the fleet, so nothing was removed); stale_removal_disabled_unreadable (same, but because a source could not be read - a fault, not a choice); target_already_current (the target already holds exactly these scans and nothing is superseded - a verified no-op). Add a code here and to SKIP_REASONS in the script together.'
+  type: String
+- contextPath: Yara.ConsolidateApply.skipped.detail
+  description: The human sentence, including any numbers or truncated error text. Read it, do not match on it - the wording is free to change, `reason` is not.
+  type: String
+- contextPath: Yara.ConsolidateApply.skipped.scan_id
+  description: The scan this entry is about, WHOLE - null for a dataset-level or ruleset-level skip. The prose this replaced truncated the scan_id to 34 characters, which cut off the run_id and the ruleset hash on every real scan.
+  type: String
+- contextPath: Yara.ConsolidateApply.skipped.hostname
+  description: 'The endpoint the scan ran on, as the scanner wrote it: taken from the scan_id where its fixed _yara_<hash> tail parses, and from the rows'' own hostname column where it does not - so a no_rule_hash entry, whose scan_id by definition has no parseable tail, names its host instead of reporting null every time. Null only where no single hostname is knowable: source_unreadable (the read that would have carried it is the one that failed - its `dataset` names the host, in the scanner''s slug_hash form) and the ruleset-level entries, which span the fleet.'
+  type: String
+- contextPath: Yara.ConsolidateApply.skipped.dataset
+  description: 'The dataset implicated: the SOURCE the rows sit in for a scan-level or source_unreadable skip, the consolidated TARGET for a ruleset-level one. Null where none is.'
+  type: String
+- contextPath: Yara.ConsolidateApply.skipped.ruleset
+  description: The ruleset hash, where known - present on ruleset-level entries and on any scan whose scan_id carries one. Null for no_rule_hash and for source_unreadable.
   type: String
 - contextPath: Yara.ConsolidateApply.failed
-  description: Groups that failed or exceeded row_ceiling.
+  description: One OBJECT per ruleset group that did not complete. Non-empty means the pass needs attention; `reason` says whether a re-run will fix it. Keys below.
+  type: Unknown
+- contextPath: Yara.ConsolidateApply.failed.reason
+  description: 'CLOSED vocabulary, one of: row_ceiling_exceeded (the group is larger than row_ceiling and was REFUSED rather than half-filled - nothing was attempted, and a re-run changes nothing until the ceiling is raised or the fleet is summarised instead); target_unreadable (the existing target could not be read, so nothing was written); write_incomplete (a write batch reported 0 rows added part-way through); write_error (the write raised). The first is an operator decision and the last three are retryable - they used to be indistinguishable without parsing English. Add a code here and to FAIL_REASONS in the script together.'
   type: String
-- contextPath: Yara.ConsolidateApply.lock_held_by_other_run
-  description: True if this pass stood down because another run holds the consolidation lock.
+- contextPath: Yara.ConsolidateApply.failed.detail
+  description: The human sentence, including the truncated exception text for write_error. Read it, do not match on it.
+  type: String
+- contextPath: Yara.ConsolidateApply.failed.ruleset
+  description: The ruleset hash of the group that failed.
+  type: String
+- contextPath: Yara.ConsolidateApply.failed.target
+  description: The full dataset the group would have been written to.
+  type: String
+- contextPath: Yara.ConsolidateApply.failed.rows
+  description: 'Rows the group holds: the whole group for row_ceiling_exceeded, target_unreadable and write_error, and the rows this pass was adding for write_incomplete.'
+  type: Number
+- contextPath: Yara.ConsolidateApply.failed.row_ceiling
+  description: The ceiling that refused the group. Populated for row_ceiling_exceeded only - null everywhere else, because no other failure involves it.
+  type: Number
+- contextPath: Yara.ConsolidateApply.failed.rows_added_before_failure
+  description: Rows that had already landed in the target when the write stopped. Populated for write_incomplete only; null elsewhere. A re-run picks up from there.
+  type: Number
+- contextPath: Yara.ConsolidateApply.failed.sources_untouched
+  description: Always true. The only path that deletes a host matches dataset is source retirement, which runs solely after a write has succeeded AND been read back - so every failure leaves the sources intact and re-running is always safe. Carried on the record so a playbook can prove it rather than trusting the documentation.
   type: Boolean
+- contextPath: Yara.ConsolidateApply.targets_written
+  description: len(written). A count beside its list, by house convention - `written` is authoritative.
+  type: Number
+- contextPath: Yara.ConsolidateApply.rows_written
+  description: Total full rows written across all ruleset groups, exactly sum(written[].rows). `written` is authoritative; this is the total the report and the run-log row use.
+  type: Number
+- contextPath: Yara.ConsolidateApply.hosts
+  description: 'Distinct hosts this pass covered, across EVERY ruleset group - written, already-current and ceiling-refused alike. Not a sum or a max of written[].hosts: a host scanned with two rulesets counts once. It was previously the largest host count in any one WRITTEN group, which reported 0 on a fully converged fleet, where every group is already current and nothing is rewritten.'
+  type: Number
+- contextPath: Yara.ConsolidateApply.groups
+  description: How many ruleset groups this pass produced - written, skipped as already-current and failed together. Always >= targets_written.
+  type: Number
+- contextPath: Yara.ConsolidateApply.skipped_count
+  description: len(skipped). A count beside its list - `skipped` is authoritative.
+  type: Number
+- contextPath: Yara.ConsolidateApply.failed_count
+  description: len(failed). A count beside its list - `failed` is authoritative.
+  type: Number
+- contextPath: Yara.ConsolidateApply.sources_retired
+  description: Host matches datasets DELETED this pass because every scan they held was read back out of the consolidated target and counted. Always present, 0 when retirement is off, on every dry run and on a lock standdown. Only ever non-zero when CONFIG_RETIRE_SOURCES_AFTER_FULL is true in the script.
+  type: Number
+- contextPath: Yara.ConsolidateApply.lock_held_by_other_run
+  description: True if this pass stood down because another run holds the consolidation lock. Nothing was read, written or deleted; status is skipped_locked and lock_standdown_reason says which of the two refusals it was.
+  type: Boolean
+- contextPath: Yara.ConsolidateApply.lock_standdown_reason
+  description: 'Why this pass stood down, null on every pass that took the lock. CLOSED vocabulary of two, because acquire_consolidation_lock refuses for two different reasons and the operator response differs: held_by_running_pass (the marker row was readable and another run is genuinely in progress - wait for it to finish) and marker_unreadable (the marker exists but its row could not be read, which is normally the add_data create-lag window moments after another run took it - re-run shortly; a marker that stays unreadable for hours is orphaned by a killed run and must be deleted by hand). The report used to assert the first of these on both paths, so a create-lag race and a real collision rendered identically. Add a code here and to LOCK_STANDDOWN_REASONS in the script together.'
+  type: String
+- contextPath: Yara.ConsolidateApply.datasets_total
+  description: Host matches datasets present for this schema version when the pass started - the whole fleet, not the slice this pass took.
+  type: Number
+- contextPath: Yara.ConsolidateApply.datasets_taken
+  description: Of datasets_total, how many this pass actually read. Bounded by max_datasets, or by the internal row budget when max_datasets is omitted.
+  type: Number
+- contextPath: Yara.ConsolidateApply.datasets_remaining
+  description: 'datasets_total - datasets_taken. THE ONE TO BRANCH ON when draining a large fleet: 0 means this pass covered everything still present, so no further pass is owed and stale-row removal was live. Kept as its own key rather than left as arithmetic because it is the loop condition.'
+  type: Number
+- contextPath: Yara.ConsolidateApply.rows_planned
+  description: Rows this pass expected to read, estimated from one count query before reading. 0 when that estimate was unavailable. Compare with rows_written to see how much of the plan the gate held back.
+  type: Number
 script: '-'
 system: false
 tags: []

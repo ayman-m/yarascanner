@@ -366,10 +366,14 @@ pack. (For a v2/v3 dataset it is correct and expected.)
 
 **Do:** `!YaraConsolidateStatus`
 
-**Expect:** a count of eligible scans, plus any still in progress or blocked, with reasons.
+**Expect:** a markdown report headed `### YARA consolidation readiness - N ready, M pending`,
+with a **Ready to consolidate** table, a **Ruleset groups a run would produce** table naming the
+target datasets, and a **Pending** table giving each held-back scan a `reason` code. There is no
+*blocked* bucket — the row ceiling and count-mismatch refusals belong to the retired per-scan
+merge, which this automation does not run.
 
-**On a fresh or freshly-wiped tenant:** `0 scan(s) ready to consolidate, in 0 ruleset group(s)`, with every
-count `0` and every scan-ID list empty. That is the correct result, not a misconfiguration —
+**On a fresh or freshly-wiped tenant:** `### YARA consolidation readiness - 0 ready, 0 pending`,
+with every count `0` and every list empty. That is the correct result, not a misconfiguration —
 a tenant with no host matches or scans datasets gives the gate nothing to evaluate.
 
 **Reading it:** eligibility is not a countdown from when the scan ran. A scan is ready once
@@ -469,9 +473,10 @@ per-host dataset and a consolidated target is what keeps a record.
 > because that check costs a query per ruleset group and a preview has nothing to protect by
 > paying it.
 >
-> So on a tenant that is already consolidated, the dry run says *"WOULD write N full row(s)"*
-> for the full set, and the very same command with `execute=true` then reports *"target
-> already current … verified, not rewritten"* and writes **zero**. Both are correct; they are
+> So on a tenant that is already consolidated, the dry run lists the full set under
+> `#### Would write` with **Rows** reading *"N would be written"*, and the very same command
+> with `execute=true` then reports the group as `target_already_current` — *"target already
+> current … verified, not rewritten"* — and writes **zero**. Both are correct; they are
 > measuring different things. Treat the dry run's row count as **the size of the group**, and
 > the executed run's as **the work actually outstanding**.
 >
@@ -486,8 +491,8 @@ per-host dataset and a consolidated target is what keeps a record.
 > `host shards deleted: 0` line, and no uppercase `WRITTEN:` / `SKIPPED:` / `FAILED:` blocks.
 > Check the heading text and the table row labels below instead.
 >
-> This is Summary only. `YaraConsolidateApply` (F3) still reports in plain text, and the F3
-> strings below are unchanged.
+> `YaraConsolidateApply` (F3) now reports the same way — headings and tables, no plain-text
+> lines — so the F3 expectations below are written against the markdown too.
 
 **Do:**
 
@@ -569,9 +574,34 @@ dataset = <MATCHES> | comp count() as rows by scan_id
 !YaraConsolidateApply
 ```
 
-**Expect:** `DRY RUN - nothing was created or written.  FULL consolidation: every column of
-every matched-file row.`, followed by a `WOULD write N full row(s) from H host(s) / S
-scan(s) -> yara_scanner_full_v4_rules_<rulehash>` line per ruleset group.
+**Expect:** a report headed `### YARA full consolidation - DRY RUN`, with *"Every column of
+every matched-file row, grouped by ruleset. Nothing was created or written. Re-run with
+`execute=true` to apply exactly this."* directly under it. Then check, by eye:
+
+- a key/value table whose left column reads **Outcome**, **Targets**, **Rows**, **Ruleset
+  groups**, **Hosts covered**, **Skipped**, **Failed**, **Source datasets**, **Fleet
+  progress** — in that order. On this path **Targets** and **Rows** are phrased
+  *"N would be written"*
+- **Outcome** reads `dry_run` — but only while `#### Failed` is absent. It reads
+  `partial_failure` on a dry run that refused a group, because a refusal is a refusal
+  whichever mode found it, and `dry_run` is the row that would otherwise hide the one
+  failure a dry run can produce. The mode is named by the heading, not by **Outcome**
+- **Source datasets** reads *"host matches datasets retired: 0 (dry run - retirement only
+  happens after a write is read back and verified)"*. That row replaced the old constant
+  `host matches datasets deleted: 0` line, and it now reports what this run did rather than
+  a policy
+- **Fleet progress** reads *"datasets: N of N - the whole fleet, so nothing is pending"*. The
+  two numbers matching is how you know the pass was not bounded by `max_datasets` — a bounded
+  pass says *"M of N this pass, K still to go - RE-RUN to continue"* and turns stale-row
+  removal off
+- a **`#### Would write`** table, one row per ruleset group, with the columns
+  `Ruleset | Rows | Hosts | Scans | Target`. The **Target** cell is the
+  `yara_scanner_full_v4_rules_<rulehash>` dataset it would create
+
+A **`#### Skipped - nothing was touched`** table appears only when something was gated;
+`#### Failed` likewise. Both carry a `Reason` column drawn from a closed set — `quiet_period`
+and `scan_in_progress` are the two you should expect to see right after a scan, and
+`row_ceiling_exceeded` is the one that does not clear by waiting.
 
 Then run it for real:
 
@@ -579,8 +609,17 @@ Then run it for real:
 !YaraConsolidateApply execute="true"
 ```
 
-**Expect:** `EXECUTED.`, a `wrote N full row(s)…` line per group, and
-**`host matches datasets deleted: 0`**.
+**Expect:** the same report, with exactly these differences:
+
+- the heading is `### YARA full consolidation - EXECUTED`, and the line under it reads
+  *"Per-ruleset full targets were created and written."*
+- **Outcome** reads `success` (or `partial_failure` if anything is in `#### Failed`)
+- **Targets** and **Rows** are phrased *"N written"*
+- **`#### Would write`** is replaced by **`#### Written`**, which carries two more columns:
+  `Ruleset | Rows | Hosts | Scans | New scans | Stale rows dropped | Target`
+- **Source datasets** now reports the retirement outcome for a real pass — *"host matches
+  datasets retired: N (a source is deleted only once its rows are read back from the ruleset
+  dataset and counted…)"*. See **Verify what Apply left alone** below for what N should be
 
 **Verify the target holds the grouped rows:**
 
@@ -603,8 +642,23 @@ matches datasets hold.
 dataset = <MATCHES> | comp count() as rows by scan_id
 ```
 
-**Expect:** identical to F2 — same dataset, same single `scan_id`, same row count. The
-per-host matches dataset is never deleted by either mode.
+**Expect:** whichever of two answers the **Source datasets** row of the report already told
+you to expect, and read that row *first*:
+
+- *retired: 0* — the per-host matches dataset is untouched, identical to F2: same dataset,
+  same `scan_id`, same row count. This is the answer on every dry run, and on any executed
+  pass whose write it could not read back and verify.
+- *retired: N* — N per-host matches datasets were **deleted**, and querying one now returns
+  dataset-not-found. That is `CONFIG_RETIRE_SOURCES_AFTER_FULL` (`True` as shipped) doing its
+  job, not a fault: a source is retired only after its rows are read back **out of the
+  ruleset target** and counted, so the rows are already safe, and the host's dataset comes
+  back on its next scan. Confirm it by counting the same `scan_id` in
+  `yara_scanner_full_v4_rules_<rulehash>` — that is the copy that now holds it.
+
+**Fails if:** a source dataset is gone while its `scan_id` is *not* in the ruleset target, or
+while **Source datasets** still reads `retired: 0`. Either way the report and the tenant
+disagree, which is the one outcome this step exists to catch. Summary mode retires nothing at
+all, so F2's source is unchanged regardless.
 
 **Do:** `!YaraReport`
 
@@ -612,9 +666,21 @@ per-host matches dataset is never deleted by either mode.
 `yara_scanner_full_v4_rules_<rulehash>` target listed as *this pack's own consolidated
 output, never a candidate*.
 
-**Reading it:** re-run `!YaraConsolidateApply execute="true"` with nothing changed and it
-should report the group as *"target already current … verified, not rewritten"*. That
-verified no-op is the reconciliation working, not a skipped pass.
+**Reading it:** re-run `!YaraConsolidateApply execute="true"` with nothing changed. If the
+sources were kept, the group comes back in `#### Skipped - nothing was touched` with reason
+`target_already_current` — *"target already current … verified, not rewritten"* — and that
+verified no-op is the reconciliation working, not a skipped pass. If they were retired, there
+is nothing left to read and **Fleet progress** says so (`datasets: none found for this schema
+version`); the ruleset target still holds the rows, and the next scan on that host recreates
+its dataset for the following pass.
+
+**One more shape worth recognising:** if another pass holds `yara_scanner_consolidation_lock`,
+this run prints `### YARA full consolidation - STOOD DOWN` and one sentence saying which of
+the two refusals it was — *"the consolidation lock is held by another concurrent run"* (wait
+for that pass) or *"the marker exists but its row could not be read … (add_data create-lag)"*
+(re-run in a minute) — followed by a `#### Lock events` list carrying the lock lines
+themselves. Nothing was read, created, written or deleted on that path, and
+`Yara.ConsolidateApply.lock_standdown_reason` carries the same answer as a code.
 
 ### F4 · Confirm the run was recorded
 
@@ -641,9 +707,17 @@ the lock records its own status, `skipped_locked`, rather than `success`.
 There is no bounded pass to drain and no `max_scans` argument. The per-pass bound is
 `row_ceiling` (shipped default `60000`), and it is a **refusal**, not a partial write.
 
-**Expect:** a ruleset group over the ceiling appears under `FAILED` as *"N row(s) exceeds
-the full-consolidation ceiling of 60000 — REFUSED rather than half-filling …"*. Re-running
-will not help — it will refuse identically.
+**Expect:** a ruleset group over the ceiling appears in the `#### Failed` table with
+**Reason** `row_ceiling_exceeded` and **Detail** *"N row(s) exceeds the full-consolidation
+ceiling of 60000 - REFUSED rather than half-filling …"*. Re-running will not help — it will
+refuse identically.
+
+**Expect it on a dry run too, and expect the header to say so.** The ceiling is checked
+before the `execute` branch, so `!YaraConsolidateApply` on its own reaches this refusal —
+and on that path **Outcome** reads `partial_failure`, not `dry_run`. That is deliberate: a
+dry run is the default mode and this is the only failure it can produce, so a `status` that
+reported `dry_run` here would hide from a playbook the one refusal an operator has to act
+on. The heading still reads `DRY RUN`, and `dry_run` in context is still `true`.
 
 **Do, if you hit it:** use `YaraConsolidateSummary` for a fleet that size (full detail runs
 roughly 40× the rows of a summary), or raise `row_ceiling` deliberately, knowing lookup
@@ -664,9 +738,19 @@ faith.
 **`execute="true"` is required for this test.** A dry run takes no lock — it has nothing to
 serialise — so two concurrent previews will both simply run.
 
-**Expect:** the second returns
-*"Skipped this pass — the consolidation lock is held by another concurrent run."*
-and touches nothing.
+**Expect:** the second returns a report headed `### YARA full consolidation - STOOD DOWN`
+over *"Skipped this pass: the consolidation lock is held by another concurrent run. Nothing
+was read, created, written or deleted."*, followed by a `#### Lock events` list carrying the
+lock line the run logged. It touches nothing, `status` is `skipped_locked` and
+`lock_standdown_reason` is `held_by_running_pass`.
+
+**The other standdown is worded differently on purpose.** If the marker dataset exists but
+its row cannot be read yet — the `add_data` create-lag window right after another run took
+the lock — the sentence instead reads *"the consolidation lock marker exists but its row
+could not be read - most likely another run created it moments ago (add_data create-lag)"*
+and `lock_standdown_reason` is `marker_unreadable`. The two used to render identically, so a
+race that clears in a minute and a genuine collision could not be told apart. Re-run after a
+minute for the second; wait for the running pass for the first.
 
 `!YaraConsolidateSummary execute="true"` takes the **same** lock, so a Summary pass and an
 Apply pass will not overlap either — but it stands down in its own words. Summary returns

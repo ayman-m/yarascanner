@@ -28,11 +28,24 @@ can start the instant after it runs), and the entire point of this tool is an op
 choosing, on purpose, to remove everything. Confirm no scan is running before you use it.
 
 ARGUMENTS
-  execute  THE DELETION OPT-IN. Leave false (the default) for a dry run. true, combined
-           with a correct confirm phrase, deletes every yara_scanner_* dataset on the
-           tenant except this pack's own run-log datasets and the consolidation lock.
-  confirm  Required when execute=true. Must equal, exactly and case-sensitively:
-           DELETE ALL YARA DATASETS
+  execute      THE DELETION OPT-IN. Leave false (the default) for a dry run. true, combined
+               with a correct confirm phrase, deletes every yara_scanner_* dataset on the
+               tenant except this pack's own run-log datasets and the consolidation lock.
+  confirm      Required when execute=true. Must equal, exactly and case-sensitively:
+               DELETE ALL YARA DATASETS
+  max_deletes  Caps a single EXECUTED pass so it finishes inside the platform's ~900s task
+               timeout. Defaults to DEFAULT_MAX_DELETES_PER_PASS; 0 or a negative number
+               disables the cap. A dry run is unaffected and always reports the full
+               candidate list.
+
+WHAT IT REPORTS
+  The result dict is the contract; the War Room report is rendered FROM it and from nothing
+  else, so the table an operator reads and the context a playbook branches on cannot
+  disagree. `status` is the one field to branch on. `to_delete` partitions exactly into
+  `deleted` + `failed` + `not_attempted`, so a capped or partly-failed pass can never leave
+  "deleted" and "never touched" indistinguishable. And `lock_taken_over` is the fact that
+  matters most on a bad day: this pass proceeded over another run's lock marker, and may
+  have deleted that run's source datasets underneath it.
 """
 
 # ############################################################################
@@ -63,6 +76,7 @@ CONFIRM_PHRASE = "DELETE ALL YARA DATASETS"
 # behaviour match every sibling automation exactly.
 # ============================================================================
 import json
+import re
 import threading
 import time
 
@@ -294,6 +308,164 @@ class CoreApiClient:
         raise last
 
 
+# ---------------------------------------------------------------------------------------
+# RUN RECORDS - what this pass reports, as fields rather than sentences.
+#
+# `failed` and `preserved` are CONTEXT before they are prose: a playbook filters on them.
+# So each entry is an OBJECT with a stable key set and a `reason` drawn from a closed
+# vocabulary, and the sentence a human reads survives as `detail` rather than BEING the
+# record. Every entry carries every key even where one does not apply, because a transformer
+# filtering on a key that is only sometimes present matches nothing and reports no error -
+# a silently empty branch, which on a wipe tool is the worst kind.
+#
+# `to_delete`, `deleted` and `not_attempted` stay lists of PLAIN dataset names on purpose.
+# Each element there carries exactly one fact - an identifier - and that is data, not prose;
+# wrapping an identifier in an object buys nothing and costs every caller that splices the
+# list. The two lists that DID carry a per-entry reason are the two that became objects.
+# ---------------------------------------------------------------------------------------
+
+# Why one delete of one dataset did not happen. Closed set: a playbook may match on these.
+# The underlying exception text always survives in `detail`, so narrowing a code here never
+# loses the specifics. Note "not found" is deliberately absent - CoreApiClient.delete_dataset
+# treats a missing dataset as {"status": "already_deleted"} and never raises for it, so the
+# desired end state was reached and the name lands in `deleted`, not here.
+FAIL_REASONS = {
+    "auth_error":
+        "HTTP 401/403 - the API key is missing, rotated, or not at ADVANCED level. Every "
+        "remaining delete in the pass fails the same way; fix the credentials and re-run",
+    "rate_limited":
+        "HTTP 429 - the tenant throttled this pass. The dataset is untouched; re-run to "
+        "pick it up again",
+    "server_error":
+        "HTTP 5xx after the client's own retries - a tenant-side failure, not a rejection "
+        "of this request",
+    "http_error":
+        "a non-200 HTTP status outside the classes above",
+    "timeout":
+        "the call did not return inside the client's request timeout. delete_dataset is "
+        "measured at ~60s server-side, so a loaded tenant can exceed it; the delete may in "
+        "fact have landed, and a re-run will report the name as already deleted",
+    "network_error":
+        "the call never reached the tenant - connection, DNS or TLS failure",
+    "unknown":
+        "the delete raised something none of the codes above classify. Read `detail`",
+}
+
+# Why a dataset was never a candidate in the first place. Closed set; mirrors
+# PRESERVED_DATASETS, which is the authority on WHICH names these are.
+PRESERVED_REASONS = {
+    "consolidation_lock":
+        "the pack's mutual-exclusion marker - transient, taken and released around an "
+        "executed pass rather than wiped",
+    "run_log":
+        "an audit trail. Deleting the record of a wipe defeats the reason the record exists",
+}
+
+# Per-name sentence for a preserved record, so `detail` says which trail it is rather than
+# restating the vocabulary. Any preserved name not listed here is a run-log by elimination.
+_PRESERVED_DETAIL = {
+    _LOCK_DATASET: "the consolidation lock. This automation takes and releases it around an "
+                   "executed pass, so it is never a deletion candidate",
+    "yara_scanner_consolidation_runs": "YaraConsolidateApply's run log - one row per "
+                                       "consolidation pass",
+    "yara_scanner_cleanup_runs": "YaraCleanup's run log - one row per retention pass",
+    _WIPE_RUNS_DATASET: "this script's own run log - the record of this very wipe",
+}
+
+# Why this pass took another run's lock marker over. Closed set.
+#
+# Only lock_stale is reachable today: wipe_all passes unreadable_is_held=True, so an
+# unreadable marker stands the pass DOWN (lock_held_by_other_run) instead of being taken
+# over. lock_unreadable is declared because acquire_consolidation_lock still emits that
+# sentence for callers that pass False, and a vocabulary that silently drops a code the
+# shared helper can produce is a vocabulary that stops being closed the day the flag flips.
+TAKEOVER_REASONS = {
+    "lock_stale":
+        "the marker carried a readable start time older than DEFAULT_LOCK_STALE_SECS, so "
+        "the run that wrote it is presumed dead",
+    "lock_unreadable":
+        "the marker existed with no readable row at all. NOT reachable from this automation "
+        "while it passes unreadable_is_held=True, which treats that state as held",
+}
+
+
+def _delete_failure_reason(exc):
+    """Closed-vocabulary FAIL_REASONS code for one delete_dataset exception.
+
+    CoreApiClient raises RuntimeError("<uri> HTTP <code>: <body>") for a non-200, so the
+    status code is the strongest signal available and is read first; the transport failures
+    below it never carry one."""
+    low = str(exc or "").lower()
+    m = re.search(r"http (\d{3})", low)
+    code = int(m.group(1)) if m else None
+    if code in (401, 403):
+        return "auth_error"
+    if code == 429:
+        return "rate_limited"
+    if code is not None and 500 <= code <= 599:
+        return "server_error"
+    if code is not None:
+        return "http_error"
+    if "timed out" in low or "timeout" in low:
+        return "timeout"
+    if ("connection" in low or "ssl" in low or "certificate" in low
+            or "name resolution" in low or "unreachable" in low):
+        return "network_error"
+    return "unknown"
+
+
+def _failed_record(dataset, exc):
+    """One `failed` entry: the dataset, a code from FAIL_REASONS, and the error itself.
+
+    Before this existed the reason was formatted into a log line that main() collected and
+    never read, so the ONLY record of why a delete failed was discarded - the yml even
+    promised it was in the readable output. It travels with the name now."""
+    return {"dataset": dataset,
+            "reason": _delete_failure_reason(exc),
+            "detail": str(exc)[:200]}
+
+
+def _preserved_record(dataset):
+    """One `preserved` entry. The WHY used to live only in a comment beside
+    PRESERVED_DATASETS and in one sentence of the report; an operator asking "why is that
+    still there" had nothing in context to read."""
+    reason = "consolidation_lock" if dataset == _LOCK_DATASET else "run_log"
+    return {"dataset": dataset, "reason": reason,
+            "detail": _PRESERVED_DETAIL.get(dataset, PRESERVED_REASONS[reason])}
+
+
+def _takeover_record(message=""):
+    """The lock-steal event as fields: a TAKEOVER_REASONS code, the marker's age, and the
+    sentence.
+
+    acquire_consolidation_lock is compared byte-for-byte against xdr_consolidate.py by
+    tests/test_consolidation.py's lock gate, so it can only ever hand a caller its own
+    sentence through on_takeover. This converts that sentence ONCE, here at the boundary,
+    and nothing downstream substring-matches prose again. Every key is always present -
+    reason "" and age_secs None mean no takeover happened."""
+    msg = str(message or "")
+    m = re.search(r"age ([0-9.]+)s", msg)
+    age = float(m.group(1)) if m else None
+    if not msg:
+        reason = ""
+    else:
+        reason = "lock_stale" if age is not None else "lock_unreadable"
+    return {"reason": reason, "age_secs": age, "detail": msg}
+
+
+def _passes_expected(candidates, max_deletes):
+    """Execute passes of max_deletes needed to drain `candidates` from scratch. 0 when there
+    is nothing to delete, 1 when the cap is disabled or everything fits.
+
+    Published rather than left to the reader: the report has always stated this number, and
+    ceil division against an optional cap is exactly the arithmetic a caller gets wrong."""
+    if candidates <= 0:
+        return 0
+    if not max_deletes or max_deletes <= 0:
+        return 1
+    return -(-candidates // max_deletes)
+
+
 def list_all_yara_datasets(client):
     """Every yara_scanner_*-prefixed LOOKUP dataset on the tenant - matches, scans,
     summary, per-scan consolidated targets, this pack's own run-logs, the lock, any schema
@@ -324,8 +496,11 @@ def list_all_yara_datasets(client):
 def _delete_all(client, names, log):
     """Concurrent delete, bounded batches - same pattern xdr_consolidate.py's
     `_delete_many` uses, WITHOUT its live-overwrite-dataset guard: that guard exists
-    specifically to protect the dataset this script exists to delete. Returns
-    (deleted, failed) name lists."""
+    specifically to protect the dataset this script exists to delete.
+
+    Returns (deleted names, failed RECORDS). The failure records are the point: the reason
+    a delete failed used to be formatted into `log` and thrown away, leaving the caller a
+    bare name list and the operator nothing to act on."""
     lock = threading.Lock()
     deleted, failed = [], []
 
@@ -337,7 +512,7 @@ def _delete_all(client, names, log):
         except Exception as e:
             log("  delete FAILED %s: %s" % (ds, str(e)[:120]))
             with lock:
-                failed.append(ds)
+                failed.append(_failed_record(ds, e))
 
     for i in range(0, len(names), DELETE_CONCURRENCY):
         batch = names[i:i + DELETE_CONCURRENCY]
@@ -347,7 +522,9 @@ def _delete_all(client, names, log):
         for t in threads:
             t.join()
         log("  deleted %d/%d" % (len(deleted), len(names)))
-    return sorted(deleted), sorted(failed)
+    # Grouped by reason, then by name: a pass that fails 40 deletes usually fails them for
+    # two or three reasons, and those want to be adjacent in the table an operator reads.
+    return sorted(deleted), sorted(failed, key=lambda f: (f["reason"], f["dataset"]))
 
 
 def record_wipe_run(client, result, now_ms=None, log=print):
@@ -355,28 +532,34 @@ def record_wipe_run(client, result, now_ms=None, log=print):
     exists to leave behind. Every exception is caught and only logged; failing to write
     this row must never replace the run's real outcome."""
     now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
-    # A lock standdown gets its OWN mode, never "executed". It returns before any delete, so
-    # it lands here with dry_run False and deleted_count 0 - byte-identical, in the run log,
-    # to a real executed pass that deleted nothing. That is the exact question this audit
-    # trail exists to answer, and recording a standdown as "executed" made it unanswerable.
-    if result.get("lock_held_by_other_run"):
-        mode = "skipped_locked"
-    elif result.get("dry_run"):
-        mode = "dry_run"
-    else:
-        mode = "executed"
+    # `mode` IS result["status"] - one derivation, so the audit trail and the context can
+    # never disagree about what kind of pass this was. A lock standdown gets its own value
+    # and is never "executed": it returns before any delete, so it lands here with dry_run
+    # False and deleted_count 0 - byte-identical, in the run log, to a real executed pass
+    # that deleted nothing, which is the exact question this audit trail exists to answer.
     row = {
         "run_ts_ms": now_ms,
-        "mode": mode,
+        "mode": str(result.get("status") or ""),
         "total_found": int(result.get("total_found", 0) or 0),
         "to_delete_count": int(result.get("to_delete_count", 0) or 0),
         "deleted_count": int(result.get("deleted_count", 0) or 0),
         "failed_count": int(result.get("failed_count", 0) or 0),
         "deleted": json.dumps(result.get("deleted", []))[:8000],
-        "failed": json.dumps(result.get("failed", []))[:4000],
-        "preserved": json.dumps(result.get("preserved", []))[:2000],
+        # Reason included, name and code only: the column is capped at 4000 characters and a
+        # truncated JSON document parses as nothing at all, so the sentence stays in context
+        # and in the report while the audit row keeps the fact you can group by. `preserved`
+        # is written as bare names for the same reason - its detail sentences alone would
+        # overrun 2000 characters.
+        "failed": json.dumps([{"dataset": f.get("dataset"), "reason": f.get("reason")}
+                              for f in (result.get("failed") or [])])[:4000],
+        "preserved": json.dumps([p.get("dataset")
+                                 for p in (result.get("preserved") or [])])[:2000],
         "stopped_early": str(bool(result.get("stopped_early"))),
     }
+    # NOTE: not_attempted has no column of its own, and deliberately so - adding one to
+    # _WIPE_RUNS_SCHEMA would not match the yara_scanner_wipe_runs dataset already on every
+    # tenant that has ever run this, and add_lookup_data against a mismatched schema fails.
+    # It is recoverable from the row as to_delete_count - deleted_count - failed_count.
     try:
         client.create_lookup_dataset(_WIPE_RUNS_DATASET, _WIPE_RUNS_SCHEMA)
         client.add_lookup_data(_WIPE_RUNS_DATASET, [row])
@@ -397,9 +580,17 @@ def wipe_all(client, execute=False, log=print, now_ms=None, max_deletes=DEFAULT_
     now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
     all_names = list_all_yara_datasets(client)
     to_delete = sorted(n for n in all_names if n not in PRESERVED_DATASETS)
-    preserved_present = sorted(n for n in all_names if n in PRESERVED_DATASETS)
+    preserved_present = [_preserved_record(n)
+                         for n in sorted(n for n in all_names if n in PRESERVED_DATASETS)]
 
+    # to_delete is the CANDIDATE set - what this pass found. deleted / failed /
+    # not_attempted partition it exactly, always, in every mode: without the third of those
+    # a capped or partly-failed pass reported "8 candidates, 3 deleted" and left the other
+    # five indistinguishable between "still there" and "gone". not_attempted starts as the
+    # whole candidate set, which is the literal truth of a dry run and of a standdown -
+    # nothing is attempted in either - and is narrowed once a real pass has run.
     result = {
+        "status": "dry_run" if not execute else "executed",
         "dry_run": not execute,
         "total_found": len(all_names),
         "to_delete_count": len(to_delete),
@@ -407,9 +598,12 @@ def wipe_all(client, execute=False, log=print, now_ms=None, max_deletes=DEFAULT_
         "preserved": preserved_present,
         "lock_held_by_other_run": False,
         "lock_taken_over": False,
-        "lock_takeover_reason": "",
+        "lock_takeover": _takeover_record(),
         "stopped_early": False,
+        "max_deletes": max_deletes if max_deletes else None,
+        "passes_expected": _passes_expected(len(to_delete), max_deletes),
         "deleted_count": 0, "failed_count": 0, "deleted": [], "failed": [],
+        "not_attempted": list(to_delete), "not_attempted_count": len(to_delete),
     }
 
     if not execute:
@@ -425,6 +619,7 @@ def wipe_all(client, execute=False, log=print, now_ms=None, max_deletes=DEFAULT_
                                       unreadable_is_held=True,
                                       on_takeover=takeovers.append):
         result["lock_held_by_other_run"] = True
+        result["status"] = "skipped_locked"
         # Recorded, not silent: a standdown returns before any delete, so without this the
         # run log cannot tell "stood down on the lock" from "never started" - the exact
         # question the wipe audit trail exists to answer.
@@ -433,8 +628,10 @@ def wipe_all(client, execute=False, log=print, now_ms=None, max_deletes=DEFAULT_
     if takeovers:
         # Reported, never silent: this pass proceeded while another run's lock marker was in
         # place, and the operator must be able to tell it apart from an uncontended pass.
+        # The boolean is the branch; the record beside it carries the code, the marker's age
+        # and the sentence.
         result["lock_taken_over"] = True
-        result["lock_takeover_reason"] = takeovers[0]
+        result["lock_takeover"] = _takeover_record(takeovers[0])
     try:
         this_pass = to_delete
         if max_deletes and len(to_delete) > max_deletes:
@@ -447,6 +644,14 @@ def wipe_all(client, execute=False, log=print, now_ms=None, max_deletes=DEFAULT_
         result["deleted_count"] = len(deleted)
         result["failed"] = failed
         result["failed_count"] = len(failed)
+        # The remainder, computed from what was actually touched rather than from the cap:
+        # a bounded pass and a pass whose deletes failed both leave candidates behind, and
+        # they leave DIFFERENT ones. Subtracting keeps to_delete == deleted + failed +
+        # not_attempted true whichever happened.
+        touched = set(deleted) | set(f["dataset"] for f in failed)
+        result["not_attempted"] = [n for n in to_delete if n not in touched]
+        result["not_attempted_count"] = len(result["not_attempted"])
+        result["status"] = "partial_failure" if failed else "executed"
     finally:
         release_consolidation_lock(client, log=log)
 
@@ -455,6 +660,197 @@ def wipe_all(client, execute=False, log=print, now_ms=None, max_deletes=DEFAULT_
 
 
 # ---- entry point ------------------------------------------------------------
+_MD_ROW_CAP = 50
+
+
+def _n(v):
+    """Thousands-separated. The numbers this reports run to six figures.
+
+    Integral values print as integers, floats included: the settings arrive as
+    float(args.get(...)), and "900.0" in a table reads as a typo rather than a default.
+
+    A NON-integral float keeps its fraction. The previous version went through int(), which
+    silently truncated - a quiet_secs of 900.5 printed as 900 while the context carried 900.5,
+    so the report and the context stated different numbers. That is the one disagreement this
+    renderer exists to make impossible, and it was being introduced by the formatter itself.
+    """
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    return format(int(f), ",d") if f.is_integer() else format(f, ",g")
+
+
+def _md_table(headers, rows):
+    """A markdown table, or "" when there is nothing to put in it. Cells are escaped: rule
+    names and hostnames reach here from a ruleset and from an endpoint, and a single pipe in
+    either would silently shear a column off every row below it."""
+    if not rows:
+        return ""
+
+    def cell(v):
+        return str("" if v is None else v).replace("|", "\\|").replace("\n", " ")
+
+    out = ["| " + " | ".join(cell(h) for h in headers) + " |",
+           "|" + "|".join("---" for _ in headers) + "|"]
+    for r in rows:
+        out.append("| " + " | ".join(cell(v) for v in r) + " |")
+    return "\n".join(out)
+
+
+def _md_capped(headers, rows, context_key):
+    """_md_table, truncated. The context keeps every entry, so a 200-host pass cannot push the
+    counts off the top of the War Room - the same trade YaraReport makes for the scan log."""
+    body = _md_table(headers, rows[:_MD_ROW_CAP])
+    if len(rows) > _MD_ROW_CAP:
+        body += ("\n\n_... and %s more - the full list is in `%s`._"
+                 % (_n(len(rows) - _MD_ROW_CAP), context_key))
+    return body
+
+
+_HEADLINE = {"dry_run": "DRY RUN", "skipped_locked": "STOOD DOWN",
+             "executed": "EXECUTED", "partial_failure": "EXECUTED, WITH FAILURES"}
+_SUBTITLE = {
+    "dry_run": "Nothing was deleted. Re-run with execute=true and a correct confirm phrase "
+               "to apply exactly this.",
+    # NOT "the lock is held by another concurrent run", which this pass cannot know:
+    # acquire_consolidation_lock refuses for TWO reasons and returns the same False for both -
+    # a fresh readable marker (another run really is in progress) and a marker whose row could
+    # not be read at all, which this automation treats as held rather than risk deleting
+    # underneath a live pass. Asserting the first on both paths told an operator to wait for a
+    # run that may not exist. Naming both is what the pass actually established.
+    "skipped_locked": "Nothing was deleted. The consolidation lock could not be taken - either "
+                      "another run holds it (YaraConsolidateApply, YaraCleanup, the CLI, or "
+                      "another wipe), or its marker exists with a row that could not be read, "
+                      "which this automation treats as held rather than delete underneath a "
+                      "pass that may still be running.",
+    "executed": "Every dataset this pass attempted was deleted.",
+    "partial_failure": "Some deletions failed. Those datasets are still on the tenant, and "
+                       "re-running is safe.",
+}
+
+
+def render_wipe_markdown(result):
+    """The War Room report for one pass, rendered from the result dict and NOTHING else.
+
+    Every number here is a key a playbook can also read, so the table an operator acts on
+    and the context a branch reads cannot disagree. The previous version formatted three of
+    its numbers - the pass count, the remainder, the preserved count - out of main() locals
+    that were published nowhere, and built its lists with `["  " + n for n in ...]`, which
+    raises TypeError the moment one of those lists holds an object rather than a name."""
+    status = str(result.get("status") or "")
+    out = ["### YARA dataset wipe - %s" % _HEADLINE.get(status, status.upper() or "UNKNOWN"),
+           "_%s_" % _SUBTITLE.get(status, ""), ""]
+
+    if result["lock_held_by_other_run"]:
+        # Same care as the subtitle: the refusal does not say WHICH of its two branches fired,
+        # so this row must not pick one. See _SUBTITLE["skipped_locked"].
+        lock = ("NOT TAKEN - held by another run, or its marker could not be read; this pass "
+                "stood down and deleted nothing")
+    elif result["lock_taken_over"]:
+        lock = ("TAKEN OVER from another run (`%s`) - see the warning below"
+                % result["lock_takeover"]["reason"])
+    elif result["dry_run"]:
+        lock = "not taken - a dry run takes no lock"
+    else:
+        lock = "taken and released by this pass, uncontended"
+
+    if status in ("executed", "partial_failure"):
+        owed = " - still on the tenant, owed a further pass"
+    elif status == "skipped_locked":
+        owed = " - the pass stood down before attempting any of them"
+    else:
+        owed = " - a dry run attempts nothing"
+
+    facts = [
+        ("Status", "`%s`" % status),
+        ("Candidates", "%s of %s yara_scanner_* dataset(s) on this tenant"
+                       % (_n(result["to_delete_count"]), _n(result["total_found"]))),
+        ("Deleted", _n(result["deleted_count"])),
+        ("Failed", "%s%s" % (_n(result["failed_count"]),
+                             " - still on the tenant" if result["failed_count"] else "")),
+        ("Not attempted", "%s%s" % (_n(result["not_attempted_count"]),
+                                    owed if result["not_attempted_count"] else "")),
+        ("Preserved", "%s - this pack's audit trail and the consolidation lock"
+                      % _n(len(result["preserved"]))),
+        ("Lock", lock),
+        ("Pass cap", ("max_deletes=%s" % _n(result["max_deletes"])) if result["max_deletes"]
+                     else "disabled - this pass was allowed to delete every candidate"),
+    ]
+    out.append(_md_table(["", ""], [("**%s**" % k, v) for k, v in facts]))
+
+    if result["lock_taken_over"]:
+        out += ["", "> **WARNING - this wipe took another run's consolidation lock over.** %s. "
+                    "If a consolidation pass was in fact still running, its source datasets "
+                    "were deleted underneath it: check `yara_scanner_consolidation_runs` for "
+                    "a pass around this time with no outcome row."
+                % (result["lock_takeover"]["detail"] or "No detail was reported").rstrip(".")]
+
+    # Stated in a dry run, which is exactly when it needs to be known - not discovered after
+    # the first capped execute pass.
+    if result["dry_run"] and result["passes_expected"] > 1:
+        out += ["", "This is more than one execute pass handles (max_deletes=%s): expect %s "
+                    "execute run(s), invoking the exact same command each time, to fully "
+                    "drain it." % (_n(result["max_deletes"]), _n(result["passes_expected"]))]
+    if result["stopped_early"]:
+        # What "remains" is what is STILL ON THE TENANT, which is not_attempted PLUS failed -
+        # a capped pass that also had failures leaves both behind, and "the rest" the next run
+        # picks up is both. Formatting not_attempted alone undercounted, and disagreed with the
+        # two rows of the table directly above that each say "still on the tenant". The
+        # breakdown is appended only when there is one to give, so an uncontended capped pass
+        # reads exactly as before.
+        remaining = result["not_attempted_count"] + result["failed_count"]
+        breakdown = ("" if not result["failed_count"] else
+                     " (%s never attempted, %s failed)"
+                     % (_n(result["not_attempted_count"]), _n(result["failed_count"])))
+        out += ["", "Pass was bounded to %s of %s candidate(s) - %s remain%s. Run this exact "
+                    "command again to continue draining the rest."
+                % (_n(result["max_deletes"]), _n(result["to_delete_count"]),
+                   _n(remaining), breakdown)]
+
+    if status in ("executed", "partial_failure"):
+        if result["deleted"]:
+            out += ["", "#### Deleted",
+                    _md_capped(["Dataset"], [("`%s`" % n,) for n in result["deleted"]],
+                               "Yara.WipeAll.deleted")]
+        if result["failed"]:
+            out += ["", "#### Failed - still on the tenant",
+                    _md_capped(["Dataset", "Reason", "Detail"],
+                               [("`%s`" % f["dataset"], "`%s`" % f["reason"], f["detail"])
+                                for f in result["failed"]], "Yara.WipeAll.failed"),
+                    "", "_A failed delete leaves the dataset exactly as it was, so every "
+                        "name here is simply a candidate again on the next run._"]
+        if result["not_attempted"]:
+            out += ["", "#### Not attempted - still on the tenant",
+                    _md_capped(["Dataset"], [("`%s`" % n,) for n in result["not_attempted"]],
+                               "Yara.WipeAll.not_attempted")]
+    elif result["to_delete"]:
+        out += ["", "#### Would delete",
+                _md_capped(["Dataset"], [("`%s`" % n,) for n in result["to_delete"]],
+                           "Yara.WipeAll.to_delete")]
+
+    if result["preserved"]:
+        out += ["", "#### Preserved - never touched",
+                _md_table(["Dataset", "Why", "Detail"],
+                          [("`%s`" % p["dataset"], "`%s`" % p["reason"], p["detail"])
+                           for p in result["preserved"]])]
+
+    out += ["", "#### Settings this run used",
+            _md_table(["Argument", "Value", "What it controls"], [
+                ("`execute`", "false - dry run" if result["dry_run"] else "true",
+                 "false reports and deletes nothing; true deletes, and additionally "
+                 "requires an exact confirm phrase"),
+                ("`confirm`", "not read on a dry run" if result["dry_run"] else "matched",
+                 'must equal exactly "%s", or nothing is deleted no matter what execute '
+                 "says" % CONFIRM_PHRASE),
+                ("`max_deletes`", _n(result["max_deletes"]) if result["max_deletes"]
+                                  else "disabled",
+                 "candidates ONE executed pass may delete, so it finishes inside the "
+                 "platform's ~900s task timeout. A dry run ignores it"),
+            ])]
+    return "\n".join(out)
+
+
 def main():
     args = demisto.args()
     execute = bool(argToBoolean(args.get("execute"))) if args.get("execute") not in (None, "") else False
@@ -478,6 +874,10 @@ def main():
             "Nothing was deleted.".format(CONFIRM_PHRASE))
         return
 
+    # The log sink stays a sink: every fact it used to be the only carrier of - why a delete
+    # failed, that a lock was taken over, that the pass was bounded - now travels in the
+    # result dict, and the report is rendered from that. This only keeps the platform's
+    # container log quiet.
     log_lines = []
     try:
         result = wipe_all(CoreApiClient(), execute=execute, max_deletes=max_deletes,
@@ -487,48 +887,11 @@ def main():
         return_error("YaraWipeAllDatasets failed: {}".format(ex))
         return
 
-    if result["lock_held_by_other_run"]:
-        lines = ["Skipped - the consolidation lock is held by another concurrent run "
-                 "(YaraConsolidateApply, YaraCleanup, or another wipe in progress). "
-                 "Nothing was deleted."]
-    elif result["dry_run"]:
-        lines = ["DRY RUN - nothing was deleted. {} of {} yara_scanner_* dataset(s) on this "
-                 "tenant WOULD be deleted; {} preserved (this pack's audit trail + lock). "
-                 "Re-run with execute=true and confirm=\"{}\" to apply."
-                 .format(result["to_delete_count"], result["total_found"],
-                         len(result["preserved"]), CONFIRM_PHRASE)]
-        # Tell the operator BEFORE they ever set execute=true, not only after the first
-        # capped pass — a dry run is exactly when this needs to be known, not discovered.
-        if max_deletes and result["to_delete_count"] > max_deletes:
-            passes = -(-result["to_delete_count"] // max_deletes)  # ceil division
-            lines.append("This is more than one execute pass handles (max_deletes={}): "
-                        "expect {} execute run(s), invoking the exact same command each "
-                        "time, to fully drain it.".format(max_deletes, passes))
-        if result["to_delete"]:
-            lines += ["", "would delete:"] + ["  {}".format(n) for n in result["to_delete"]]
-    else:
-        lines = ["EXECUTED - {} dataset(s) deleted, {} failed.".format(
-            result["deleted_count"], result["failed_count"])]
-        if result["stopped_early"]:
-            remaining = result["to_delete_count"] - result["deleted_count"]
-            lines.append("Pass was bounded to {} of {} candidate(s) - {} remain. Run this "
-                         "exact command again to continue draining the rest."
-                         .format(max_deletes, result["to_delete_count"], remaining))
-        if result["failed"]:
-            lines += ["", "failed:"] + ["  {}".format(n) for n in result["failed"]]
-
-    if result.get("lock_taken_over"):
-        lines.append("WARNING: another run's consolidation lock marker was present and this "
-                     "wipe TOOK IT OVER as stale ({}). If a consolidation pass was in fact "
-                     "still running, its source datasets were deleted underneath it."
-                     .format(result.get("lock_takeover_reason", "")))
-
-    if result["preserved"]:
-        lines += ["", "preserved (never touched):"] + ["  {}".format(n) for n in result["preserved"]]
-
+    # List-valued context is APPENDED to across repeated calls in one investigation; clear
+    # it first so to_delete/deleted/failed never carry a prior call's entries.
     demisto.executeCommand("DeleteContext", {"key": "Yara.WipeAll"})
     return_results(CommandResults(
-        readable_output="\n".join(lines),
+        readable_output=render_wipe_markdown(result),
         outputs_prefix="Yara.WipeAll",
         outputs=result,
         raw_response=result,

@@ -1,177 +1,202 @@
 args:
-- name: older_than_months
-  description: Delete rotated datasets older than N whole months. No default, on
-    purpose — omit it (and delete_legacy) and this automation selects nothing and
-    deletes nothing. N=0 means "every month before the current one". A negative value
-    is clamped to 0.
-  required: false
+- default: false
+  description: Delete rotated datasets older than N whole months. No default, on purpose — omit it (and delete_legacy) and this automation selects nothing and deletes nothing. N=0 means "every month before the current one". A negative value is clamped to 0.
   isArray: false
-  default: false
+  name: older_than_months
+  required: false
   secret: false
-- name: delete_legacy
-  description: Also delete datasets on an older/unversioned schema. Every safety rail
-    applies to these exactly as it does to the retention-window path, because "legacy"
-    is derived from schema_version — set that one version too high and live datasets
-    classify as legacy. Refused outright while any NEWER-schema dataset exists (that
-    proves schema_version is stale), and unsuffixed legacy datasets are never blanket
-    candidates. Datasets on a NEWER schema are never deleted regardless.
-  required: false
-  isArray: false
+- auto: PREDEFINED
   default: false
   defaultValue: 'false'
-  secret: false
-  auto: PREDEFINED
+  description: Also delete datasets on an older/unversioned schema. Every safety rail applies to these exactly as it does to the retention-window path, because "legacy" is derived from schema_version — set that one version too high and live datasets classify as legacy. Refused outright while any NEWER-schema dataset exists (that proves schema_version is stale), and unsuffixed legacy datasets are never blanket candidates. Datasets on a NEWER schema are never deleted regardless.
+  isArray: false
+  name: delete_legacy
   predefined:
   - 'true'
   - 'false'
-- name: execute
-  description: THE DELETION OPT-IN. Leave false (the default) for a dry run that
-    reports what it would delete and deletes nothing. Set true to actually delete —
-    whole datasets, irreversibly.
   required: false
-  isArray: false
+  secret: false
+- auto: PREDEFINED
   default: false
   defaultValue: 'false'
-  secret: false
-  auto: PREDEFINED
+  description: THE DELETION OPT-IN. Leave false (the default) for a dry run that reports what it would delete and deletes nothing. Set true to actually delete — whole datasets, irreversibly.
+  isArray: false
+  name: execute
   predefined:
   - 'true'
   - 'false'
-- name: min_quiet_hours
-  description: Never delete a dataset whose newest row is younger than this many hours,
-    regardless of its month label — protects against a scan still writing near a month
-    boundary, or clock/timezone skew between the scanning endpoint and the tenant
-    (default 24). This argument CANNOT switch the rail off - anything below the 1h
-    floor is raised to 1h and the run says so.
   required: false
-  isArray: false
-  default: false
   secret: false
-- name: force
+- default: false
+  description: Never delete a dataset whose newest row is younger than this many hours, regardless of its month label — protects against a scan still writing near a month boundary, or clock/timezone skew between the scanning endpoint and the tenant (default 24). This argument CANNOT switch the rail off - anything below the 1h floor is raised to 1h and the run says so.
+  isArray: false
+  name: min_quiet_hours
+  required: false
+  secret: false
+- auto: PREDEFINED
+  default: false
+  defaultValue: 'false'
   description: Pass force=true to delete_dataset, for datasets that have dependencies.
-  required: false
   isArray: false
-  default: false
-  defaultValue: 'false'
-  secret: false
-  auto: PREDEFINED
+  name: force
   predefined:
   - 'true'
   - 'false'
-- name: schema_version
-  description: The scanner's current lookup schema version (YARA_LOOKUP_SCHEMA_VER on
-    the endpoints; "4" if unset). Must be a whole number — a non-numeric value is
-    rejected outright, because it would silently reclassify every live dataset as
-    "legacy". Datasets on a HIGHER version are classified as "newer" and are never
-    deleted; if this is stale-LOW the run prunes little and says which datasets rail 4
-    vetoed. If it is stale-HIGH, live datasets classify as legacy — the live recency
-    and consolidation rails are what stop that from deleting them, and they are
-    reported as skips.
   required: false
-  isArray: false
-  default: false
   secret: false
-comment: >-
-  Retention pruning for YARA lookup datasets — DELETES WHOLE DATASETS. Dry run by
-  default: without execute=true it reports what it would delete and deletes nothing,
-  so a bare invocation can never lose data. Seven safety rails apply to every
-  candidate on BOTH selection paths (retention window and delete_legacy) and are not
-  optional — never the current month (a scan may be writing to it), never a
-  future-dated month (clock skew), never an unsuffixed dataset (it holds ALL
-  pre-rotation history for that host), never a newer schema version, never a name
-  outside the yara_scanner_* contract, never a dataset written to within
-  min_quiet_hours, and never a dataset still holding a scan consolidation has not
-  verified into a per-scan target. Per-scan consolidated targets are never candidates
-  either. Every kept candidate's reason is reported, including the newer-schema and
-  (when delete_legacy is off) legacy buckets. A real deletion pass takes the same
-  consolidation lock YaraConsolidateApply uses and stands down if another run holds
-  it — treating an unreadable lock row as held, and reporting any takeover; a dry run
-  never takes the lock. Each executed pass writes one row to yara_scanner_cleanup_runs.
+- default: false
+  description: The scanner's current lookup schema version (YARA_LOOKUP_SCHEMA_VER on the endpoints; "4" if unset). Must be a whole number — a non-numeric value is rejected outright, because it would silently reclassify every live dataset as "legacy". Datasets on a HIGHER version are classified as "newer" and are never deleted; if this is stale-LOW the run prunes little and says which datasets rail 4 vetoed. If it is stale-HIGH, live datasets classify as legacy — the live recency and consolidation rails are what stop that from deleting them, and they are reported as skips.
+  isArray: false
+  name: schema_version
+  required: false
+  secret: false
+comment: 'Retention pruning for YARA lookup datasets — DELETES WHOLE DATASETS. Dry run by default: without execute=true it reports what it would delete and deletes nothing, so a bare invocation can never lose data. Seven safety rails apply to every candidate on BOTH selection paths (retention window and delete_legacy) and are not optional — never the current month (a scan may be writing to it), never a future-dated month (clock skew), never an unsuffixed dataset (it holds ALL pre-rotation history for that host), never a newer schema version, never a name outside the yara_scanner_* contract, never a dataset written to within min_quiet_hours, and never a dataset still holding a scan consolidation has not verified into a per-scan target. Per-scan consolidated targets are never candidates either. Every kept candidate''s reason is reported, including the newer-schema and (when delete_legacy is off) legacy buckets. A real deletion pass takes the same consolidation lock YaraConsolidateApply uses and stands down if another run holds it — treating an unreadable lock row as held, and reporting any takeover; a dry run never takes the lock. Each executed pass writes one row to yara_scanner_cleanup_runs.'
 commonfields:
   id: YaraCleanup
   version: -1
+dockerimage: demisto/python3:3.11.10.116949
 enabled: true
+fromversion: 6.5.0
+marketplaces:
+- xsoar
+- marketplacev2
 name: YaraCleanup
 outputs:
+- contextPath: Yara.Cleanup.status
+  description: 'ONE key to branch on, folding in the precedence a caller reading the booleans below would have to rebuild and would get wrong. Closed set: nothing_requested (no window and no delete_legacy, so no API call was made), lock_held (another run holds the consolidation lock, so nothing was deleted), dry_run (execute was not true), success (an executed pass with no delete failures), partial_failure (an executed pass where at least one delete raised). dry_run/nothing_requested/lock_held_by_other_run stay as separate booleans because each is independently meaningful; this key is the verdict over them and is what a playbook should switch on.'
+  type: String
 - contextPath: Yara.Cleanup.dry_run
-  description: True if this run deleted nothing by design (execute was not true).
+  description: True if this run deleted nothing by design (execute was not true). See status for the single key that folds this together with the two stand-down cases.
   type: Boolean
 - contextPath: Yara.Cleanup.nothing_requested
-  description: True if neither older_than_months nor delete_legacy was given, so
-    nothing was selected and no API call was made.
+  description: True if neither older_than_months nor delete_legacy was given, so nothing was selected and no API call was made.
   type: Boolean
 - contextPath: Yara.Cleanup.lock_held_by_other_run
-  description: True if the consolidation lock was held by another run, so this pass
-    deleted nothing.
+  description: True if the consolidation lock was held by another run, so this pass deleted nothing.
   type: Boolean
 - contextPath: Yara.Cleanup.lock_taken_over
-  description: True if another run's lock marker was present and this pass took it
-    over as stale — it deleted while that marker was in place.
+  description: True if another run's lock marker was present and this pass took it over as stale - it deleted while that marker was in place.
   type: Boolean
 - contextPath: Yara.Cleanup.lock_takeover_reason
-  description: The takeover message, when lock_taken_over is true.
+  description: The takeover message, when lock_taken_over is true; empty otherwise. Prose for a human - branch on lock_taken_over, or on the stale_marker_taken_over entry in lock_events.
   type: String
-- contextPath: Yara.Cleanup.selected
-  description: Dataset(s) that passed every safety rail — deleted this run, or that
-    would be deleted on a dry run.
-  type: String
-- contextPath: Yara.Cleanup.selected_count
-  description: Number of datasets selected for deletion.
-  type: Number
-- contextPath: Yara.Cleanup.deleted
-  description: Dataset(s) actually deleted this run (always empty on a dry run).
-  type: String
-- contextPath: Yara.Cleanup.deleted_count
-  description: Number of datasets actually deleted this run.
-  type: Number
-- contextPath: Yara.Cleanup.failed
-  description: Per-dataset delete failures — dataset and error. One failure does not
-    strand the rest of the cleanup.
+- contextPath: Yara.Cleanup.lock_events
+  description: One entry per distinct lock event this pass produced, at most one per event code, in the order they happened. These previously existed only inside the run's log and were surfaced by scraping it for the word "lock", so a lock this pass failed to RELEASE - which blocks the next run until it ages out - reached nothing automated at all.
   type: Unknown
-- contextPath: Yara.Cleanup.failed_count
-  description: Number of datasets that failed to delete.
-  type: Number
-- contextPath: Yara.Cleanup.skipped
-  description: Every candidate that was kept, with the specific rail and reason that
-    kept it — including newer-schema datasets and, when delete_legacy is off, legacy
-    ones.
+- contextPath: Yara.Cleanup.lock_events.event
+  description: 'Closed set: held_by_other_run (another run''s lock was live, so this pass stood down); unreadable_marker_stood_down (the marker existed but its row was unreadable, most likely another run had just created it); stale_marker_taken_over (a marker was present but judged stale and this pass proceeded); release_failed (the lock could not be released at the end of the pass); other (a lock line with no code, detail carries it verbatim).'
   type: String
-- contextPath: Yara.Cleanup.skipped_count
-  description: Number of candidates kept.
-  type: Number
-- contextPath: Yara.Cleanup.newer
-  description: Datasets on a HIGHER schema version than schema_version — never
-    pruned (rail 4). A non-empty list here means schema_version may be stale.
-  type: String
-- contextPath: Yara.Cleanup.newer_count
-  description: Number of newer-schema datasets vetoed by rail 4.
-  type: Number
-- contextPath: Yara.Cleanup.schema_version
-  description: The schema version this run treated as current — it decides whether
-    the run had any scope at all.
+- contextPath: Yara.Cleanup.lock_events.detail
+  description: The log line itself, verbatim. Provenance for the event code, not a contract.
   type: String
 - contextPath: Yara.Cleanup.older_than_months
-  description: The retention window this run used (null if none was given).
+  description: The retention window this run actually used (null if none was given). If it was clamped, warnings carries an older_than_months_clamped entry with the value that was requested - this key is the value that ran.
   type: Number
 - contextPath: Yara.Cleanup.delete_legacy
   description: Whether legacy-schema datasets were in scope for this run.
   type: Boolean
 - contextPath: Yara.Cleanup.min_quiet_hours
-  description: The quiet-period threshold this run used, after the 1h floor.
+  description: The quiet-period threshold this run actually used, after the 1h floor. If the floor raised it, warnings carries a min_quiet_hours_floored entry with the requested value.
+  type: Number
+- contextPath: Yara.Cleanup.schema_version
+  description: The schema version this run treated as current - it decides whether the run had any scope at all.
+  type: String
+- contextPath: Yara.Cleanup.warnings
+  description: One entry per argument this run did NOT use as given. Empty on a run whose arguments were all accepted as passed. Without this a clamped run published only the clamped value, with nothing anywhere saying it had been changed.
+  type: Unknown
+- contextPath: Yara.Cleanup.warnings.reason
+  description: 'Closed set: older_than_months_clamped (a negative window was clamped to 0); min_quiet_hours_floored (a value below the 1h floor was raised to it, because below the floor the value DISABLES rail 6 rather than relaxing it).'
+  type: String
+- contextPath: Yara.Cleanup.warnings.detail
+  description: Why the value was changed, for a human to read.
+  type: String
+- contextPath: Yara.Cleanup.warnings.argument
+  description: Which argument was changed.
+  type: String
+- contextPath: Yara.Cleanup.warnings.requested
+  description: The value the caller passed, as a string, exactly as the platform delivered it.
+  type: String
+- contextPath: Yara.Cleanup.warnings.applied
+  description: The value the run used instead.
+  type: String
+- contextPath: Yara.Cleanup.selected
+  description: Dataset NAMES that passed every safety rail - deleted this run, or that would be deleted on a dry run. Plain strings, because a dataset name is an identifier and needs no unpacking. On an EXECUTED pass this is exactly deleted + failed[].dataset, so a caller must not count all three; on a DRY RUN deleted and failed are empty and this is the only list carrying the outcome, which is why it is published on both paths.
+  type: String
+- contextPath: Yara.Cleanup.selected_count
+  description: len(selected).
+  type: Number
+- contextPath: Yara.Cleanup.deleted
+  description: Dataset names actually deleted this run (always empty on a dry run). Irreversible.
+  type: String
+- contextPath: Yara.Cleanup.deleted_count
+  description: len(deleted).
+  type: Number
+- contextPath: Yara.Cleanup.failed
+  description: One entry per dataset whose delete raised. A record here means the dataset was NOT deleted and the pass carried on - one dataset with dependencies must not strand the rest of the cleanup.
+  type: Unknown
+- contextPath: Yara.Cleanup.failed.dataset
+  description: The dataset the delete was attempted on.
+  type: String
+- contextPath: Yara.Cleanup.failed.reason
+  description: 'Closed set: delete_refused_dependencies (the API''s error text says something still depends on the dataset - re-run with force=true if you mean to drop it anyway); delete_failed (the delete raised for any other reason). The classification is read off the API''s own message, which is the only signal the platform gives.'
+  type: String
+- contextPath: Yara.Cleanup.failed.error
+  description: What the API said, truncated to 200 characters. This list's detail field - there is deliberately no second key restating it.
+  type: String
+- contextPath: Yara.Cleanup.failed.path
+  description: 'Which selection path chose this dataset: retention (the older_than_months path) or legacy (the delete_legacy path).'
+  type: String
+- contextPath: Yara.Cleanup.failed_count
+  description: len(failed).
+  type: Number
+- contextPath: Yara.Cleanup.skipped
+  description: Every candidate that was KEPT, one object each, with the rail that kept it - including the buckets that were never candidates (newer-schema datasets always, legacy ones when delete_legacy is off). A dataset silently not deleted is indistinguishable from a bug. Sorted by (reason, name) so like sits with like. This list is the authoritative record of what was kept and why; Yara.Cleanup.newer is a convenience view over the subset whose reason is newer_schema.
+  type: Unknown
+- contextPath: Yara.Cleanup.skipped.name
+  description: The dataset the rail kept. Empty ONLY on the one whole-path refusal (reason=legacy_refused_newer_schema_present), which is about the run rather than any single dataset.
+  type: String
+- contextPath: Yara.Cleanup.skipped.reason
+  description: 'Closed set, and the field to filter on. pack_output_full and pack_output_summary: this pack''s own cross-host rollup, consolidation output rather than a rotation shard. not_yara_name: outside the yara_scanner_<kind>_v<N> naming contract. retired_scan_target: a per-scan target from the retired per-scan merge, which can be a scan''s only copy. overwrite_dataset: the scanner''s permanent per-host matches dataset, bounded by overwrite rather than by rotation. unrotated_frozen: unsuffixed with rotated siblings, so frozen rather than growing. unrotated_growing: unsuffixed with none, so rotation is off and deleting it would destroy ALL history for that host. current_month: a scan may be writing to it right now. future_month: dated ahead of the clock. inside_window: aged, but still inside older_than_months. recency_check_failed and consolidation_check_failed: the rail''s query errored, so it fails closed and keeps the dataset. within_quiet_period: its newest row is younger than min_quiet_hours. unconsolidated_scans: it still holds scan_id(s) no per-scan target has verified. legacy_refused_newer_schema_present: a whole-path refusal, because a newer-schema dataset proves schema_version is stale. legacy_unsuffixed: an unsuffixed legacy dataset holds ALL pre-rotation history for that host. newer_schema: on a higher schema version than this run assumes. legacy_not_requested: legacy schema and delete_legacy was off. unclassified: the rail''s sentence matched no known template, which is a bug in this automation rather than a condition on the tenant - detail still carries the sentence.'
+  type: String
+- contextPath: Yara.Cleanup.skipped.detail
+  description: The rail's own sentence, verbatim. Provenance and human explanation; reason is the contract, and this text may be reworded without notice.
+  type: String
+- contextPath: Yara.Cleanup.skipped.path
+  description: 'Closed set: retention (the older_than_months path), legacy (the delete_legacy path), schema (neither - rail 4 vetoed the dataset before either path could see it). Several rails fire on BOTH paths and produce an identical sentence on each, so this is the only field that separates them.'
+  type: String
+- contextPath: Yara.Cleanup.skipped.rail
+  description: 'Which numbered safety rail kept the candidate: 1 current month, 2 future month, 3 unsuffixed dataset, 4 newer schema version, 5 outside the naming contract, 6 written to within min_quiet_hours, 7 still holding an unconsolidated scan. Null where the guard is real but unnumbered - the pack''s own consolidation output, a retired per-scan target, the retention window itself, and the legacy bucket nobody asked for.'
+  type: Number
+- contextPath: Yara.Cleanup.skipped.age_months
+  description: Whole months between the dataset's month suffix and this run. Populated for reason=inside_window only; null everywhere else.
+  type: Number
+- contextPath: Yara.Cleanup.skipped.window_months
+  description: The older_than_months window the age was compared against. Populated for reason=inside_window only; null everywhere else.
+  type: Number
+- contextPath: Yara.Cleanup.skipped.newest_age_hours
+  description: How old the dataset's newest row was, in hours. Populated for reason=within_quiet_period only; null everywhere else. Compare against min_quiet_hours.
+  type: Number
+- contextPath: Yara.Cleanup.skipped.stuck_scan_ids
+  description: The scan_id(s) rail 7 found no verified per-scan target for - the FIRST FIVE only, because the rail names no more than five and nothing in its output says whether there were others. Empty list everywhere except reason=unconsolidated_scans.
+  type: String
+- contextPath: Yara.Cleanup.skipped.newer_datasets
+  description: Every newer-schema dataset that caused the blanket legacy refusal - the full list, not the five the sentence names. Empty list except on reason=legacy_refused_newer_schema_present.
+  type: String
+- contextPath: Yara.Cleanup.skipped.error
+  description: The exception text a failing rail query raised. Populated for reason=recency_check_failed and reason=consolidation_check_failed only; empty string everywhere else.
+  type: String
+- contextPath: Yara.Cleanup.skipped_count
+  description: len(skipped).
+  type: Number
+- contextPath: Yara.Cleanup.newer
+  description: 'Dataset names on a HIGHER schema version than schema_version - never pruned (rail 4). A non-empty list here means schema_version may be stale. A CONVENIENCE VIEW: it is exactly [s.name for s in skipped if s.reason == "newer_schema"], and skipped is the authoritative record. It is kept because delete_legacy is refused outright while it is non-empty, which makes it worth reading on its own.'
+  type: String
+- contextPath: Yara.Cleanup.newer_count
+  description: len(newer).
   type: Number
 script: '-'
+subtype: python3
 system: false
 tags: []
-# Higher than the rest of the pack on purpose. This automation's live-query fan-out is
-# unbounded in a way the consolidation automations' is not — one XQL per candidate for the
-# recency rail, plus one per candidate and one per scan_id it holds for the consolidation
-# rail, each with a polling loop — and it is the only automation that holds the consolidation
-# lock across that work. A platform kill mid-run skips the finally that releases the lock.
 timeout: 5400
 type: python
-subtype: python3
-dockerimage: demisto/python3:3.11.10.116949
-fromversion: 6.5.0
-marketplaces:
-- xsoar
-- marketplacev2

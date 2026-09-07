@@ -97,10 +97,14 @@ def test_match_rows_are_evidence_but_never_the_verdict():
     c = FakeClient(scans=[("a", "initiated", DISPATCH + 17000)], matches=[])
     r = V.verify_wave(c, ["a"], DISPATCH)
     assert r["verdict"] == "ok", "no matches must not fail a started host"
-    assert r["match_rows"] == {}
+    # `none_yet` and 0, NOT an empty container: the query answered, and that is a different
+    # fact from the query having failed. See test_scan_verify_reports_objects_not_prose.py.
+    assert r["match_evidence"] == "none_yet" and r["match_rows_total"] == 0
+    assert [h["match_rows"] for h in r["hosts"]] == [0]
     c2 = FakeClient(scans=[("a", "initiated", DISPATCH + 17000)], matches=[("a", 122)])
     r2 = V.verify_wave(c2, ["a"], DISPATCH)
-    assert r2["match_rows"] == {"a": 122}
+    assert r2["match_rows_total"] == 122 and r2["match_evidence"] == "observed"
+    assert [(h["hostname"], h["match_rows"]) for h in r2["hosts"]] == [("a", 122)]
     assert r2["verdict"] == "ok"
 
 
@@ -120,4 +124,11 @@ def test_an_unreadable_dataset_is_unknown_not_a_failed_wave():
             raise RuntimeError("tenant hiccup")
     r = V.verify_wave(Boom(), ["a"], DISPATCH)
     assert r["verdict"] == "unknown"
-    assert r["error"]
+    assert [e["reason"] for e in r["errors"]] == ["lifecycle_query_failed"]
+    assert r["errors"][0]["fatal"] is True
+    # And exactly ONE failure is claimed. This return happens before the match query is
+    # issued, so `unavailable` here - whose declared meaning is that the match query ran and
+    # failed - would publish a second failure that `errors` does not list, and the War Room
+    # report rendered from this dict would print it.
+    assert r["match_evidence"] == "not_attempted"
+    assert all(h["match_evidence"] == "not_attempted" for h in r["hosts"])

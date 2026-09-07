@@ -216,7 +216,9 @@ def test_dry_run_reports_the_correct_split_and_records_itself():
         "not_yara_owned_at_all", "yara_scanner_consolidation_lock",
         "yara_scanner_consolidation_runs", "yara_scanner_cleanup_runs",
     }
-    assert set(result["preserved"]) == {
+    # preserved carries OBJECTS now — the name plus why it was never a candidate. See
+    # test_wipe_all_datasets_reports_objects_not_prose.py for the shape and the vocabulary.
+    assert {p["dataset"] for p in result["preserved"]} == {
         "yara_scanner_consolidation_lock", "yara_scanner_consolidation_runs",
         "yara_scanner_cleanup_runs",
     }
@@ -445,7 +447,9 @@ def test_a_taken_over_lock_is_reported_and_never_silent():
                         now_ms=stale + W.DEFAULT_LOCK_STALE_SECS * 1000 + 1)
     assert result["lock_held_by_other_run"] is False
     assert result["lock_taken_over"] is True
-    assert "taking over" in result["lock_takeover_reason"]
+    # The sentence survives as `detail`; the code beside it is what a playbook matches on.
+    assert "taking over" in result["lock_takeover"]["detail"]
+    assert result["lock_takeover"]["reason"] == "lock_stale"
 
 
 # --------------------------------------------------------------------- confirm-phrase gate

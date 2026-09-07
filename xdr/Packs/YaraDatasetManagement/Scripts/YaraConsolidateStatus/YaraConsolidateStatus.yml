@@ -1,60 +1,135 @@
 args:
-- name: scan_id
-  description: Restrict the preview to these scan_id(s), comma-separated.
-  required: false
+- description: Restrict the preview to these scan_id(s), comma-separated. It narrows the gate loop itself, so eligible_count, pending_count, group_count and every list describe the same filtered population - group_count and groups previously kept describing scans the filter had removed, and the report printed the two side by side. Omit to consider every scan that has match rows at this schema version - the population is built from the matches shards, so a scan that found nothing appears in neither list.
   isArray: true
+  name: scan_id
+  required: false
   secret: false
-- name: schema_version
+- defaultValue: '4'
   description: Lookup schema version to act on. Defaults to 4.
-  required: false
   isArray: false
-  defaultValue: '4'
-  secret: false
-- name: retention_hours
-  description: A scan with no terminal lifecycle row is treated as finished past this age. Defaults to 24. Must match what the consolidation run will use, or this preview and that run disagree.
+  name: schema_version
   required: false
-  isArray: false
-  defaultValue: '24'
   secret: false
-- name: quiet_secs
-  description: How long (seconds) a finished scan's newest match row must have been quiet before it counts as ready. Defaults to 900, and must match what YaraConsolidateApply and YaraConsolidateSummary use - this automation is their preview, and the playbook feeds its eligible_scan_ids straight into them. The scanner writes its terminal lifecycle row BEFORE draining the upload queue, so a scan can report completed while rows are still landing.
+- defaultValue: '24'
+  description: A scan with no terminal lifecycle row is treated as finished past this age. Defaults to 24. Must match what the consolidation run will use, or this preview and that run disagree. A non-numeric value is refused by name, and nothing is read.
+  isArray: false
+  name: retention_hours
   required: false
-  isArray: false
-  defaultValue: '900'
   secret: false
-comment: 'Read-only readiness check. Never writes or deletes. Previews exactly what YaraConsolidateSummary (compact) and YaraConsolidateApply (full detail) would group: which scans pass the finished-or-aged gate, and how they bucket by ruleset hash into consolidated datasets. It does NOT preview a scans-lifecycle merge - nothing performs one today.'
+- defaultValue: '900'
+  description: How long (seconds) a finished scan's newest match row must have been quiet before it counts as ready. Defaults to 900, and must match what YaraConsolidateApply and YaraConsolidateSummary use - this automation is their preview, and the playbook feeds its eligible_scan_ids straight into them. The scanner writes its terminal lifecycle row BEFORE draining the upload queue, so a scan can report completed while rows are still landing. A non-numeric value is refused by name, and nothing is read.
+  isArray: false
+  name: quiet_secs
+  required: false
+  secret: false
+comment: 'Read-only readiness check. Never writes or deletes. Previews exactly what YaraConsolidateSummary (compact) and YaraConsolidateApply (full detail) would group: which scans pass the finished-or-aged gate, and how they bucket by ruleset hash into consolidated datasets. Every scan comes back as an OBJECT carrying a `reason` code from a closed vocabulary - terminal_and_quiet / aged_out on the eligible side, scan_in_progress / no_lifecycle_row / quiet_period / no_timestamp / clock_skew on the pending side - so a playbook can tell a scan that is genuinely running from one that finished a minute ago and is still settling, without matching on prose. The two scan_id lists stay plain strings beside those objects, because that is what the consolidation automations and GenericPolling take. It does NOT preview a scans-lifecycle merge - nothing performs one today, and there is no `blocked` bucket.'
 commonfields:
   id: YaraConsolidateStatus
   version: -1
-enabled: true
-name: YaraConsolidateStatus
-outputs:
-- contextPath: Yara.ConsolidateStatus.eligible_count
-  description: How many scans passed the finished-or-aged gate and are ready for either consolidation mode.
-  type: Number
-- contextPath: Yara.ConsolidateStatus.eligible_scan_ids
-  description: Those scan_ids. Feed straight into YaraConsolidateSummary or YaraConsolidateApply.
-  type: String
-- contextPath: Yara.ConsolidateStatus.pending_count
-  description: Scans still in progress - not yet eligible.
-  type: Number
-- contextPath: Yara.ConsolidateStatus.pending_scan_ids
-  description: Those scan_ids.
-  type: String
-- contextPath: Yara.ConsolidateStatus.group_count
-  description: How many ruleset groups the ready scans fall into - i.e. how many consolidated datasets a run would produce.
-  type: Number
-- contextPath: Yara.ConsolidateStatus.groups
-  description: 'Per ruleset hash: how many scans and which hosts land in that group.'
-  type: Unknown
-script: '-'
-system: false
-tags: []
-timeout: 900
-type: python
-subtype: python3
 dockerimage: demisto/python3:3.11.10.116949
+enabled: true
 fromversion: 6.5.0
 marketplaces:
 - xsoar
 - marketplacev2
+name: YaraConsolidateStatus
+outputs:
+- contextPath: Yara.ConsolidateStatus.eligible_count
+  description: 'How many scans passed the finished-or-aged gate and are ready for either consolidation mode. The cheap branch condition, and the house count-beside-list convention: it is exactly len(eligible_scan_ids) and len(eligible), always, including under a scan_id filter - the filter narrows the gate loop itself, so every count and every list here describes one population.'
+  type: Number
+- contextPath: Yara.ConsolidateStatus.eligible_scan_ids
+  description: Those scan_ids, as PLAIN STRINGS. This is the list to splice into YaraConsolidateSummary or YaraConsolidateApply's scan_id argument, and into GenericPolling - it is deliberately not a list of objects, because those consumers put it through set() and hand it to the platform as an identifier list. Same scans and same order as `eligible`, from which it is derived; `eligible` is where the per-scan detail lives.
+  type: String
+- contextPath: Yara.ConsolidateStatus.eligible
+  description: One OBJECT per eligible scan - the same scans as eligible_scan_ids, in the same order, each carrying WHY it qualified. Read this when you need the reason; read eligible_scan_ids when you need identifiers to pass on. Keys below; every entry carries every key.
+  type: Unknown
+- contextPath: Yara.ConsolidateStatus.eligible.scan_id
+  description: The scan_id - the same string that appears at this position in eligible_scan_ids.
+  type: String
+- contextPath: Yara.ConsolidateStatus.eligible.reason
+  description: 'WHY this scan is ready, from a CLOSED set of exactly two codes: "terminal_and_quiet" (every host that reported a lifecycle status reported a terminal one, and the newest match row has been quiet for quiet_secs - the normal way in) or "aged_out" (the newest match row is older than retention_hours, so the scan is treated as finished whether or not a terminal status ever arrived - the fallback, so a scan whose agent died is not stranded for ever). Branch on this code, never on `detail`. The eligible and pending vocabularies are disjoint, so this code alone also says which list an entry came from.'
+  type: String
+- contextPath: Yara.ConsolidateStatus.eligible.detail
+  description: The same fact as `reason`, written out for a human with this scan's actual numbers in it. Display it; do not match on it - it is free to be reworded, `reason` is not.
+  type: String
+- contextPath: Yara.ConsolidateStatus.eligible.ruleset
+  description: The ruleset hash trailing the scan_id (the _yara_<hash> suffix), which is the key both consolidation modes group on - so this field is the per-scan version of the `groups` partition. Null when the scan_id carries no hash.
+  type: String
+- contextPath: Yara.ConsolidateStatus.eligible.hostnames
+  description: Every distinct hostname seen on this scan's match rows, sorted. Normally one - a scan_id embeds its own hostname - but it is a list because the source rows are what is being reported, not the name.
+  type: String
+- contextPath: Yara.ConsolidateStatus.eligible.newest_ms
+  description: Epoch-ms of the newest match row this scan has written, which is the value both time gates measure. Null when no row carried a usable stamp.
+  type: Number
+- contextPath: Yara.ConsolidateStatus.eligible.age_hours
+  description: That row's age in hours AT THIS RUN's clock, rounded to two decimals - one decimal cannot express an age inside the 900-second quiet window. Kept beside newest_ms rather than derived from it because the run's own clock is not published, so a reader cannot recompute it. Null when newest_ms is null.
+  type: Number
+- contextPath: Yara.ConsolidateStatus.pending_count
+  description: 'How many scans did NOT pass the gate this pass. Exactly len(pending_scan_ids) and len(pending). Not a failure count and not a backlog: scan_in_progress, no_lifecycle_row and quiet_period all resolve on their own, which is why the playbook polls this automation rather than escalating. The other two do NOT - no_timestamp never ages out at all, and clock_skew only stops blocking once real time passes a stamp the endpoint keeps moving ahead - so read `pending[].reason` before deciding to keep waiting.'
+  type: Number
+- contextPath: Yara.ConsolidateStatus.pending_scan_ids
+  description: Those scan_ids, as PLAIN STRINGS - the list GenericPolling takes as Ids and as its dt expression. Same scans and same order as `pending`, from which it is derived; `pending` is where the reason lives.
+  type: String
+- contextPath: Yara.ConsolidateStatus.pending
+  description: One OBJECT per pending scan, same key set as `eligible`, sorted so that scans held back for the same reason sit together. This is what replaced a single hardcoded War Room sentence that called every pending scan "still in progress" - including the ones that had already finished and were merely settling. Keys below; every entry carries every key.
+  type: Unknown
+- contextPath: Yara.ConsolidateStatus.pending.scan_id
+  description: The scan_id - the same string that appears at this position in pending_scan_ids.
+  type: String
+- contextPath: Yara.ConsolidateStatus.pending.reason
+  description: 'WHY this scan is not ready, from a CLOSED set of exactly five codes. "scan_in_progress": at least one host''s lifecycle row is non-terminal and the scan is younger than retention_hours - it is still running. "no_lifecycle_row": no lifecycle row exists for it on any scans shard, and it is younger than retention_hours - nothing has yet said it finished, one way or the other. "quiet_period": it FINISHED, but its newest match row is inside the quiet window; the scanner writes its terminal row before the uploaders drain, so consolidating now would copy a partial set. "clock_skew": its newest match row is stamped in the FUTURE of this run''s clock by more than the five-minute skew tolerance - the endpoint''s clock is ahead of the platform, so the age both time tests measure is negative and neither can be satisfied until real time catches up; correct the endpoint clock (NTP), because every row it writes while the clock is ahead re-arms the wait. YaraConsolidateApply and YaraConsolidateSummary defer the same shard for the same underlying condition - verified, they write zero rows for it - but they report it under their own code `quiet_period`, not `clock_skew`, which they do not have. So the preview agrees with the run on the OUTCOME while the two codes differ; match on whichever automation you are actually reading. "no_timestamp": none of its match rows carries a usable event_timestamp_ms, so neither time test can be applied and the scan cannot age out on its own - one of the TWO pending reasons that waiting does not clear, the other being clock_skew. Branch on this code, never on `detail`.'
+  type: String
+- contextPath: Yara.ConsolidateStatus.pending.detail
+  description: The same fact as `reason`, written out for a human with this scan's actual numbers and lifecycle status in it. Display it; do not match on it.
+  type: String
+- contextPath: Yara.ConsolidateStatus.pending.ruleset
+  description: The ruleset hash trailing the scan_id - which group this scan will join once it becomes eligible. Null when the scan_id carries no hash.
+  type: String
+- contextPath: Yara.ConsolidateStatus.pending.hostnames
+  description: Every distinct hostname seen on this scan's match rows, sorted.
+  type: String
+- contextPath: Yara.ConsolidateStatus.pending.newest_ms
+  description: Epoch-ms of the newest match row this scan has written. Null when no row carried a usable stamp - which is exactly the no_timestamp reason.
+  type: Number
+- contextPath: Yara.ConsolidateStatus.pending.age_hours
+  description: That row's age in hours at this run's clock, rounded to two decimals. Null when newest_ms is null - which is exactly the no_timestamp reason.
+  type: Number
+- contextPath: Yara.ConsolidateStatus.group_count
+  description: 'How many ruleset groups the ELIGIBLE scans fall into - i.e. how many consolidated datasets a run would produce. Exactly len(groups), and it counts the same filtered population as eligible_count: under a scan_id argument it used to keep describing scans the filter had removed.'
+  type: Number
+- contextPath: Yara.ConsolidateStatus.groups
+  description: 'One OBJECT per ruleset hash: the per-ruleset ROLL-UP of `eligible`, which stays the authoritative per-scan record. Read `groups` to answer "how many datasets will this produce and which hosts land in each"; read `eligible` (and its `ruleset` field) to answer "which scans". Pending scans are not in here - they have no group until they become eligible. Keys below.'
+  type: Unknown
+- contextPath: Yara.ConsolidateStatus.groups.rule_hash
+  description: The ruleset hash the group is keyed on, or "unknown" for eligible scans whose scan_id carried no _yara_<hash> suffix.
+  type: String
+- contextPath: Yara.ConsolidateStatus.groups.scans
+  description: 'How many eligible scans fall in this group. WHICH scans is not repeated here: filter `eligible` on ruleset == this rule_hash. The group counts sum to eligible_count.'
+  type: Number
+- contextPath: Yara.ConsolidateStatus.groups.hosts
+  description: Every distinct hostname across this group's eligible scans, sorted.
+  type: String
+- contextPath: Yara.ConsolidateStatus.groups.summary_target
+  description: The dataset YaraConsolidateSummary would write for this group - yara_scanner_summary_v<schema_version>_rules_<rule_hash>. Derived from the naming convention so a caller need not rebuild it; null when rule_hash is "unknown", because no target exists for those scans.
+  type: String
+- contextPath: Yara.ConsolidateStatus.groups.full_target
+  description: The dataset YaraConsolidateApply would write for this group - yara_scanner_full_v<schema_version>_rules_<rule_hash>. Null under the same condition as summary_target.
+  type: String
+- contextPath: Yara.ConsolidateStatus.schema_version
+  description: The schema_version this pass actually ran with, echoed so stored context can say which shards were in scope. A preview and the run it previews must agree on this.
+  type: String
+- contextPath: Yara.ConsolidateStatus.quiet_secs
+  description: The quiet_secs this pass actually ran with. It decides the quiet_period reason, so without it a stored pending list cannot be interpreted later.
+  type: Number
+- contextPath: Yara.ConsolidateStatus.retention_hours
+  description: The retention_hours this pass actually ran with. It decides the aged_out reason. NOT a deletion window - this automation deletes nothing.
+  type: Number
+- contextPath: Yara.ConsolidateStatus.scan_id_filter
+  description: The scan_id argument this pass ran with, as a list - empty when none was given, which means every scan on the tenant at this schema version was considered. Every count and every list above describes the filtered population.
+  type: String
+script: '-'
+subtype: python3
+system: false
+tags: []
+timeout: 900
+type: python

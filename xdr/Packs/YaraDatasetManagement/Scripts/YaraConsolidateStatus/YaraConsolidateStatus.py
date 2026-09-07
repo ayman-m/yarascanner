@@ -1,10 +1,17 @@
 """YaraConsolidateStatus - read-only readiness check for the YARA per-scan dataset merge.
 
-Reports which finished scans are eligible to consolidate now, which are still in progress (a
-scan genuinely running, or one that just finished and is still inside its settle window), and
-which are blocked - the row ceiling exceeded, or a per-scan target that already exists with a
-row count that does not match its sources. Its eligible_scan_ids output is what
-YaraConsolidateApply's scan_id argument expects.
+Reports which finished scans are eligible to consolidate now and which are not yet, and puts a
+`reason` code from a CLOSED vocabulary on every one of them - so a playbook can tell a scan
+that is genuinely running from one that finished a minute ago and is still inside its settle
+window, without substring-matching a sentence written for a human. Its eligible_scan_ids
+output is what YaraConsolidateApply's scan_id argument expects; `eligible` carries the same
+scans as objects, adding why each one qualified.
+
+THERE IS NO `blocked` BUCKET, and this docstring used to promise one. The row ceiling and the
+count-mismatch refusal belong to check_consolidation_status - part of the RETIRED per-scan
+library inlined below, which main() never calls - so a playbook written from that promise
+branched on a key nothing here has ever emitted, and took the silently-empty branch every
+time. Two buckets is the whole answer: eligible, and pending.
 
 Writes nothing and deletes nothing, so it is safe to call repeatedly, including from inside a
 wait/retry poll loop.
@@ -732,8 +739,153 @@ def rule_hash_of(scan_id):
     return m.group(1) if m else None
 
 
+# ---------------------------------------------------------------------------------------
+# THE READINESS RECORDS AND THE WAR ROOM REPORT
+#
+# `eligible` and `pending` are CONTEXT before they are prose: a playbook filters on them. So
+# each entry is an OBJECT with a stable key set and a `reason` drawn from a closed
+# vocabulary, and the sentence a human reads survives as `detail` rather than BEING the
+# record. Every entry carries every key even where one does not apply, because a transformer
+# filtering on a key that is only sometimes present matches nothing and reports no error -
+# the failure mode is a silently empty branch, which is the worst kind to debug.
+#
+# The reason existed here before and was THROWN AWAY: the gate below computed terminal/quiet/
+# aged per scan and then published a bare scan_id, so the only place the distinction survived
+# was one hardcoded War Room sentence that called every pending scan "still in progress" -
+# including the ones that had already finished and were merely settling.
+#
+# eligible_scan_ids and pending_scan_ids stay LISTS OF PLAIN STRINGS beside these, and are
+# derived from them: playbook-YARA_Dataset_Consolidation.yml splices them wholesale into
+# another automation's scan_id argument and into GenericPolling's Ids, and
+# YaraConsolidateApply does set(only_scan_ids), which raises on a dict. A list of scan_ids is
+# DATA, not prose, and needs no conversion.
+# ---------------------------------------------------------------------------------------
+
+PENDING_REASONS = {
+    "scan_in_progress":
+        "at least one host's lifecycle row is non-terminal, and the scan is younger than "
+        "retention_hours - it is still running",
+    "no_lifecycle_row":
+        "no lifecycle row exists for this scan on any scans shard, and it is younger than "
+        "retention_hours - nothing has yet said it finished, one way or the other",
+    "quiet_period":
+        "finished, but its newest match row is inside the quiet window. The scanner writes "
+        "its terminal row BEFORE the uploaders drain, so rows may still be landing; "
+        "consolidating now would copy a partial set and the loss would be permanent",
+    "no_timestamp":
+        "none of its match rows carries a usable event_timestamp_ms, so neither the quiet "
+        "test nor the aged test can be applied and the scan can never age out on its own",
+    "clock_skew":
+        "its newest match row is stamped in the FUTURE of this run's clock by more than "
+        "SKEW_TOLERANCE_MS - the endpoint's clock is ahead of the platform, so the age both "
+        "time tests measure is negative and neither can be satisfied until real time catches "
+        "up. The same condition makes YaraConsolidateApply defer the shard",
+}
+
+# Which pending reasons a further poll actually clears. Everything listed here becomes
+# eligible on its own once enough time passes; the ones deliberately left out do NOT, and the
+# War Room footer is DERIVED from this rather than asserting "every reason above resolves on
+# its own" over a list that may hold one that never will.
+SELF_CLEARING_PENDING_REASONS = ("no_lifecycle_row", "quiet_period", "scan_in_progress")
+
+# What an operator has to do about a pending reason that polling will not clear, keyed by the
+# same codes - so a reason can never be reported as stuck without the report also saying what
+# to do about it. Every PENDING_REASONS code outside SELF_CLEARING_PENDING_REASONS must have
+# an entry here.
+PENDING_REASON_REMEDIES = {
+    "no_timestamp":
+        "nothing ages out without a stamp, so the rows must gain a usable "
+        "event_timestamp_ms before this scan can ever be consolidated",
+    "clock_skew":
+        "the endpoint's clock is ahead of the platform's - correct it (NTP); until then the "
+        "scan waits for real time to pass its stamps, and every new row it writes while the "
+        "clock is ahead re-arms that wait",
+}
+
+ELIGIBLE_REASONS = {
+    "terminal_and_quiet":
+        "every host that reported a lifecycle status reported a terminal one, and the newest "
+        "match row has been quiet for quiet_secs - the normal way in",
+    "aged_out":
+        "the newest match row is older than retention_hours, so the scan is treated as "
+        "finished whether or not a terminal status ever arrived - the fallback way in, so a "
+        "scan whose agent died or whose endpoint left the network is not stranded for ever",
+}
+
+
+def _scan_record(scan_id, reason, detail, ruleset, hostnames, newest_ms, age_hours):
+    """One entry in `eligible` or `pending` - ONE shape for both, so a transformer written
+    against either works unchanged against the other.
+
+    `reason` comes from ELIGIBLE_REASONS on an eligible entry and from PENDING_REASONS on a
+    pending one. The two vocabularies are DISJOINT by design, so `reason` alone identifies
+    which list an entry came from and a caller that concatenates the two lists loses nothing.
+
+    newest_ms and age_hours are both None when no match row carried a usable stamp - None
+    rather than 0, because 1970 and "no answer" are not the same claim. age_hours is that
+    stamp's age AT THIS RUN's clock, which is not otherwise published, so it is not
+    recomputable from newest_ms alone."""
+    return {"scan_id": scan_id, "reason": reason, "detail": detail,
+            "ruleset": ruleset, "hostnames": list(hostnames),
+            "newest_ms": newest_ms, "age_hours": age_hours}
+
+
+def _age_phrase(age_hours):
+    """A row age in the unit that still carries information at that scale.
+
+    The quiet window is 900 SECONDS and the aged threshold is 24 HOURS, so one unit cannot
+    serve both: a scan that finished a minute ago reads "0.0h old" in hours, which looks like
+    a missing value rather than a fresh one - and that is exactly the scan an operator is
+    deciding whether to wait for.
+
+    A NEGATIVE age is a stamp in the FUTURE of this run's clock, and the phrase says so. The
+    unit test `mins < 1.0` is true of every negative value, so the previous version described
+    a row stamped five hours AHEAD of the run as "under a minute" old - the opposite of the
+    cause, on the one scan that cannot become eligible until real time catches up.
+    check_readiness really does produce negative ages: it reads event_timestamp_ms straight
+    off the row, and unlike _newest_ms it has no _insert_time to correct an endpoint clock
+    with - correcting it here would move the preview off the gate Apply applies."""
+    if age_hours is None:
+        return "no stamp"
+    mins = abs(age_hours) * 60.0
+    if mins < 1.0:
+        magnitude = "under a minute"
+    elif mins < 90.0:
+        magnitude = "%.0f min" % mins
+    else:
+        magnitude = "%.1fh" % abs(age_hours)
+    if age_hours < 0:
+        return "%s in the FUTURE of this run's clock" % magnitude
+    return "%s old" % magnitude
+
+
+def _status_phrase(t_entries):
+    """How this scan's lifecycle reads, from the tmap entries themselves.
+
+    Every branch that names the lifecycle goes through this one function, so no two of them
+    can describe the same entries differently - the failure this rework exists to remove,
+    one scale down."""
+    if not t_entries:
+        return "no lifecycle row on any scans shard"
+    return "lifecycle status %s" % ", ".join(
+        sorted({str(e.get("status") or "unknown") for e in t_entries}))
+
+
+def _rules_target(kind, ver, rule_hash):
+    """The dataset a consolidation run WOULD write for this ruleset, or None.
+
+    Derived from the naming convention rather than left for the caller to rebuild - the
+    convention is "<_PREFIX>_<kind>_v<ver>_rules_<hash>" and getting it subtly wrong produces
+    a plausible name that resolves to nothing. None when the scan_ids in the group carried no
+    ruleset hash: there is no target for them, and inventing "rules_unknown" would name a
+    dataset nothing will ever create."""
+    if not rule_hash or rule_hash == "unknown":
+        return None
+    return "%s_%s_v%s_rules_%s" % (_PREFIX, kind, ver, rule_hash)
+
+
 def check_readiness(client, ver="4", retention_hours=24.0, now_ms=None,
-                    quiet_secs=DEFAULT_QUIET_SECS, log=lambda *a: None):
+                    quiet_secs=DEFAULT_QUIET_SECS, only_scan_ids=None, log=lambda *a: None):
     """Which scans are ready for YaraConsolidateSummary / YaraConsolidateApply to group.
 
     Mirrors the gate BOTH consolidation modes apply, so this previews the work they would
@@ -745,6 +897,12 @@ def check_readiness(client, ver="4", retention_hours=24.0, now_ms=None,
     makes an operator wait out retention_hours for work that is ready now. Then it buckets the
     ready ones by ruleset hash, which is the key both modes group on - so the preview also
     answers "how many datasets will this produce, and which hosts land in each".
+
+    only_scan_ids narrows WHICH scans are reported, and is applied HERE rather than to the
+    returned lists, so every count and every list describes one population. Applied afterwards
+    it reached eligible_scan_ids and pending_scan_ids only: group_count and groups went on
+    describing scans the filter had removed, and the report stated a group count that was
+    nowhere in the context beside it.
 
     NOT the same question as check_consolidation_status, which previews the scans-lifecycle
     merge. Nothing consumes that today; it is retained for a future lifecycle automation.
@@ -770,7 +928,12 @@ def check_readiness(client, ver="4", retention_hours=24.0, now_ms=None,
             if not sid:
                 continue
             hosts.setdefault(sid, set()).add(r.get("hostname"))
-            newest[sid] = max(newest.get(sid, 0), int(r.get("event_timestamp_ms") or 0))
+            # _as_ms rather than int(... or 0): the endpoint stamp comes back as an integer
+            # on every tenant seen so far, but an ISO string is a shape the platform does
+            # return, and int() on one raises ValueError - failing the WHOLE readiness check
+            # over a single row. _as_ms reads both and never raises; numeric stamps are
+            # unaffected, so the gate's answer does not move.
+            newest[sid] = max(newest.get(sid, 0), _as_ms(r.get("event_timestamp_ms")) or 0)
 
     # build_terminal_map keys on the 2-tuple (scan_id, host) - the host being the shard SLUG,
     # which this path does not carry. A bare tmap.get(sid) can never match, so this gate was
@@ -780,27 +943,106 @@ def check_readiness(client, ver="4", retention_hours=24.0, now_ms=None,
     for (t_sid, _t_host), t_entry in tmap.items():
         term_by_sid.setdefault(t_sid, []).append(t_entry)
 
-    ready, pending, groups = [], [], {}
+    want = set(only_scan_ids) if only_scan_ids is not None else None
+    eligible, pending, groups = [], [], {}
     for sid in sorted(hosts):
+        if want is not None and sid not in want:
+            continue
         t_entries = term_by_sid.get(sid) or []
         terminal = bool(t_entries) and all(bool(e.get("terminal")) for e in t_entries)
+        newest_ms = newest.get(sid) or None
+        age_ms = (now_ms - newest_ms) if newest_ms is not None else None
+        # Two decimals, not one: one decimal cannot express an age inside the 900-second
+        # quiet window at all - every scan held back by it would report 0.0.
+        age_hours = round(age_ms / 3_600_000.0, 2) if age_ms is not None else None
         # The scanner writes its terminal row BEFORE draining the uploaders, so `completed`
         # does not mean the rows have landed - see consolidate_full's quiet-period note.
-        quiet = bool(newest.get(sid)) and (now_ms - newest[sid]) >= quiet_secs * 1000
-        aged = bool(newest.get(sid)) and (now_ms - newest[sid]) >= cutoff_ms
+        quiet = age_ms is not None and age_ms >= quiet_secs * 1000
+        aged = age_ms is not None and age_ms >= cutoff_ms
+        hostnames = sorted(x for x in hosts[sid] if x)
+        ruleset = rule_hash_of(sid)
+
         if not ((terminal and quiet) or aged):
-            pending.append(sid)
+            # One branch per PENDING_REASONS code, in the order that makes each one true
+            # exclusively: no stamp beats everything (neither time test could run), then a
+            # stamp in the FUTURE (both time tests ran, and neither one CAN pass), then no
+            # lifecycle row at all, then a non-terminal one, and only what is left is a
+            # finished scan still settling.
+            if newest_ms is None:
+                reason = "no_timestamp"
+                detail = ("no match row carries a usable event_timestamp_ms, so neither the "
+                          "%ds quiet test nor the %.1fh aged test can be applied - this scan "
+                          "stays pending until a stamped row lands"
+                          % (int(quiet_secs), float(retention_hours)))
+            elif age_ms < -SKEW_TOLERANCE_MS:
+                # Second only to no_timestamp, and for the same reason: the stamp both time
+                # tests measure is not usable as an age, so every branch below - each of
+                # which quotes that age - would state a number that is not one. This branch
+                # names the lifecycle as well, so nothing the branches below would have said
+                # is lost by taking precedence over them.
+                reason = "clock_skew"
+                detail = ("its newest match row is stamped %s (%s), so neither the %ds quiet "
+                          "test nor the %.1fh aged test can be satisfied until real time "
+                          "catches up with the endpoint's clock"
+                          % (_age_phrase(age_hours), _status_phrase(t_entries),
+                             int(quiet_secs), float(retention_hours)))
+            elif not t_entries:
+                reason = "no_lifecycle_row"
+                detail = ("%s, and its newest match row is only %s - short of the %.1fh "
+                          "that would let it be treated as finished anyway"
+                          % (_status_phrase(t_entries), _age_phrase(age_hours),
+                             float(retention_hours)))
+            elif not terminal:
+                reason = "scan_in_progress"
+                detail = ("%s - not terminal on every host - and its newest match row is "
+                          "only %s" % (_status_phrase(t_entries), _age_phrase(age_hours)))
+            else:
+                reason = "quiet_period"
+                detail = ("finished, but its newest match row is only %s against the "
+                          "%ds quiet window - rows may still be landing"
+                          % (_age_phrase(age_hours), int(quiet_secs)))
+            pending.append(_scan_record(sid, reason, detail, ruleset, hostnames,
+                                        newest_ms, age_hours))
             continue
-        ready.append(sid)
-        rh = rule_hash_of(sid) or "unknown"
-        g = groups.setdefault(rh, {"scans": [], "hosts": set()})
+
+        if terminal and quiet:
+            reason = "terminal_and_quiet"
+            detail = ("terminal lifecycle on every host that reported one, and its newest "
+                      "match row is %s - past the %ds settle window"
+                      % (_age_phrase(age_hours), int(quiet_secs)))
+        else:
+            reason = "aged_out"
+            # Deliberately does not claim "no terminal status": with a quiet_secs set longer
+            # than retention_hours - a misconfiguration, but a reachable one - a FINISHED
+            # scan reaches this branch too, and a detail that asserted otherwise would be
+            # the report stating something the gate never checked.
+            detail = ("its newest match row is %s - past retention_hours=%.1f, so it "
+                      "is treated as finished whether or not a terminal lifecycle row ever "
+                      "arrived" % (_age_phrase(age_hours), float(retention_hours)))
+        eligible.append(_scan_record(sid, reason, detail, ruleset, hostnames,
+                                     newest_ms, age_hours))
+        g = groups.setdefault(ruleset or "unknown", {"scans": [], "hosts": set()})
         g["scans"].append(sid)
         g["hosts"].update(hosts[sid])
-    return {"eligible_count": len(ready), "eligible_scan_ids": ready,
-            "pending_count": len(pending), "pending_scan_ids": pending,
+
+    # Sorted so like sits with like: a 200-host fleet goes pending in runs of one reason, and
+    # an operator wants the three held back for a DIFFERENT reason adjacent rather than
+    # scattered through scan_id order. The two scan_id lists are then DERIVED from the
+    # records, so the strings a playbook splices and the objects an operator reads can never
+    # be two different sets, or the same set in two different orders.
+    eligible.sort(key=lambda r: (r["reason"], r["scan_id"]))
+    pending.sort(key=lambda r: (r["reason"], r["scan_id"]))
+    return {"eligible_count": len(eligible),
+            "eligible_scan_ids": [r["scan_id"] for r in eligible],
+            "eligible": eligible,
+            "pending_count": len(pending),
+            "pending_scan_ids": [r["scan_id"] for r in pending],
+            "pending": pending,
             "group_count": len(groups),
             "groups": [{"rule_hash": k, "scans": len(v["scans"]),
-                        "hosts": sorted(x for x in v["hosts"] if x)}
+                        "hosts": sorted(x for x in v["hosts"] if x),
+                        "summary_target": _rules_target("summary", ver, k),
+                        "full_target": _rules_target("full", ver, k)}
                        for k, v in sorted(groups.items())]}
 
 
@@ -1246,6 +1488,36 @@ def select_legacy_for_deletion(legacy_names, newer_names=(), now_yyyymm=None):
     return candidates, skipped
 
 
+DATASET_TYPES = ("host_matches", "host_scans", "consolidated_full", "consolidated_summary",
+                 "retired_scan_target", "internal")
+
+_TYPE_TITLES = (
+    ("host_matches",         "PER-HOST FINDINGS  - latest scan per host, replaced wholesale "
+                             "by the next scan"),
+    # Deliberately does NOT name the rotation setting. That string appears only in the
+    # not_rotated advice below, where it is actionable; printing it on every run tells an
+    # operator whose rotation is already correct to go and change it.
+    ("host_scans",           "PER-HOST SCAN LOG  - lifecycle rows, append-only, one dataset "
+                             "per host per retained month"),
+    ("consolidated_summary", "CONSOLIDATED (SUMMARY) - one row per (host, rule) per ruleset, "
+                             "fleet-wide"),
+    ("consolidated_full",    "CONSOLIDATED (FULL)    - every column of every matched-file row "
+                             "per ruleset, fleet-wide"),
+    ("retired_scan_target",  "RETIRED PER-SCAN TARGETS - from the withdrawn per-scan merge; "
+                             "nothing produces these now"),
+    # NOT the pack's own lock or run record. yara_scanner_consolidation_lock,
+    # yara_scanner_consolidation_runs and yara_scanner_cleanup_runs all fail YARA_OWNED_RE,
+    # so no inventory ever lists them and this bucket has never held one. It is
+    # dataset_type's FALLBACK - a yara-owned name none of the rows above matched - and
+    # calling it "the consolidation lock and run record" had the By type table asserting a
+    # provenance for a dataset whose own record says its origin is unknown.
+    ("internal",             "UNPARSED NAME - a yara_scanner_* name none of the rows above "
+                             "matched; the pack's lock and run-record datasets are not "
+                             "yara-owned and never appear here"),
+)
+
+_COUNT_ONLY_TYPES = ("host_scans",)
+
 def dataset_type(name):
     """Which of DATASET_TYPES this dataset is, from the name alone. Never queries."""
     n = str(name or "")
@@ -1264,34 +1536,25 @@ def dataset_type(name):
         return "host_scans"
     return "internal"
 
-def group_by_type(names, state_of=None):
-    """{type: {"count": n, "names": [...], "by_state": {state: [...]}}}.
+def group_by_type(names):
+    """{type: {"count": n, "names": [...]}} - the dataset list grouped by what each dataset
+    IS, decided from the name alone.
 
-    ONE place in the context holds the dataset lists. State is nested under the type it
-    belongs to rather than repeated as a parallel top-level key, because every state is a
-    state OF a type - `overwrite` only ever describes a host_matches dataset, `frozen` and
-    `not_rotated` only ever a host_scans one - and publishing both spellings meant the same
-    names appeared two or three times in one context blob, which then hit the display cap
-    and truncated the part an operator actually wanted.
+    A GROUPED VIEW of report_datasets' `datasets` list, never a second copy of the facts on
+    it: the only thing this adds is the grouping. `datasets` is the authoritative record, and
+    by_type[t]["names"] is exactly sorted(d["name"] for d in datasets if d["type"] == t) over
+    the same population - so the two can never answer the same question differently.
+
+    State used to be nested here as well, under "by_state", which published the
+    (name -> state) map twice - once here and once as datasets[].state - and left a reader
+    with no way to tell which spelling to trust. State is carried on the record only.
 
     Every type bucket is present even when empty, so a caller can index it without testing.
-    Within a bucket only the states that actually occur appear, so an empty deployment does
-    not carry six empty state lists per type.
     """
     buckets = {t: [] for t in DATASET_TYPES}
     for n in names or ():
         buckets[dataset_type(n)].append(n)
-    out = {}
-    for t, ns in buckets.items():
-        ns = sorted(ns)
-        entry = {"count": len(ns), "names": ns}
-        if state_of is not None:
-            states = {}
-            for n in ns:
-                states.setdefault(state_of.get(n) or "unknown", []).append(n)
-            entry["by_state"] = {k: sorted(v) for k, v in sorted(states.items())}
-        out[t] = entry
-    return out
+    return {t: {"count": len(ns), "names": sorted(ns)} for t, ns in buckets.items()}
 
 def render_by_type(current, legacy, newer, now_yyyymm):
     """One table per KIND OF DATASET, so the inventory can be read without knowing the
@@ -1465,69 +1728,115 @@ def report_datasets(client, now_yyyymm=None):
     """READ-ONLY inventory of every yara_scanner_* lookup dataset. Issues exactly one API
     call (the dataset listing) and never writes or deletes.
 
-    Returns the rendered text under "report", plus the same information structured for
-    context in three states that need different advice:
-      overwrite     a permanent per-host matches dataset - replaced wholesale at the start
-                    of every scan, so unsuffixed is its correct steady state
-      frozen        unsuffixed, but rotated siblings exist - a pre-rotation leftover
-      not_rotated   unsuffixed with no rotated siblings - rotation is off and it will grow
-      consolidated  a per-scan target (…_v<N>_scan_<slug>) - finished and immutable by design
+    Returns ONE RECORD PER DATASET under "datasets" - the authoritative row, carrying name,
+    type, kind, host, month and age_months alongside a `state` drawn from the closed
+    DATASET_STATES vocabulary, the `detail` sentence that state means for THIS dataset, and
+    the `remedy` an operator would act on (empty for every state that needs no action).
+    Every record carries every key even where one does not apply: a transformer filtering on
+    a sometimes-absent key matches nothing and reports no error, which is a silently empty
+    branch rather than a failure anyone sees.
+
+    The record covers CURRENT, LEGACY and NEWER schema datasets alike - the schema buckets
+    are STATES ("legacy", "newer") rather than separate name lists, so no two keys in this
+    dict answer the same question over different populations. Records are ordered by
+    (state, name), so like sits with like in the context and in the rendered table.
+
+    "by_type" is a grouped VIEW of that same list and nothing more; `datasets` is what to
+    trust. The rendered fixed-width inventory is NOT returned: it is a second spelling of
+    everything here, and the automation renders the War Room's markdown from this dict
+    instead. render_report survives for the CLI, which prints it to a terminal.
     """
     now_yyyymm = now_yyyymm or datetime.date.today().strftime("%Y%m")
     current, legacy, newer = classify_yara_datasets(client)
-    datasets, frozen, not_rotated, consolidated, overwrite = [], [], [], [], []
+    datasets = []
+
+    def _age(info):
+        month = (info or {}).get("month")
+        return months_between(month, now_yyyymm) if month else None
+
+    def _record(name, state, detail, remedy="", info=None):
+        return {"name": name, "type": dataset_type(name),
+                "kind": (info or {}).get("kind") or "",
+                "host": (info or {}).get("host") or "",
+                "month": (info or {}).get("month") or "",
+                "age_months": _age(info),
+                "state": state, "detail": detail, "remedy": remedy}
+
     for name in current:
         info = parse_dataset_name(name)
         if info is None:
-            datasets.append({"name": name, "type": dataset_type(name),
-                             "kind": (("full" if "_full_v" in name else "summary")
-                                      if is_pack_output_dataset(name) else ""),
-                             "host": "", "month": "", "age_months": None,
-                             "state": (("full" if "_full_v" in name else "summary")
-                                       if is_pack_output_dataset(name) else "unrecognised")})
+            # NAME_RE deliberately refuses to parse this pack's own consolidated output -
+            # that refusal IS safety rail 5. `type` already says which of the two it is
+            # (consolidated_summary / consolidated_full), so neither `state` nor `kind`
+            # spells that same fact a second time.
+            pack = is_pack_output_dataset(name)
+            datasets.append(_record(
+                name, "pack_output" if pack else "unrecognised",
+                "this pack's own consolidated output - a cross-host rollup for one ruleset, "
+                "not a rotation shard, and never a retention candidate" if pack else
+                "matches the current-schema name filter but not the yara_scanner naming "
+                "contract - never a retention candidate, and its origin is unknown"))
             continue
         if info["scan_target"]:
-            state, age = "consolidated", None
-            consolidated.append(name)
+            datasets.append(_record(
+                name, "consolidated",
+                "per-scan target from the retired per-scan merge - consolidation output, "
+                "unrotated by design, finished and not growing; on a tenant that ran that "
+                "merge it can be the only surviving copy of that scan", info=info))
         elif info["overwrite"]:
-            state, age = "overwrite", None
-            overwrite.append(name)
+            datasets.append(_record(
+                name, "overwrite",
+                "permanent per-host matches dataset - the scanner replaces it wholesale at "
+                "the start of every scan, so it is bounded by that overwrite rather than by "
+                "rotation and an unsuffixed name is correct here", info=info))
         elif info["month"]:
-            state, age = "rotated", months_between(info["month"], now_yyyymm)
+            datasets.append(_record(
+                name, "rotated",
+                "rotation shard for %s, %d month(s) old"
+                % (info["month"], months_between(info["month"], now_yyyymm)), info=info))
+        elif has_rotated_sibling(name, current):
+            datasets.append(_record(
+                name, "frozen",
+                "unsuffixed, but rotated siblings exist for this host - a pre-rotation "
+                "leftover; writes moved to the dated names, so it is frozen and not growing",
+                info=info))
         else:
-            age = None
-            if has_rotated_sibling(name, current):
-                state = "frozen"
-                frozen.append(name)
-            else:
-                state = "not_rotated"
-                not_rotated.append(name)
-        datasets.append({"name": name, "type": dataset_type(name), "kind": info["kind"],
-                         "host": info["host"] or "", "month": info["month"] or "",
-                         "age_months": age, "state": state})
-    state_of = {d["name"]: d.get("state") for d in datasets}
-    for n in legacy:
-        state_of.setdefault(n, "legacy")
-    for n in newer:
-        state_of.setdefault(n, "newer")
-    by_type = group_by_type(current + legacy + newer, state_of)
+            datasets.append(_record(
+                name, "not_rotated",
+                "unsuffixed with no rotated sibling - rotation is off for that deployment, "
+                "so this dataset grows without bound until add_data merge time exceeds the "
+                "client timeout and it goes write-dead",
+                remedy='set CONFIG_LOOKUP_ROTATION="monthly" in the scanner',
+                info=info))
+    for name in legacy:
+        datasets.append(_record(
+            name, "legacy",
+            "on an older or unversioned schema - prunable by YaraCleanup with "
+            "delete_legacy, subject to its own rails", info=parse_dataset_name(name)))
+    for name in newer:
+        datasets.append(_record(
+            name, "newer",
+            "on a HIGHER schema version than the %s this run assumes - never pruned, "
+            "because a host reading a stale version must not delete a future schema's data"
+            % YARA_SCHEMA_VERSION,
+            remedy="raise schema_version to the version the fleet actually writes",
+            info=parse_dataset_name(name)))
+    datasets.sort(key=lambda d: (d["state"], d["name"]))
     return {
         "now_yyyymm": now_yyyymm,
         "schema_version": YARA_SCHEMA_VERSION,
-        "report": render_report(current, legacy, newer, now_yyyymm),
-        # THE dataset breakdown. Split by what each dataset IS, with its state nested
-        # underneath. Nothing else in this dict repeats these names - see group_by_type.
-        "by_type": by_type,
-        "by_type_counts": {t: v["count"] for t, v in by_type.items()},
-        # Per-dataset detail: host, month, age. A different SHAPE, not a second copy of the
-        # lists - this is the only place age_months and month are carried.
+        # THE per-dataset record, and the only place any fact about a dataset is carried.
         "datasets": datasets,
-        # Schema buckets. Orthogonal to type: a legacy dataset still has a type, and pruning
-        # decisions are made on schema version rather than on what the dataset holds.
-        "legacy": legacy, "legacy_count": len(legacy),
-        "newer": newer, "newer_count": len(newer),
+        # A grouped VIEW of `datasets` - count and names per type bucket, so a caller can
+        # branch on "how many host_scans" without walking every record. Same population,
+        # same names; `datasets` is authoritative if the two could ever disagree.
+        "by_type": group_by_type([d["name"] for d in datasets]),
+        # The schema-bucket verdict. Counts rather than lists, because the names are already
+        # on the records: a caller wanting them filters `datasets` on state legacy / newer.
         "current_count": len(current),
-        "total_count": len(current) + len(legacy) + len(newer),
+        "legacy_count": len(legacy),
+        "newer_count": len(newer),
+        "total_count": len(datasets),
     }
 
 
@@ -1800,47 +2109,215 @@ class CoreApiClient:
 
 
 # ---- entry point ------------------------------------------------------------
+_MD_ROW_CAP = 50
+
+
+def _n(v):
+    """Thousands-separated. The numbers this reports run to six figures.
+
+    Integral values print as integers, floats included: the settings arrive as
+    float(args.get(...)), and "900.0" in a table reads as a typo rather than a default.
+
+    A NON-integral float keeps its fraction. The previous version went through int(), which
+    silently truncated - a quiet_secs of 900.5 printed as 900 while the context carried 900.5,
+    so the report and the context stated different numbers. That is the one disagreement this
+    renderer exists to make impossible, and it was being introduced by the formatter itself.
+    """
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    return format(int(f), ",d") if f.is_integer() else format(f, ",g")
+
+
+def _md_table(headers, rows):
+    """A markdown table, or "" when there is nothing to put in it. Cells are escaped: rule
+    names and hostnames reach here from a ruleset and from an endpoint, and a single pipe in
+    either would silently shear a column off every row below it."""
+    if not rows:
+        return ""
+
+    def cell(v):
+        return str("" if v is None else v).replace("|", "\\|").replace("\n", " ")
+
+    out = ["| " + " | ".join(cell(h) for h in headers) + " |",
+           "|" + "|".join("---" for _ in headers) + "|"]
+    for r in rows:
+        out.append("| " + " | ".join(cell(v) for v in r) + " |")
+    return "\n".join(out)
+
+
+def _md_capped(headers, rows, context_key):
+    """_md_table, truncated. The context keeps every entry, so a 200-host pass cannot push the
+    counts off the top of the War Room - the same trade YaraReport makes for the scan log."""
+    body = _md_table(headers, rows[:_MD_ROW_CAP])
+    if len(rows) > _MD_ROW_CAP:
+        body += ("\n\n_... and %s more - the full list is in `%s`._"
+                 % (_n(len(rows) - _MD_ROW_CAP), context_key))
+    return body
+
+
+def _pending_footer(pending):
+    """The line under the pending table, DERIVED from the reasons actually in it.
+
+    It used to read "Every reason above resolves on its own", unconditionally. That is false
+    the moment a `no_timestamp` scan is in the table - the declared vocabulary for that code
+    says in as many words that the scan "can never age out on its own" - and false again for
+    `clock_skew`, which only stops blocking once real time passes a stamp the endpoint keeps
+    moving further ahead. Telling an operator to keep polling a scan that will never clear is
+    the report contradicting the context printed directly above it, so the sentence is built
+    from the codes in `pending` instead of asserted over them."""
+    reasons = {p["reason"] for p in pending}
+    waiting = sorted(reasons & set(SELF_CLEARING_PENDING_REASONS))
+    stuck = sorted(reasons - set(SELF_CLEARING_PENDING_REASONS))
+    parts = ["_Pending is not a failure and not a backlog."]
+    if waiting:
+        parts.append("A further poll clears %s - re-run this check, or let the playbook's "
+                     "poll do it." % ", ".join("`%s`" % r for r in waiting))
+    if stuck:
+        parts.append(
+            "Waiting does NOT clear %s: %s."
+            % (", ".join("`%s`" % r for r in stuck),
+               "; ".join("%s - %s" % (r, PENDING_REASON_REMEDIES.get(
+                   r, "see this code in the pending reason vocabulary")) for r in stuck)))
+    return " ".join(parts) + "_"
+
+
+def render_status_markdown(result):
+    """The War Room report for one readiness check, rendered from the result dict ALONE.
+
+    Nothing here reaches past `result`, so the table an operator reads and the context a
+    playbook branches on cannot disagree. The version this replaced formatted its sentences
+    from one set of expressions and its context from another, which is exactly how a report
+    comes to state a number - the unfiltered group count, beside a filtered eligible count -
+    that is nowhere in the context beside it."""
+    filt = result["scan_id_filter"]
+    out = ["### YARA consolidation readiness - %s ready, %s pending"
+           % (_n(result["eligible_count"]), _n(result["pending_count"])),
+           "_Read-only: nothing was created, written or deleted. This previews what "
+           "YaraConsolidateSummary (compact) and YaraConsolidateApply (full detail) would "
+           "group; it does not preview the scans-lifecycle merge._",
+           ""]
+
+    facts = [
+        ("Ready to consolidate", _n(result["eligible_count"])),
+        ("Still pending", _n(result["pending_count"])),
+        ("Ruleset groups", "%s - one summary and/or one full dataset each"
+                           % _n(result["group_count"])),
+        # "every scan the tenant holds" would over-claim: the population is built from the
+        # MATCHES shards, so a scan that found nothing has no row here to be counted and is
+        # in neither list. Say what was actually considered.
+        ("Scan filter", ("%s scan(s) named: %s" % (_n(len(filt)), ", ".join(filt))) if filt
+                        else "none - every scan with match rows at this schema version"),
+        ("Datasets deleted", "0 - this automation has no write or delete path"),
+    ]
+    out.append(_md_table(["", ""], [("**%s**" % k, v) for k, v in facts]))
+
+    if result["eligible"]:
+        out += ["", "#### Ready to consolidate",
+                _md_capped(["Scan", "Ruleset", "Hosts", "Ready because", "Newest row"],
+                           [(e["scan_id"], e["ruleset"] or "-",
+                             ", ".join(e["hostnames"]) or "-", "`%s`" % e["reason"],
+                             _age_phrase(e["age_hours"]))
+                            for e in result["eligible"]],
+                           "Yara.ConsolidateStatus.eligible")]
+
+    if result["groups"]:
+        out += ["", "#### Ruleset groups a run would produce",
+                _md_capped(["Ruleset", "Scans", "Hosts", "Summary target", "Full target"],
+                           [(g["rule_hash"], _n(g["scans"]),
+                             ", ".join(g["hosts"]) or "-",
+                             ("`%s`" % g["summary_target"]) if g["summary_target"] else "-",
+                             ("`%s`" % g["full_target"]) if g["full_target"] else "-")
+                            for g in result["groups"]],
+                           "Yara.ConsolidateStatus.groups")]
+
+    if result["pending"]:
+        out += ["", "#### Pending - not yet eligible",
+                _md_capped(["Scan", "Hosts", "Reason", "Detail"],
+                           [(p["scan_id"], ", ".join(p["hostnames"]) or "-",
+                             "`%s`" % p["reason"], p["detail"])
+                            for p in result["pending"]],
+                           "Yara.ConsolidateStatus.pending"),
+                "", _pending_footer(result["pending"])]
+
+    out += ["", "#### Settings this run used",
+            _md_table(["Argument", "Value", "What it controls"], [
+                ("`schema_version`", result["schema_version"],
+                 "which matches and scans shards are in scope"),
+                ("`quiet_secs`", _n(result["quiet_secs"]),
+                 "how long a FINISHED scan's newest row must have been quiet before it "
+                 "counts as ready. Must match what Apply and Summary use, or this preview "
+                 "and the run it previews disagree"),
+                ("`retention_hours`", _n(result["retention_hours"]),
+                 "fallback only: a scan that never reported a terminal status is treated as "
+                 "finished once its newest row is this old. NOT a deletion window - this "
+                 "automation deletes nothing"),
+                ("`scan_id`", ", ".join(filt) or "all",
+                 "narrows every list, every count and the ruleset groups together"),
+            ])]
+    return "\n".join(out)
+
+
+def _float_arg(args, name, default):
+    """A numeric script argument, or a ValueError that NAMES the argument.
+
+    Bare float() raises "could not convert string to float: 'abc'", which says nothing about
+    WHICH of the two numeric arguments was mistyped - and, hoisted above main()'s try, it
+    escaped the handler entirely: the automation died with a raw platform traceback instead
+    of its own "YaraConsolidateStatus failed: ..." message. Both coercions run inside the try
+    now, and this is the message the operator gets, in the same spirit as the one
+    set_schema_version raises for a bad schema_version.
+
+    `not raw` keeps the previous `args.get(name) or default` semantics exactly - an omitted
+    argument, an empty string and a numeric 0 all take the default - so only the error path
+    changes."""
+    raw = args.get(name)
+    if not raw:
+        return float(default)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "%s must be a number, but got %r. Refusing to continue: this argument decides "
+            "the gate this preview applies, and the run it previews would use a different "
+            "one." % (name, raw))
+
+
 def main():
     args = demisto.args()
     scan_ids = argToList(args.get("scan_id")) or None
     ver = str(args.get("schema_version") or DEFAULT_LOOKUP_SCHEMA_VERSION).strip()
-    retention_hours = float(args.get("retention_hours") or 24.0)
 
     try:
+        # INSIDE the try, both of them. See _float_arg.
+        retention_hours = _float_arg(args, "retention_hours", 24.0)
+        quiet_secs = _float_arg(args, "quiet_secs", DEFAULT_QUIET_SECS)
         client = CoreApiClient()
+        # The scan_id filter goes IN, not on the way out: check_readiness narrows the gate
+        # loop itself, so eligible/pending/groups and all three counts describe one
+        # population. Filtering the returned lists left group_count unfiltered beside a
+        # filtered eligible_count, and the two were then printed in one sentence.
         st = check_readiness(client, ver=ver, retention_hours=retention_hours,
-                             quiet_secs=float(args.get("quiet_secs") or DEFAULT_QUIET_SECS))
+                             quiet_secs=quiet_secs, only_scan_ids=scan_ids)
     except Exception as ex:
         return_error("YaraConsolidateStatus failed: {}".format(ex))
         return
 
-    if scan_ids:
-        want = set(scan_ids)
-        st["eligible_scan_ids"] = [s for s in st["eligible_scan_ids"] if s in want]
-        st["pending_scan_ids"] = [s for s in st["pending_scan_ids"] if s in want]
-        st["eligible_count"] = len(st["eligible_scan_ids"])
-        st["pending_count"] = len(st["pending_scan_ids"])
+    # The settings this pass ran with, published beside the answer they produced. Without
+    # them stored context cannot say which quiet_secs produced a given pending list, and a
+    # preview that disagrees with the run it previews is indistinguishable from a bug in the
+    # run. Summary publishes its own for the same reason.
+    st["schema_version"] = ver
+    st["retention_hours"] = retention_hours
+    st["quiet_secs"] = quiet_secs
+    st["scan_id_filter"] = list(scan_ids or [])
 
-    lines = ["%d scan(s) ready to consolidate, in %d ruleset group(s)"
-             % (st["eligible_count"], st["group_count"])]
-    if st["eligible_scan_ids"]:
-        lines.append("  ready: %s" % ", ".join(st["eligible_scan_ids"][:10]))
-    for g in st["groups"]:
-        lines.append("  rules %s: %d scan(s) across %d host(s) -> one summary dataset and/or "
-                     "one full dataset (%s)"
-                     % (g["rule_hash"], g["scans"], len(g["hosts"]), ", ".join(g["hosts"][:6])))
-    if st["pending_count"]:
-        lines.append("%d scan(s) still in progress - not yet eligible: %s"
-                     % (st["pending_count"], ", ".join(st["pending_scan_ids"][:10])))
-    lines.append("")
-    lines.append("Read-only. This previews what YaraConsolidateSummary (compact) and "
-                 "YaraConsolidateApply (full detail) would group; it does not preview the "
-                 "scans-lifecycle merge.")
-
-    # List-valued context is APPENDED to across repeated calls in one investigation;
-    # clear it first so eligible_scan_ids/pending_scan_ids/groups never carries a prior call's entries.
+    # List-valued context is APPENDED to across repeated calls in one investigation; clear
+    # it first so eligible/pending/groups and the two scan_id lists never carry a prior
+    # call's entries. This automation is polled in a loop, so that is the normal case.
     demisto.executeCommand("DeleteContext", {"key": "Yara.ConsolidateStatus"})
-    return_results(CommandResults(readable_output="\n".join(lines),
+    return_results(CommandResults(readable_output=render_status_markdown(st),
                                   outputs_prefix="Yara.ConsolidateStatus",
                                   outputs=st, raw_response=st))
 

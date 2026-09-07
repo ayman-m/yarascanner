@@ -285,14 +285,22 @@ are labelled "this pack's own consolidated output, never a candidate"; legacy pe
 (`…_scan_<id>`), which neither mode creates any more, still get their own `consolidated`
 state.
 
-Outputs land under `Yara.Report.*`: the rendered table as `report`, per-dataset rows as
-`datasets` (name / kind / host / month / age_months / state), plus `frozen`, `not_rotated`,
-`consolidated`, `legacy`, `newer` and a `*_count` for each. The War Room entry carries the
-same table inside a code fence so its fixed-width columns stay aligned.
+Outputs land under `Yara.Report.*`, and each fact is published exactly once.
+`datasets` is the authoritative list — one record per dataset, current-schema, legacy and
+newer-schema alike, each carrying `name` / `type` / `kind` / `host` / `month` / `age_months`
+plus a `state` from a closed nine-value vocabulary (`overwrite`, `rotated`, `frozen`,
+`not_rotated`, `consolidated`, `pack_output`, `unrecognised`, `legacy`, `newer`), the
+`detail` sentence that state means for that dataset, and the `remedy` to act on (empty for
+every state that needs none). Branch on `state`; filter on a non-empty `remedy` to ask "does
+anything here need doing". `by_type` is a grouped *view* of that same list — `count` and
+`names` per type bucket, for branching without walking every record — and `current_count`,
+`legacy_count`, `newer_count` and `total_count` summarise it. The War Room entry is markdown
+rendered from that dict and from nothing else, so the table and the context cannot disagree.
+(The fixed-width table lives on in the CLI, which prints it to a terminal.)
 
 **A tenant with no YARA datasets yet reports zeros, and that is the correct answer.** The
-header line reads `0 current-schema dataset(s), 0 legacy, 0 newer-schema (never pruned)`,
-the table's only body row is `(none)`, `datasets` is empty and every `*_count` is `0`, while
+heading reads `YARA lookup datasets - none on this tenant`, `datasets` is empty, every
+`*_count` is `0` and every `by_type` bucket is present with a count of `0`, while
 `now_yyyymm` and `schema_version` are still populated. Nothing is misconfigured: a listing
 that fails — a bad credential included — raises, and the automation returns an error rather
 than a table, so a report of zeros is a successful run and not a silent one.
@@ -350,8 +358,12 @@ be the only surviving copy of it.
 ### The rest of the safety posture
 
 * **Dry run by default.** Without `execute=true` it reports what it *would* delete and
-  deletes nothing. The War Room entry always states which mode the run was in, opening with
-  either `DRY RUN — nothing was deleted.` or `EXECUTED — N dataset(s) deleted`.
+  deletes nothing. The War Room entry is markdown — a headline stating the mode
+  (`### YARA dataset cleanup - DRY RUN` or `- EXECUTED`), a fact table, then one table per
+  result list — and it is rendered from the output context and nothing else, so the table an
+  operator reads and the branch a playbook takes cannot disagree. `Yara.Cleanup.status`
+  carries the same verdict as one value: `nothing_requested`, `lock_held`, `dry_run`,
+  `success` or `partial_failure`.
 * **No implicit window.** `older_than_months` has no default. Run it with neither
   `older_than_months` nor `delete_legacy=true` and it selects nothing, deletes nothing, and
   says so — without making a single API call.
@@ -380,12 +392,33 @@ be the only surviving copy of it.
   datasets did we prune last month, and why were the rest kept" for the one action in this
   pack that cannot be undone.
 
-Outputs land under `Yara.Cleanup.*`: `dry_run`, `selected` / `selected_count` (passed every
-rail), `deleted` / `deleted_count` (always empty on a dry run), `failed` (per-dataset delete
-errors — one failure never strands the rest of the pass), `skipped` with every kept
-candidate's reason, `newer` (rail 4's veto list), the `nothing_requested` /
-`lock_held_by_other_run` / `lock_taken_over` flags, and the scope the run actually used
-(`schema_version`, `older_than_months`, `delete_legacy`, `min_quiet_hours`).
+Outputs land under `Yara.Cleanup.*`: `status` (the single verdict), `dry_run`, `selected` /
+`selected_count` (passed every rail), `deleted` / `deleted_count` (always empty on a dry
+run), `failed` / `failed_count` (per-dataset delete errors — one failure never strands the
+rest of the pass), `skipped` / `skipped_count` with every kept candidate's reason, `newer`
+(rail 4's veto list), `warnings` (an argument this run did not use as given), `lock_events`,
+the `nothing_requested` / `lock_held_by_other_run` / `lock_taken_over` flags, and the scope
+the run actually used (`schema_version`, `older_than_months`, `delete_legacy`,
+`min_quiet_hours`).
+
+`selected`, `deleted` and `newer` are lists of dataset **names** — plain strings, because a
+name is data already. `skipped`, `failed`, `warnings` and `lock_events` are lists of
+**objects**, each carrying a `reason` (or `event`) drawn from a closed vocabulary the yml
+spells out, so a playbook branches on a code rather than substring-matching a sentence that
+may be reworded for clarity at any time. Every entry carries every key, null where one does
+not apply — a key present on only *some* entries is a filter that matches some of the time,
+which is worse than one that never matches. `skipped[]` carries `name`, `reason`, `detail`
+(the rail's own sentence), `path` (`retention` / `legacy` / `schema` — several rails fire on
+both selection paths and word the skip identically, so this is the only thing separating
+them), `rail` (1–7, or null where the guard is real but unnumbered), and the numbers the
+sentence used to swallow: `age_months`, `window_months`, `newest_age_hours`,
+`stuck_scan_ids`, `newer_datasets`, `error`.
+
+Where two keys overlap, `skipped` is the authoritative one: `newer` is exactly the subset
+whose `reason` is `newer_schema`, kept as its own key because `delete_legacy` is refused
+outright while it is non-empty. On an **executed** pass `selected` is exactly `deleted` plus
+`failed[].dataset`, so do not count all three; on a **dry run** the other two are empty and
+`selected` is the only list carrying the outcome, which is why it is published on both.
 
 **The intended way to run it**, and the reason `execute` exists as a separate argument
 rather than a `--dry-run` inverse: run `YaraReport` to see the inventory, run `YaraCleanup`
@@ -633,21 +666,22 @@ the YaraCleanup section above before granting this key to anything.
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `YaraConsolidateStatus failed: ... HTTP 401: ...` or `YaraConsolidateApply failed: ... HTTP 401: ...` in the Job's task error / War Room | The embedded `DEFAULT_XDR_API_KEY`/`DEFAULT_XDR_API_ID` were rotated, revoked, or hit their `expiration` on the tenant. The identical generic 401 also covers a mistyped key/ID and a Standard/Advanced type mismatch — the response body alone cannot tell you which. | Regenerate an Advanced-type key for this pack's role (see Credentials above), edit the three `DEFAULT_XDR_*` constants in **all seven** automations that carry the `CONFIGURATION - the only values in this file you need to edit` banner — `YaraConsolidateStatus`, `YaraConsolidateApply`, `YaraConsolidateSummary`, `YaraReport`, `YaraCleanup`, **`YaraScanVerify`** and **`YaraWipeAllDatasets`**; each one carries its own credential block, because the tenant resolves no cross-script import and every automation is therefore self-contained. The last two are the ones a rotation usually misses, and each then fails at client construction on its next run. (`YaraRulesFromFile` and `YaraRulesDecode` make no API call, hold no credentials and need nothing done to them.) Then re-deliver the pack (editing the repo file alone does nothing until it's re-imported/re-installed — see Deployment above). Confirm with `YaraConsolidateStatus` — it's read-only and safe to run any time. |
-| `YaraConsolidateStatus` reports `0 scan(s) ready to consolidate, in 0 ruleset group(s)` | A fresh or freshly-wiped tenant holds no host matches datasets at all, so the gate has no scan to evaluate. | Not a failure and not a misconfiguration. `eligible_count`, `pending_count` and `group_count` are all `0` and `eligible_scan_ids` / `pending_scan_ids` / `groups` are empty — that is the correct read-only answer on an empty tenant. Run a scan, wait out the settle window, and re-run. |
+| `YaraConsolidateStatus` reports `### YARA consolidation readiness - 0 ready, 0 pending` | A fresh or freshly-wiped tenant holds no host matches datasets at all, so the gate has no scan to evaluate. | Not a failure and not a misconfiguration. `eligible_count`, `pending_count` and `group_count` are all `0` and `eligible_scan_ids` / `pending_scan_ids` / `eligible` / `pending` / `groups` are empty — that is the correct read-only answer on an empty tenant. Run a scan, wait out the settle window, and re-run. |
+| A scan sits in `Yara.ConsolidateStatus.pending` and you need to know whether to wait | The old War Room line called every pending scan "still in progress", which was wrong for three of the four cases. | Read the `reason` on the object, not the sentence: `scan_in_progress` (genuinely running — wait), `quiet_period` (finished, draining its upload queue — wait ~`quiet_secs`), `no_lifecycle_row` (nothing has said it finished; it becomes eligible at `retention_hours`), `no_timestamp` (**the one that does not clear by waiting** — no match row carries a usable `event_timestamp_ms`, so neither time gate can ever fire on it). |
 | `YaraConsolidateStatus` still reports the same `N scan(s) ready to consolidate` after a consolidation run has already written its dataset | **Expected.** "Ready" means the scan is *finished* — terminal lifecycle, or silent past `retention_hours` — not that it is unconsolidated. A finished scan stays ready however many times you group it, because both modes are idempotent: a re-run reconciles on `scan_id` sets rather than appending, so running twice is a verified no-op. | Not a failure, and not a to-do list that empties. Read `Status` as "what would a run group right now". To check whether the work is done, look for the output datasets in `!YaraReport`: `yara_scanner_summary_v4_rules_<hash>` for the compact record, `yara_scanner_full_v4_rules_<hash>` for full detail. |
 | Every scheduled Job run fails at task "Check consolidation status" (or "Apply consolidation") and task 8 ("Flag failures for attention") never lights up | `return_error` halts the whole playbook run at the failing task, before task 8's condition is ever evaluated — task 8 only reports data-level `failed_count` from a *completed* run, not a total execution error. | Watch the Job's own run history, not just the task-8 context flag — a dead key (or any other uncaught exception) is a hard failure, not a soft one. The `yara_scanner_consolidation_runs` dataset (see Monitoring below) also gets a `status="crashed"` row for a mid-run `YaraConsolidateApply` crash specifically (not for a `YaraConsolidateStatus` crash — that one never reaches `YaraConsolidateApply` at all). |
-| Job history shows "0 scan(s) consolidated" every run, nothing actually being merged | Consolidation lock held by another concurrent run (the CLI's `xdr_data_management.py --consolidate --yes`, or an overlapping Job execution) | Check `Yara.ConsolidateApply.lock_held_by_other_run` in context, or just read the readable output — it now says "Skipped this pass — consolidation lock is held by another concurrent run" instead of looking identical to a genuinely-empty pass. Confirm the Job's Queue Handling is set to "Don't trigger a new job instance" and that no one is running the CLI `--consolidate --yes` concurrently. |
+| Job history shows "0 scan(s) consolidated" every run, nothing actually being merged | Consolidation lock held by another concurrent run (the CLI's `xdr_data_management.py --consolidate --yes`, or an overlapping Job execution) | Check `Yara.ConsolidateApply.lock_held_by_other_run` in context, or just read the readable output — it is headed `### YARA full consolidation - STOOD DOWN` instead of looking identical to a genuinely-empty pass, and the sentence under it says which of the two refusals it was: "the consolidation lock is held by another concurrent run" (a pass really is running — wait for it) or "the marker exists but its row could not be read … (add_data create-lag)" (re-run shortly; a marker still unreadable hours later is orphaned and must be deleted by hand). `Yara.ConsolidateApply.lock_standdown_reason` carries the same answer as a code — `held_by_running_pass` or `marker_unreadable` — and a `#### Lock events` section carries the lock lines themselves. Confirm the Job's Queue Handling is set to "Don't trigger a new job instance" and that no one is running the CLI `--consolidate --yes` concurrently. |
 | The playbook run ends at **"Unrecognised consolidation_mode - nothing done"** and nothing was merged or written | `consolidation_mode` is neither exactly `full` nor exactly `summary` — a typo, a capitalised value, or an empty one. This is the designed fail-safe, not a bug: neither branch deletes source data, but an unrecognised mode must never silently pick one for you. | Set the input to exactly `full` or exactly `summary` and re-run. If it is already one of those, the `isEqualString` condition in task 11 is the thing to verify against the live tenant (see the playbook description's NOTE ON VERIFICATION) — it has no local precedent in this repo. |
-| Full mode runs every pass, reports rows it "WOULD write", and never writes any | `full_execute` was set to `false` (or the automation was invoked directly without `execute=true`). **`YaraConsolidateApply` is a dry run by default** — a bare `!YaraConsolidateApply` writes nothing and deletes nothing. | Leave the playbook's `full_execute` at its default of `true`. The War Room entry names the mode it ran in on its first line — `DRY RUN - nothing was created or written.` vs `EXECUTED.` |
+| Full mode runs every pass, reports rows it "WOULD write", and never writes any | `full_execute` was set to `false` (or the automation was invoked directly without `execute=true`). **`YaraConsolidateApply` is a dry run by default** — a bare `!YaraConsolidateApply` writes nothing and deletes nothing. | Leave the playbook's `full_execute` at its default of `true`. The War Room entry names the mode it ran in in its heading — `### YARA full consolidation - DRY RUN` vs `### YARA full consolidation - EXECUTED` — and each `written[]` record says it too, as `action: "would_write"` rather than `"wrote"`. `status` does NOT answer this: it reads `partial_failure` on a dry run that refused a group, because a refusal is a refusal whichever mode found it. The `dry_run` boolean is the one to branch on for the mode. |
 | Summary mode runs every pass, reports rows under `#### Would write`, and never writes any | `summary_execute` was set to `false` (or the automation was invoked directly without `execute=true`). `YaraConsolidateSummary` is a dry run by default. | Leave the playbook's `summary_execute` at its default of `true`. The War Room entry names the mode it ran in in its heading — `### YARA summary consolidation - DRY RUN` vs `### YARA summary consolidation - EXECUTED` — and `status` carries the same answer as `dry_run` or `success`. Each `written[]` record says it too, as `action: "would_write"` rather than `"wrote"`. |
 | Summary mode reports failures in `Yara.ConsolidateSummary.failed` | A write or a count query failed for that ruleset target. **Nothing was destroyed** — this automation touches no source data, and every `failed[]` record asserts `sources_untouched: true` alongside a `reason` from the closed set `target_unreadable`, `refresh_clear_failed`, `write_incomplete`, `write_error`. Match on `reason`, not on the readable `detail`. | Re-run; it is idempotent. Reconciliation is on `scan_id` sets, not on row counts, but a re-run does **not** leave a matching target alone: it **refreshes**, rewriting the rows for every scan it observed, so a target whose `scan_id` set is unchanged is still rewritten from the sources and `scans_refreshed` reports how many scans that covered. Rows for a `scan_id` no longer present in any source are dropped from the target — the one removal this automation makes, and it is against its own output. If a source dataset could not be read that pass, that removal is skipped entirely and the run says so, in `skipped[]` and in `stale_removal_enabled`. |
 | `YaraCleanup` reports `Nothing selected and nothing deleted: no retention window was given` | Neither `older_than_months` nor `delete_legacy=true` was passed. This is not a failure — it is the "a bare invocation must never delete" property, and no API call was made at all. | Pass a retention window (`older_than_months=N`) and/or `delete_legacy=true`. There is deliberately no default window to fall back on. |
 | `YaraCleanup` ran `EXECUTED` but deleted far less than expected, and `Yara.Cleanup.newer` is non-empty | Rail 4 vetoed those datasets: they are on a **higher** schema version than the `schema_version` argument, i.e. the argument is stale-LOW. | Set `schema_version` to what the fleet actually writes (`YARA_LOOKUP_SCHEMA_VER` on the endpoints). Run `YaraReport` first — its "newer schema" bucket shows the same thing without touching anything. |
-| `YaraCleanup` selected almost nothing and every skip reason names the recency or consolidation rail | Working as designed, and usually one of two real conditions: scans are still writing to those shards (rail 6 — the *name*'s month is not when it was last written), or consolidation has not verified their `scan_id`s into a consolidated target (rail 7 — which still looks for the **obsolete** per-scan target name, so on a current tenant it holds back any month-suffixed shard that still carries a `scan_id`, however many consolidation passes have run). Both rails also keep a dataset when their live query **errors**, so a flaky query window looks the same. | Read the per-candidate reasons in `Yara.Cleanup.skipped` — they name the specific rail. For rail 6, let the scans finish and re-run. For rail 7, re-running consolidation will **not** clear it: satisfy yourself from `!YaraReport` and the `…_rules_<hash>` targets that the data is consolidated, then delete the shard by name. Do not lower `min_quiet_hours` to force rail 6 through; below 1h it is raised back to the floor anyway. |
+| `YaraCleanup` selected almost nothing and every skip reason names the recency or consolidation rail | Working as designed, and usually one of two real conditions: scans are still writing to those shards (rail 6 — the *name*'s month is not when it was last written), or consolidation has not verified their `scan_id`s into a consolidated target (rail 7 — which still looks for the **obsolete** per-scan target name, so on a current tenant it holds back any month-suffixed shard that still carries a `scan_id`, however many consolidation passes have run). Both rails also keep a dataset when their live query **errors**, so a flaky query window looks the same. | Read the per-candidate reasons in `Yara.Cleanup.skipped` — `reason` names the specific rail as a code (`within_quiet_period`, `unconsolidated_scans`, `recency_check_failed`, `consolidation_check_failed`) and `rail` gives its number. For rail 6, let the scans finish and re-run. For rail 7, re-running consolidation will **not** clear it: satisfy yourself from `!YaraReport` and the `…_rules_<hash>` targets that the data is consolidated, then delete the shard by name. Do not lower `min_quiet_hours` to force rail 6 through; below 1h it is raised back to the floor anyway. |
 | `YaraCleanup` reports `Skipped this pass — the consolidation lock is held by another concurrent run` and deletes nothing | `YaraConsolidateApply`, the CLI, or another `YaraCleanup` run holds `yara_scanner_consolidation_lock`. On this path an existing marker whose row cannot yet be read also counts as held — that is the `add_data` create-lag window right after another run took it. | Expected when a prune overlaps the twice-daily merge Job. Re-run after the merge pass finishes. A **dry run** never takes the lock, so it is always available to see what *would* go. |
-| War Room entry contains `WARNING: another run's consolidation lock marker was present and this pass TOOK IT OVER as stale` | A previous lock holder died without releasing the marker (e.g. a platform kill mid-run, which skips the `finally`), and this pass judged it stale and proceeded. | Check `Yara.Cleanup.lock_taken_over` / `lock_takeover_reason` and confirm no consolidation pass was in fact still running — if one was, its shards were pruned concurrently. This is reported rather than silent precisely because it is not an ordinary pass. |
+| War Room entry contains `another run's consolidation lock marker was present and this pass **TOOK IT OVER** as stale` | A previous lock holder died without releasing the marker (e.g. a platform kill mid-run, which skips the `finally`), and this pass judged it stale and proceeded. | Check `Yara.Cleanup.lock_taken_over`, the `stale_marker_taken_over` entry in `Yara.Cleanup.lock_events`, and `lock_takeover_reason`, then confirm no consolidation pass was in fact still running — if one was, its shards were pruned concurrently. This is reported rather than silent precisely because it is not an ordinary pass. |
 | `YaraWipeAllDatasets` (or `YaraCleanup`) logs `consolidation lock marker exists but its row is unreadable ... standing down rather than taking over`, and keeps doing so on every re-run | The `yara_scanner_consolidation_lock` dataset exists but holds no readable row. Normally that is the ~60s `add_lookup_data` create-lag window right after another run took the lock, and standing down is correct. If it persists, the marker is orphaned — a run created it and died before its row landed. | First confirm nothing is actually running (`yara_scanner_consolidation_runs`, newest row). Then delete the `yara_scanner_consolidation_lock` dataset by hand; the next acquire recreates it. **Do not** "fix" this by passing `unreadable_is_held=False` for a deleting automation — refusing is the intended direction to fail when the alternative is deleting datasets out from under a live pass. |
-| `YaraWipeAllDatasets` reports `Skipped - the consolidation lock is held...` and you want to know whether an earlier run did nothing or never started | Both look identical in `Yara.WipeAll` outputs alone. | Query `yara_scanner_wipe_runs`: a standdown writes `mode = "skipped_locked"`, a real pass that found nothing to delete writes `mode = "executed"` with `deleted_count = 0`, and a dry run writes `mode = "dry_run"`. An **absent** row for a run you know was launched is the platform-timeout-kill signature — a kill runs no Python, so the audit write never executes. |
+| `YaraWipeAllDatasets` reports `### YARA dataset wipe - STOOD DOWN` and deletes nothing — or you are looking back at an earlier run and need to tell "stood down", "ran and found nothing" and "never started" apart | `YaraConsolidateApply`, `YaraCleanup`, the CLI, or another wipe holds `yara_scanner_consolidation_lock`. A marker that exists with no readable row counts as held on this path too, deliberately — see the row above. | For the run in front of you this is answered in context, not by a query: **`Yara.WipeAll.status`** is a closed set — `dry_run`, `skipped_locked`, `executed`, `partial_failure` — and a standdown is exactly `skipped_locked` (`lock_held_by_other_run` is the same answer as a boolean). The report says so in its heading, and the sentence under it names **both** refusals — "the consolidation lock could not be taken - either another run holds it … or its marker exists with a row that could not be read" — because nothing this pass established tells them apart, and the second is the create-lag window of the row above rather than a pass to wait for. (`YaraConsolidateApply` does publish `lock_standdown_reason` for exactly this; `YaraWipeAllDatasets` does not carry that key, so its sentence covers both.) Nothing was attempted either way, so re-running once the other pass finishes is safe; a **dry run** never takes the lock and always works. For an **earlier** run, whose context is long gone, query `yara_scanner_wipe_runs` — its `mode` column *is* that same `status` value, written from the same field: `skipped_locked` for a standdown, `executed` with `deleted_count = 0` for a real pass that found nothing to delete, `partial_failure` for a pass whose deletes partly failed, `dry_run` for a dry run. An **absent** row for a run you know was launched is the platform-timeout-kill signature — a kill runs no Python, so the audit write never executes. |
 
 ## Monitoring — `yara_scanner_consolidation_runs`
 
@@ -716,7 +750,27 @@ place, deliberately: **it records every invocation, dry run included**, not only
 passes. For a tool with no scoping argument at all, knowing who checked what a full wipe
 would delete, and when, is worth keeping even when nothing was actually deleted.
 
-Every run — `mode` (`dry_run` / `executed`) — writes one row: `run_ts_ms`, `total_found`,
-`to_delete_count`, `deleted_count`, `failed_count`, the `deleted` / `failed` dataset name
-lists, and `preserved`. Same best-effort write discipline as the other two logs: a failure
-to record never changes the run's real outcome.
+Every run writes one row, and its `mode` **is** that run's `Yara.WipeAll.status`, written
+from the same field so the run log and the context can never disagree about what kind of pass
+it was. That is four values, not two: `dry_run`, `skipped_locked` (the consolidation lock was
+held or its marker was unreadable — nothing was attempted), `executed`, and `partial_failure`
+(the pass ran and at least one delete raised). **A query filtering `mode = "executed"` to
+count real passes silently misses every partly-failed one** — match
+`mode in ("executed", "partial_failure")`, or read `deleted_count` instead.
+
+The columns are `run_ts_ms`, `mode`, `total_found`, `to_delete_count`, `deleted_count`,
+`failed_count`, `deleted`, `failed`, `preserved` and `stopped_early` (a text column carrying
+`"True"` / `"False"`, not a boolean). `deleted` and `preserved` are JSON arrays of plain
+dataset names, kept that way deliberately so an existing query over them still works — but
+**`failed` is a JSON array of `{dataset, reason}` objects**, not names: the reason a delete
+failed is the part an operator can act on, and it used to exist only in a log line nothing
+read. That column is truncated at 4000 characters and a truncated JSON document parses as
+nothing at all, so each entry carries the name and the code only (`auth_error`,
+`rate_limited`, `server_error`, `http_error`, `timeout`, `network_error`, `unknown`); the
+underlying error text stays in `Yara.WipeAll.failed[].detail` and in the War Room report.
+Rows written by an older version of the automation hold bare names there, so anything parsing
+that column must tolerate both shapes. There is deliberately no
+`not_attempted` column — adding one would no longer match the `yara_scanner_wipe_runs` dataset
+already on every tenant that has run this, and `add_data` against a mismatched schema fails —
+so derive it as `to_delete_count - deleted_count - failed_count`. Same best-effort write
+discipline as the other two logs: a failure to record never changes the run's real outcome.

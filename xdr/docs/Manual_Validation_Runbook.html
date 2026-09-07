@@ -534,8 +534,8 @@ macOS    /usr/local/yara_scanner/logs/scan_summary_&lt;run_id&gt;.json</code></p
       <code>host shards deleted: 0</code> line, and no uppercase <code>WRITTEN:</code> /
       <code>SKIPPED:</code> / <code>FAILED:</code> blocks. Check the heading text and the table row
       labels below instead.</p>
-      <p>This is Summary only. <code>YaraConsolidateApply</code> (F3) still reports in plain text, and
-      the F3 strings below are unchanged.</p></div>
+      <p><code>YaraConsolidateApply</code> (F3) now reports the same way — headings and tables, no
+      plain-text lines — so the F3 expectations below are written against the markdown too.</p></div>
 
     <div class="blk"><span class="lead do">Do</span><pre><code>!YaraConsolidateSummary execute="false"</code></pre></div>
     <div class="blk"><span class="lead exp">Expect</span><p>A report headed
@@ -612,12 +612,47 @@ macOS    /usr/local/yara_scanner/logs/scan_summary_&lt;run_id&gt;.json</code></p
     <div class="blk"><span class="lead do">Do</span><p>The dry run first, which is what a bare invocation already gives you:</p>
     <pre><code>!YaraConsolidateApply</code></pre>
     <p>Then for real:</p><pre><code>!YaraConsolidateApply execute="true"</code></pre></div>
-    <div class="blk"><span class="lead exp">Expect</span><p><code>DRY RUN - nothing was created or
-      written.  FULL consolidation: every column of every matched-file row.</code>, followed by a
-      <code>WOULD write N full row(s) from H host(s) / S scan(s) -&gt;
-      yara_scanner_full_v4_rules_&lt;rulehash&gt;</code> line per ruleset group. The real run reports
-      <code>EXECUTED.</code>, a <code>wrote N full row(s)…</code> line per group, and
-      <strong><code>host matches datasets deleted: 0</code></strong>.</p>
+    <div class="blk"><span class="lead exp">Expect</span><p>A report headed
+      <code>### YARA full consolidation - DRY RUN</code>, with <em>"Every column of every matched-file
+      row, grouped by ruleset. Nothing was created or written. Re-run with <code>execute=true</code> to
+      apply exactly this."</em> directly under it. Then check, by eye:</p>
+      <ul style="margin-bottom:.5rem">
+      <li>a key/value table whose left column reads <strong>Outcome</strong>, <strong>Targets</strong>,
+        <strong>Rows</strong>, <strong>Ruleset groups</strong>, <strong>Hosts covered</strong>,
+        <strong>Skipped</strong>, <strong>Failed</strong>, <strong>Source datasets</strong>,
+        <strong>Fleet progress</strong> — in that order. On this path <strong>Targets</strong> and
+        <strong>Rows</strong> are phrased <em>"N would be written"</em>.</li>
+      <li><strong>Outcome</strong> reads <code>dry_run</code> — but only while
+        <code>#### Failed</code> is absent. It reads <code>partial_failure</code> on a dry run that
+        refused a group, because a refusal is a refusal whichever mode found it, and
+        <code>dry_run</code> is the value that would otherwise hide the one failure a dry run can
+        produce. The mode is named by the heading, not by <strong>Outcome</strong>.</li>
+      <li><strong>Source datasets</strong> reads <em>"host matches datasets retired: 0 (dry run -
+        retirement only happens after a write is read back and verified)"</em>. That row replaced the
+        old constant <code>host matches datasets deleted: 0</code> line, and it now reports what this
+        run did rather than a policy.</li>
+      <li><strong>Fleet progress</strong> reads <em>"datasets: N of N - the whole fleet, so nothing is
+        pending"</em>. The two numbers matching is how you know the pass was not bounded by
+        <code>max_datasets</code> — a bounded pass says <em>"M of N this pass, K still to go - RE-RUN
+        to continue"</em> and turns stale-row removal off.</li>
+      <li>a <strong><code>#### Would write</code></strong> table, one row per ruleset group, with the
+        columns <code>Ruleset | Rows | Hosts | Scans | Target</code>. The <strong>Target</strong> cell
+        is the <code>yara_scanner_full_v4_rules_&lt;rulehash&gt;</code> dataset it would create.</li>
+      </ul>
+      <p>A <strong><code>#### Skipped - nothing was touched</code></strong> table appears only when
+      something was gated; <code>#### Failed</code> likewise. Both carry a <code>Reason</code> column
+      drawn from a closed set — <code>quiet_period</code> and <code>scan_in_progress</code> are the two
+      to expect right after a scan, and <code>row_ceiling_exceeded</code> is the one that does not
+      clear by waiting.</p>
+      <p>The real run prints the same report with exactly these differences: the heading is
+      <code>### YARA full consolidation - EXECUTED</code> over <em>"Per-ruleset full targets were
+      created and written."</em>; <strong>Outcome</strong> reads <code>success</code> (or
+      <code>partial_failure</code> if anything is in <code>#### Failed</code>);
+      <strong>Targets</strong> and <strong>Rows</strong> are phrased <em>"N written"</em>;
+      <strong><code>#### Would write</code></strong> becomes <strong><code>#### Written</code></strong>
+      with two more columns, <code>Ruleset | Rows | Hosts | Scans | New scans | Stale rows dropped |
+      Target</code>; and <strong>Source datasets</strong> reports the retirement outcome for a real
+      pass.</p>
       <p><strong>Verify the target holds the grouped rows:</strong></p>
       <pre><code>dataset = yara_scanner_full_v4_rules_&lt;rulehash&gt;
 | comp count() as rows by scan_id</code></pre>
@@ -629,14 +664,36 @@ macOS    /usr/local/yara_scanner/logs/scan_summary_&lt;run_id&gt;.json</code></p
       querying one returns a dataset-not-found error that reads exactly like a failed consolidation.</p>
       <p><strong>Verify what Apply left alone:</strong></p>
       <pre><code>dataset = &lt;MATCHES&gt; | comp count() as rows by scan_id</code></pre>
-      <p>Identical to F2 — same dataset, same single <code>scan_id</code>, same row count. The per-host
-      matches dataset is never deleted by either mode. Run <code>!YaraReport</code> and every per-host
-      matches and scans dataset is still present, with the new
-      <code>yara_scanner_full_v4_rules_&lt;rulehash&gt;</code> target listed as <em>this pack's own
-      consolidated output, never a candidate</em>.</p>
+      <p>Whichever of two answers the <strong>Source datasets</strong> row of the report already told
+      you to expect, and read that row <em>first</em>. <em>retired: 0</em> — the per-host matches
+      dataset is untouched, identical to F2: same dataset, same <code>scan_id</code>, same row count.
+      That is the answer on every dry run, and on any executed pass whose write it could not read back
+      and verify. <em>retired: N</em> — N per-host matches datasets were <strong>deleted</strong>, and
+      querying one now returns dataset-not-found. That is
+      <code>CONFIG_RETIRE_SOURCES_AFTER_FULL</code> (<code>True</code> as shipped) doing its job, not a
+      fault: a source is retired only after its rows are read back <strong>out of the ruleset
+      target</strong> and counted, so the rows are already safe, and the host's dataset comes back on
+      its next scan.</p>
+      <p><strong>Fails if:</strong> a source dataset is gone while its <code>scan_id</code> is
+      <em>not</em> in the ruleset target, or while <strong>Source datasets</strong> still reads
+      <code>retired: 0</code>. Either way the report and the tenant disagree, which is the one outcome
+      this step exists to catch. Summary mode retires nothing at all, so F2's source is unchanged
+      regardless.</p>
       <p><strong>Reading it:</strong> re-run <code>!YaraConsolidateApply execute="true"</code> with
-      nothing changed and it should report the group as <em>"target already current … verified, not
-      rewritten"</em>. That verified no-op is the reconciliation working, not a skipped pass.</p></div>
+      nothing changed. If the sources were kept, the group comes back under
+      <code>#### Skipped - nothing was touched</code> with reason <code>target_already_current</code> —
+      <em>"target already current … verified, not rewritten"</em> — and that verified no-op is the
+      reconciliation working, not a skipped pass. If they were retired, there is nothing left to read
+      and <strong>Fleet progress</strong> says so
+      (<code>datasets: none found for this schema version</code>).</p>
+      <p><strong>One more shape worth recognising:</strong> if another pass holds
+      <code>yara_scanner_consolidation_lock</code>, this run prints
+      <code>### YARA full consolidation - STOOD DOWN</code> and one sentence saying which of the two
+      refusals it was — <em>"the consolidation lock is held by another concurrent run"</em> (wait for
+      that pass) or <em>"the marker exists but its row could not be read … (add_data create-lag)"</em>
+      (re-run in a minute) — followed by a <code>#### Lock events</code> list carrying the lock lines
+      themselves. Nothing was read, created, written or deleted on that path, and
+      <code>Yara.ConsolidateApply.lock_standdown_reason</code> carries the same answer as a code.</p></div>
   </div></div>
 
   <div class="step"><div class="sh"><span class="n">F4</span><span class="t">Confirm the run was recorded</span></div><div class="sb">

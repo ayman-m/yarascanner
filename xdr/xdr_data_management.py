@@ -365,7 +365,15 @@ _TYPE_TITLES = (
                              "per ruleset, fleet-wide"),
     ("retired_scan_target",  "RETIRED PER-SCAN TARGETS - from the withdrawn per-scan merge; "
                              "nothing produces these now"),
-    ("internal",             "PACK INTERNAL - consolidation lock and run record"),
+    # NOT the pack's own lock or run record. yara_scanner_consolidation_lock,
+    # yara_scanner_consolidation_runs and yara_scanner_cleanup_runs all fail YARA_OWNED_RE,
+    # so no inventory ever lists them and this bucket has never held one. It is
+    # dataset_type's FALLBACK - a yara-owned name none of the rows above matched - and
+    # calling it "the consolidation lock and run record" had the By type table asserting a
+    # provenance for a dataset whose own record says its origin is unknown.
+    ("internal",             "UNPARSED NAME - a yara_scanner_* name none of the rows above "
+                             "matched; the pack's lock and run-record datasets are not "
+                             "yara-owned and never appear here"),
 )
 
 
@@ -418,34 +426,52 @@ def render_by_type(current, legacy, newer, now_yyyymm):
     return out
 
 
-def group_by_type(names, state_of=None):
-    """{type: {"count": n, "names": [...], "by_state": {state: [...]}}}.
+# What each dataset IS, decided from its NAME alone. Deliberately name-only: opening a
+# dataset to find out what it holds would cost a metered query per dataset, and at 400+
+# datasets that is a real bill for information the naming scheme already encodes.
+DATASET_TYPES = ("host_matches", "host_scans", "consolidated_full", "consolidated_summary",
+                 "retired_scan_target", "internal")
 
-    ONE place in the context holds the dataset lists. State is nested under the type it
-    belongs to rather than repeated as a parallel top-level key, because every state is a
-    state OF a type - `overwrite` only ever describes a host_matches dataset, `frozen` and
-    `not_rotated` only ever a host_scans one - and publishing both spellings meant the same
-    names appeared two or three times in one context blob, which then hit the display cap
-    and truncated the part an operator actually wanted.
+
+def group_by_type(names):
+    """{type: {"count": n, "names": [...]}} - the dataset list grouped by what each dataset
+    IS, decided from the name alone.
+
+    A GROUPED VIEW of report_datasets' `datasets` list, never a second copy of the facts on
+    it: the only thing this adds is the grouping. `datasets` is the authoritative record, and
+    by_type[t]["names"] is exactly sorted(d["name"] for d in datasets if d["type"] == t) over
+    the same population - so the two can never answer the same question differently.
+
+    State used to be nested here as well, under "by_state", which published the
+    (name -> state) map twice - once here and once as datasets[].state - and left a reader
+    with no way to tell which spelling to trust. State is carried on the record only.
 
     Every type bucket is present even when empty, so a caller can index it without testing.
-    Within a bucket only the states that actually occur appear, so an empty deployment does
-    not carry six empty state lists per type.
     """
     buckets = {t: [] for t in DATASET_TYPES}
     for n in names or ():
         buckets[dataset_type(n)].append(n)
-    out = {}
-    for t, ns in buckets.items():
-        ns = sorted(ns)
-        entry = {"count": len(ns), "names": ns}
-        if state_of is not None:
-            states = {}
-            for n in ns:
-                states.setdefault(state_of.get(n) or "unknown", []).append(n)
-            entry["by_state"] = {k: sorted(v) for k, v in sorted(states.items())}
-        out[t] = entry
-    return out
+    return {t: {"count": len(ns), "names": sorted(ns)} for t, ns in buckets.items()}
+
+
+def dataset_type(name):
+    """Which of DATASET_TYPES this dataset is, from the name alone. Never queries."""
+    n = str(name or "")
+    if re.search(r"_full_v\d+_rules_", n):
+        return "consolidated_full"
+    if re.search(r"_summary_v\d+_rules_", n):
+        return "consolidated_summary"
+    # BOTH kinds have per-scan targets: target_name() builds
+    # yara_scanner_<kind>_v<N>_scan_<slug>, so matching only the matches spelling filed every
+    # scans-kind target under host_scans and inflated the per-host count.
+    if re.search(r"_(?:matches|scans)_v\d+_scan(?:_|$)", n):
+        return "retired_scan_target"
+    if re.search(r"_matches_v\d+_", n):
+        return "host_matches"
+    if re.search(r"_scans_v\d+_", n):
+        return "host_scans"
+    return "internal"
+
 
 def render_report(current, legacy, newer, now_yyyymm):
     """Human-readable inventory. Ages are whole months."""

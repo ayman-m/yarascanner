@@ -1138,7 +1138,15 @@ _TYPE_TITLES = (
                              "per ruleset, fleet-wide"),
     ("retired_scan_target",  "RETIRED PER-SCAN TARGETS - from the withdrawn per-scan merge; "
                              "nothing produces these now"),
-    ("internal",             "PACK INTERNAL - consolidation lock and run record"),
+    # NOT the pack's own lock or run record. yara_scanner_consolidation_lock,
+    # yara_scanner_consolidation_runs and yara_scanner_cleanup_runs all fail YARA_OWNED_RE,
+    # so no inventory ever lists them and this bucket has never held one. It is
+    # dataset_type's FALLBACK - a yara-owned name none of the rows above matched - and
+    # calling it "the consolidation lock and run record" had the By type table asserting a
+    # provenance for a dataset whose own record says its origin is unknown.
+    ("internal",             "UNPARSED NAME - a yara_scanner_* name none of the rows above "
+                             "matched; the pack's lock and run-record datasets are not "
+                             "yara-owned and never appear here"),
 )
 
 
@@ -1340,7 +1348,15 @@ def record_cleanup_run(client, result, now_ms=None, log=print):
 #   retired_scan_target  yara_scanner_matches_v<N>_scan_<slug>
 #                        Output of the retired per-scan merge. Nothing produces these now;
 #                        on a tenant that ran it they may be a scan's only surviving copy.
-#   internal             the pack's own bookkeeping - the consolidation lock and run record.
+#   internal             dataset_type's FALLBACK: a yara-owned name none of the rows above
+#                        matched, e.g. yara_scanner_summary_v4 with no _rules_<hash> tail.
+#                        It is NOT the pack's bookkeeping, whatever the name suggests: the
+#                        consolidation lock, the consolidation run log and the cleanup run
+#                        log are all yara_scanner_<word>_<word> names that fail
+#                        YARA_OWNED_RE, so classify_yara_datasets drops them before the
+#                        inventory sees them and this bucket cannot hold one. The bucket
+#                        name is kept because `type` is a closed vocabulary a playbook
+#                        branches on; the description is what was wrong.
 DATASET_TYPES = ("host_matches", "host_scans", "consolidated_full", "consolidated_summary",
                  "retired_scan_target", "internal")
 
@@ -1364,103 +1380,180 @@ def dataset_type(name):
     return "internal"
 
 
-def group_by_type(names, state_of=None):
-    """{type: {"count": n, "names": [...], "by_state": {state: [...]}}}.
+def group_by_type(names):
+    """{type: {"count": n, "names": [...]}} - the dataset list grouped by what each dataset
+    IS, decided from the name alone.
 
-    ONE place in the context holds the dataset lists. State is nested under the type it
-    belongs to rather than repeated as a parallel top-level key, because every state is a
-    state OF a type - `overwrite` only ever describes a host_matches dataset, `frozen` and
-    `not_rotated` only ever a host_scans one - and publishing both spellings meant the same
-    names appeared two or three times in one context blob, which then hit the display cap
-    and truncated the part an operator actually wanted.
+    A GROUPED VIEW of report_datasets' `datasets` list, never a second copy of the facts on
+    it: the only thing this adds is the grouping. `datasets` is the authoritative record, and
+    by_type[t]["names"] is exactly sorted(d["name"] for d in datasets if d["type"] == t) over
+    the same population - so the two can never answer the same question differently.
+
+    State used to be nested here as well, under "by_state", which published the
+    (name -> state) map twice - once here and once as datasets[].state - and left a reader
+    with no way to tell which spelling to trust. State is carried on the record only.
 
     Every type bucket is present even when empty, so a caller can index it without testing.
-    Within a bucket only the states that actually occur appear, so an empty deployment does
-    not carry six empty state lists per type.
     """
     buckets = {t: [] for t in DATASET_TYPES}
     for n in names or ():
         buckets[dataset_type(n)].append(n)
-    out = {}
-    for t, ns in buckets.items():
-        ns = sorted(ns)
-        entry = {"count": len(ns), "names": ns}
-        if state_of is not None:
-            states = {}
-            for n in ns:
-                states.setdefault(state_of.get(n) or "unknown", []).append(n)
-            entry["by_state"] = {k: sorted(v) for k, v in sorted(states.items())}
-        out[t] = entry
-    return out
+    return {t: {"count": len(ns), "names": sorted(ns)} for t, ns in buckets.items()}
+
+
+# Every value datasets[].state can take. CLOSED: a playbook branches on this field, and a
+# state invented at a call site and never declared here is exactly as unmatchable as the
+# prose these records replaced - it just looks like a contract. Each entry's text is what the
+# state means; the per-record `detail` says what it means for THAT dataset.
+#
+# The first five describe a CURRENT-schema dataset's rotation posture; pack_output and
+# unrecognised describe a current-schema name the naming contract will not parse; legacy and
+# newer are the two schema buckets, which are states of a dataset rather than separate name
+# lists.
+DATASET_STATES = {
+    "overwrite":
+        "the scanner's permanent per-host matches dataset (v4+, no month) - replaced "
+        "wholesale at the start of every scan, so unsuffixed is its correct steady state",
+    "rotated":
+        "a month-suffixed rotation shard - the only shape retention pruning ever selects",
+    "frozen":
+        "unsuffixed, but rotated siblings exist for the same host - a pre-rotation leftover; "
+        "writes moved to the dated names, so it is not growing",
+    "not_rotated":
+        "unsuffixed with no rotated sibling - rotation is off for that deployment and the "
+        "dataset grows without bound. The one state that carries a remedy",
+    "consolidated":
+        "a per-scan target from the retired per-scan merge - consolidation OUTPUT, unrotated "
+        "by design, finished and never a cleanup candidate",
+    "pack_output":
+        "this pack's own consolidated output (summary or full, per ruleset, fleet-wide). "
+        "`type` says which of the two; NAME_RE refuses to parse it, and that refusal is "
+        "safety rail 5",
+    "unrecognised":
+        "inside the current-schema name filter but outside the yara_scanner naming contract "
+        "- never a retention candidate, and nothing here can say what wrote it",
+    "legacy":
+        "an older or unversioned schema - prunable by YaraCleanup with delete_legacy, "
+        "subject to its own rails",
+    "newer":
+        "a HIGHER schema version than this run assumes - never pruned. Its presence means "
+        "the schema_version argument is stale",
+}
 
 
 def report_datasets(client, now_yyyymm=None):
     """READ-ONLY inventory of every yara_scanner_* lookup dataset. Issues exactly one API
     call (the dataset listing) and never writes or deletes.
 
-    Returns the rendered text under "report", plus the same information structured for
-    context in three states that need different advice:
-      overwrite     a permanent per-host matches dataset - replaced wholesale at the start
-                    of every scan, so unsuffixed is its correct steady state
-      frozen        unsuffixed, but rotated siblings exist - a pre-rotation leftover
-      not_rotated   unsuffixed with no rotated siblings - rotation is off and it will grow
-      consolidated  a per-scan target (…_v<N>_scan_<slug>) - finished and immutable by design
+    Returns ONE RECORD PER DATASET under "datasets" - the authoritative row, carrying name,
+    type, kind, host, month and age_months alongside a `state` drawn from the closed
+    DATASET_STATES vocabulary, the `detail` sentence that state means for THIS dataset, and
+    the `remedy` an operator would act on (empty for every state that needs no action).
+    Every record carries every key even where one does not apply: a transformer filtering on
+    a sometimes-absent key matches nothing and reports no error, which is a silently empty
+    branch rather than a failure anyone sees.
+
+    The record covers CURRENT, LEGACY and NEWER schema datasets alike - the schema buckets
+    are STATES ("legacy", "newer") rather than separate name lists, so no two keys in this
+    dict answer the same question over different populations. Records are ordered by
+    (state, name), so like sits with like in the context and in the rendered table.
+
+    "by_type" is a grouped VIEW of that same list and nothing more; `datasets` is what to
+    trust. The rendered fixed-width inventory is NOT returned: it is a second spelling of
+    everything here, and the automation renders the War Room's markdown from this dict
+    instead. render_report survives for the CLI, which prints it to a terminal.
     """
     now_yyyymm = now_yyyymm or datetime.date.today().strftime("%Y%m")
     current, legacy, newer = classify_yara_datasets(client)
-    datasets, frozen, not_rotated, consolidated, overwrite = [], [], [], [], []
+    datasets = []
+
+    def _age(info):
+        month = (info or {}).get("month")
+        return months_between(month, now_yyyymm) if month else None
+
+    def _record(name, state, detail, remedy="", info=None):
+        return {"name": name, "type": dataset_type(name),
+                "kind": (info or {}).get("kind") or "",
+                "host": (info or {}).get("host") or "",
+                "month": (info or {}).get("month") or "",
+                "age_months": _age(info),
+                "state": state, "detail": detail, "remedy": remedy}
+
     for name in current:
         info = parse_dataset_name(name)
         if info is None:
-            datasets.append({"name": name, "type": dataset_type(name),
-                             "kind": (("full" if "_full_v" in name else "summary")
-                                      if is_pack_output_dataset(name) else ""),
-                             "host": "", "month": "", "age_months": None,
-                             "state": (("full" if "_full_v" in name else "summary")
-                                       if is_pack_output_dataset(name) else "unrecognised")})
+            # NAME_RE deliberately refuses to parse this pack's own consolidated output -
+            # that refusal IS safety rail 5. `type` already says which of the two it is
+            # (consolidated_summary / consolidated_full), so neither `state` nor `kind`
+            # spells that same fact a second time.
+            pack = is_pack_output_dataset(name)
+            datasets.append(_record(
+                name, "pack_output" if pack else "unrecognised",
+                "this pack's own consolidated output - a cross-host rollup for one ruleset, "
+                "not a rotation shard, and never a retention candidate" if pack else
+                "matches the current-schema name filter but not the yara_scanner naming "
+                "contract - never a retention candidate, and its origin is unknown"))
             continue
         if info["scan_target"]:
-            state, age = "consolidated", None
-            consolidated.append(name)
+            datasets.append(_record(
+                name, "consolidated",
+                "per-scan target from the retired per-scan merge - consolidation output, "
+                "unrotated by design, finished and not growing; on a tenant that ran that "
+                "merge it can be the only surviving copy of that scan", info=info))
         elif info["overwrite"]:
-            state, age = "overwrite", None
-            overwrite.append(name)
+            datasets.append(_record(
+                name, "overwrite",
+                "permanent per-host matches dataset - the scanner replaces it wholesale at "
+                "the start of every scan, so it is bounded by that overwrite rather than by "
+                "rotation and an unsuffixed name is correct here", info=info))
         elif info["month"]:
-            state, age = "rotated", months_between(info["month"], now_yyyymm)
+            datasets.append(_record(
+                name, "rotated",
+                "rotation shard for %s, %d month(s) old"
+                % (info["month"], months_between(info["month"], now_yyyymm)), info=info))
+        elif has_rotated_sibling(name, current):
+            datasets.append(_record(
+                name, "frozen",
+                "unsuffixed, but rotated siblings exist for this host - a pre-rotation "
+                "leftover; writes moved to the dated names, so it is frozen and not growing",
+                info=info))
         else:
-            age = None
-            if has_rotated_sibling(name, current):
-                state = "frozen"
-                frozen.append(name)
-            else:
-                state = "not_rotated"
-                not_rotated.append(name)
-        datasets.append({"name": name, "type": dataset_type(name), "kind": info["kind"],
-                         "host": info["host"] or "", "month": info["month"] or "",
-                         "age_months": age, "state": state})
-    state_of = {d["name"]: d.get("state") for d in datasets}
-    for n in legacy:
-        state_of.setdefault(n, "legacy")
-    for n in newer:
-        state_of.setdefault(n, "newer")
-    by_type = group_by_type(current + legacy + newer, state_of)
+            datasets.append(_record(
+                name, "not_rotated",
+                "unsuffixed with no rotated sibling - rotation is off for that deployment, "
+                "so this dataset grows without bound until add_data merge time exceeds the "
+                "client timeout and it goes write-dead",
+                remedy='set CONFIG_LOOKUP_ROTATION="monthly" in the scanner',
+                info=info))
+    for name in legacy:
+        datasets.append(_record(
+            name, "legacy",
+            "on an older or unversioned schema - prunable by YaraCleanup with "
+            "delete_legacy, subject to its own rails", info=parse_dataset_name(name)))
+    for name in newer:
+        datasets.append(_record(
+            name, "newer",
+            "on a HIGHER schema version than the %s this run assumes - never pruned, "
+            "because a host reading a stale version must not delete a future schema's data"
+            % YARA_SCHEMA_VERSION,
+            remedy="raise schema_version to the version the fleet actually writes",
+            info=parse_dataset_name(name)))
+    datasets.sort(key=lambda d: (d["state"], d["name"]))
     return {
         "now_yyyymm": now_yyyymm,
         "schema_version": YARA_SCHEMA_VERSION,
-        "report": render_report(current, legacy, newer, now_yyyymm),
-        # THE dataset breakdown. Split by what each dataset IS, with its state nested
-        # underneath. Nothing else in this dict repeats these names - see group_by_type.
-        "by_type": by_type,
-        "by_type_counts": {t: v["count"] for t, v in by_type.items()},
-        # Per-dataset detail: host, month, age. A different SHAPE, not a second copy of the
-        # lists - this is the only place age_months and month are carried.
+        # THE per-dataset record, and the only place any fact about a dataset is carried.
         "datasets": datasets,
-        # Schema buckets. Orthogonal to type: a legacy dataset still has a type, and pruning
-        # decisions are made on schema version rather than on what the dataset holds.
-        "legacy": legacy, "legacy_count": len(legacy),
-        "newer": newer, "newer_count": len(newer),
+        # A grouped VIEW of `datasets` - count and names per type bucket, so a caller can
+        # branch on "how many host_scans" without walking every record. Same population,
+        # same names; `datasets` is authoritative if the two could ever disagree.
+        "by_type": group_by_type([d["name"] for d in datasets]),
+        # The schema-bucket verdict. Counts rather than lists, because the names are already
+        # on the records: a caller wanting them filters `datasets` on state legacy / newer.
         "current_count": len(current),
-        "total_count": len(current) + len(legacy) + len(newer),
+        "legacy_count": len(legacy),
+        "newer_count": len(newer),
+        "total_count": len(datasets),
     }
 
 
@@ -1733,6 +1826,124 @@ class CoreApiClient:
 
 
 # ---- entry point ------------------------------------------------------------
+_MD_ROW_CAP = 50
+
+
+def _n(v):
+    """Thousands-separated. The numbers this reports run to six figures.
+
+    Integral values print as integers, floats included: the settings arrive as
+    float(args.get(...)), and "900.0" in a table reads as a typo rather than a default.
+
+    A NON-integral float keeps its fraction. The previous version went through int(), which
+    silently truncated - a quiet_secs of 900.5 printed as 900 while the context carried 900.5,
+    so the report and the context stated different numbers. That is the one disagreement this
+    renderer exists to make impossible, and it was being introduced by the formatter itself.
+    """
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    return format(int(f), ",d") if f.is_integer() else format(f, ",g")
+
+
+def _md_table(headers, rows):
+    """A markdown table, or "" when there is nothing to put in it. Cells are escaped: rule
+    names and hostnames reach here from a ruleset and from an endpoint, and a single pipe in
+    either would silently shear a column off every row below it."""
+    if not rows:
+        return ""
+
+    def cell(v):
+        return str("" if v is None else v).replace("|", "\\|").replace("\n", " ")
+
+    out = ["| " + " | ".join(cell(h) for h in headers) + " |",
+           "|" + "|".join("---" for _ in headers) + "|"]
+    for r in rows:
+        out.append("| " + " | ".join(cell(v) for v in r) + " |")
+    return "\n".join(out)
+
+
+def _md_capped(headers, rows, context_key):
+    """_md_table, truncated. The context keeps every entry, so a 200-host pass cannot push the
+    counts off the top of the War Room - the same trade YaraReport makes for the scan log."""
+    body = _md_table(headers, rows[:_MD_ROW_CAP])
+    if len(rows) > _MD_ROW_CAP:
+        body += ("\n\n_... and %s more - the full list is in `%s`._"
+                 % (_n(len(rows) - _MD_ROW_CAP), context_key))
+    return body
+
+
+def render_inventory_markdown(result):
+    """The War Room report for one inventory, rendered from report_datasets' result dict and
+    from nothing else - so the table an operator reads and the context a playbook branches on
+    cannot disagree. The previous version formatted its sentences from one set of expressions
+    and its context from another, which is exactly how a report comes to state a number that
+    is nowhere in the context.
+
+    Deliberately NOT render_report. That one is a fixed-width TERMINAL rendering shared
+    byte-for-byte with the CLI (xdr_data_management.py prints it to a tty), where markdown
+    would reflow the columns into noise. Two audiences, two renderers, one set of facts.
+    """
+    datasets = result["datasets"]
+    by_type = result["by_type"]
+    needs = [d for d in datasets if d["remedy"]]
+    if not datasets:
+        headline = "none on this tenant"
+    elif needs:
+        headline = "%s dataset(s), %s needing attention" % (_n(result["total_count"]),
+                                                            _n(len(needs)))
+    else:
+        headline = "%s dataset(s), nothing needing attention" % _n(result["total_count"])
+
+    out = ["### YARA lookup datasets - %s" % headline,
+           "_Read-only: one dataset listing, no queries, nothing written and nothing "
+           "deleted. Every dataset below is classified from its NAME alone._",
+           ""]
+
+    facts = [
+        ("Inventory month", result["now_yyyymm"]),
+        ("Schema version assumed current", "v%s" % result["schema_version"]),
+        ("Datasets", _n(result["total_count"])),
+        ("Current schema", _n(result["current_count"])),
+        ("Legacy schema", "%s - older or unversioned; prunable by YaraCleanup"
+                          % _n(result["legacy_count"])),
+        ("Newer schema", "%s - never pruned%s"
+                         % (_n(result["newer_count"]),
+                            "; schema_version looks stale" if result["newer_count"] else "")),
+        ("Needs attention", "%s - see below" % _n(len(needs)) if needs else "0"),
+    ]
+    out.append(_md_table(["", ""], [("**%s**" % k, v) for k, v in facts]))
+
+    out += ["", "#### By type",
+            _md_table(["Type", "Datasets", "What it holds"],
+                      [(t, _n((by_type.get(t) or {}).get("count") or 0), title)
+                       for t, title in _TYPE_TITLES])]
+
+    if needs:
+        out += ["", "#### Needs attention",
+                _md_capped(["Dataset", "Type", "Host", "State", "What to do"],
+                           [("`%s`" % d["name"], d["type"], d["host"] or "-",
+                             "`%s`" % d["state"], d["remedy"]) for d in needs],
+                           "Yara.Report.datasets")]
+
+    if datasets:
+        out += ["", "#### Every dataset",
+                _md_capped(["Dataset", "Type", "Kind", "Host", "Month", "Age", "State",
+                            "What that means"],
+                           [("`%s`" % d["name"], d["type"], d["kind"] or "-",
+                             d["host"] or "-", d["month"] or "-",
+                             "%s mo" % _n(d["age_months"])
+                             if d["age_months"] is not None else "-",
+                             "`%s`" % d["state"], d["detail"]) for d in datasets],
+                           "Yara.Report.datasets")]
+    else:
+        out += ["", "_No yara_scanner_* lookup datasets on this tenant. A report of zeros is "
+                    "a successful run, not a silent one: a listing that failed would have "
+                    "raised and returned an error instead of this table._"]
+    return "\n".join(out)
+
+
 def main():
     args = demisto.args()
     try:
@@ -1751,39 +1962,12 @@ def main():
         return_error("YaraReport failed: {}".format(ex))
         return
 
-    def _state(kind, state):
-        return ((report["by_type"].get(kind) or {}).get("by_state") or {}).get(state) or []
-
-    lines = ["{} dataset(s): {} current-schema, {} legacy, {} newer-schema (never pruned)".format(
-        report["total_count"], report["current_count"],
-        report["legacy_count"], report["newer_count"])]
-    lines.append("  " + " | ".join(
-        "{} {}".format(v, t) for t, v in sorted(report["by_type_counts"].items()) if v))
-
-    consolidated = _state("retired_scan_target", "consolidated")
-    if consolidated:
-        lines.append("{} per-scan CONSOLIDATED TARGET(s) — consolidation OUTPUT, unrotated by "
-                     "design, finished and not growing; never a cleanup candidate.".format(
-                         len(consolidated)))
-    frozen = _state("host_scans", "frozen") + _state("host_matches", "frozen")
-    if frozen:
-        lines.append("{} frozen (pre-rotation leftovers — rotation IS on for that host, "
-                     "writes moved to the dated names; not growing): {}".format(
-                         len(frozen), ", ".join(frozen)))
-    not_rotated = _state("host_scans", "not_rotated") + _state("host_matches", "not_rotated")
-    if not_rotated:
-        lines.append('{} NOT rotated — rotation is off for that deployment and these grow '
-                     'without bound; set CONFIG_LOOKUP_ROTATION="monthly" in the scanner: '
-                     '{}'.format(len(not_rotated), ", ".join(not_rotated)))
-    # The rendered table is fixed-width; a code fence keeps the columns aligned in the War Room.
-    lines += ["", "```", report["report"], "```"]
-
     # List-valued context is APPENDED to across repeated calls in one investigation, so
-    # clear the path first or datasets/frozen/not_rotated accumulate stale entries.
+    # clear the path first or `datasets` accumulates stale entries.
     demisto.executeCommand("DeleteContext", {"key": "Yara.Report"})
 
     return_results(CommandResults(
-        readable_output="\n".join(lines),
+        readable_output=render_inventory_markdown(report),
         outputs_prefix="Yara.Report",
         outputs=report,
         raw_response=report,

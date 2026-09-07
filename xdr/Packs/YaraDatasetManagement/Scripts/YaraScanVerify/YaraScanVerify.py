@@ -34,11 +34,6 @@ DEFAULT_XDR_API_ID = "replace_with_xdr_advanced_api_id"     # that key's numeric
 # Tenant API base URL, https://api-<tenant>.xdr.<region>.paloaltonetworks.com
 DEFAULT_XDR_API_URL = "replace_with_xdr_api_url"
 
-# Merge gates. Each is also overridable per run from the matching script argument.
-DEFAULT_QUIET_SECS = 900            # a finished scan's newest row must be older than this
-DEFAULT_ROW_CEILING = 2_000_000     # a scan bigger than this is reported, never half-merged
-DEFAULT_ABANDONED_SECS = 24 * 3600  # a non-terminal scan silent this long counts as finished
-
 # Lookup schema version assumed when the schema_version argument is left empty.
 # Must match the scanner's YARA_LOOKUP_SCHEMA_VER on the endpoints.
 DEFAULT_LOOKUP_SCHEMA_VERSION = "4"
@@ -51,8 +46,6 @@ DEFAULT_LOOKUP_SCHEMA_VERSION = "4"
 import json
 import re
 import time
-
-DEFAULT_LOOKUP_SCHEMA_VERSION = "4"
 
 
 class CoreApiClient:
@@ -202,17 +195,150 @@ def _norm(h):
 STARTED_STATES = ("initiated", "running", "completed", "cancelled", "failed")
 
 
+# ---------------------------------------------------------------------------------------
+# RUN RECORDS AND THE WAR ROOM REPORT
+#
+# `hosts` and `errors` are CONTEXT before they are prose: a playbook filters on them. So each
+# entry is an OBJECT with a stable key set and a `reason` drawn from a closed vocabulary, and
+# the sentence a human reads survives as `detail` rather than BEING the record. Every entry
+# carries every key even where one does not apply, because a transformer filtering on a key
+# that is only sometimes present matches nothing and reports no error - the failure mode is a
+# silently empty branch, which is the worst kind to debug.
+#
+# `hosts` is the ONE authoritative per-host structure. The previous version published the same
+# facts twice - a flat `started` list beside a nested `states` dict built from the same source
+# in the adjacent line - and the two disagreed on case, so a playbook could not even join them
+# without knowing which spelling to lowercase. dispatched / started / not_started survive as
+# plain hostname lists because they are the branch-friendly partition a playbook wants without
+# running a set difference in a transformer; every one of them is derivable from `hosts`, and
+# the yml says so, so a reader knows which key is authoritative.
+#
+# The markdown is rendered FROM the result dict and from nothing else, so the table an operator
+# reads and the context a playbook branches on cannot disagree. The previous version formatted
+# its sentences from len() expressions that appeared in NO context key, which is exactly how a
+# report comes to state a number a playbook cannot reproduce.
+# ---------------------------------------------------------------------------------------
+
+HOST_REASONS = {
+    "started":
+        "a lifecycle row in a started state landed for this host since dispatch - the scanner "
+        "is running",
+    "no_lifecycle_row":
+        "no lifecycle row for this host since dispatch. NOT necessarily a failure: a host "
+        "offline or busy at dispatch simply stays due for the next wave",
+    "lifecycle_unreadable":
+        "the lifecycle query failed, so whether this host started is UNKNOWN. It is not "
+        "evidence the host did not start",
+}
+
+ERROR_REASONS = {
+    "lifecycle_query_failed":
+        "the scan lifecycle query raised. Fatal to the verdict, which becomes unknown and "
+        "never wave_dead: XQL hiccuping is not evidence a scan failed, and paging an analyst "
+        "about a healthy wave trains them to ignore the gate",
+    "match_query_failed":
+        "the match-evidence query raised. Never fatal - match rows are positive evidence only "
+        "and can never decide the verdict - but it does mean an absent match count reads "
+        "'not known' rather than 'none'",
+}
+
+# The one rule a caller would get wrong: only a lifecycle failure costs us the verdict. A
+# failed match query removes evidence and nothing else, so `fatal` is derived here rather than
+# passed in at the call site, where the two would eventually drift apart.
+FATAL_ERROR_REASONS = ("lifecycle_query_failed",)
+
+MATCH_EVIDENCE = {
+    "observed":
+        "at least one match row landed since dispatch - which proves the whole path works: "
+        "scanner started, rules compiled, uploader delivered, dataset writable",
+    "none_yet":
+        "the query succeeded and returned no rows. NEVER a failure: a clean host legitimately "
+        "has none, and a host is never failed for having none",
+    "unavailable":
+        "the match query ran and failed, so nothing is known. This is deliberately NOT the "
+        "same value as none_yet - an empty count doing double duty for 'zero' and 'unread' is "
+        "how a report comes to assert a clean host on evidence it never saw",
+    "not_attempted":
+        "the lifecycle query failed first, so the match query was never issued and nothing is "
+        "known. Deliberately NOT unavailable, which states that the match query itself ran "
+        "and failed: claiming that here would put a second failure in the report that its own "
+        "Errors table does not list",
+}
+
+
+def _check(value, vocabulary, field):
+    """Reject a code that is not in its closed set, AT CONSTRUCTION.
+
+    The three vocabularies above are the contract the yml publishes and a playbook filters on,
+    and a closed set is only closed if something closes it. Before this, they were declarative
+    only: nothing read HOST_REASONS or ERROR_REASONS at all, so a reason invented at a call
+    site shipped the moment someone added one without also editing the test file that pinned
+    the vocabulary. Raising here means the FIRST run down that path names the undeclared code
+    instead of publishing it into context, where it would silently match no transformer.
+    """
+    if value not in vocabulary:
+        raise ValueError(
+            "undeclared %s %r - it is a CLOSED vocabulary (%s). Add it to the constant AND to "
+            "the yml's declared set, or use an existing code; a playbook filters on this field "
+            "and cannot match a value the contract never mentioned."
+            % (field, value, ", ".join(sorted(vocabulary))))
+    return value
+
+
+def _host_record(hostname, started, states, match_rows, match_evidence, reason, detail):
+    """One `hosts` entry - the authoritative per-host structure.
+
+    `started` is a THREE-state field: True, False, or None meaning unknown because the
+    lifecycle query failed. None rather than False on that path is load-bearing - a playbook
+    filtering hosts on `started == false` would otherwise sweep up every host of a wave nobody
+    could read and conclude it was dead, which is the one error this gate must not make.
+
+    `match_rows` is None on the same principle: 0 is a measurement, None is the absence of one.
+    """
+    return {"hostname": hostname, "started": started, "states": list(states),
+            "match_rows": match_rows,
+            "match_evidence": _check(match_evidence, MATCH_EVIDENCE, "match_evidence"),
+            "reason": _check(reason, HOST_REASONS, "host reason"), "detail": detail}
+
+
+def _error_record(reason, detail, stage, exception):
+    """One `errors` entry. `fatal` is the field to branch on: it folds in the rule that only a
+    lifecycle failure costs the verdict, so a caller never has to know which stage is which."""
+    return {"reason": _check(reason, ERROR_REASONS, "error reason"), "detail": detail,
+            "stage": stage, "exception": str(exception)[:160],
+            "fatal": reason in FATAL_ERROR_REASONS}
+
+
 def verify_wave(client, hostnames, dispatch_ms, ver="4", log=lambda *a: None):
-    """Which of the dispatched hosts have started scanning since dispatch_ms."""
+    """Which of the dispatched hosts have started scanning since dispatch_ms.
+
+    Returns the dict main() publishes as context AND renders the War Room report from -
+    render_run_markdown reads this dict and nothing else.
+    """
     want = {}
     for h in (hostnames or []):
         if _norm(h):
             want[_norm(h)] = h
-    out = {"verdict": "unknown", "dispatched": sorted(want.values()),
-           "started": [], "not_started": [], "match_rows": {}, "states": {},
-           "error": ""}
+    out = {"verdict": "unknown", "dispatch_ms": int(dispatch_ms), "schema_version": str(ver),
+           "hosts": [], "dispatched": sorted(want.values()),
+           "started": [], "not_started": [],
+           "dispatched_count": len(want), "started_count": 0, "not_started_count": 0,
+           # The honest state before anything has been queried. It was "unavailable" here,
+           # which claims a match query ran and failed before one had even been issued, and
+           # the lifecycle-failure return below inherited exactly that claim.
+           "match_evidence": "not_attempted", "match_rows_total": None,
+           "errors": [], "error_count": 0}
     if not want:
+        # Zero hosts really do have zero match rows, so this is a measurement rather than the
+        # empty-dict-as-zero the unavailable case exists to keep apart from it.
+        #
+        # UNREACHABLE FROM THE AUTOMATION: main() refuses an hostnames argument that resolves
+        # to no host, because `ok` here is only defensible as "nothing was asked, so nothing
+        # is wrong" and reads in the War Room as "the wave is fine". Kept for a direct caller
+        # that has already established there was nothing to dispatch.
         out["verdict"] = "ok"
+        out["match_evidence"] = "none_yet"
+        out["match_rows_total"] = 0
         return out
 
     try:
@@ -223,7 +349,26 @@ def verify_wave(client, hostnames, dispatch_ms, ver="4", log=lambda *a: None):
             limit=10000) or []
     except Exception as e:
         # UNKNOWN, never wave_dead: a query failing is not evidence a scan failed.
-        out["error"] = "scan lifecycle query failed: %s" % str(e)[:160]
+        out["errors"].append(_error_record(
+            "lifecycle_query_failed",
+            "the scan lifecycle query failed, so nothing is known about this wave: %s"
+            % str(e)[:160], "lifecycle", e))
+        out["error_count"] = len(out["errors"])
+        # The match query is issued BELOW this return, so on this path it was never issued at
+        # all. `not_attempted`, not `unavailable`: the latter states that the match query
+        # failed, which would put a second failure in the report and in a caller's context
+        # that appears nowhere in `errors` - the only place a failure is actually recorded.
+        out["match_evidence"] = "not_attempted"
+        # One record per dispatched host, so `hosts` covers the whole wave on every path -
+        # with started=None, not False. started/not_started stay EMPTY here rather than
+        # splitting the wave: putting a host in not_started would report "no row yet" as a
+        # finding when the truth is that nobody looked.
+        out["hosts"] = [_host_record(name, None, [], None, "not_attempted",
+                                     "lifecycle_unreadable",
+                                     "the lifecycle query failed, so whether this host "
+                                     "started is unknown - see `errors`. The match query was "
+                                     "never issued, so its count is unread, not zero.")
+                        for name in out["dispatched"]]
         return out
 
     seen = {}
@@ -243,12 +388,19 @@ def verify_wave(client, hostnames, dispatch_ms, ver="4", log=lambda *a: None):
             continue
         seen.setdefault(h, set()).add(st)
 
+    # The partition a playbook branches on. INVARIANT, asserted by the tests: on every path
+    # that reaches here, sorted(started + not_started) == dispatched, and they are disjoint.
+    # It does NOT hold on the lifecycle-failure path above, deliberately - both are empty
+    # there because neither claim can be made.
     out["started"] = sorted(want[h] for h in seen)
     out["not_started"] = sorted(v for k, v in want.items() if k not in seen)
-    out["states"] = dict((k, sorted(v)) for k, v in seen.items())
+    out["started_count"] = len(out["started"])
+    out["not_started_count"] = len(out["not_started"])
 
     # Soft evidence, queried AFTER the verdict inputs are settled so a failure here can never
-    # change the verdict.
+    # change the verdict. `evidence_ok` is carried separately from the counts because an empty
+    # dict cannot tell "every host is clean" from "the query never answered".
+    counts, evidence_ok = {}, True
     try:
         for r in (client.xql(
                 "dataset = yara_scanner_matches* "
@@ -256,9 +408,49 @@ def verify_wave(client, hostnames, dispatch_ms, ver="4", log=lambda *a: None):
                 "| comp count() as n by hostname" % int(dispatch_ms), limit=10000) or []):
             h = _norm(r.get("hostname"))
             if h in want:
-                out["match_rows"][want[h]] = int(r.get("n") or 0)
+                counts[h] = int(r.get("n") or 0)
     except Exception as e:
+        evidence_ok = False
         log("match evidence unavailable (not a failure): %s" % str(e)[:120])
+        out["errors"].append(_error_record(
+            "match_query_failed",
+            "the match-evidence query failed, so an absent match count means 'not known' "
+            "rather than 'none'. The verdict is unaffected - match rows never decide it: %s"
+            % str(e)[:160], "match_evidence", e))
+    out["error_count"] = len(out["errors"])
+    out["match_evidence"] = ("unavailable" if not evidence_ok
+                             else ("observed" if any(counts.values()) else "none_yet"))
+    out["match_rows_total"] = sum(counts.values()) if evidence_ok else None
+
+    # One record per dispatched host, sorted so the hosts that need looking at come first:
+    # lifecycle_unreadable < no_lifecycle_row < started, alphabetically and by usefulness.
+    hosts = []
+    for name in out["dispatched"]:
+        k = _norm(name)
+        states = sorted(seen.get(k) or ())
+        n = (counts.get(k, 0) if evidence_ok else None)
+        if states:
+            reason = "started"
+            detail = "lifecycle states since dispatch: %s." % ", ".join(states)
+        else:
+            reason = "no_lifecycle_row"
+            detail = ("no lifecycle row since dispatch. Not necessarily failed - a host "
+                      "offline or busy at dispatch stays due for the next wave.")
+        if n:
+            detail += " %s match row(s) have landed." % _n(n)
+            if reason == "no_lifecycle_row":
+                # Match rows are keyed on the dispatched set, not on the started set, so this
+                # combination is reachable and worth saying out loud rather than leaving an
+                # operator to reconcile two tables.
+                detail += (" Match rows without a lifecycle row means the row has not landed "
+                           "yet, not that the scan never started.")
+        elif not evidence_ok:
+            detail += (" Match evidence is unavailable this pass, so the missing count here "
+                       "means unread, not zero.")
+        evidence = ("unavailable" if not evidence_ok else ("observed" if n else "none_yet"))
+        hosts.append(_host_record(name, bool(states), states, n, evidence, reason, detail))
+    hosts.sort(key=lambda h: (h["reason"], h["hostname"]))
+    out["hosts"] = hosts
 
     if not out["started"]:
         out["verdict"] = "wave_dead"
@@ -269,10 +461,176 @@ def verify_wave(client, hostnames, dispatch_ms, ver="4", log=lambda *a: None):
     return out
 
 
+_MD_ROW_CAP = 50
+
+
+def _n(v):
+    """Thousands-separated. The numbers this reports run to six figures.
+
+    Integral values print as integers, floats included: the settings arrive as
+    float(args.get(...)), and "900.0" in a table reads as a typo rather than a default.
+
+    A NON-integral float keeps its fraction. The previous version went through int(), which
+    silently truncated - a quiet_secs of 900.5 printed as 900 while the context carried 900.5,
+    so the report and the context stated different numbers. That is the one disagreement this
+    renderer exists to make impossible, and it was being introduced by the formatter itself.
+    """
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    return format(int(f), ",d") if f.is_integer() else format(f, ",g")
+
+
+def _md_table(headers, rows):
+    """A markdown table, or "" when there is nothing to put in it. Cells are escaped: rule
+    names and hostnames reach here from a ruleset and from an endpoint, and a single pipe in
+    either would silently shear a column off every row below it."""
+    if not rows:
+        return ""
+
+    def cell(v):
+        return str("" if v is None else v).replace("|", "\\|").replace("\n", " ")
+
+    out = ["| " + " | ".join(cell(h) for h in headers) + " |",
+           "|" + "|".join("---" for _ in headers) + "|"]
+    for r in rows:
+        out.append("| " + " | ".join(cell(v) for v in r) + " |")
+    return "\n".join(out)
+
+
+def _md_capped(headers, rows, context_key):
+    """_md_table, truncated. The context keeps every entry, so a 200-host pass cannot push the
+    counts off the top of the War Room - the same trade YaraReport makes for the scan log."""
+    body = _md_table(headers, rows[:_MD_ROW_CAP])
+    if len(rows) > _MD_ROW_CAP:
+        body += ("\n\n_... and %s more - the full list is in `%s`._"
+                 % (_n(len(rows) - _MD_ROW_CAP), context_key))
+    return body
+
+
+_VERDICT_TITLES = {"ok": "OK", "partial": "PARTIAL", "wave_dead": "WAVE DEAD",
+                   "unknown": "UNKNOWN"}
+
+_STARTED_CELL = {True: "yes", False: "no", None: "unknown"}
+
+
+def render_run_markdown(result):
+    """The War Room report for one verification pass, rendered from the result dict alone.
+
+    XSOAR renders readable_output AS markdown, so the previous version's five plain sentences
+    joined with single newlines collapsed into one run-on paragraph - and its host lists were
+    hard-capped at 20 names with no note that any were missing.
+    """
+    v = result["verdict"]
+    if v == "ok":
+        head = "All %s dispatched host(s) are scanning." % _n(result["started_count"])
+    elif v == "partial":
+        head = ("%s of %s host(s) started; %s have written no lifecycle row yet."
+                % (_n(result["started_count"]), _n(result["dispatched_count"]),
+                   _n(result["not_started_count"])))
+    elif v == "wave_dead":
+        head = ("NO host started. The whole wave appears dead - check the ruleset, the script "
+                "UID and the delivery action before re-dispatching.")
+    else:
+        head = ("Could not determine - the lifecycle query failed. Treat as UNKNOWN, not "
+                "failed: a query error is not evidence a scan failed.")
+
+    out = ["### YARA wave verification - %s" % _VERDICT_TITLES.get(v, str(v).upper()),
+           "_%s_" % head, ""]
+
+    # WHY a match count is missing, derived from the errors this run actually recorded rather
+    # than from the mere absence of the count. "the query failed" and "the query was never
+    # issued" are different facts, and the absence of a number is equally consistent with
+    # both; keying the sentence on `match_rows_total is None` picked one and asserted it. On
+    # the lifecycle-failure path that was the wrong one - the report claimed a match-query
+    # failure while its own Errors table listed only `lifecycle_query_failed`. Reading the
+    # errors list means the report can only ever claim a failure that table also shows.
+    match_failed = any(e["reason"] == "match_query_failed" for e in result["errors"])
+    if result["match_rows_total"] is not None:
+        match_rows_cell = _n(result["match_rows_total"])
+    elif match_failed:
+        match_rows_cell = "not known - the evidence query failed"
+    else:
+        match_rows_cell = ("not known - the lifecycle query failed first, so the match query "
+                           "was never issued")
+
+    facts = [
+        ("Verdict", "`%s`" % v),
+        ("Dispatched", _n(result["dispatched_count"])),
+        ("Started", _n(result["started_count"]) if v != "unknown"
+                    else "unknown - the lifecycle query failed"),
+        ("No lifecycle row yet", _n(result["not_started_count"]) if v != "unknown"
+                                 else "unknown - nothing was read, so nothing is claimed"),
+        ("Match evidence", "`%s`" % result["match_evidence"]),
+        ("Match rows since dispatch", match_rows_cell),
+        ("Dispatch bound", "%s (epoch ms). Every query is bounded on it, so a host scanned "
+                           "yesterday cannot read as this wave starting"
+                           % _n(result["dispatch_ms"])),
+        ("Schema version", "%s - recorded for the run log only: both reads use the "
+                           "unversioned `yara_scanner_scans*` and `yara_scanner_matches*` "
+                           "wildcards, which span every schema version"
+                           % result["schema_version"]),
+        ("Errors", _n(result["error_count"])),
+    ]
+    out.append(_md_table(["", ""], [("**%s**" % k, val) for k, val in facts]))
+
+    # The one number that would otherwise be read as a verdict. Spelled out from the closed
+    # vocabulary rather than left as a code, because "no match rows" and "nobody could read
+    # the match rows" look identical in a count and mean opposite things.
+    # .get, not [], on the last line of defence: an unexpected code degrades this one sentence
+    # instead of raising KeyError out of the renderer after both queries have already run,
+    # which would throw away a completed verification to save a caption.
+    out += ["", "**Match evidence - `%s`.** %s. Match rows are positive evidence ONLY: their "
+                "presence proves the whole path works, their absence proves nothing, and no "
+                "host is ever failed for having none."
+            % (result["match_evidence"],
+               MATCH_EVIDENCE.get(result["match_evidence"],
+                                  "this code is not in the declared vocabulary, so nothing "
+                                  "can be said about what it means - read `hosts` and "
+                                  "`errors`"))]
+
+    if result["hosts"]:
+        out += ["", "#### Hosts",
+                _md_capped(["Host", "Started", "Lifecycle states", "Match rows", "Reason",
+                            "Detail"],
+                           [(h["hostname"], _STARTED_CELL.get(h["started"], "unknown"),
+                             ", ".join(h["states"]) or "-",
+                             _n(h["match_rows"]) if h["match_rows"] is not None else "unknown",
+                             "`%s`" % h["reason"], h["detail"])
+                            for h in result["hosts"]],
+                           "Yara.ScanVerify.hosts")]
+
+    if result["errors"]:
+        out += ["", "#### Errors",
+                _md_capped(["Stage", "Reason", "Fatal", "Detail"],
+                           [(e["stage"], "`%s`" % e["reason"],
+                             "yes" if e["fatal"] else "no", e["detail"])
+                            for e in result["errors"]],
+                           "Yara.ScanVerify.errors"),
+                "", "_A query failure is never evidence a scan failed. A fatal one makes the "
+                    "verdict `unknown`; a non-fatal one only removes evidence, and match rows "
+                    "never decide the verdict in the first place._"]
+
+    return "\n".join(out)
+
+
 def main():
     args = demisto.args()
-    hosts = argToList(args.get("hostnames"))
+    hosts = [h for h in argToList(args.get("hostnames")) if _norm(h)]
     ver = str(args.get("schema_version") or DEFAULT_LOOKUP_SCHEMA_VERSION).strip()
+    if not hosts:
+        # The yml marks hostnames required, which blocks a MISSING argument and nothing else:
+        # ", ,  ," is present, parses to no hosts, and is exactly what a playbook transformer
+        # that resolved no endpoints hands over. Verifying nobody would otherwise return
+        # verdict `ok` under the banner "All 0 dispatched host(s) are scanning" - a wave
+        # dispatched to nobody reading as a passing gate, which is worse than no gate. Refuse
+        # it the way the dispatch_ms guard below refuses its own empty case.
+        return_error("YaraScanVerify: hostnames resolved to no host (%r given). A wave "
+                     "dispatched to nobody cannot be verified, and must not report ok - "
+                     "check the transformer that produced this list."
+                     % (args.get("hostnames"),))
+        return
     try:
         dispatch_ms = int(float(args.get("dispatch_ms") or 0))
     except (TypeError, ValueError):
@@ -284,47 +642,16 @@ def main():
                      "yesterday would count as this wave starting.")
         return
 
-    log_lines = []
     try:
-        result = verify_wave(CoreApiClient(), hosts, dispatch_ms, ver=ver,
-                             log=lambda m: log_lines.append(m))
+        result = verify_wave(CoreApiClient(), hosts, dispatch_ms, ver=ver)
     except Exception as ex:
         return_error("YaraScanVerify failed: {}".format(ex))
         return
 
-    v = result["verdict"]
-    if v == "ok":
-        head = "All %d dispatched host(s) are scanning." % len(result["started"])
-    elif v == "partial":
-        head = ("%d of %d host(s) started; %d have written no lifecycle row yet."
-                % (len(result["started"]), len(result["dispatched"]),
-                   len(result["not_started"])))
-    elif v == "wave_dead":
-        head = ("NO host started. The whole wave appears dead - check the ruleset, the script "
-                "UID and the delivery action before re-dispatching.")
-    else:
-        head = ("Could not determine - the lifecycle query failed. Treat as UNKNOWN, not "
-                "failed: a query error is not evidence a scan failed.")
-
-    lines = [head]
-    if result["started"]:
-        lines.append("started: %s" % ", ".join(result["started"][:20]))
-    if result["not_started"]:
-        lines.append("no row yet: %s" % ", ".join(result["not_started"][:20]))
-    if result["match_rows"]:
-        lines.append("match rows already landed: %s"
-                     % ", ".join("%s=%d" % (k, n)
-                                 for k, n in sorted(result["match_rows"].items())))
-    else:
-        lines.append("no match rows yet - evidence only, never a failure: a clean host has "
-                     "none.")
-    if result["error"]:
-        lines.append("error: %s" % result["error"])
-
     # List-valued context is APPENDED to across calls in one investigation, so a second
     # verification pass would otherwise merge both waves' host lists.
     demisto.executeCommand("DeleteContext", {"key": "Yara.ScanVerify"})
-    return_results(CommandResults(readable_output="\n".join(lines),
+    return_results(CommandResults(readable_output=render_run_markdown(result),
                                   outputs_prefix="Yara.ScanVerify",
                                   outputs=result, raw_response=result))
 

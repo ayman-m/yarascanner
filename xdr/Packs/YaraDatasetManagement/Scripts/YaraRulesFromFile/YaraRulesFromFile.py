@@ -185,13 +185,19 @@ def validate_rules(raw, max_bytes=DEFAULT_MAX_BYTES):
 
 
 def read_entry(entry_id):
-    """War Room entry id -> (bytes, filename). Raises with an actionable message."""
+    """War Room entry id -> (bytes, filename or None). Raises with an actionable message.
+
+    The name is None, NOT the entry id, when the entry carries no name. Substituting the id
+    produced a `filename` that read as a real one - the War Room said "Rules accepted from
+    **111@abc**" and a caller had no way to tell that apart from a file actually called
+    that. Null is the honest answer, and the entry id is published separately anyway.
+    """
     res = demisto.getFilePath(entry_id)
     if not res or not res.get("path"):
         raise ValueError("Entry %s is not a file entry, or the file is no longer available."
                          % entry_id)
     with open(res["path"], "rb") as fh:
-        return fh.read(), res.get("name") or str(entry_id)
+        return fh.read(), (res.get("name") or None)
 
 
 def _from_file_context():
@@ -271,6 +277,277 @@ def find_rules_entry_id():
 find_attachment_entry_id = _from_attachments
 
 
+_MD_ROW_CAP = 50
+
+
+def _n(v):
+    """Thousands-separated. The numbers this reports run to six figures.
+
+    Integral values print as integers, floats included: the settings arrive as
+    float(args.get(...)), and "900.0" in a table reads as a typo rather than a default.
+
+    A NON-integral float keeps its fraction. The previous version went through int(), which
+    silently truncated - a quiet_secs of 900.5 printed as 900 while the context carried 900.5,
+    so the report and the context stated different numbers. That is the one disagreement this
+    renderer exists to make impossible, and it was being introduced by the formatter itself.
+    """
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    return format(int(f), ",d") if f.is_integer() else format(f, ",g")
+
+
+def _md_table(headers, rows):
+    """A markdown table, or "" when there is nothing to put in it. Cells are escaped: rule
+    names and hostnames reach here from a ruleset and from an endpoint, and a single pipe in
+    either would silently shear a column off every row below it."""
+    if not rows:
+        return ""
+
+    def cell(v):
+        return str("" if v is None else v).replace("|", "\\|").replace("\n", " ")
+
+    out = ["| " + " | ".join(cell(h) for h in headers) + " |",
+           "|" + "|".join("---" for _ in headers) + "|"]
+    for r in rows:
+        out.append("| " + " | ".join(cell(v) for v in r) + " |")
+    return "\n".join(out)
+
+
+def _md_capped(headers, rows, context_key):
+    """_md_table, truncated. The context keeps every entry, so a 200-host pass cannot push the
+    counts off the top of the War Room - the same trade YaraReport makes for the scan log."""
+    body = _md_table(headers, rows[:_MD_ROW_CAP])
+    if len(rows) > _MD_ROW_CAP:
+        body += ("\n\n_... and %s more - the full list is in `%s`._"
+                 % (_n(len(rows) - _MD_ROW_CAP), context_key))
+    return body
+
+
+# ---------------------------------------------------------------------------------------
+# ERRORS ARE CONTEXT BEFORE THEY ARE PROSE
+#
+# `errors` used to ship as a list of preformatted sentences. A playbook that wanted to act
+# on a rejection - retry a too-large file with a bigger ceiling, tell "you uploaded a PDF"
+# from "your braces are unbalanced" - had to substring match on prose written for a human,
+# and three of those sentences were the ONLY place a number appeared at all. The brace one
+# was the worst: to learn how many braces short a file is, a caller had to parse "%d
+# unclosed" out of a sentence that also branches on the sign of the count.
+#
+# So each entry is an OBJECT now, with a `reason` from the closed set below, the sentence
+# preserved verbatim as `detail`, and the numbers lifted into fields. Every entry carries
+# every key even where one does not apply, because a transformer filtering on a key that is
+# only sometimes present matches nothing and reports no error - a silently empty branch.
+#
+# WHY THE MAPPING LIVES HERE AND NOT IN validate_rules. validate_rules is byte-identical to
+# YaraRulesDecode's copy and a drift gate (tests/test_rules_decode.py) compares the two by
+# AST: the sentence IS the contract shared between the pre-dispatch encoder and the
+# post-dispatch verifier, and it stays a sentence. main() translates it on the way out.
+# tests/test_rules_from_file_reports_objects_not_prose.py drives all eight of
+# validate_rules' rejection branches through this table, so rewording a message fails a
+# test loudly instead of quietly reclassifying a rejection as `unrecognised`.
+# ---------------------------------------------------------------------------------------
+
+ERROR_REASONS = {
+    "not_text": "the bytes decode as neither UTF-8 nor Latin-1, so there is no text to check",
+    "empty": "the file holds nothing once whitespace is stripped",
+    "too_large": "bigger than the max_bytes ceiling - `observed` is the size, `limit` the "
+                 "ceiling it was judged against",
+    "pdf": "the file begins with %PDF-. Named separately from `binary` because it is the "
+           "likeliest wrong upload when the ask is 'attach your rules'",
+    "binary": "too many non-text bytes, or a NUL, to be a plain-text rules file",
+    "no_rules": "no `rule <Name> {` declaration anywhere in the text",
+    "unbalanced_braces": "braces do not close - `observed` is the NET depth, positive for "
+                         "unclosed and negative for unexpected closing, against an "
+                         "`expected` of 0",
+    "missing_condition": "fewer `condition:` sections than rules - `observed` is the "
+                         "condition count, `expected` the rule count it has to match",
+    "unrecognised": "validate_rules emitted a message this table does not know. Never "
+                    "produced by any of its current branches; it exists so a message added "
+                    "there cannot leak an undeclared reason code into a playbook",
+}
+
+# Sentence fragment -> reason, most specific first. Substrings rather than full sentences:
+# these have to survive a comma being added to a message, but not a rewrite - and a rewrite
+# is what the test above is there to catch.
+_ERROR_SIGNATURES = (
+    ("not_text", "File is not text"),
+    ("empty", "File is empty"),
+    ("too_large", "File is too large"),
+    ("pdf", "File is a PDF"),
+    ("binary", "File looks binary"),
+    ("no_rules", "No YARA rule declarations found"),
+    ("unbalanced_braces", "Unbalanced braces"),
+    ("missing_condition", "`condition:` section"),
+)
+
+# A sign is allowed on both numbers. The ceiling is main()'s to police - it refuses a
+# negative one now - but validate_rules takes any int from a direct caller and treats every
+# non-zero value as a live ceiling, so "40 bytes against a -5 byte limit" is a sentence this
+# pattern has to be able to read. It could not, and an unmatched pattern does not fail: it
+# leaves `observed` and `limit` null on a record whose whole purpose is to carry them, so a
+# playbook filtering on `limit` to retry with a bigger ceiling matches nothing and reports no
+# error. This is the FALLBACK path only - main() hands the two numbers in directly.
+_TOO_LARGE_RE = re.compile(r"(-?\d+) bytes against a (-?\d+) byte limit")
+_BRACE_RE = re.compile(r"\((\d+) (unclosed|unexpected closing)\)")
+_CONDITION_COUNT_RE = re.compile(r"(\d+) rule\(s\) but only (\d+) `condition:` section")
+
+
+def _error_record(reason, detail, observed=None, expected=None, limit=None):
+    """One `errors` entry. The key set is fixed: `observed`, `expected` and `limit` are null
+    on the reasons that carry no number, rather than absent, so a filter on any of them
+    behaves the same way for every reason."""
+    return {"reason": reason, "detail": detail,
+            "observed": observed, "expected": expected, "limit": limit}
+
+
+def _error_records(errors, size_bytes=None, max_bytes=None):
+    """validate_rules' sentences -> objects. Order is preserved.
+
+    `size_bytes` and `max_bytes` are the FACTS the caller already holds. A too_large record's
+    numbers are taken from them rather than regexed back out of the sentence main() just
+    produced: round-tripping through prose can only lose, and it did - a ceiling the pattern
+    could not express stripped both numbers off the record silently. The regex remains for a
+    caller that hands over only the sentences (the drift gate calls it that way), and is
+    written to read every ceiling validate_rules will accept.
+
+    Today the list is always empty or a single entry - every rejection branch returns
+    immediately - but it stays a list because that is what it is, and because nothing here
+    should promise a shape validate_rules does not owe.
+    """
+    out = []
+    for text in errors:
+        detail = str(text)
+        reason = "unrecognised"
+        for code, fragment in _ERROR_SIGNATURES:
+            if fragment in detail:
+                reason = code
+                break
+        observed = expected = limit = None
+        if reason == "too_large":
+            observed, limit = size_bytes, max_bytes
+            if observed is None or limit is None:
+                m = _TOO_LARGE_RE.search(detail)
+                if m:
+                    observed, limit = int(m.group(1)), int(m.group(2))
+        elif reason == "unbalanced_braces":
+            m = _BRACE_RE.search(detail)
+            if m:
+                # Signed, so the DIRECTION survives as data: +2 is two blocks left open,
+                # -2 is two closing braces with nothing to close.
+                observed = int(m.group(1)) * (1 if m.group(2) == "unclosed" else -1)
+                expected = 0
+        elif reason == "missing_condition":
+            m = _CONDITION_COUNT_RE.search(detail)
+            if m:
+                expected, observed = int(m.group(1)), int(m.group(2))
+        out.append(_error_record(reason, detail, observed, expected, limit))
+    return out
+
+
+# The two datasets this ruleset's results consolidate into. The names were previously
+# assembled only inside the War Room sentence, so a playbook that wanted to know which
+# dataset its scan lands in had to re-derive the convention or substring-parse the report.
+_SUMMARY_TARGET = "yara_scanner_summary_v4_rules_%s"
+_FULL_TARGET = "yara_scanner_full_v4_rules_%s"
+
+
+# WHICH NUMBERS THIS RUN ACTUALLY MEASURED.
+#
+# validate_rules returns at the FIRST failure, so the rejection reason says exactly how far
+# the run got - and therefore which fields of the result are measurements and which are still
+# the 0 the result dict was initialised with. `rule_count` is the one that bit: five of the
+# eight rejection branches return before the declaration scan, and the report printed
+# "Rules found: 0" on all of them. A PDF whose text contains `rule RealRule { ... }` was
+# reported as holding no rules. Zero is a claim; the run never made it.
+#
+# The sets below list the reasons reached AFTER each measurement. Membership is a whitelist:
+# a reason outside a set - including an `unrecognised` message from a branch added to the
+# validator later - reads as NOT measured, because "unknown" is the honest answer for a
+# branch nobody has placed, and the report has a way to say that.
+_REACHED_AFTER_THE_SIZE_MEASUREMENT = frozenset((
+    "empty", "too_large", "pdf", "binary", "no_rules", "unbalanced_braces",
+    "missing_condition"))
+_REACHED_AFTER_THE_RULE_SCAN = frozenset((
+    "no_rules", "unbalanced_braces", "missing_condition"))
+
+
+def _was_measured(result, reached_after):
+    """True when this run got far enough for the named measurement to have been taken.
+
+    A run that passed took all of them. A rejected one took exactly those its reason sits
+    after. Note `no_rules` IS after the rule scan: there the scan ran and genuinely found
+    none, so 0 is the measurement and printing it is right.
+    """
+    if result["valid"]:
+        return True
+    return bool(result["errors"]) and all(e["reason"] in reached_after
+                                          for e in result["errors"])
+
+
+def render_rules_markdown(result):
+    """The War Room report, rendered from the result dict and from nothing else - so the
+    table an operator reads and the context a playbook branches on cannot disagree."""
+    ok = bool(result["valid"])
+
+    def num(v):
+        return "-" if v is None else _n(v)
+
+    out = ["### YARA rules from file - %s" % ("ACCEPTED" if ok else "REJECTED"),
+           "_%s_" % ("Validated before dispatch. Nothing has been sent to any host yet."
+                     if ok else
+                     "Nothing was dispatched. Fix the file and upload it again."),
+           ""]
+
+    # `max_bytes` is None when no ceiling was applied - see main(). Saying "against a 0 byte
+    # ceiling" for a file that passed described a judgement that never happened.
+    ceiling = result["max_bytes"]
+    if not _was_measured(result, _REACHED_AFTER_THE_SIZE_MEASUREMENT):
+        size = "_not measured - the file never decoded as text_"
+    elif ceiling is None:
+        size = ("%s bytes, against no ceiling - `max_bytes` was 0, which turns the size "
+                "check off" % _n(result["size_bytes"]))
+    else:
+        size = "%s bytes, against a %s byte ceiling" % (_n(result["size_bytes"]),
+                                                        _n(ceiling))
+
+    facts = [("File", ("`%s`" % result["filename"]) if result["filename"]
+                      else "_the entry carries no filename_"),
+             ("Entry", "`%s`" % result["entry_id"]),
+             ("Rules found",
+              _n(result["rule_count"])
+              if _was_measured(result, _REACHED_AFTER_THE_RULE_SCAN)
+              else "_not counted - rejected before the rule scan_"),
+             ("Size", size)]
+    if ok:
+        facts += [("Base64 length", _n(len(result["b64"]))),
+                  ("Ruleset hash", "`%s`" % result["rule_hash"]),
+                  ("Summary target", "`%s`" % result["summary_target"]),
+                  ("Full target", "`%s`" % result["full_target"])]
+    out.append(_md_table(["", ""], [("**%s**" % k, v) for k, v in facts]))
+
+    if result["rule_names"]:
+        out += ["", "#### Rules in the pack",
+                _md_capped(["#", "Rule"],
+                           list(enumerate(result["rule_names"], 1)),
+                           "Yara.Rules.rule_names")]
+
+    if result["errors"]:
+        out += ["", "#### Rejected because",
+                _md_capped(["Reason", "Detail", "Observed", "Expected", "Limit"],
+                           [("`%s`" % e["reason"], e["detail"], num(e["observed"]),
+                             num(e["expected"]), num(e["limit"]))
+                            for e in result["errors"]],
+                           "Yara.Rules.errors")]
+
+    out += ["", "_This runs before dispatch so a pack that cannot compile never reaches the "
+                "fleet. It cannot prove one compiles: libyara is not in this image, and "
+                "rules valid on one agent can still fail on another. `failed_rules` on the "
+                "scan's lifecycle row stays the authority on what actually compiled._"]
+    return "\n".join(out)
+
+
 def main():
     args = demisto.args()
     # `entryID`, the name every Cortex content script uses (CommonScripts/ReadFile,
@@ -283,13 +560,24 @@ def main():
     except (TypeError, ValueError):
         return_error("YaraRulesFromFile: max_bytes must be a whole number (%r given)." % mb)
         return
+    if max_bytes < 0:
+        # A negative ceiling is not a smaller limit, it is a limit no file can be under: the
+        # size check refuses every possible upload, with a sentence quoting a byte count
+        # nobody asked for. No caller means it, so it is an argument error like a
+        # non-numeric one, not a validation result.
+        return_error("YaraRulesFromFile: max_bytes cannot be negative (%r given) - a "
+                     "negative ceiling refuses every possible file. Pass 0 to turn the size "
+                     "check off." % mb)
+        return
 
     if not entry_id:
         entry_id = find_rules_entry_id()
     if not entry_id:
+        # `entryID`, not `entry_id` - naming the spelling the script rejects sent the
+        # operator round a loop this message exists to end.
         return_error(
             "YaraRulesFromFile: no rules file found. Attach the .yar/.txt file to this issue, "
-            "or pass entry_id with the War Room entry of the uploaded file.")
+            "or pass entryID with the War Room entry of the uploaded file.")
         return
 
     try:
@@ -299,31 +587,35 @@ def main():
         return
 
     result = validate_rules(raw, max_bytes=max_bytes)
+    # The ceiling this file was ACTUALLY judged against. It was previously visible only
+    # inside the too_large sentence, so a run that PASSED never said which limit it passed.
+    #
+    # None when max_bytes is 0, because 0 turns the size check off - validate_rules
+    # short-circuits on the falsy value and never compares anything. Publishing 0 as "the
+    # ceiling this run judged the file against" said a 40-byte file had passed a zero-byte
+    # limit; null is the truth, and it is what a run that judged nothing has to report.
+    applied_ceiling = max_bytes or None
+    result["max_bytes"] = applied_ceiling
+    # The sentences validate_rules returns are the contract it shares byte-for-byte with
+    # YaraRulesDecode. What ships as CONTEXT is the object form - built from the numbers
+    # already in hand, not from a regex over the sentence they were formatted into.
+    result["errors"] = _error_records(result["errors"],
+                                      size_bytes=result["size_bytes"],
+                                      max_bytes=applied_ceiling)
     result["entry_id"] = entry_id
+    # May be None: an entry can carry no name, and read_entry no longer papers over that
+    # with the entry id. A caller that wants something to print falls back to entry_id.
     result["filename"] = filename
-
-    if result["valid"]:
-        lines = ["Rules accepted from **%s**." % filename,
-                 "%d rule(s): %s" % (result["rule_count"],
-                                     ", ".join(result["rule_names"][:12])
-                                     + (" ..." if result["rule_count"] > 12 else "")),
-                 "ruleset hash: `%s` - this scan's results consolidate into "
-                 "`yara_scanner_summary_v4_rules_%s` and "
-                 "`yara_scanner_full_v4_rules_%s`."
-                 % (result["rule_hash"], result["rule_hash"], result["rule_hash"]),
-                 "%d bytes, base64 length %d." % (result["size_bytes"], len(result["b64"]))]
-    else:
-        lines = ["Rules REJECTED from **%s** - nothing was dispatched." % filename, ""]
-        lines += ["  - %s" % e for e in result["errors"]]
-        lines += ["", "This check runs before dispatch so a pack that cannot compile never "
-                      "reaches the fleet. It cannot prove a pack compiles: rules valid on one "
-                      "agent may still fail on another, which the scan's own `failed_rules` "
-                      "reports."]
+    # Where this ruleset's results will land. Empty string on a rejection, matching
+    # rule_hash and b64, because there is no hash to name a dataset after.
+    rh = result["rule_hash"]
+    result["summary_target"] = (_SUMMARY_TARGET % rh) if rh else ""
+    result["full_target"] = (_FULL_TARGET % rh) if rh else ""
 
     # List-valued context is APPENDED to across calls in one investigation, so a second
     # upload in the same issue would otherwise show both files' rule names merged.
     demisto.executeCommand("DeleteContext", {"key": "Yara.Rules"})
-    return_results(CommandResults(readable_output="\n".join(lines),
+    return_results(CommandResults(readable_output=render_rules_markdown(result),
                                   outputs_prefix="Yara.Rules",
                                   outputs=result, raw_response=result))
 
