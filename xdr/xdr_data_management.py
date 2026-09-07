@@ -369,6 +369,15 @@ _TYPE_TITLES = (
 )
 
 
+# Types listed as a COUNT only in the human-readable report, never name by name.
+# host_scans is one dataset per host per retained month and nothing overwrites it, so it is
+# the one bucket that grows without bound - 208 of them on the lab tenant already. Printing
+# every name pushes the buckets an operator actually reads off the screen, and the names
+# carry nothing the count does not: host and month are both in the name, and anything
+# needing them has by_type.host_scans.names in the context.
+_COUNT_ONLY_TYPES = ("host_scans",)
+
+
 def render_by_type(current, legacy, newer, now_yyyymm):
     """One table per KIND OF DATASET, so the inventory can be read without knowing the
     naming scheme. The single flat table below answers "what state is each dataset in";
@@ -381,6 +390,14 @@ def render_by_type(current, legacy, newer, now_yyyymm):
         out.append("%s  [%d]" % (title, len(names)))
         if not names:
             out.append("    (none)")
+            out.append("")
+            continue
+        if key in _COUNT_ONLY_TYPES:
+            months = sorted({(parse_dataset_name(n) or {}).get("month") or "-" for n in names})
+            hosts = len({(parse_dataset_name(n) or {}).get("host") or n for n in names})
+            out.append("    %d dataset(s) across %d host(s), month(s): %s"
+                       % (len(names), hosts, ", ".join(m for m in months if m != "-") or "none"))
+            out.append("    (not listed by name - see by_type.host_scans.names in the context)")
             out.append("")
             continue
         out.append("    %-56s %-14s %8s" % ("dataset", "host", "age"))
@@ -400,6 +417,35 @@ def render_by_type(current, legacy, newer, now_yyyymm):
         out.append("")
     return out
 
+
+def group_by_type(names, state_of=None):
+    """{type: {"count": n, "names": [...], "by_state": {state: [...]}}}.
+
+    ONE place in the context holds the dataset lists. State is nested under the type it
+    belongs to rather than repeated as a parallel top-level key, because every state is a
+    state OF a type - `overwrite` only ever describes a host_matches dataset, `frozen` and
+    `not_rotated` only ever a host_scans one - and publishing both spellings meant the same
+    names appeared two or three times in one context blob, which then hit the display cap
+    and truncated the part an operator actually wanted.
+
+    Every type bucket is present even when empty, so a caller can index it without testing.
+    Within a bucket only the states that actually occur appear, so an empty deployment does
+    not carry six empty state lists per type.
+    """
+    buckets = {t: [] for t in DATASET_TYPES}
+    for n in names or ():
+        buckets[dataset_type(n)].append(n)
+    out = {}
+    for t, ns in buckets.items():
+        ns = sorted(ns)
+        entry = {"count": len(ns), "names": ns}
+        if state_of is not None:
+            states = {}
+            for n in ns:
+                states.setdefault(state_of.get(n) or "unknown", []).append(n)
+            entry["by_state"] = {k: sorted(v) for k, v in sorted(states.items())}
+        out[t] = entry
+    return out
 
 def render_report(current, legacy, newer, now_yyyymm):
     """Human-readable inventory. Ages are whole months."""

@@ -1260,6 +1260,92 @@ script: |
       return candidates, skipped
 
 
+  def dataset_type(name):
+      """Which of DATASET_TYPES this dataset is, from the name alone. Never queries."""
+      n = str(name or "")
+      if re.search(r"_full_v\d+_rules_", n):
+          return "consolidated_full"
+      if re.search(r"_summary_v\d+_rules_", n):
+          return "consolidated_summary"
+      # BOTH kinds have per-scan targets: target_name() builds
+      # yara_scanner_<kind>_v<N>_scan_<slug>, so matching only the matches spelling filed every
+      # scans-kind target under host_scans and inflated the per-host count.
+      if re.search(r"_(?:matches|scans)_v\d+_scan(?:_|$)", n):
+          return "retired_scan_target"
+      if re.search(r"_matches_v\d+_", n):
+          return "host_matches"
+      if re.search(r"_scans_v\d+_", n):
+          return "host_scans"
+      return "internal"
+
+  def group_by_type(names, state_of=None):
+      """{type: {"count": n, "names": [...], "by_state": {state: [...]}}}.
+
+      ONE place in the context holds the dataset lists. State is nested under the type it
+      belongs to rather than repeated as a parallel top-level key, because every state is a
+      state OF a type - `overwrite` only ever describes a host_matches dataset, `frozen` and
+      `not_rotated` only ever a host_scans one - and publishing both spellings meant the same
+      names appeared two or three times in one context blob, which then hit the display cap
+      and truncated the part an operator actually wanted.
+
+      Every type bucket is present even when empty, so a caller can index it without testing.
+      Within a bucket only the states that actually occur appear, so an empty deployment does
+      not carry six empty state lists per type.
+      """
+      buckets = {t: [] for t in DATASET_TYPES}
+      for n in names or ():
+          buckets[dataset_type(n)].append(n)
+      out = {}
+      for t, ns in buckets.items():
+          ns = sorted(ns)
+          entry = {"count": len(ns), "names": ns}
+          if state_of is not None:
+              states = {}
+              for n in ns:
+                  states.setdefault(state_of.get(n) or "unknown", []).append(n)
+              entry["by_state"] = {k: sorted(v) for k, v in sorted(states.items())}
+          out[t] = entry
+      return out
+
+  def render_by_type(current, legacy, newer, now_yyyymm):
+      """One table per KIND OF DATASET, so the inventory can be read without knowing the
+      naming scheme. The single flat table below answers "what state is each dataset in";
+      this answers "what do I actually have", which is the question asked first."""
+      everything = list(current) + list(legacy) + list(newer)
+      grouped = group_by_type(everything)
+      out = []
+      for key, title in _TYPE_TITLES:
+          names = (grouped.get(key) or {}).get("names") or []
+          out.append("%s  [%d]" % (title, len(names)))
+          if not names:
+              out.append("    (none)")
+              out.append("")
+              continue
+          if key in _COUNT_ONLY_TYPES:
+              months = sorted({(parse_dataset_name(n) or {}).get("month") or "-" for n in names})
+              hosts = len({(parse_dataset_name(n) or {}).get("host") or n for n in names})
+              out.append("    %d dataset(s) across %d host(s), month(s): %s"
+                         % (len(names), hosts, ", ".join(m for m in months if m != "-") or "none"))
+              out.append("    (not listed by name - see by_type.host_scans.names in the context)")
+              out.append("")
+              continue
+          out.append("    %-56s %-14s %8s" % ("dataset", "host", "age"))
+          out.append("    " + "-" * 80)
+          for n in names:
+              info = parse_dataset_name(n)
+              host = (info or {}).get("host") or "-"
+              if info and info.get("month"):
+                  age = "%dmo" % months_between(info["month"], now_yyyymm)
+              elif info and info.get("overwrite"):
+                  age = "live"
+              elif info and info.get("scan_target"):
+                  age = "scan"
+              else:
+                  age = "-"
+              out.append("    %-56s %-14s %8s" % (n[:56], str(host)[:14], age))
+          out.append("")
+      return out
+
   def render_report(current, legacy, newer, now_yyyymm):
       """Human-readable inventory. Ages are whole months."""
       schema = os.environ.get("YARA_LOOKUP_SCHEMA_VER", "4")

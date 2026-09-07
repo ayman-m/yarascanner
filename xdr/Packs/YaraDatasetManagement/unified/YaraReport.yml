@@ -1193,6 +1193,15 @@ script: |
   )
 
 
+  # Types listed as a COUNT only in the human-readable report, never name by name.
+  # host_scans is one dataset per host per retained month and nothing overwrites it, so it is
+  # the one bucket that grows without bound - 208 of them on the lab tenant already. Printing
+  # every name pushes the buckets an operator actually reads off the screen, and the names
+  # carry nothing the count does not: host and month are both in the name, and anything
+  # needing them has by_type.host_scans.names in the context.
+  _COUNT_ONLY_TYPES = ("host_scans",)
+
+
   def render_by_type(current, legacy, newer, now_yyyymm):
       """One table per KIND OF DATASET, so the inventory can be read without knowing the
       naming scheme. The single flat table below answers "what state is each dataset in";
@@ -1205,6 +1214,14 @@ script: |
           out.append("%s  [%d]" % (title, len(names)))
           if not names:
               out.append("    (none)")
+              out.append("")
+              continue
+          if key in _COUNT_ONLY_TYPES:
+              months = sorted({(parse_dataset_name(n) or {}).get("month") or "-" for n in names})
+              hosts = len({(parse_dataset_name(n) or {}).get("host") or n for n in names})
+              out.append("    %d dataset(s) across %d host(s), month(s): %s"
+                         % (len(names), hosts, ", ".join(m for m in months if m != "-") or "none"))
+              out.append("    (not listed by name - see by_type.host_scans.names in the context)")
               out.append("")
               continue
           out.append("    %-56s %-14s %8s" % ("dataset", "host", "age"))
