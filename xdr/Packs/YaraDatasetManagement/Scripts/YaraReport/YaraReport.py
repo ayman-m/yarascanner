@@ -1150,7 +1150,7 @@ def render_by_type(current, legacy, newer, now_yyyymm):
     grouped = group_by_type(everything)
     out = []
     for key, title in _TYPE_TITLES:
-        names = grouped.get(key) or []
+        names = (grouped.get(key) or {}).get("names") or []
         out.append("%s  [%d]" % (title, len(names)))
         if not names:
             out.append("    (none)")
@@ -1178,10 +1178,11 @@ def render_report(current, legacy, newer, now_yyyymm):
     """Human-readable inventory. Ages are whole months."""
     schema = os.environ.get("YARA_LOOKUP_SCHEMA_VER", "4")
     lines = ["YARA lookup datasets (schema v%s current, now %s)" % (schema, now_yyyymm), ""]
+    # One table per type, and only one. The flat by-state table that used to follow listed
+    # every name a second time - the same duplication the context had - and the state each
+    # dataset is in is already the `age` column here (live / frozen / n/a / <n>mo).
     lines += render_by_type(current, legacy, newer, now_yyyymm)
-    lines += ["", "ALL CURRENT-SCHEMA DATASETS BY STATE", ""]
-    lines.append("%-52s %-8s %-14s %6s" % ("dataset", "kind", "host", "age"))
-    lines.append("-" * 84)
+    _sink = []
     unrotated, abandoned, consolidated, overwritten = [], [], [], []
     for name in current:
         info = parse_dataset_name(name)
@@ -1189,7 +1190,7 @@ def render_report(current, legacy, newer, now_yyyymm):
             label = (("(%s - this pack's own consolidated output, never a candidate)"
                       % ("full" if "_full_v" in name else "summary"))
                      if is_pack_output_dataset(name) else "(unrecognised - never a candidate)")
-            lines.append("%-52s %s" % (name[:52], label))
+            _sink.append("%-52s %s" % (name[:52], label))
             continue
         if info["scan_target"]:
             age = "scan"
@@ -1202,10 +1203,8 @@ def render_report(current, legacy, newer, now_yyyymm):
         else:
             age = "frozen" if has_rotated_sibling(name, current) else "n/a"
             (abandoned if age == "frozen" else unrotated).append(name)
-        lines.append("%-52s %-8s %-14s %6s"
+        _sink.append("%-52s %-8s %-14s %6s"
                      % (name[:52], info["kind"], (info["host"] or "-")[:14], age))
-    if not current:
-        lines.append("(none)")
     if legacy:
         lines += ["", "legacy schema (deletable with --delete-legacy):"]
         lines += ["  " + n for n in legacy]
@@ -1336,7 +1335,10 @@ def dataset_type(name):
         return "consolidated_full"
     if re.search(r"_summary_v\d+_rules_", n):
         return "consolidated_summary"
-    if re.search(r"_matches_v\d+_scan_", n) or re.search(r"_matches_v\d+_scan$", n):
+    # BOTH kinds have per-scan targets: target_name() builds
+    # yara_scanner_<kind>_v<N>_scan_<slug>, so matching only the matches spelling filed every
+    # scans-kind target under host_scans and inflated the per-host count.
+    if re.search(r"_(?:matches|scans)_v\d+_scan(?:_|$)", n):
         return "retired_scan_target"
     if re.search(r"_matches_v\d+_", n):
         return "host_matches"
@@ -1345,13 +1347,34 @@ def dataset_type(name):
     return "internal"
 
 
-def group_by_type(names):
-    """{type: [name, ...]} for every DATASET_TYPES bucket, empty lists included so a caller
-    can rely on the key existing rather than testing for it."""
-    out = {t: [] for t in DATASET_TYPES}
+def group_by_type(names, state_of=None):
+    """{type: {"count": n, "names": [...], "by_state": {state: [...]}}}.
+
+    ONE place in the context holds the dataset lists. State is nested under the type it
+    belongs to rather than repeated as a parallel top-level key, because every state is a
+    state OF a type - `overwrite` only ever describes a host_matches dataset, `frozen` and
+    `not_rotated` only ever a host_scans one - and publishing both spellings meant the same
+    names appeared two or three times in one context blob, which then hit the display cap
+    and truncated the part an operator actually wanted.
+
+    Every type bucket is present even when empty, so a caller can index it without testing.
+    Within a bucket only the states that actually occur appear, so an empty deployment does
+    not carry six empty state lists per type.
+    """
+    buckets = {t: [] for t in DATASET_TYPES}
     for n in names or ():
-        out[dataset_type(n)].append(n)
-    return {t: sorted(v) for t, v in out.items()}
+        buckets[dataset_type(n)].append(n)
+    out = {}
+    for t, ns in buckets.items():
+        ns = sorted(ns)
+        entry = {"count": len(ns), "names": ns}
+        if state_of is not None:
+            states = {}
+            for n in ns:
+                states.setdefault(state_of.get(n) or "unknown", []).append(n)
+            entry["by_state"] = {k: sorted(v) for k, v in sorted(states.items())}
+        out[t] = entry
+    return out
 
 
 def report_datasets(client, now_yyyymm=None):
@@ -1398,39 +1421,29 @@ def report_datasets(client, now_yyyymm=None):
         datasets.append({"name": name, "type": dataset_type(name), "kind": info["kind"],
                          "host": info["host"] or "", "month": info["month"] or "",
                          "age_months": age, "state": state})
-    by_type = group_by_type(current + legacy + newer)
+    state_of = {d["name"]: d.get("state") for d in datasets}
+    for n in legacy:
+        state_of.setdefault(n, "legacy")
+    for n in newer:
+        state_of.setdefault(n, "newer")
+    by_type = group_by_type(current + legacy + newer, state_of)
     return {
         "now_yyyymm": now_yyyymm,
         "schema_version": YARA_SCHEMA_VERSION,
-        # Split by WHAT THE DATASET IS, alongside the existing split by what STATE it is in.
-        # The two answer different questions and an operator usually wants the first: "how
-        # many hosts have findings", "which consolidated outputs exist" - questions the
-        # state-based keys (frozen / not_rotated / overwrite) cannot answer without the
-        # reader knowing the naming scheme. Every bucket is present even when empty.
-        "by_type": by_type,
-        "by_type_counts": {t: len(v) for t, v in by_type.items()},
-        "host_matches": by_type["host_matches"],
-        "host_matches_count": len(by_type["host_matches"]),
-        "host_scans": by_type["host_scans"],
-        "host_scans_count": len(by_type["host_scans"]),
-        "consolidated_full": by_type["consolidated_full"],
-        "consolidated_full_count": len(by_type["consolidated_full"]),
-        "consolidated_summary": by_type["consolidated_summary"],
-        "consolidated_summary_count": len(by_type["consolidated_summary"]),
-        "retired_scan_target": by_type["retired_scan_target"],
-        "retired_scan_target_count": len(by_type["retired_scan_target"]),
-        "internal": by_type["internal"],
-        "internal_count": len(by_type["internal"]),
-        "total_count": len(current) + len(legacy) + len(newer),
         "report": render_report(current, legacy, newer, now_yyyymm),
+        # THE dataset breakdown. Split by what each dataset IS, with its state nested
+        # underneath. Nothing else in this dict repeats these names - see group_by_type.
+        "by_type": by_type,
+        "by_type_counts": {t: v["count"] for t, v in by_type.items()},
+        # Per-dataset detail: host, month, age. A different SHAPE, not a second copy of the
+        # lists - this is the only place age_months and month are carried.
         "datasets": datasets,
-        "current_count": len(current),
-        "frozen": frozen, "frozen_count": len(frozen),
-        "not_rotated": not_rotated, "not_rotated_count": len(not_rotated),
-        "consolidated": consolidated, "consolidated_count": len(consolidated),
-        "overwrite": overwrite, "overwrite_count": len(overwrite),
+        # Schema buckets. Orthogonal to type: a legacy dataset still has a type, and pruning
+        # decisions are made on schema version rather than on what the dataset holds.
         "legacy": legacy, "legacy_count": len(legacy),
         "newer": newer, "newer_count": len(newer),
+        "current_count": len(current),
+        "total_count": len(current) + len(legacy) + len(newer),
     }
 
 
@@ -1721,25 +1734,30 @@ def main():
         return_error("YaraReport failed: {}".format(ex))
         return
 
-    lines = ["{} current-schema dataset(s), {} legacy, {} newer-schema (never pruned)".format(
-        report["current_count"], report["legacy_count"], report["newer_count"])]
-    if report["consolidated_count"]:
-        lines.append("{} per-scan consolidated target(s) — consolidation OUTPUT, unrotated by "
+    def _state(kind, state):
+        return ((report["by_type"].get(kind) or {}).get("by_state") or {}).get(state) or []
+
+    lines = ["{} dataset(s): {} current-schema, {} legacy, {} newer-schema (never pruned)".format(
+        report["total_count"], report["current_count"],
+        report["legacy_count"], report["newer_count"])]
+    lines.append("  " + " | ".join(
+        "{} {}".format(v, t) for t, v in sorted(report["by_type_counts"].items()) if v))
+
+    consolidated = _state("retired_scan_target", "consolidated")
+    if consolidated:
+        lines.append("{} per-scan CONSOLIDATED TARGET(s) — consolidation OUTPUT, unrotated by "
                      "design, finished and not growing; never a cleanup candidate.".format(
-                         report["consolidated_count"]))
-    if report["overwrite_count"]:
-        lines.append("{} permanent per-host matches dataset(s) — replaced wholesale at the "
-                     "start of every scan, so an unsuffixed name is correct and rotation does "
-                     "not apply: {}".format(
-                         report["overwrite_count"], ", ".join(report["overwrite"])))
-    if report["frozen_count"]:
+                         len(consolidated)))
+    frozen = _state("host_scans", "frozen") + _state("host_matches", "frozen")
+    if frozen:
         lines.append("{} frozen (pre-rotation leftovers — rotation IS on for that host, "
                      "writes moved to the dated names; not growing): {}".format(
-                         report["frozen_count"], ", ".join(report["frozen"])))
-    if report["not_rotated_count"]:
+                         len(frozen), ", ".join(frozen)))
+    not_rotated = _state("host_scans", "not_rotated") + _state("host_matches", "not_rotated")
+    if not_rotated:
         lines.append('{} NOT rotated — rotation is off for that deployment and these grow '
                      'without bound; set CONFIG_LOOKUP_ROTATION="monthly" in the scanner: '
-                     '{}'.format(report["not_rotated_count"], ", ".join(report["not_rotated"])))
+                     '{}'.format(len(not_rotated), ", ".join(not_rotated)))
     # The rendered table is fixed-width; a code fence keeps the columns aligned in the War Room.
     lines += ["", "```", report["report"], "```"]
 

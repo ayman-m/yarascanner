@@ -1300,10 +1300,11 @@ script: |
       """Human-readable inventory. Ages are whole months."""
       schema = os.environ.get("YARA_LOOKUP_SCHEMA_VER", "4")
       lines = ["YARA lookup datasets (schema v%s current, now %s)" % (schema, now_yyyymm), ""]
+      # One table per type, and only one. The flat by-state table that used to follow listed
+      # every name a second time - the same duplication the context had - and the state each
+      # dataset is in is already the `age` column here (live / frozen / n/a / <n>mo).
       lines += render_by_type(current, legacy, newer, now_yyyymm)
-      lines += ["", "ALL CURRENT-SCHEMA DATASETS BY STATE", ""]
-      lines.append("%-52s %-8s %-14s %6s" % ("dataset", "kind", "host", "age"))
-      lines.append("-" * 84)
+      _sink = []
       unrotated, abandoned, consolidated, overwritten = [], [], [], []
       for name in current:
           info = parse_dataset_name(name)
@@ -1311,7 +1312,7 @@ script: |
               label = (("(%s - this pack's own consolidated output, never a candidate)"
                         % ("full" if "_full_v" in name else "summary"))
                        if is_pack_output_dataset(name) else "(unrecognised - never a candidate)")
-              lines.append("%-52s %s" % (name[:52], label))
+              _sink.append("%-52s %s" % (name[:52], label))
               continue
           if info["scan_target"]:
               age = "scan"
@@ -1324,10 +1325,8 @@ script: |
           else:
               age = "frozen" if has_rotated_sibling(name, current) else "n/a"
               (abandoned if age == "frozen" else unrotated).append(name)
-          lines.append("%-52s %-8s %-14s %6s"
+          _sink.append("%-52s %-8s %-14s %6s"
                        % (name[:52], info["kind"], (info["host"] or "-")[:14], age))
-      if not current:
-          lines.append("(none)")
       if legacy:
           lines += ["", "legacy schema (deletable with --delete-legacy):"]
           lines += ["  " + n for n in legacy]
@@ -1444,8 +1443,12 @@ script: |
       for name in current:
           info = parse_dataset_name(name)
           if info is None:
-              datasets.append({"name": name, "kind": "", "host": "", "month": "",
-                               "age_months": None, "state": "unrecognised"})
+              datasets.append({"name": name, "type": dataset_type(name),
+                               "kind": (("full" if "_full_v" in name else "summary")
+                                        if is_pack_output_dataset(name) else ""),
+                               "host": "", "month": "", "age_months": None,
+                               "state": (("full" if "_full_v" in name else "summary")
+                                         if is_pack_output_dataset(name) else "unrecognised")})
               continue
           if info["scan_target"]:
               state, age = "consolidated", None
@@ -1463,20 +1466,32 @@ script: |
               else:
                   state = "not_rotated"
                   not_rotated.append(name)
-          datasets.append({"name": name, "kind": info["kind"], "host": info["host"] or "",
-                           "month": info["month"] or "", "age_months": age, "state": state})
+          datasets.append({"name": name, "type": dataset_type(name), "kind": info["kind"],
+                           "host": info["host"] or "", "month": info["month"] or "",
+                           "age_months": age, "state": state})
+      state_of = {d["name"]: d.get("state") for d in datasets}
+      for n in legacy:
+          state_of.setdefault(n, "legacy")
+      for n in newer:
+          state_of.setdefault(n, "newer")
+      by_type = group_by_type(current + legacy + newer, state_of)
       return {
           "now_yyyymm": now_yyyymm,
           "schema_version": YARA_SCHEMA_VERSION,
           "report": render_report(current, legacy, newer, now_yyyymm),
+          # THE dataset breakdown. Split by what each dataset IS, with its state nested
+          # underneath. Nothing else in this dict repeats these names - see group_by_type.
+          "by_type": by_type,
+          "by_type_counts": {t: v["count"] for t, v in by_type.items()},
+          # Per-dataset detail: host, month, age. A different SHAPE, not a second copy of the
+          # lists - this is the only place age_months and month are carried.
           "datasets": datasets,
-          "current_count": len(current),
-          "frozen": frozen, "frozen_count": len(frozen),
-          "not_rotated": not_rotated, "not_rotated_count": len(not_rotated),
-          "consolidated": consolidated, "consolidated_count": len(consolidated),
-          "overwrite": overwrite, "overwrite_count": len(overwrite),
+          # Schema buckets. Orthogonal to type: a legacy dataset still has a type, and pruning
+          # decisions are made on schema version rather than on what the dataset holds.
           "legacy": legacy, "legacy_count": len(legacy),
           "newer": newer, "newer_count": len(newer),
+          "current_count": len(current),
+          "total_count": len(current) + len(legacy) + len(newer),
       }
 
 

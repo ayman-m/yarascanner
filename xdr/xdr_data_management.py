@@ -377,7 +377,7 @@ def render_by_type(current, legacy, newer, now_yyyymm):
     grouped = group_by_type(everything)
     out = []
     for key, title in _TYPE_TITLES:
-        names = grouped.get(key) or []
+        names = (grouped.get(key) or {}).get("names") or []
         out.append("%s  [%d]" % (title, len(names)))
         if not names:
             out.append("    (none)")
@@ -405,10 +405,11 @@ def render_report(current, legacy, newer, now_yyyymm):
     """Human-readable inventory. Ages are whole months."""
     schema = os.environ.get("YARA_LOOKUP_SCHEMA_VER", "4")
     lines = ["YARA lookup datasets (schema v%s current, now %s)" % (schema, now_yyyymm), ""]
+    # One table per type, and only one. The flat by-state table that used to follow listed
+    # every name a second time - the same duplication the context had - and the state each
+    # dataset is in is already the `age` column here (live / frozen / n/a / <n>mo).
     lines += render_by_type(current, legacy, newer, now_yyyymm)
-    lines += ["", "ALL CURRENT-SCHEMA DATASETS BY STATE", ""]
-    lines.append("%-52s %-8s %-14s %6s" % ("dataset", "kind", "host", "age"))
-    lines.append("-" * 84)
+    _sink = []
     unrotated, abandoned, consolidated, overwritten = [], [], [], []
     for name in current:
         info = parse_dataset_name(name)
@@ -416,7 +417,7 @@ def render_report(current, legacy, newer, now_yyyymm):
             label = (("(%s - this pack's own consolidated output, never a candidate)"
                       % ("full" if "_full_v" in name else "summary"))
                      if is_pack_output_dataset(name) else "(unrecognised - never a candidate)")
-            lines.append("%-52s %s" % (name[:52], label))
+            _sink.append("%-52s %s" % (name[:52], label))
             continue
         if info["scan_target"]:
             age = "scan"
@@ -429,10 +430,8 @@ def render_report(current, legacy, newer, now_yyyymm):
         else:
             age = "frozen" if has_rotated_sibling(name, current) else "n/a"
             (abandoned if age == "frozen" else unrotated).append(name)
-        lines.append("%-52s %-8s %-14s %6s"
+        _sink.append("%-52s %-8s %-14s %6s"
                      % (name[:52], info["kind"], (info["host"] or "-")[:14], age))
-    if not current:
-        lines.append("(none)")
     if legacy:
         lines += ["", "legacy schema (deletable with --delete-legacy):"]
         lines += ["  " + n for n in legacy]

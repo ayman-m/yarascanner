@@ -236,6 +236,16 @@ R = YaraReport
 
 # --------------------------------------------------------------- fake tenant
 NOW_MS = 10_000_000_000
+def _state(rep, kind, state):
+    """State lists now live under by_type[kind]["by_state"], not as top-level keys - one
+    place holds the names instead of two or three spellings of the same list."""
+    return ((rep["by_type"].get(kind) or {}).get("by_state") or {}).get(state) or []
+
+
+def _names(rep, kind):
+    return (rep["by_type"].get(kind) or {}).get("names") or []
+
+
 NOW_YYYYMM = "202607"
 
 
@@ -794,8 +804,8 @@ def _classify_at_v4(impl, names):
 def test_the_v4_matches_dataset_is_not_reported_as_unrotated():
     ds = "yara_scanner_matches_v4_hostA_abc123"
     r = _classify_at_v4(R, [ds])
-    assert r["overwrite"] == [ds], r["overwrite"]
-    assert r["not_rotated"] == [] and r["frozen"] == []
+    assert _state(r, "host_matches", "overwrite") == [ds], r["by_type"]["host_matches"]
+    assert _state(r, "host_matches", "not_rotated") == [] and _state(r, "host_matches", "frozen") == []
     assert [d["state"] for d in r["datasets"]] == ["overwrite"]
 
 
@@ -839,7 +849,7 @@ def test_only_matches_and_only_from_v4_count_as_overwrite():
         r = R.report_datasets(FakeTenant([scans_v4]), now_yyyymm=NOW_YYYYMM)
     finally:
         R.set_schema_version(TEST_SCHEMA_VERSION)
-    assert r["overwrite"] == [] and r["not_rotated"] == [scans_v4]
+    assert _state(r, "host_matches", "overwrite") == [] and _state(r, "host_scans", "not_rotated") == [scans_v4]
 
     matches_v3 = "yara_scanner_matches_v3_hostA_abc123"
     R.set_schema_version("3")
@@ -847,7 +857,7 @@ def test_only_matches_and_only_from_v4_count_as_overwrite():
         r = R.report_datasets(FakeTenant([matches_v3]), now_yyyymm=NOW_YYYYMM)
     finally:
         R.set_schema_version(TEST_SCHEMA_VERSION)
-    assert r["overwrite"] == [] and r["not_rotated"] == [matches_v3]
+    assert _state(r, "host_matches", "overwrite") == [] and _state(r, "host_matches", "not_rotated") == [matches_v3]
 
 
 @pytest.mark.parametrize("impl", SHIPPING_IMPLS)
@@ -976,7 +986,7 @@ def test_a_timestamp_shaped_slug_does_not_crash_either_automation():
     r = _prune(t, older_than_months=6, execute=True)
     assert r["deleted"] == [] and target in t.names
     rep = R.report_datasets(FakeTenant([target]), now_yyyymm=NOW_YYYYMM)
-    assert rep["consolidated"] == [target]
+    assert _names(rep, "retired_scan_target") == [target]
 
 
 def test_a_fully_verified_quiet_old_shard_is_deleted():
@@ -1461,8 +1471,8 @@ def test_the_report_flags_frozen_separately_from_not_rotated():
     sibling = "yara_scanner_matches_v2_hostA_202601"
     lonely = "yara_scanner_matches_v2_hostB"
     r = R.report_datasets(FakeTenant([frozen, sibling, lonely]), now_yyyymm=NOW_YYYYMM)
-    assert r["frozen"] == [frozen] and r["not_rotated"] == [lonely]
-    assert r["frozen_count"] == 1 and r["not_rotated_count"] == 1
+    assert _state(r, "host_matches", "frozen") == [frozen]
+    assert _state(r, "host_matches", "not_rotated") == [lonely]
     states = {d["name"]: d["state"] for d in r["datasets"]}
     assert states == {frozen: "frozen", sibling: "rotated", lonely: "not_rotated"}
     assert "abandoned pre-rotation" not in r["report"]   # that wording is a SKIP reason
@@ -1477,9 +1487,9 @@ def test_consolidated_targets_are_not_reported_as_unrotated():
     t1 = R.target_name("matches", "2", "scan_2026_07_01_a1b2")
     t2 = R.target_name("scans", "2", "scan_2026_07_01_a1b2")
     r = R.report_datasets(FakeTenant([shard, t1, t2]), now_yyyymm=NOW_YYYYMM)
-    assert r["not_rotated_count"] == 0 and r["not_rotated"] == []
-    assert r["frozen_count"] == 0
-    assert sorted(r["consolidated"]) == sorted([t1, t2])
+    assert _state(r, "host_scans", "not_rotated") == [] and _state(r, "host_matches", "not_rotated") == []
+    assert _state(r, "host_scans", "frozen") == [] and _state(r, "host_matches", "frozen") == []
+    assert sorted(_names(r, "retired_scan_target")) == sorted([t1, t2])
     assert "CONFIG_LOOKUP_ROTATION" not in r["report"]
     assert "CONSOLIDATED TARGETS" in r["report"]
 
