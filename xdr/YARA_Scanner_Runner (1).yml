@@ -1,0 +1,1201 @@
+id: YARA_Scanner_Runner
+version: 43
+vcShouldKeepItemLegacyProdMachine: false
+aclrelations: []
+aclowner:
+  id: ""
+  type: ""
+  name: ""
+name: YARA Scanner Runner
+description: |-
+  Runs the YARA scanner (xdr_yara_scanner.py) on targeted Cortex agents via Action Center.
+  Flow: resolve the script UID from the library by name (core-get-scripts) -> resolve target
+  endpoints (core-get-endpoints) -> execute the scanner with its parameters (core-script-run).
+
+  Uses the built-in "Cortex Core - IR" integration, which is available on Cortex XDR (edr),
+  XSIAM, and cloud_runtime_security. Designed to be run manually or as a scheduled Job.
+
+  PREREQUISITE: the scanner must already exist in the Action Center script library (upload via
+  the console once) with entry point `main` and string inputs, in order:
+  yarafile, scan_folder, alert_severity, mode, options.
+starttaskid: "0"
+tasks:
+  "0":
+    id: "0"
+    taskid: 80d1b775-ea30-40a3-8986-76d70b2e1cb9
+    type: start
+    task:
+      id: 80d1b775-ea30-40a3-8986-76d70b2e1cb9
+      version: -1
+      name: ""
+      iscommand: false
+      brand: ""
+      playbooktaskmissingcomponent: null
+      istaskmissingcomponenterrordismissed: false
+    nexttasks:
+      '#none#':
+      - "1"
+    separatecontext: false
+    continueonerrortype: ""
+    view: |-
+      {
+        "position": {
+          "x": 265,
+          "y": 50
+        }
+      }
+    note: false
+    timertriggers: []
+    ignoreworker: false
+    skipunavailable: false
+    quietmode: 0
+    isoversize: false
+    isautoswitchedtoquietmode: false
+  "1":
+    id: "1"
+    taskid: ef8e80c5-ad3a-4f2d-864e-51f7863d4a14
+    type: regular
+    task:
+      id: ef8e80c5-ad3a-4f2d-864e-51f7863d4a14
+      version: -1
+      name: Resolve script UID
+      description: Get the list of library scripts and match the one named by inputs.script_name.
+      script: Cortex Core - IR|||core-get-scripts
+      type: regular
+      iscommand: true
+      brand: Cortex Core - IR
+      playbooktaskmissingcomponent: null
+      istaskmissingcomponenterrordismissed: false
+    nexttasks:
+      '#none#':
+      - "2"
+    scriptarguments:
+      script_name:
+        simple: ${inputs.script_name}
+    separatecontext: false
+    continueonerrortype: ""
+    view: |-
+      {
+        "position": {
+          "x": 265,
+          "y": 220
+        }
+      }
+    note: false
+    timertriggers: []
+    ignoreworker: false
+    skipunavailable: false
+    quietmode: 0
+    isoversize: false
+    isautoswitchedtoquietmode: false
+  "2":
+    id: "2"
+    taskid: 25ed1ac0-f98d-4270-8cc3-88111c87b778
+    type: regular
+    task:
+      id: 25ed1ac0-f98d-4270-8cc3-88111c87b778
+      version: -1
+      name: Store script UID
+      description: Save the resolved script_uid to context.
+      scriptName: SetAndHandleEmpty
+      type: regular
+      iscommand: false
+      brand: ""
+      playbooktaskmissingcomponent: null
+      istaskmissingcomponenterrordismissed: false
+    nexttasks:
+      '#none#':
+      - "12"
+    scriptarguments:
+      append:
+        simple: "false"
+      key:
+        simple: script_uuid
+      value:
+        simple: ${Core.Scripts.script_uid}
+    separatecontext: false
+    continueonerrortype: ""
+    view: |-
+      {
+        "position": {
+          "x": 265,
+          "y": 405
+        }
+      }
+    note: false
+    timertriggers: []
+    ignoreworker: false
+    skipunavailable: false
+    quietmode: 0
+    isoversize: false
+    isautoswitchedtoquietmode: false
+  "3":
+    id: "3"
+    taskid: f8c26a8b-4c93-4c1c-894d-d79000734446
+    type: regular
+    task:
+      id: f8c26a8b-4c93-4c1c-894d-d79000734446
+      version: -1
+      name: Get target endpoints
+      description: Resolve connected endpoints by hostname and/or group.
+      script: Cortex Core - IR|||core-get-endpoints
+      type: regular
+      iscommand: true
+      brand: Cortex Core - IR
+      playbooktaskmissingcomponent: null
+      istaskmissingcomponenterrordismissed: false
+    nexttasks:
+      '#none#':
+      - "4"
+    scriptarguments:
+      group_name:
+        simple: ${target_group}
+      hostname:
+        complex:
+          root: inputs.endpoint_hostnames
+          transformers:
+          - operator: join
+            args:
+              separator:
+                value:
+                  simple: ','
+      status:
+        simple: connected
+    separatecontext: false
+    continueonerrortype: ""
+    view: |-
+      {
+        "position": {
+          "x": 1125,
+          "y": 2255
+        }
+      }
+    note: false
+    timertriggers: []
+    ignoreworker: false
+    skipunavailable: false
+    quietmode: 0
+    isoversize: false
+    isautoswitchedtoquietmode: false
+  "4":
+    id: "4"
+    taskid: 68c59de9-68fc-4376-8c07-08f952dcb041
+    type: regular
+    task:
+      id: 68c59de9-68fc-4376-8c07-08f952dcb041
+      version: -1
+      name: Collect endpoint IDs
+      description: Extract endpoint IDs from the resolved endpoints into context.
+      scriptName: SetAndHandleEmpty
+      type: regular
+      iscommand: false
+      brand: ""
+      playbooktaskmissingcomponent: null
+      istaskmissingcomponenterrordismissed: false
+    nexttasks:
+      '#none#':
+      - "9"
+    scriptarguments:
+      append:
+        simple: "false"
+      key:
+        simple: endpoint_id
+      value:
+        simple: ${Core.Endpoint.endpoint_id}
+    separatecontext: false
+    continueonerrortype: ""
+    view: |-
+      {
+        "position": {
+          "x": 910,
+          "y": 2440
+        }
+      }
+    note: false
+    timertriggers: []
+    ignoreworker: false
+    skipunavailable: false
+    quietmode: 0
+    isoversize: false
+    isautoswitchedtoquietmode: false
+  "5":
+    id: "5"
+    taskid: 047a350c-131c-4d42-888a-fc664762975a
+    type: regular
+    task:
+      id: 047a350c-131c-4d42-888a-fc664762975a
+      version: -1
+      name: Run YARA scanner
+      description: Execute the scanner from the library on the resolved endpoints,
+        passing its parameters.
+      script: Cortex Core - IR|||core-script-run
+      type: regular
+      iscommand: true
+      brand: Cortex Core - IR
+      playbooktaskmissingcomponent: null
+      istaskmissingcomponenterrordismissed: false
+    nexttasks:
+      '#none#':
+      - "6"
+    scriptarguments:
+      endpoint_ids:
+        complex:
+          root: endpoint_id
+          transformers:
+          - operator: join
+            args:
+              separator:
+                value:
+                  simple: ','
+      parameters:
+        simple: '{"yarafile":"${rules_b64}","scan_folder":"${inputs.scan_folder}","alert_severity":"${inputs.alert_severity}"}'
+      script_uid:
+        simple: ${script_uuid}
+      timeout:
+        simple: ${inputs.timeout}
+    separatecontext: false
+    continueonerrortype: ""
+    view: |-
+      {
+        "position": {
+          "x": 1125,
+          "y": 2810
+        }
+      }
+    note: false
+    timertriggers: []
+    ignoreworker: false
+    skipunavailable: false
+    quietmode: 0
+    isoversize: false
+    isautoswitchedtoquietmode: false
+  "6":
+    id: "6"
+    taskid: f41948e8-35c6-485d-8725-36d4631bde76
+    type: title
+    task:
+      id: f41948e8-35c6-485d-8725-36d4631bde76
+      version: -1
+      name: Done
+      type: title
+      iscommand: false
+      brand: ""
+      playbooktaskmissingcomponent: null
+      istaskmissingcomponenterrordismissed: false
+    separatecontext: false
+    continueonerrortype: ""
+    view: |-
+      {
+        "position": {
+          "x": 1125,
+          "y": 2995
+        }
+      }
+    note: false
+    timertriggers: []
+    ignoreworker: false
+    skipunavailable: false
+    quietmode: 0
+    isoversize: false
+    isautoswitchedtoquietmode: false
+  "7":
+    id: "7"
+    taskid: 5a36da77-c3c6-4f22-83fb-12ad7469f1f5
+    type: condition
+    task:
+      id: 5a36da77-c3c6-4f22-83fb-12ad7469f1f5
+      version: -1
+      name: Scan all, or a named scope?
+      description: '`all` needs confirming before it reaches the fleet. A named group
+        does not - the operator already said what they meant.'
+      type: condition
+      iscommand: false
+      brand: ""
+      playbooktaskmissingcomponent: null
+      istaskmissingcomponenterrordismissed: false
+    nexttasks:
+      '#default#':
+      - "10"
+      all:
+      - "20"
+      scoped:
+      - "23"
+    separatecontext: false
+    conditions:
+    - label: all
+      condition:
+      - - operator: isEqualString
+          left:
+            value:
+              simple: inputs.endpoint_groups
+            iscontext: true
+          right:
+            value:
+              simple: all
+          ignorecase: true
+    - label: scoped
+      condition:
+      - - operator: isNotEmpty
+          left:
+            value:
+              simple: inputs.endpoint_groups
+            iscontext: true
+        - operator: isNotEmpty
+          left:
+            value:
+              simple: inputs.endpoint_hostnames
+            iscontext: true
+    continueonerrortype: ""
+    view: |-
+      {
+        "position": {
+          "x": 910,
+          "y": 1515
+        }
+      }
+    note: false
+    timertriggers: []
+    ignoreworker: false
+    skipunavailable: false
+    quietmode: 0
+    isoversize: false
+    isautoswitchedtoquietmode: false
+  "8":
+    id: "8"
+    taskid: 28fb22f3-37e8-4d59-8542-6462c5af1fa6
+    type: regular
+    task:
+      id: 28fb22f3-37e8-4d59-8542-6462c5af1fa6
+      version: -1
+      name: Get ALL connected endpoints
+      description: The `all` branch. No hostname or group filter - only status, so
+        every connected endpoint on the tenant is a target. Reached only when an operator
+        typed `all`, never by leaving an input blank.
+      script: Cortex Core - IR|||core-get-endpoints
+      type: regular
+      iscommand: true
+      brand: Cortex Core - IR
+      playbooktaskmissingcomponent: null
+      istaskmissingcomponenterrordismissed: false
+    nexttasks:
+      '#none#':
+      - "4"
+    scriptarguments:
+      status:
+        simple: connected
+    separatecontext: false
+    continueonerrortype: ""
+    view: |-
+      {
+        "position": {
+          "x": 582.5,
+          "y": 2255
+        }
+      }
+    note: false
+    timertriggers: []
+    ignoreworker: false
+    skipunavailable: false
+    quietmode: 0
+    isoversize: false
+    isautoswitchedtoquietmode: false
+  "9":
+    id: "9"
+    taskid: f4301449-92de-4d81-8d7e-68ac800c4732
+    type: condition
+    task:
+      id: f4301449-92de-4d81-8d7e-68ac800c4732
+      version: -1
+      name: Any endpoints resolved?
+      description: A misspelled group, or a group whose members are all disconnected,
+        resolves to nothing. Without this the playbook dispatches to an empty target
+        list and completes green having scanned no host.
+      type: condition
+      iscommand: false
+      brand: ""
+      playbooktaskmissingcomponent: null
+      istaskmissingcomponenterrordismissed: false
+    nexttasks:
+      '#default#':
+      - "11"
+      found:
+      - "5"
+    separatecontext: false
+    conditions:
+    - label: found
+      condition:
+      - - operator: isExists
+          left:
+            value:
+              simple: endpoint_id
+            iscontext: true
+    continueonerrortype: ""
+    view: |-
+      {
+        "position": {
+          "x": 910,
+          "y": 2625
+        }
+      }
+    note: false
+    timertriggers: []
+    ignoreworker: false
+    skipunavailable: false
+    quietmode: 0
+    isoversize: false
+    isautoswitchedtoquietmode: false
+  "10":
+    id: "10"
+    taskid: b7e3aaba-4c88-4c4e-865d-39b6943b520f
+    type: title
+    task:
+      id: b7e3aaba-4c88-4c4e-865d-39b6943b520f
+      version: -1
+      name: STOPPED - no scope given (use `all` or a group)
+      type: title
+      iscommand: false
+      brand: ""
+      playbooktaskmissingcomponent: null
+      istaskmissingcomponenterrordismissed: false
+    separatecontext: false
+    continueonerrortype: ""
+    view: |-
+      {
+        "position": {
+          "x": 265,
+          "y": 1707.5
+        }
+      }
+    note: false
+    timertriggers: []
+    ignoreworker: false
+    skipunavailable: false
+    quietmode: 0
+    isoversize: false
+    isautoswitchedtoquietmode: false
+  "11":
+    id: "11"
+    taskid: 23e59e3e-3a60-416c-800c-1e05ef027575
+    type: title
+    task:
+      id: 23e59e3e-3a60-416c-800c-1e05ef027575
+      version: -1
+      name: STOPPED - no connected endpoint matched
+      type: title
+      iscommand: false
+      brand: ""
+      playbooktaskmissingcomponent: null
+      istaskmissingcomponenterrordismissed: false
+    separatecontext: false
+    continueonerrortype: ""
+    view: |-
+      {
+        "position": {
+          "x": 695,
+          "y": 2817.5
+        }
+      }
+    note: false
+    timertriggers: []
+    ignoreworker: false
+    skipunavailable: false
+    quietmode: 0
+    isoversize: false
+    isautoswitchedtoquietmode: false
+  "12":
+    id: "12"
+    taskid: 47ccd024-50d2-4fe7-8f9f-5d827f0205ea
+    type: condition
+    task:
+      id: 47ccd024-50d2-4fe7-8f9f-5d827f0205ea
+      version: -1
+      name: Rules supplied as base64?
+      description: The yarafile input is the direct path. Empty is not a licence to
+        fall back to whatever the scanner has compiled in - a scan must run the rules
+        someone chose.
+      type: condition
+      iscommand: false
+      brand: ""
+      playbooktaskmissingcomponent: null
+      istaskmissingcomponenterrordismissed: false
+    nexttasks:
+      '#default#':
+      - "13"
+      supplied:
+      - "16"
+    separatecontext: false
+    conditions:
+    - label: supplied
+      condition:
+      - - operator: isNotEmpty
+          left:
+            value:
+              simple: inputs.yarafile
+            iscontext: true
+    continueonerrortype: ""
+    view: |-
+      {
+        "position": {
+          "x": 265,
+          "y": 590
+        }
+      }
+    note: false
+    timertriggers: []
+    ignoreworker: false
+    skipunavailable: false
+    quietmode: 0
+    isoversize: false
+    isautoswitchedtoquietmode: false
+  "13":
+    id: "13"
+    taskid: b3c80f34-11f0-410e-8e2b-b2332c22a514
+    type: condition
+    task:
+      id: b3c80f34-11f0-410e-8e2b-b2332c22a514
+      version: -1
+      name: Was a rules file uploaded instead?
+      description: No base64, so look for an uploaded file. File.EntryID is where
+        a .yar dropped into the issue lands in context.
+      type: condition
+      iscommand: false
+      brand: ""
+      playbooktaskmissingcomponent: null
+      istaskmissingcomponenterrordismissed: false
+    nexttasks:
+      '#default#':
+      - "18"
+      uploaded:
+      - "14"
+    separatecontext: false
+    conditions:
+    - label: uploaded
+      condition:
+      - - operator: isExists
+          left:
+            value:
+              simple: File.EntryID
+            iscontext: true
+    continueonerrortype: ""
+    view: |-
+      {
+        "position": {
+          "x": 50,
+          "y": 775
+        }
+      }
+    note: false
+    timertriggers: []
+    ignoreworker: false
+    skipunavailable: false
+    quietmode: 0
+    isoversize: false
+    isautoswitchedtoquietmode: false
+  "14":
+    id: "14"
+    taskid: a6a275dd-886a-4016-836e-62264fbd20b6
+    type: regular
+    task:
+      id: a6a275dd-886a-4016-836e-62264fbd20b6
+      version: -1
+      name: Encode the uploaded rules
+      description: Validate and base64-encode the uploaded file. This also rejects
+        a ruleset that cannot compile, before a single endpoint is touched.
+      scriptName: YaraRulesFromFile
+      type: regular
+      iscommand: false
+      brand: ""
+      playbooktaskmissingcomponent: null
+      istaskmissingcomponenterrordismissed: false
+    nexttasks:
+      '#none#':
+      - "15"
+    scriptarguments:
+      entryID:
+        simple: ${File.EntryID}
+    separatecontext: false
+    continueonerrortype: ""
+    view: |-
+      {
+        "position": {
+          "x": 480,
+          "y": 960
+        }
+      }
+    note: false
+    timertriggers: []
+    ignoreworker: false
+    skipunavailable: false
+    quietmode: 0
+    isoversize: false
+    isautoswitchedtoquietmode: false
+  "15":
+    id: "15"
+    taskid: acb77687-50ed-49b3-805b-534e114bd7b5
+    type: condition
+    task:
+      id: acb77687-50ed-49b3-805b-534e114bd7b5
+      version: -1
+      name: Did the rules encode cleanly?
+      description: YaraRulesFromFile returns valid=false with a reason rather than
+        raising, so the failure has to be branched on explicitly or a rejected ruleset
+        would sail through as empty.
+      type: condition
+      iscommand: false
+      brand: ""
+      playbooktaskmissingcomponent: null
+      istaskmissingcomponenterrordismissed: false
+    nexttasks:
+      '#default#':
+      - "17"
+      valid:
+      - "19"
+    separatecontext: false
+    conditions:
+    - label: valid
+      condition:
+      - - operator: isEqualString
+          left:
+            value:
+              simple: Yara.Rules.valid
+            iscontext: true
+          right:
+            value:
+              simple: "true"
+          ignorecase: true
+    continueonerrortype: ""
+    view: |-
+      {
+        "position": {
+          "x": 480,
+          "y": 1145
+        }
+      }
+    note: false
+    timertriggers: []
+    ignoreworker: false
+    skipunavailable: false
+    quietmode: 0
+    isoversize: false
+    isautoswitchedtoquietmode: false
+  "16":
+    id: "16"
+    taskid: e31c508c-6ffa-4047-8890-5011ee43a3be
+    type: regular
+    task:
+      id: e31c508c-6ffa-4047-8890-5011ee43a3be
+      version: -1
+      name: Use the supplied base64
+      description: Operator passed base64 directly.
+      scriptName: SetAndHandleEmpty
+      type: regular
+      iscommand: false
+      brand: ""
+      playbooktaskmissingcomponent: null
+      istaskmissingcomponenterrordismissed: false
+    nexttasks:
+      '#none#':
+      - "7"
+    scriptarguments:
+      append:
+        simple: "false"
+      key:
+        simple: rules_b64
+      value:
+        simple: ${inputs.yarafile}
+    separatecontext: false
+    continueonerrortype: ""
+    view: |-
+      {
+        "position": {
+          "x": 1125,
+          "y": 1330
+        }
+      }
+    note: false
+    timertriggers: []
+    ignoreworker: false
+    skipunavailable: false
+    quietmode: 0
+    isoversize: false
+    isautoswitchedtoquietmode: false
+  "17":
+    id: "17"
+    taskid: b5604988-0f7d-43c0-80f5-34af27c6de52
+    type: title
+    task:
+      id: b5604988-0f7d-43c0-80f5-34af27c6de52
+      version: -1
+      name: STOPPED - the rules file could not be encoded
+      type: title
+      iscommand: false
+      brand: ""
+      playbooktaskmissingcomponent: null
+      istaskmissingcomponenterrordismissed: false
+    separatecontext: false
+    continueonerrortype: ""
+    view: |-
+      {
+        "position": {
+          "x": 265,
+          "y": 1337.5
+        }
+      }
+    note: false
+    timertriggers: []
+    ignoreworker: false
+    skipunavailable: false
+    quietmode: 0
+    isoversize: false
+    isautoswitchedtoquietmode: false
+  "18":
+    id: "18"
+    taskid: 54ec63b9-ef14-441f-80db-3b3bc8c18b05
+    type: title
+    task:
+      id: 54ec63b9-ef14-441f-80db-3b3bc8c18b05
+      version: -1
+      name: STOPPED - no rules supplied (pass yarafile, or attach a .yar)
+      type: title
+      iscommand: false
+      brand: ""
+      playbooktaskmissingcomponent: null
+      istaskmissingcomponenterrordismissed: false
+    separatecontext: false
+    continueonerrortype: ""
+    view: |-
+      {
+        "position": {
+          "x": 50,
+          "y": 967.5
+        }
+      }
+    note: false
+    timertriggers: []
+    ignoreworker: false
+    skipunavailable: false
+    quietmode: 0
+    isoversize: false
+    isautoswitchedtoquietmode: false
+  "19":
+    id: "19"
+    taskid: 606a9adb-b722-4ea7-883a-a94d81c7f1ec
+    type: regular
+    task:
+      id: 606a9adb-b722-4ea7-883a-a94d81c7f1ec
+      version: -1
+      name: Use the encoded file
+      description: Base64 produced from the uploaded rules file.
+      scriptName: SetAndHandleEmpty
+      type: regular
+      iscommand: false
+      brand: ""
+      playbooktaskmissingcomponent: null
+      istaskmissingcomponenterrordismissed: false
+    nexttasks:
+      '#none#':
+      - "7"
+    scriptarguments:
+      append:
+        simple: "false"
+      key:
+        simple: rules_b64
+      value:
+        simple: ${Yara.Rules.b64}
+    separatecontext: false
+    continueonerrortype: ""
+    view: |-
+      {
+        "position": {
+          "x": 695,
+          "y": 1330
+        }
+      }
+    note: false
+    timertriggers: []
+    ignoreworker: false
+    skipunavailable: false
+    quietmode: 0
+    isoversize: false
+    isautoswitchedtoquietmode: false
+  "20":
+    id: "20"
+    taskid: ea3b3aa5-2efd-4194-8168-37682e395ef4
+    type: collection
+    task:
+      id: ea3b3aa5-2efd-4194-8168-37682e395ef4
+      version: -1
+      name: 'Confirm: scan every connected endpoint?'
+      description: Pauses for a human. Reached only when the scope is `all`; a named
+        group skips this.
+      type: collection
+      iscommand: false
+      brand: ""
+      playbooktaskmissingcomponent: null
+      istaskmissingcomponenterrordismissed: false
+    nexttasks:
+      '#none#':
+      - "21"
+    separatecontext: false
+    continueonerrortype: ""
+    view: |-
+      {
+        "position": {
+          "x": 695,
+          "y": 1700
+        }
+      }
+    note: false
+    timertriggers: []
+    ignoreworker: false
+    message:
+      to: null
+      subject: null
+      body:
+        simple: A YARA scan is about to target EVERY connected endpoint. Confirm,
+          or name a group to scan instead.
+      methods: []
+      format: ""
+      bcc: null
+      cc: null
+      timings:
+        retriescount: 2
+        retriesinterval: 360
+        completeafterreplies: 1
+        completeafterv2: false
+        completeaftersla: false
+    form:
+      questions:
+      - id: "0"
+        label: ""
+        labelarg:
+          simple: Scan every connected endpoint?
+        required: true
+        gridcolumns: []
+        defaultrows: []
+        type: singleSelect
+        options: []
+        optionsarg:
+        - simple: Yes - scan all connected endpoints
+        - simple: No - I will name a group
+        fieldassociated: ""
+        placeholder: ""
+        tooltip: Choosing No requires a group name in the next field.
+        readonly: false
+      - id: "1"
+        label: ""
+        labelarg:
+          simple: Group name (only if you answered No)
+        required: false
+        gridcolumns: []
+        defaultrows: []
+        type: shortText
+        options: []
+        optionsarg: []
+        fieldassociated: ""
+        placeholder: ""
+        tooltip: Exact endpoint group name.
+        readonly: false
+      title: Confirm scan scope
+      description: Confirm a fleet-wide YARA scan, or narrow it to one group.
+      sender: ""
+      expired: false
+      totalanswers: 0
+      syncid: ""
+    skipunavailable: false
+    quietmode: 0
+    isoversize: false
+    isautoswitchedtoquietmode: false
+  "21":
+    id: "21"
+    taskid: e9fe58f1-1667-471d-841c-13e84b8e0114
+    type: condition
+    task:
+      id: e9fe58f1-1667-471d-841c-13e84b8e0114
+      version: -1
+      name: Did they name a group?
+      description: A group name in answer 1 wins over the yes/no, because typing one
+        is the more specific instruction. Nothing typed falls through to the fleet-wide
+        branch.
+      type: condition
+      iscommand: false
+      brand: ""
+      playbooktaskmissingcomponent: null
+      istaskmissingcomponenterrordismissed: false
+    nexttasks:
+      '#default#':
+      - "24"
+      all:
+      - "8"
+      group:
+      - "22"
+    separatecontext: false
+    conditions:
+    - label: group
+      condition:
+      - - operator: isNotEmpty
+          left:
+            value:
+              simple: Confirm scan scope.Answers.1
+            iscontext: true
+          right:
+            value: {}
+      - - operator: isEqualString
+          left:
+            value:
+              simple: Confirm scan scope.Answers.0
+            iscontext: true
+          right:
+            value:
+              simple: No - I will name a group
+    - label: all
+      condition:
+      - - operator: isEqualString
+          left:
+            value:
+              simple: Confirm scan scope.Answers.0
+            iscontext: true
+          right:
+            value:
+              simple: Yes - scan all connected endpoints
+    continueonerrortype: ""
+    view: |-
+      {
+        "position": {
+          "x": 695,
+          "y": 1885
+        }
+      }
+    note: false
+    timertriggers: []
+    ignoreworker: false
+    skipunavailable: false
+    quietmode: 0
+    isoversize: false
+    isautoswitchedtoquietmode: false
+  "22":
+    id: "22"
+    taskid: 34a95102-62d2-4c05-84f0-c353046742cb
+    type: regular
+    task:
+      id: 34a95102-62d2-4c05-84f0-c353046742cb
+      version: -1
+      name: Use the group they named
+      description: Group supplied at the confirmation prompt.
+      scriptName: SetAndHandleEmpty
+      type: regular
+      iscommand: false
+      brand: ""
+      playbooktaskmissingcomponent: null
+      istaskmissingcomponenterrordismissed: false
+    nexttasks:
+      '#none#':
+      - "3"
+    scriptarguments:
+      append:
+        simple: "false"
+      key:
+        simple: target_group
+      value:
+        simple: ${Confirm scan scope.Answers.1}
+    separatecontext: false
+    continueonerrortype: ""
+    view: |-
+      {
+        "position": {
+          "x": 910,
+          "y": 2070
+        }
+      }
+    note: false
+    timertriggers: []
+    ignoreworker: false
+    skipunavailable: false
+    quietmode: 0
+    isoversize: false
+    isautoswitchedtoquietmode: false
+  "23":
+    id: "23"
+    taskid: 1d14a65a-c4c2-4461-8803-960a8363d8d9
+    type: regular
+    task:
+      id: 1d14a65a-c4c2-4461-8803-960a8363d8d9
+      version: -1
+      name: Use the group from inputs
+      description: Group supplied as a playbook input.
+      scriptName: SetAndHandleEmpty
+      type: regular
+      iscommand: false
+      brand: ""
+      playbooktaskmissingcomponent: null
+      istaskmissingcomponenterrordismissed: false
+    nexttasks:
+      '#none#':
+      - "3"
+    scriptarguments:
+      append:
+        simple: "false"
+      key:
+        simple: target_group
+      value:
+        simple: ${inputs.endpoint_groups}
+    separatecontext: false
+    continueonerrortype: ""
+    view: |-
+      {
+        "position": {
+          "x": 1340,
+          "y": 2070
+        }
+      }
+    note: false
+    timertriggers: []
+    ignoreworker: false
+    skipunavailable: false
+    quietmode: 0
+    isoversize: false
+    isautoswitchedtoquietmode: false
+  "24":
+    id: "24"
+    taskid: d6b81f9f-92d7-4994-936f-f2bb37340d1b
+    type: title
+    task:
+      id: d6b81f9f-92d7-4994-936f-f2bb37340d1b
+      version: -1
+      name: STOOPED - invalid answer
+      type: title
+      iscommand: false
+      brand: ""
+      playbooktaskmissingcomponent: null
+      istaskmissingcomponenterrordismissed: false
+    separatecontext: false
+    continueonerrortype: ""
+    view: |-
+      {
+        "position": {
+          "x": 265,
+          "y": 2077.5
+        }
+      }
+    note: false
+    timertriggers: []
+    ignoreworker: false
+    skipunavailable: false
+    quietmode: 0
+    isoversize: false
+    isautoswitchedtoquietmode: false
+outlinetasks: {}
+view: |-
+  {
+    "linkLabelsPosition": {},
+    "paper": {
+      "dimensions": {
+        "height": 3005,
+        "width": 1670,
+        "x": 50,
+        "y": 50
+      }
+    }
+  }
+inputs:
+- key: script_name
+  value:
+    simple: xdr_yara_scanner
+  required: true
+  description: |-
+    Exact name of the scanner script in the Action Center library. IMPORTANT: core-script-run
+    rejects any parameter set that does not exactly match the script's defined inputs, so this
+    script MUST be uploaded with exactly these 5 string inputs, in order:
+    yarafile, scan_folder, alert_severity, mode, options. The older 3-input build will be rejected.
+  playbookInputQuery: null
+- key: yarafile
+  value: {}
+  required: false
+  description: Base64-encoded YARA rules. Leave empty and the playbook looks for an
+    uploaded .yar via File.EntryID and encodes it. If neither is present the playbook
+    stops - it never falls back to a built-in ruleset.
+  playbookInputQuery: null
+- key: scan_folder
+  value:
+    simple: default
+  required: false
+  description: Target folder to scan, or "default" for the platform default scope.
+  playbookInputQuery: null
+- key: alert_severity
+  value:
+    simple: low
+  required: false
+  description: low | medium | high.
+  playbookInputQuery: null
+- key: mode
+  value:
+    simple: scan
+  required: false
+  description: scan | cancel (deliver a cancel to a running scan on the targets).
+  playbookInputQuery: null
+- key: options
+  value: {}
+  required: false
+  description: Compact runtime options, e.g. create_alerts=false,throttle_mode=os,collect_files=true.
+  playbookInputQuery: null
+- key: endpoint_hostnames
+  value: {}
+  required: false
+  description: Comma-separated hostnames to scan. Combine with endpoint_groups, or
+    use instead of it. Ignored when endpoint_groups is `all`.
+  playbookInputQuery: null
+- key: endpoint_groups
+  value:
+    simple: all
+  required: false
+  description: 'Comma-separated endpoint group names to scan. The literal `all` scans
+    every CONNECTED endpoint on the tenant - that is the default, and it is deliberate:
+    it must be typed, never arrived at by leaving a box empty. Leaving this AND endpoint_hostnames
+    blank stops the playbook.'
+  playbookInputQuery: null
+- key: timeout
+  value:
+    simple: "3600"
+  required: false
+  description: Per-endpoint script execution timeout in seconds, enforced on the endpoint.
+    The playbook does NOT wait this long - the dispatch task returns as soon as the
+    wave is away. Verify the wave separately with YaraScanVerify.
+  playbookInputQuery: null
+inputSections:
+- inputs:
+  - script_name
+  - yarafile
+  - scan_folder
+  - alert_severity
+  - mode
+  - options
+  - endpoint_hostnames
+  - endpoint_groups
+  - timeout
+  name: General (Inputs group)
+  description: Generic group for inputs
+outputSections:
+- outputs:
+  - Core.ScriptResult.action_id
+  - Core.ScriptResult.results.standard_output
+  - Core.ScriptResult.results.execution_status
+  name: General (Outputs group)
+  description: Generic group for outputs
+outputs:
+- contextPath: Core.ScriptResult.action_id
+  description: ID of the Action Center action initiated.
+  type: Number
+- contextPath: Core.ScriptResult.results.standard_output
+  description: STDOUT/STDERR from the scanner (the SCAN_RESULT summary line). POPULATED
+    ONLY IF THE DISPATCH TASK WAITS. This playbook returns as soon as the wave is
+    away, so expect this to be empty - the scan is still running on the endpoint at
+    that point. Read the scanner's own lifecycle and match rows instead, or re-enable
+    polling on task 5 if a caller genuinely needs to block until every endpoint finishes.
+  type: String
+- contextPath: Core.ScriptResult.results.execution_status
+  description: Per-endpoint execution status. Same caveat as standard_output - not
+    available on a dispatch-and-return. Use YaraScanVerify to confirm the wave started.
+  type: String
+dirtyInputs: true
+adopted: true
+possibleresponses: []
