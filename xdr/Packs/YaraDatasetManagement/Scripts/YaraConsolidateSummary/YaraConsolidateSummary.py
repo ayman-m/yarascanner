@@ -1174,6 +1174,8 @@ def render_report(current, legacy, newer, now_yyyymm):
     """Human-readable inventory. Ages are whole months."""
     schema = os.environ.get("YARA_LOOKUP_SCHEMA_VER", "4")
     lines = ["YARA lookup datasets (schema v%s current, now %s)" % (schema, now_yyyymm), ""]
+    lines += render_by_type(current, legacy, newer, now_yyyymm)
+    lines += ["", "ALL CURRENT-SCHEMA DATASETS BY STATE", ""]
     lines.append("%-52s %-8s %-14s %6s" % ("dataset", "kind", "host", "age"))
     lines.append("-" * 84)
     unrotated, abandoned, consolidated, overwritten = [], [], [], []

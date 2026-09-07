@@ -351,10 +351,62 @@ def select_legacy_for_deletion(legacy_names, newer_names=(), now_yyyymm=None):
     return candidates, skipped
 
 
+_TYPE_TITLES = (
+    ("host_matches",         "PER-HOST FINDINGS  - latest scan per host, replaced wholesale "
+                             "by the next scan"),
+    # Deliberately does NOT name the rotation setting. That string appears only in the
+    # not_rotated advice below, where it is actionable; printing it on every run tells an
+    # operator whose rotation is already correct to go and change it.
+    ("host_scans",           "PER-HOST SCAN LOG  - lifecycle rows, append-only, one dataset "
+                             "per host per retained month"),
+    ("consolidated_summary", "CONSOLIDATED (SUMMARY) - one row per (host, rule) per ruleset, "
+                             "fleet-wide"),
+    ("consolidated_full",    "CONSOLIDATED (FULL)    - every column of every matched-file row "
+                             "per ruleset, fleet-wide"),
+    ("retired_scan_target",  "RETIRED PER-SCAN TARGETS - from the withdrawn per-scan merge; "
+                             "nothing produces these now"),
+    ("internal",             "PACK INTERNAL - consolidation lock and run record"),
+)
+
+
+def render_by_type(current, legacy, newer, now_yyyymm):
+    """One table per KIND OF DATASET, so the inventory can be read without knowing the
+    naming scheme. The single flat table below answers "what state is each dataset in";
+    this answers "what do I actually have", which is the question asked first."""
+    everything = list(current) + list(legacy) + list(newer)
+    grouped = group_by_type(everything)
+    out = []
+    for key, title in _TYPE_TITLES:
+        names = grouped.get(key) or []
+        out.append("%s  [%d]" % (title, len(names)))
+        if not names:
+            out.append("    (none)")
+            out.append("")
+            continue
+        out.append("    %-56s %-14s %8s" % ("dataset", "host", "age"))
+        out.append("    " + "-" * 80)
+        for n in names:
+            info = parse_dataset_name(n)
+            host = (info or {}).get("host") or "-"
+            if info and info.get("month"):
+                age = "%dmo" % months_between(info["month"], now_yyyymm)
+            elif info and info.get("overwrite"):
+                age = "live"
+            elif info and info.get("scan_target"):
+                age = "scan"
+            else:
+                age = "-"
+            out.append("    %-56s %-14s %8s" % (n[:56], str(host)[:14], age))
+        out.append("")
+    return out
+
+
 def render_report(current, legacy, newer, now_yyyymm):
     """Human-readable inventory. Ages are whole months."""
     schema = os.environ.get("YARA_LOOKUP_SCHEMA_VER", "4")
     lines = ["YARA lookup datasets (schema v%s current, now %s)" % (schema, now_yyyymm), ""]
+    lines += render_by_type(current, legacy, newer, now_yyyymm)
+    lines += ["", "ALL CURRENT-SCHEMA DATASETS BY STATE", ""]
     lines.append("%-52s %-8s %-14s %6s" % ("dataset", "kind", "host", "age"))
     lines.append("-" * 84)
     unrotated, abandoned, consolidated, overwritten = [], [], [], []

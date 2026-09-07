@@ -1124,10 +1124,62 @@ def select_legacy_for_deletion(legacy_names, newer_names=(), now_yyyymm=None):
     return candidates, skipped
 
 
+_TYPE_TITLES = (
+    ("host_matches",         "PER-HOST FINDINGS  - latest scan per host, replaced wholesale "
+                             "by the next scan"),
+    # Deliberately does NOT name the rotation setting. That string appears only in the
+    # not_rotated advice below, where it is actionable; printing it on every run tells an
+    # operator whose rotation is already correct to go and change it.
+    ("host_scans",           "PER-HOST SCAN LOG  - lifecycle rows, append-only, one dataset "
+                             "per host per retained month"),
+    ("consolidated_summary", "CONSOLIDATED (SUMMARY) - one row per (host, rule) per ruleset, "
+                             "fleet-wide"),
+    ("consolidated_full",    "CONSOLIDATED (FULL)    - every column of every matched-file row "
+                             "per ruleset, fleet-wide"),
+    ("retired_scan_target",  "RETIRED PER-SCAN TARGETS - from the withdrawn per-scan merge; "
+                             "nothing produces these now"),
+    ("internal",             "PACK INTERNAL - consolidation lock and run record"),
+)
+
+
+def render_by_type(current, legacy, newer, now_yyyymm):
+    """One table per KIND OF DATASET, so the inventory can be read without knowing the
+    naming scheme. The single flat table below answers "what state is each dataset in";
+    this answers "what do I actually have", which is the question asked first."""
+    everything = list(current) + list(legacy) + list(newer)
+    grouped = group_by_type(everything)
+    out = []
+    for key, title in _TYPE_TITLES:
+        names = grouped.get(key) or []
+        out.append("%s  [%d]" % (title, len(names)))
+        if not names:
+            out.append("    (none)")
+            out.append("")
+            continue
+        out.append("    %-56s %-14s %8s" % ("dataset", "host", "age"))
+        out.append("    " + "-" * 80)
+        for n in names:
+            info = parse_dataset_name(n)
+            host = (info or {}).get("host") or "-"
+            if info and info.get("month"):
+                age = "%dmo" % months_between(info["month"], now_yyyymm)
+            elif info and info.get("overwrite"):
+                age = "live"
+            elif info and info.get("scan_target"):
+                age = "scan"
+            else:
+                age = "-"
+            out.append("    %-56s %-14s %8s" % (n[:56], str(host)[:14], age))
+        out.append("")
+    return out
+
+
 def render_report(current, legacy, newer, now_yyyymm):
     """Human-readable inventory. Ages are whole months."""
     schema = os.environ.get("YARA_LOOKUP_SCHEMA_VER", "4")
     lines = ["YARA lookup datasets (schema v%s current, now %s)" % (schema, now_yyyymm), ""]
+    lines += render_by_type(current, legacy, newer, now_yyyymm)
+    lines += ["", "ALL CURRENT-SCHEMA DATASETS BY STATE", ""]
     lines.append("%-52s %-8s %-14s %6s" % ("dataset", "kind", "host", "age"))
     lines.append("-" * 84)
     unrotated, abandoned, consolidated, overwritten = [], [], [], []
@@ -1252,6 +1304,56 @@ def record_cleanup_run(client, result, now_ms=None, log=print):
 
 # ---- orchestration ----------------------------------------------------------
 
+# What each dataset IS, decided from its NAME alone. Deliberately name-only: opening a
+# dataset to find out what it holds would cost a metered query per dataset, and at 400+
+# datasets that is a real bill for information the naming scheme already encodes.
+#
+#   host_matches         yara_scanner_matches_v<N>_<host>_<hex>
+#                        One per host. The findings of that host's LATEST scan, replaced
+#                        wholesale at the start of the next one.
+#   host_scans           yara_scanner_scans_v<N>_<host>_<hex>[_<YYYYMM>]
+#                        One per host per retained month. Scan lifecycle rows (initiated /
+#                        running / completed), append-only. THE ONLY KIND THAT ROTATES.
+#   consolidated_full    yara_scanner_full_v<N>_rules_<rulehash>
+#                        Output of YaraConsolidateApply. Every column of every matched-file
+#                        row for one ruleset, across the fleet. No host in the name because
+#                        it spans hosts.
+#   consolidated_summary yara_scanner_summary_v<N>_rules_<rulehash>
+#                        Output of YaraConsolidateSummary. One row per (host, rule) for one
+#                        ruleset - roughly a fortieth of the full form.
+#   retired_scan_target  yara_scanner_matches_v<N>_scan_<slug>
+#                        Output of the retired per-scan merge. Nothing produces these now;
+#                        on a tenant that ran it they may be a scan's only surviving copy.
+#   internal             the pack's own bookkeeping - the consolidation lock and run record.
+DATASET_TYPES = ("host_matches", "host_scans", "consolidated_full", "consolidated_summary",
+                 "retired_scan_target", "internal")
+
+
+def dataset_type(name):
+    """Which of DATASET_TYPES this dataset is, from the name alone. Never queries."""
+    n = str(name or "")
+    if re.search(r"_full_v\d+_rules_", n):
+        return "consolidated_full"
+    if re.search(r"_summary_v\d+_rules_", n):
+        return "consolidated_summary"
+    if re.search(r"_matches_v\d+_scan_", n) or re.search(r"_matches_v\d+_scan$", n):
+        return "retired_scan_target"
+    if re.search(r"_matches_v\d+_", n):
+        return "host_matches"
+    if re.search(r"_scans_v\d+_", n):
+        return "host_scans"
+    return "internal"
+
+
+def group_by_type(names):
+    """{type: [name, ...]} for every DATASET_TYPES bucket, empty lists included so a caller
+    can rely on the key existing rather than testing for it."""
+    out = {t: [] for t in DATASET_TYPES}
+    for n in names or ():
+        out[dataset_type(n)].append(n)
+    return {t: sorted(v) for t, v in out.items()}
+
+
 def report_datasets(client, now_yyyymm=None):
     """READ-ONLY inventory of every yara_scanner_* lookup dataset. Issues exactly one API
     call (the dataset listing) and never writes or deletes.
@@ -1270,7 +1372,7 @@ def report_datasets(client, now_yyyymm=None):
     for name in current:
         info = parse_dataset_name(name)
         if info is None:
-            datasets.append({"name": name,
+            datasets.append({"name": name, "type": dataset_type(name),
                              "kind": (("full" if "_full_v" in name else "summary")
                                       if is_pack_output_dataset(name) else ""),
                              "host": "", "month": "", "age_months": None,
@@ -1293,11 +1395,33 @@ def report_datasets(client, now_yyyymm=None):
             else:
                 state = "not_rotated"
                 not_rotated.append(name)
-        datasets.append({"name": name, "kind": info["kind"], "host": info["host"] or "",
-                         "month": info["month"] or "", "age_months": age, "state": state})
+        datasets.append({"name": name, "type": dataset_type(name), "kind": info["kind"],
+                         "host": info["host"] or "", "month": info["month"] or "",
+                         "age_months": age, "state": state})
+    by_type = group_by_type(current + legacy + newer)
     return {
         "now_yyyymm": now_yyyymm,
         "schema_version": YARA_SCHEMA_VERSION,
+        # Split by WHAT THE DATASET IS, alongside the existing split by what STATE it is in.
+        # The two answer different questions and an operator usually wants the first: "how
+        # many hosts have findings", "which consolidated outputs exist" - questions the
+        # state-based keys (frozen / not_rotated / overwrite) cannot answer without the
+        # reader knowing the naming scheme. Every bucket is present even when empty.
+        "by_type": by_type,
+        "by_type_counts": {t: len(v) for t, v in by_type.items()},
+        "host_matches": by_type["host_matches"],
+        "host_matches_count": len(by_type["host_matches"]),
+        "host_scans": by_type["host_scans"],
+        "host_scans_count": len(by_type["host_scans"]),
+        "consolidated_full": by_type["consolidated_full"],
+        "consolidated_full_count": len(by_type["consolidated_full"]),
+        "consolidated_summary": by_type["consolidated_summary"],
+        "consolidated_summary_count": len(by_type["consolidated_summary"]),
+        "retired_scan_target": by_type["retired_scan_target"],
+        "retired_scan_target_count": len(by_type["retired_scan_target"]),
+        "internal": by_type["internal"],
+        "internal_count": len(by_type["internal"]),
+        "total_count": len(current) + len(legacy) + len(newer),
         "report": render_report(current, legacy, newer, now_yyyymm),
         "datasets": datasets,
         "current_count": len(current),
