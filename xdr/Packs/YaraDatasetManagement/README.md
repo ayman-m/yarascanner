@@ -7,8 +7,11 @@ data**: both read the permanent per-host datasets and leave them exactly as they
 and the only rows either one ever removes are stale rows inside its own output. There are
 **two consolidation modes**, full detail and summary only; which one you want is the first
 decision to make and it is answered in
-[Two consolidation modes](#two-consolidation-modes--full-detail-or-summary-only) below. This
-is the XSOAR-pack delivery of the same logic in [`xdr_consolidate.py`](../../xdr_consolidate.py)
+[Two consolidation modes](#two-consolidation-modes--full-detail-or-summary-only) below. The
+shipped `YARA Dataset Consolidation` playbook only orchestrates **summary** mode — full
+detail is a separate automation this pack still ships but the playbook no longer calls;
+invoke `YaraConsolidateApply` directly (CLI or a standalone task) when full detail is needed.
+This is the XSOAR-pack delivery of the same logic in [`xdr_consolidate.py`](../../xdr_consolidate.py)
 and [`xdr_data_management.py`](../../xdr_data_management.py) (see
 [Datasets and Maintenance](../../docs/topics/Datasets_and_Maintenance.md) §5 for the
 underlying design and safety rails); this pack runs it as a scheduled Job instead of a
@@ -18,10 +21,10 @@ manual CLI invocation.
 
 | Item | Type | Role |
 |---|---|---|
-| `YARA Dataset Consolidation` | Playbook | Orchestrates one pass: check readiness → wait on in-progress scans → **consolidate in the mode `consolidation_mode` selects** → flag failures. Meant to run **twice daily** as a scheduled Job. |
-| `YaraConsolidateStatus` | Automation | Read-only readiness check. Never writes or deletes. Shared by both modes. |
-| `YaraConsolidateApply` | Automation | **Mode A, full detail.** Groups every column of every matched-file row, across every host scanned with one ruleset, into a single `yara_scanner_full_v<VER>_rules_<hash>` dataset. **Deletes no source dataset:** the only `remove_lookup_data` call it makes is against its *own* output, dropping `scan_id`s the sources no longer hold. **Dry run unless `execute=true`.** |
-| `YaraConsolidateSummary` | Automation | **Mode B, summary only.** One row per (host, rule) — which rules fired on which host — into `yara_scanner_summary_v<VER>_rules_<hash>`. Four columns, no filenames, no per-rule counts. **Deletes no source dataset:** exactly like Mode A, its only `remove_lookup_data` call is against its *own* output. Dry run unless `execute=true`. The compact counterpart to Mode A: same sources, same grouping key, roughly a fortieth of the rows. |
+| `YARA Dataset Consolidation` | Playbook | Orchestrates one pass: clear context → summarise (`YaraConsolidateSummary`, self-gating on its own eligibility check) → flag failures. Meant to run **twice daily** as a scheduled Job. Summary-only — see [Two consolidation modes](#two-consolidation-modes--full-detail-or-summary-only). |
+| `YaraConsolidateStatus` | Automation | Read-only readiness check. Never writes or deletes. Not called by the shipped playbook (both consolidation automations compute their own eligibility internally) — useful standalone, e.g. before a manual full-detail pass. |
+| `YaraConsolidateApply` | Automation | **Mode A, full detail.** Groups every column of every matched-file row, across every host scanned with one ruleset, into a single `yara_scanner_full_v<VER>_rules_<hash>` dataset. **Deletes no source dataset:** the only `remove_lookup_data` call it makes is against its *own* output, dropping `scan_id`s the sources no longer hold. **Dry run unless `execute=true`.** Not called by the shipped playbook — invoke directly when full detail is needed. |
+| `YaraConsolidateSummary` | Automation | **Mode B, summary only — what the shipped playbook runs.** One row per (host, rule) — which rules fired on which host — into `yara_scanner_summary_v<VER>_rules_<hash>`. Four columns, no filenames, no per-rule counts. **Deletes no source dataset:** exactly like Mode A, its only `remove_lookup_data` call is against its *own* output. Dry run unless `execute=true`. The compact counterpart to Mode A: same sources, same grouping key, roughly a fortieth of the rows. |
 | `YaraReport` | Automation | Read-only inventory of every `yara_scanner_*` lookup dataset (kind, host, age, plus the legacy / newer-schema / consolidated buckets). One API call, no writes — safe any time. Writes to `Yara.Report.*`. |
 | `YaraCleanup` | Automation | Retention pruning — **deletes whole datasets**. Dry run by default; see below. |
 | `YaraWipeAllDatasets` | Automation | **Deletes every `yara_scanner_*` dataset on the tenant, unconditionally.** No scoping, no rules. **Not wired to the playbook or any other content item — run it by hand only.** See below. |
@@ -137,25 +140,33 @@ the same rows to one per (host, rule). Same sources, same grouping key, same rec
   `Yara.ConsolidateApply.failed` — rather than half-filling the target, because a
   partially-written consolidated dataset is indistinguishable from a complete one. If a group
   is refused, use `YaraConsolidateSummary` for a fleet that size, or raise `row_ceiling`
-  deliberately knowing where the write ceiling actually is. (The playbook still carries a
-  vestigial `max_scans` input; it is wired to no task and has no effect on this automation.)
+  deliberately knowing where the write ceiling actually is. `row_ceiling` is an argument of
+  `YaraConsolidateApply` itself, not a playbook input — the shipped playbook doesn't call it
+  at all; pass it when invoking the automation directly.
 
-### Choosing the mode from the playbook
+### Choosing the mode
 
-`YARA Dataset Consolidation` takes a **`consolidation_mode`** input, `full` (default) or
-`summary`. Task 11 branches on it: `full` → `YaraConsolidateApply`, `summary` →
-`YaraConsolidateSummary`. Every pre-existing input still works unchanged, and an existing
-scheduled Job that predates this input picks up the `full` default. Both branches are
-non-destructive, and each is gated by its own execute flag.
+Mode is no longer a playbook input — it's a choice of *which automation you invoke*. The
+shipped `YARA Dataset Consolidation` playbook calls only `YaraConsolidateSummary`: clear
+context → summarise → flag failures. There is no separate readiness/poll gate in front of
+it — `YaraConsolidateSummary` is dry-run-by-default and computes its own eligibility
+internally (which scans are ready, which are still running), so a standalone status check
+ahead of it was pure overhead. That gate (`YaraConsolidateStatus` + `GenericPolling`) was
+measured timing out at scale on a live tenant, which is what triggered this rebuild — the
+playbook used to branch on a `consolidation_mode` input between this and a full-detail path
+through that gate; both the gate and the full-detail branch were removed, not just
+bypassed, so nothing in the shipped playbook is unreachable or orphaned.
+
+Full detail is still a fully supported automation (`YaraConsolidateApply`) — it's just not
+wired to this playbook. Invoke it directly (CLI, a standalone task, or your own playbook)
+when full detail is what you need for a given run; see its own argument table above for
+`row_ceiling`, `retention_hours` and `execute`.
 
 | Playbook input | Default | Notes |
 |---|---|---|
-| `consolidation_mode` | `full` | Matched **exactly** against `full` and `summary`. Anything else — a typo, an empty value — reaches neither automation: it lands on a dead-end task that consolidates and writes nothing, so an unrecognised mode can never quietly pick a mode on your behalf. |
-| `summary_execute` | `true` | Summary mode only. `YaraConsolidateSummary` is a dry run unless `execute=true`, so a scheduled Job with this defaulted the other way would report forever and never write a row. Set it to `false` deliberately to preview a pass. |
-| `full_execute` | `true` | The exact counterpart, full mode only. `YaraConsolidateApply` is **also** a dry run unless `execute=true`; left at `false` the full branch reports what it would write and writes nothing, every run, for ever. Neither flag can cause a deletion of source data — neither branch has a path to one. |
-| `row_ceiling` | *(script default: 60000)* | Full mode only. Refuses a ruleset group larger than this many rows rather than half-filling the target. |
-| `max_scans` | *(unused)* | Vestigial. It is wired to no task and the full-consolidation `YaraConsolidateApply` has no such argument; the per-pass bound is `row_ceiling`. |
-| `abandoned_after_hours` | *(script default: 24h)* | Reaches **both** modes as their `retention_hours`: how long a non-terminal scan may be silent before it is consolidated anyway. In both modes it is **only** that threshold — it is never a deletion window, because neither mode deletes source data. A cleanly completed scan does not wait it out at all: the terminal-lifecycle gate makes it eligible as soon as its rows have settled — the 15-minute quiet window — instead of after `retention_hours`. |
+| `scan_id` | *(empty)* | Restrict this run to these scan_id(s), comma-separated. Leave empty for every eligible scan across the tenant — `YaraConsolidateSummary` computes eligibility itself. |
+| `execute` | `true` | `YaraConsolidateSummary` is a dry run unless `execute=true`, so a scheduled Job with this defaulted the other way would report forever and never write a row. Set it to `false` deliberately to preview a pass. |
+| `retention_hours` | *(script default: 24h)* | How long a non-terminal scan may be silent before it is consolidated anyway. It is **only** that threshold — never a deletion window, because this automation deletes no source data. A cleanly completed scan does not wait it out at all: the terminal-lifecycle gate makes it eligible as soon as its rows have settled — the 15-minute quiet window — instead of after `retention_hours`. |
 
 `schema_version` is deliberately **not** a playbook input. A single-version fleet is served
 by the automation's own default; a fleet mid-rollout should be summarised by invoking
@@ -531,7 +542,7 @@ python3 tools/build_pack_unified.py --check    # exit 1 if any is stale
 ```
 
 `tests/test_pack_unified_yaml_is_in_sync.py` runs `--check` in CI, and
-`tests/test_pack_playbook_consolidation_modes.py` checks the playbook's tasks against the
+`tests/test_pack_playbook_consolidation.py` checks the playbook's tasks against the
 automations they call. `YaraConsolidateSummary` is self-contained
 on the `Scripts/` side too (its `Scripts/<Name>/<Name>.yml` embeds the script); the rest
 carry `script: '-'` there and are unified at upload time.
@@ -669,11 +680,10 @@ the YaraCleanup section above before granting this key to anything.
 | `YaraConsolidateStatus` reports `### YARA consolidation readiness - 0 ready, 0 pending` | A fresh or freshly-wiped tenant holds no host matches datasets at all, so the gate has no scan to evaluate. | Not a failure and not a misconfiguration. `eligible_count`, `pending_count` and `group_count` are all `0` and `eligible_scan_ids` / `pending_scan_ids` / `eligible` / `pending` / `groups` are empty — that is the correct read-only answer on an empty tenant. Run a scan, wait out the settle window, and re-run. |
 | A scan sits in `Yara.ConsolidateStatus.pending` and you need to know whether to wait | The old War Room line called every pending scan "still in progress", which was wrong for three of the four cases. | Read the `reason` on the object, not the sentence: `scan_in_progress` (genuinely running — wait), `quiet_period` (finished, draining its upload queue — wait ~`quiet_secs`), `no_lifecycle_row` (nothing has said it finished; it becomes eligible at `retention_hours`), `no_timestamp` (**the one that does not clear by waiting** — no match row carries a usable `event_timestamp_ms`, so neither time gate can ever fire on it). |
 | `YaraConsolidateStatus` still reports the same `N scan(s) ready to consolidate` after a consolidation run has already written its dataset | **Expected.** "Ready" means the scan is *finished* — terminal lifecycle, or silent past `retention_hours` — not that it is unconsolidated. A finished scan stays ready however many times you group it, because both modes are idempotent: a re-run reconciles on `scan_id` sets rather than appending, so running twice is a verified no-op. | Not a failure, and not a to-do list that empties. Read `Status` as "what would a run group right now". To check whether the work is done, look for the output datasets in `!YaraReport`: `yara_scanner_summary_v4_rules_<hash>` for the compact record, `yara_scanner_full_v4_rules_<hash>` for full detail. |
-| Every scheduled Job run fails at task "Check consolidation status" (or "Apply consolidation") and task 8 ("Flag failures for attention") never lights up | `return_error` halts the whole playbook run at the failing task, before task 8's condition is ever evaluated — task 8 only reports data-level `failed_count` from a *completed* run, not a total execution error. | Watch the Job's own run history, not just the task-8 context flag — a dead key (or any other uncaught exception) is a hard failure, not a soft one. The `yara_scanner_consolidation_runs` dataset (see Monitoring below) also gets a `status="crashed"` row for a mid-run `YaraConsolidateApply` crash specifically (not for a `YaraConsolidateStatus` crash — that one never reaches `YaraConsolidateApply` at all). |
+| Every scheduled Job run fails at task "Summarise consolidation" and task 14 ("Flag failures for attention") never lights up | `return_error` halts the whole playbook run at the failing task, before task 14's condition is ever evaluated — task 14 only reports data-level `failed_count` from a *completed* run, not a total execution error. | Watch the Job's own run history, not just the task-14 context flag — a dead key (or any other uncaught exception) is a hard failure, not a soft one. The `yara_scanner_consolidation_runs` dataset (see Monitoring below) does not get a `status="crashed"` row for this — `YaraConsolidateSummary` has no crash-recording path (only `YaraConsolidateApply` does), so a crash here leaves no row at all; the Job's own run history is the only signal. |
 | Job history shows "0 scan(s) consolidated" every run, nothing actually being merged | Consolidation lock held by another concurrent run (the CLI's `xdr_data_management.py --consolidate --yes`, or an overlapping Job execution) | Check `Yara.ConsolidateApply.lock_held_by_other_run` in context, or just read the readable output — it is headed `### YARA full consolidation - STOOD DOWN` instead of looking identical to a genuinely-empty pass, and the sentence under it says which of the two refusals it was: "the consolidation lock is held by another concurrent run" (a pass really is running — wait for it) or "the marker exists but its row could not be read … (add_data create-lag)" (re-run shortly; a marker still unreadable hours later is orphaned and must be deleted by hand). `Yara.ConsolidateApply.lock_standdown_reason` carries the same answer as a code — `held_by_running_pass` or `marker_unreadable` — and a `#### Lock events` section carries the lock lines themselves. Confirm the Job's Queue Handling is set to "Don't trigger a new job instance" and that no one is running the CLI `--consolidate --yes` concurrently. |
-| The playbook run ends at **"Unrecognised consolidation_mode - nothing done"** and nothing was merged or written | `consolidation_mode` is neither exactly `full` nor exactly `summary` — a typo, a capitalised value, or an empty one. This is the designed fail-safe, not a bug: neither branch deletes source data, but an unrecognised mode must never silently pick one for you. | Set the input to exactly `full` or exactly `summary` and re-run. If it is already one of those, the `isEqualString` condition in task 11 is the thing to verify against the live tenant (see the playbook description's NOTE ON VERIFICATION) — it has no local precedent in this repo. |
-| Full mode runs every pass, reports rows it "WOULD write", and never writes any | `full_execute` was set to `false` (or the automation was invoked directly without `execute=true`). **`YaraConsolidateApply` is a dry run by default** — a bare `!YaraConsolidateApply` writes nothing and deletes nothing. | Leave the playbook's `full_execute` at its default of `true`. The War Room entry names the mode it ran in in its heading — `### YARA full consolidation - DRY RUN` vs `### YARA full consolidation - EXECUTED` — and each `written[]` record says it too, as `action: "would_write"` rather than `"wrote"`. `status` does NOT answer this: it reads `partial_failure` on a dry run that refused a group, because a refusal is a refusal whichever mode found it. The `dry_run` boolean is the one to branch on for the mode. |
-| Summary mode runs every pass, reports rows under `#### Would write`, and never writes any | `summary_execute` was set to `false` (or the automation was invoked directly without `execute=true`). `YaraConsolidateSummary` is a dry run by default. | Leave the playbook's `summary_execute` at its default of `true`. The War Room entry names the mode it ran in in its heading — `### YARA summary consolidation - DRY RUN` vs `### YARA summary consolidation - EXECUTED` — and `status` carries the same answer as `dry_run` or `success`. Each `written[]` record says it too, as `action: "would_write"` rather than `"wrote"`. |
+| The playbook's summarise task runs every pass, reports rows under `#### Would write`, and never writes any | The playbook's `execute` input was set to `false` (or the automation was invoked directly without `execute=true`). `YaraConsolidateSummary` is a dry run by default. | Leave the playbook's `execute` at its default of `true`. The War Room entry names the mode it ran in in its heading — `### YARA summary consolidation - DRY RUN` vs `### YARA summary consolidation - EXECUTED` — and `status` carries the same answer as `dry_run` or `success`. Each `written[]` record says it too, as `action: "would_write"` rather than `"wrote"`. |
+| I want full-detail consolidation and the playbook isn't producing it | The shipped playbook only calls `YaraConsolidateSummary` — the full-detail path was removed from it deliberately (see [Choosing the mode](#choosing-the-mode) above), not left as a dead branch. | Invoke `YaraConsolidateApply` directly (CLI, `!YaraConsolidateApply ...`, or your own playbook task) with `execute=true`, `row_ceiling` and `retention_hours` as needed — it's still fully supported, just not wired to this playbook. |
 | Summary mode reports failures in `Yara.ConsolidateSummary.failed` | A write or a count query failed for that ruleset target. **Nothing was destroyed** — this automation touches no source data, and every `failed[]` record asserts `sources_untouched: true` alongside a `reason` from the closed set `target_unreadable`, `refresh_clear_failed`, `write_incomplete`, `write_error`. Match on `reason`, not on the readable `detail`. | Re-run; it is idempotent. Reconciliation is on `scan_id` sets, not on row counts, but a re-run does **not** leave a matching target alone: it **refreshes**, rewriting the rows for every scan it observed, so a target whose `scan_id` set is unchanged is still rewritten from the sources and `scans_refreshed` reports how many scans that covered. Rows for a `scan_id` no longer present in any source are dropped from the target — the one removal this automation makes, and it is against its own output. If a source dataset could not be read that pass, that removal is skipped entirely and the run says so, in `skipped[]` and in `stale_removal_enabled`. |
 | `YaraCleanup` reports `Nothing selected and nothing deleted: no retention window was given` | Neither `older_than_months` nor `delete_legacy=true` was passed. This is not a failure — it is the "a bare invocation must never delete" property, and no API call was made at all. | Pass a retention window (`older_than_months=N`) and/or `delete_legacy=true`. There is deliberately no default window to fall back on. |
 | `YaraCleanup` ran `EXECUTED` but deleted far less than expected, and `Yara.Cleanup.newer` is non-empty | Rail 4 vetoed those datasets: they are on a **higher** schema version than the `schema_version` argument, i.e. the argument is stale-LOW. | Set `schema_version` to what the fleet actually writes (`YARA_LOOKUP_SCHEMA_VER` on the endpoints). Run `YaraReport` first — its "newer schema" bucket shows the same thing without touching anything. |
@@ -690,13 +700,15 @@ lookup dataset: `run_ts_ms`, `status` (a `started` row before the merge, then on
 `success` / `partial_failure` / `crashed` / `skipped_locked`), `consolidated_count`,
 `failed_count`, `failed_scan_ids`, `failed_reasons`, `error_message`. An **executed**
 `YaraConsolidateSummary` pass records here too (`success` / `partial_failure` /
-`skipped_locked`, and no `started` row), so a summary-mode Job keeps this dataset — and the
-widget's liveness check — alive just as a full-mode one does. Otherwise a **dry run writes
-no row**: the automation is dry-run by default, so a Job left without `full_execute=true`
-leaves this dataset as silent as it leaves the tenant. The single exception is a crash —
-`YaraConsolidateApply` records `crashed` whether or not the pass was executing. A `started`
-row with no terminal row is the pass the platform killed on timeout.
-This is the one queryable, persistent signal for pipeline health — task 8's own description
+`skipped_locked`, and no `started` row), so the shipped playbook's summary-mode Job keeps
+this dataset — and the widget's liveness check — alive on its own; a manually-invoked
+full-detail pass keeps it alive the same way. Otherwise a **dry run writes no row**: both
+automations are dry-run by default, so a Job left without `execute=true` (the playbook's
+input, for the shipped summary path) leaves this dataset as silent as it leaves the tenant.
+The single exception is a crash — `YaraConsolidateApply` records `crashed` whether or not
+the pass was executing. A `started` row with no terminal row is the pass the platform killed
+on timeout.
+This is the one queryable, persistent signal for pipeline health — task 14's own description
 in the playbook says plainly that it is a **placeholder**: it only writes a flag into that
 one run's ephemeral XSOAR investigation context, which nothing else reads, and it is never
 reached at all when a run crashes outright (see the Troubleshooting row above). Use the

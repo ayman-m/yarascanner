@@ -672,36 +672,26 @@ _PLAYBOOK = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
                          "playbook-YARA_Dataset_Consolidation.yml")
 
 
-def test_the_playbook_declares_apply_outputs_the_way_the_automation_produces_them():
-    """The playbook is the shipped consumer, and its outputs block is what a content author
-    reads before writing a task against this data. It declared `written` and `failed` as
-    `String` - "one line per consolidated dataset written" - long after both became lists of
-    objects, and declared no `status` at all while the automation's own yml nominates status
-    as the single field to branch on. The sibling Summary rework updated this same file, so
-    the two halves of one outputs block disagreed with each other.
+def test_the_playbook_no_longer_publishes_apply_outputs():
+    """playbook-YARA_Dataset_Consolidation.yml was rebuilt to call only YaraConsolidateSummary
+    - the full-detail path (this automation) is invoked directly elsewhere, not from this
+    playbook. Its outputs block used to document Yara.ConsolidateApply.* alongside
+    Yara.ConsolidateSummary.*; leaving stale Apply entries there would tell a content author
+    reading the playbook to expect data a task in it never produces. This pins the absence so
+    a copy-paste doesn't quietly bring them back.
     """
     with open(_PLAYBOOK, encoding="utf-8") as fh:
         pb = yaml.safe_load(fh)
-    with open(_YML, encoding="utf-8") as fh:
-        script = yaml.safe_load(fh)
-    declared = {o["contextPath"]: o for o in script["outputs"]}
-    published = {o["contextPath"]: o for o in pb["outputs"]
-                 if o["contextPath"].startswith("Yara.ConsolidateApply.")}
-
-    assert "Yara.ConsolidateApply.status" in published, (
-        "the playbook publishes no status, the one field the automation's yml nominates as "
-        "the field to branch on")
-    for path, out in sorted(published.items()):
-        assert path in declared, "the playbook declares %s, which the automation does not" % path
-        assert out["type"] == declared[path]["type"], (
-            "%s is %s in the playbook and %s in %s - a list of objects declared as a String "
-            "tells an author to match prose that is not there"
-            % (path, out["type"], declared[path]["type"], os.path.basename(_YML)))
-    # and the three result lists are all published, all as objects
-    for key in ("written", "skipped", "failed"):
-        path = "Yara.ConsolidateApply.%s" % key
-        assert published[path]["type"] == "Unknown", published[path]
-        assert "OBJECT" in published[path]["description"]
+    published = {o["contextPath"] for o in pb["outputs"]}
+    apply_paths = {p for p in published if p.startswith("Yara.ConsolidateApply.")}
+    assert not apply_paths, (
+        "the playbook still publishes Apply outputs it can no longer produce: %s"
+        % sorted(apply_paths))
+    scripts = {t["task"]["script"] for t in pb["tasks"].values()
+              if (t["task"].get("script") or "").startswith("Yara")}
+    assert "YaraConsolidateApply" not in scripts, (
+        "the playbook calls YaraConsolidateApply again - its outputs should be documented "
+        "in the playbook's outputs block once more")
 
 
 def _dry_result(failed):
