@@ -2,16 +2,21 @@ id: YARA_Dataset_Consolidation
 version: -1
 name: YARA Dataset Consolidation
 description: "Groups the matched-file rows every host produced under one RULESET into a single consolidated dataset,\
-  \ safely handling scans still in progress. Meant to run twice daily as a Job.\n\nFlow: check readiness -> wait\
-  \ on a bounded poll if scans are still running -> consolidate in the mode consolidation_mode selects -> flag anything\
-  \ that failed. Nothing eligible and nothing running ends the run cleanly; the next trigger picks up whatever has\
-  \ since finished. No state persists between runs.\n\nTwo modes, both reading the same permanent per-host matches\
-  \ datasets and NEITHER DELETING A SOURCE:\n  full (default) - YaraConsolidateApply, every column of every matched-file\
-  \ row, one dataset per ruleset.\n  summary - YaraConsolidateSummary, one row per (host, rule), roughly a fortieth\
-  \ of the rows.\n\nA finished scan is not grouped until its newest row has been quiet for 900s: the scanner writes\
-  \ its terminal lifecycle row before draining its uploaders, so 'completed' does not mean the rows landed, and\
-  \ grouping inside that window would copy a partial set permanently.\n\nSee the pack README for the full reasoning,\
-  \ the safety rails and the argument tables."
+  \ safely handling scans still in progress. Meant to run twice daily as a Job.\n\nFlow: clear context -> consolidate\
+  \ in the mode consolidation_mode selects -> flag anything that failed. There is no separate readiness/poll gate\
+  \ in front of the consolidate step: YaraConsolidateApply and YaraConsolidateSummary are both dry-run-by-default\
+  \ and compute their own eligibility internally (the same check a standalone status task would have made), so\
+  \ calling either directly with execute=true both checks and applies in one call. Nothing eligible ends the run\
+  \ cleanly, reported by the script itself; the next trigger picks up whatever has since finished. No state persists\
+  \ between runs.\n\nTwo modes, both reading the same permanent per-host matches datasets and NEITHER DELETING A\
+  \ SOURCE:\n  full - YaraConsolidateApply, every column of every matched-file row, one dataset per ruleset.\n \
+  \ summary (default) - YaraConsolidateSummary, one row per (host, rule), roughly a fortieth of the rows.\n\nThe\
+  \ readiness-check/poll tasks (status check, GenericPolling wait, recheck) are still defined in this playbook but\
+  \ are currently UNREACHABLE - kept for a possible future re-wire rather than deleted, since removing them loses\
+  \ the automatic wait-for-in-progress-scans behavior they provided. See the pack README for the full reasoning,\
+  \ the safety rails and the argument tables.\n\nA finished scan is not grouped until its newest row has been quiet\
+  \ for 900s: the scanner writes its terminal lifecycle row before draining its uploaders, so 'completed' does not\
+  \ mean the rows landed, and grouping inside that window would copy a partial set permanently."
 starttaskid: '0'
 tasks:
   '0':
@@ -556,23 +561,23 @@ tasks:
         simple: 'yes'
     nexttasks:
       '#none#':
-      - '1'
+      - '12'
     separatecontext: false
     continueonerrortype: ''
     view: '{"position": {"x": 450, "y": 195}}'
 inputs:
 - key: consolidation_mode
   value:
-    simple: full
+    simple: summary
   required: false
-  description: 'Which consolidation step runs on the eligible scans: "full" (default) runs YaraConsolidateApply,
-    which groups every column of every matched-file row, across every host scanned with one ruleset, into ONE yara_scanner_full_v<VER>_rules_<rulehash>
-    dataset per ruleset. "summary" runs YaraConsolidateSummary, which writes one row per (host, rule) into yara_scanner_summary_v<VER>_rules_<hash>.
-    Both read the permanent per-host matches datasets and NEITHER deletes them, so the choice is one of fidelity
-    and cost - full detail is roughly 40x the rows of a summary - not of what survives the pass. Either way the
-    per-host dataset remains the deep-dive source, until the next scan on that host overwrites it. Matched exactly
-    - any other value, including an empty one, runs NEITHER and ends the pass at a dead-end task rather than defaulting
-    to a branch nobody asked for.'
+  description: 'Which consolidation step runs on the eligible scans: "full" runs YaraConsolidateApply, which groups
+    every column of every matched-file row, across every host scanned with one ruleset, into ONE yara_scanner_full_v<VER>_rules_<rulehash>
+    dataset per ruleset. "summary" (default) runs YaraConsolidateSummary, which writes one row per (host, rule) into
+    yara_scanner_summary_v<VER>_rules_<hash>. Both read the permanent per-host matches datasets and NEITHER deletes
+    them, so the choice is one of fidelity and cost - full detail is roughly 40x the rows of a summary - not of
+    what survives the pass. Either way the per-host dataset remains the deep-dive source, until the next scan on
+    that host overwrites it. Matched exactly - any other value, including an empty one, runs NEITHER and ends the
+    pass at a dead-end task rather than defaulting to a branch nobody asked for.'
   playbookInputQuery: null
 - key: summary_execute
   value:
@@ -584,12 +589,14 @@ inputs:
   playbookInputQuery: null
 - key: full_execute
   value:
-    simple: 'true'
+    simple: 'false'
   required: false
-  description: 'Only read in full mode, and the exact counterpart of summary_execute. YaraConsolidateApply is now
-    a dry run unless execute=true, so this is "true" by default - left at "false" the full branch would report what
-    it would write and write nothing, every scheduled run, for ever. Both modes are non-destructive: both read the
-    per-host matches datasets and neither removes them, so they stay the deep-dive source.'
+  description: 'Only read in full mode, and the exact counterpart of summary_execute. Defaults to "false" - the
+    opposite of summary_execute - because this pack currently runs summary-only: the full path is reachable by
+    setting consolidation_mode="full", and this stays "false" until you deliberately opt into it, so a stray mode
+    change alone can''t start writing the ~40x-larger full dataset. YaraConsolidateApply is itself a dry run unless
+    execute=true regardless of this default. Both modes are non-destructive: both read the per-host matches datasets
+    and neither removes them, so they stay the deep-dive source.'
   playbookInputQuery: null
 - key: scan_id
   value:
